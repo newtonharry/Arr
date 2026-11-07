@@ -141,6 +141,23 @@ struct McpSection {
     max_concurrent: usize,
     #[serde(default = "d_mcp_timeout")]
     timeout_secs: u64,
+    /// OAuth 2.1 sign-in (Google) for connectors such as ChatGPT. Absent: static token only.
+    oauth: Option<OAuthSection>,
+}
+
+/// `[mcp.oauth]`: Google as the identity provider for the remote MCP endpoint.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OAuthSection {
+    public_url: String,
+    google_client_id: String,
+    google_client_secret_file: String,
+    allowed_emails: Vec<String>,
+    trusted_client_metadata: Option<Vec<String>>,
+    google_authorization_endpoint: Option<String>,
+    google_token_endpoint: Option<String>,
+    access_token_ttl_secs: Option<u64>,
+    refresh_token_ttl_days: Option<u64>,
 }
 
 fn d_mcp_body() -> usize {
@@ -670,6 +687,136 @@ pub struct McpConfig {
     pub max_body_bytes: usize,
     pub max_concurrent: usize,
     pub timeout: Duration,
+    pub oauth: Option<OAuthConfig>,
+}
+
+/// Validated `[mcp.oauth]`.
+#[derive(Debug, Clone)]
+pub struct OAuthConfig {
+    /// The public origin without a trailing slash (`https://host[:port]`).
+    pub public_url: String,
+    pub google_client_id: String,
+    pub google_client_secret: Secret,
+    /// Lowercase exact addresses.
+    pub allowed_emails: Vec<String>,
+    /// URL prefixes (ending in `/`) under which client metadata documents are trusted.
+    pub trusted_client_metadata: Vec<String>,
+    pub google_authorization_endpoint: Url,
+    pub google_token_endpoint: Url,
+    pub access_token_ttl: Duration,
+    pub refresh_token_ttl: Duration,
+}
+
+/// An https URL (http only for loopback hosts, for tests) without credentials or fragment.
+fn oauth_url(raw: &str, what: &str) -> Result<Url> {
+    let url = Url::parse(raw.trim()).with_context(|| format!("{what}: invalid URL"))?;
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|a| a.is_loopback());
+    if !(url.scheme() == "https" || (url.scheme() == "http" && loopback)) {
+        bail!("{what}: must be an https URL (http only for loopback hosts)");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("{what}: must not contain credentials or a fragment");
+    }
+    Ok(url)
+}
+
+fn oauth_config(
+    o: OAuthSection,
+    allowed_hosts: &[String],
+    read_secret: &dyn Fn(&str, &str) -> Result<String>,
+) -> Result<OAuthConfig> {
+    let public = oauth_url(&o.public_url, "mcp.oauth.public_url")?;
+    if public.path() != "/" || public.query().is_some() {
+        bail!("mcp.oauth.public_url must be an origin only (no path or query)");
+    }
+    let authority = match public.port() {
+        Some(p) => format!("{}:{p}", public.host_str().unwrap_or_default()),
+        None => public.host_str().unwrap_or_default().to_string(),
+    };
+    if !crate::mcp::host_allowed(&authority, allowed_hosts) {
+        bail!("mcp.oauth.public_url host must be listed in mcp.allowed_hosts");
+    }
+    if o.google_client_id.trim().is_empty() {
+        bail!("mcp.oauth.google_client_id must not be empty");
+    }
+    let secret = read_secret(
+        &o.google_client_secret_file,
+        "mcp.oauth.google_client_secret_file",
+    )?;
+    if secret.is_empty() {
+        bail!("mcp.oauth.google_client_secret_file must not be empty");
+    }
+    if o.allowed_emails.is_empty() || o.allowed_emails.len() > 32 {
+        bail!("mcp.oauth.allowed_emails must list 1 to 32 addresses");
+    }
+    let allowed_emails = o
+        .allowed_emails
+        .iter()
+        .map(|e| {
+            let e = e.trim().to_ascii_lowercase();
+            let ok = e.matches('@').count() == 1
+                && !e.starts_with('@')
+                && !e.ends_with('@')
+                && !e.contains(|c: char| c == '*' || c.is_whitespace() || c.is_control());
+            if !ok {
+                bail!("mcp.oauth.allowed_emails entries must be exact addresses (no wildcards)");
+            }
+            Ok(e)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let prefixes = o
+        .trusted_client_metadata
+        .unwrap_or_else(|| vec!["https://chatgpt.com/oauth/".into()]);
+    if prefixes.is_empty() || prefixes.len() > 16 {
+        bail!("mcp.oauth.trusted_client_metadata must list 1 to 16 URL prefixes");
+    }
+    for p in &prefixes {
+        let u = oauth_url(p, "mcp.oauth.trusted_client_metadata")?;
+        if u.as_str() != p || !p.ends_with('/') || u.query().is_some() {
+            bail!(
+                "mcp.oauth.trusted_client_metadata entries must be normalized URL prefixes ending in '/' (got {p:?})"
+            );
+        }
+    }
+    let endpoint = |v: Option<String>, default: &str, what: &str| {
+        oauth_url(v.as_deref().unwrap_or(default), what)
+    };
+    Ok(OAuthConfig {
+        public_url: public.origin().ascii_serialization(),
+        google_client_id: o.google_client_id.trim().to_string(),
+        google_client_secret: Secret(secret),
+        allowed_emails,
+        trusted_client_metadata: prefixes,
+        google_authorization_endpoint: endpoint(
+            o.google_authorization_endpoint,
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "mcp.oauth.google_authorization_endpoint",
+        )?,
+        google_token_endpoint: endpoint(
+            o.google_token_endpoint,
+            "https://oauth2.googleapis.com/token",
+            "mcp.oauth.google_token_endpoint",
+        )?,
+        access_token_ttl: Duration::from_secs(within(
+            "mcp.oauth.access_token_ttl_secs",
+            o.access_token_ttl_secs.unwrap_or(3600),
+            60,
+            86_400,
+        )?),
+        refresh_token_ttl: Duration::from_secs(
+            86_400
+                * within(
+                    "mcp.oauth.refresh_token_ttl_days",
+                    o.refresh_token_ttl_days.unwrap_or(30),
+                    1,
+                    365,
+                )?,
+        ),
+    })
 }
 
 fn absolute_path(raw: &str, what: &str) -> Result<PathBuf> {
@@ -1320,6 +1467,10 @@ pub fn parse_config(
                 .iter()
                 .map(|o| mcp_origin(o))
                 .collect::<Result<Vec<_>>>()?;
+            let oauth = m
+                .oauth
+                .map(|o| oauth_config(o, &allowed_hosts, &read_secret))
+                .transpose()?;
             Some(McpConfig {
                 token: Secret(token),
                 allowed_hosts,
@@ -1333,6 +1484,7 @@ pub fn parse_config(
                 max_concurrent: within("mcp.max_concurrent", m.max_concurrent as u64, 1, 64)?
                     as usize,
                 timeout: Duration::from_secs(within("mcp.timeout_secs", m.timeout_secs, 1, 600)?),
+                oauth,
             })
         }
         _ => None,
@@ -1750,7 +1902,8 @@ mode = "coexistence"
 # movies_path = "/data/movies"        # [library] movies as Plex sees it
 # tv_path = "/data/tv"                # [library] tv as Plex sees it
 
-# Remote MCP at /mcp (Streamable HTTP, static bearer token; no OAuth).
+# Remote MCP at /mcp (Streamable HTTP, static bearer token; optional Google OAuth sign-in,
+# see config/standalone.example.toml and docs/MCP.md).
 # [mcp]
 # enabled = true
 # token_file = "secrets/mcp_token"    # a different token than the API's
@@ -2229,6 +2382,58 @@ mod tests {
             load(&cfg).unwrap().mcp.is_none(),
             "disabled means no endpoint"
         );
+    }
+
+    #[test]
+    fn oauth_section_is_validated() {
+        let base = "[server]\napi_token_file = \"secrets/api_token\"\n[mcp]\nenabled = true\ntoken_file = \"secrets/mcp_token\"\nallowed_hosts = [\"media.example.org\"]\n[mcp.oauth]\ngoogle_client_id = \"id\"\ngoogle_client_secret_file = \"secrets/g\"\n";
+        let try_load = |extra: &str| {
+            let (_t, cfg) = setup(&format!("{base}{extra}"));
+            let d = cfg.parent().unwrap();
+            for (n, v) in [
+                ("mcp_token", "mcp-token-0123456789abcdef0123"),
+                ("g", "secret"),
+            ] {
+                fsutil::write_new_private_file(&d.join("secrets").join(n), v.as_bytes()).unwrap();
+            }
+            load(&cfg).map_err(|e| format!("{e:#}"))
+        };
+        let ok =
+            "public_url = \"https://media.example.org\"\nallowed_emails = [\"You@Example.com\"]\n";
+        let c = try_load(ok).unwrap();
+        let o = c.mcp.unwrap().oauth.unwrap();
+        assert_eq!(o.public_url, "https://media.example.org");
+        assert_eq!(o.allowed_emails, ["you@example.com"]);
+        assert_eq!(o.trusted_client_metadata, ["https://chatgpt.com/oauth/"]);
+        for (bad, why) in [
+            (
+                "public_url = \"https://other.example.org\"\nallowed_emails = [\"a@b.c\"]\n",
+                "allowed_hosts",
+            ),
+            (
+                "public_url = \"http://media.example.org\"\nallowed_emails = [\"a@b.c\"]\n",
+                "https",
+            ),
+            (
+                "public_url = \"https://media.example.org/x\"\nallowed_emails = [\"a@b.c\"]\n",
+                "origin only",
+            ),
+            (
+                "public_url = \"https://media.example.org\"\nallowed_emails = [\"*@b.c\"]\n",
+                "exact",
+            ),
+            (
+                "public_url = \"https://media.example.org\"\nallowed_emails = []\n",
+                "1 to 32",
+            ),
+            (
+                "public_url = \"https://media.example.org\"\nallowed_emails = [\"a@b.c\"]\ngoogle_token_endpoint = \"http://example.com/t\"\n",
+                "https",
+            ),
+        ] {
+            let e = try_load(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     #[test]

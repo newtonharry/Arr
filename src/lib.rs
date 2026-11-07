@@ -24,6 +24,7 @@ pub mod ingest;
 pub mod library;
 pub mod mcp;
 pub mod metadata;
+pub mod oauth;
 pub mod openapi;
 pub mod paths;
 pub mod plan;

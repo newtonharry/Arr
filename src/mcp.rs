@@ -6,7 +6,7 @@
 //!   (stateless JSON responses), which calls the API router in-process (the same auth,
 //!   limits, deadline and contracts, without depending on the configured listen address).
 //!   Each request passes `Host` and `Origin` validation and its own bearer token (not the API
-//!   token) before rmcp parses it; bodies, concurrency and time are bounded. The six tools and
+//!   token; or an OAuth access token, see `oauth.rs`) before rmcp parses it; bodies, concurrency and time are bounded. The six tools and
 //!   their contracts are identical in both transports.
 //!
 //! It keeps no state and knows no other service. Every tool is one or two REST calls with a
@@ -93,9 +93,11 @@ struct RemoteGuard {
     max_body: usize,
     slots: std::sync::Arc<tokio::sync::Semaphore>,
     timeout: Duration,
+    /// OAuth sign-in (`[mcp.oauth]`): its access tokens are accepted besides `token`.
+    oauth: Option<std::sync::Arc<crate::oauth::OAuth>>,
 }
 
-fn host_allowed(host: &str, allowed: &[String]) -> bool {
+pub(crate) fn host_allowed(host: &str, allowed: &[String]) -> bool {
     let Ok(a) = axum::http::uri::Authority::try_from(host) else {
         return false;
     };
@@ -170,12 +172,21 @@ async fn remote_guard(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(str::trim);
-        if !presented.is_some_and(|t| bool::from(t.as_bytes().ct_eq(g.token.expose().as_bytes()))) {
-            break 'checked refuse(
+        let static_token =
+            presented.is_some_and(|t| bool::from(t.as_bytes().ct_eq(g.token.expose().as_bytes())));
+        let oauth_token =
+            presented.is_some_and(|t| g.oauth.as_ref().is_some_and(|o| o.verify_access(t)));
+        if !static_token && !oauth_token {
+            let mut r = refuse(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "missing or invalid MCP bearer token",
             );
+            if let Some(o) = &g.oauth {
+                r.headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, o.challenge());
+            }
+            break 'checked r;
         }
         if req
             .headers()
@@ -216,6 +227,7 @@ pub fn remote(
     cfg: &crate::config::McpConfig,
     api: axum::Router,
     api_token: &str,
+    state_dir: &std::path::Path,
 ) -> Result<(axum::Router, impl FnOnce() + Send + 'static)> {
     use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
     use rmcp::transport::streamable_http_server::{
@@ -236,6 +248,11 @@ pub fn remote(
         std::sync::Arc::new(NeverSessionManager::default()),
         config,
     );
+    let oauth = cfg
+        .oauth
+        .as_ref()
+        .map(|o| crate::oauth::OAuth::new(o, &cfg.allowed_hosts, state_dir))
+        .transpose()?;
     let guard = std::sync::Arc::new(RemoteGuard {
         token: cfg.token.clone(),
         hosts: cfg.allowed_hosts.clone(),
@@ -243,10 +260,14 @@ pub fn remote(
         max_body: cfg.max_body_bytes,
         slots: std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent)),
         timeout: cfg.timeout + Duration::from_secs(5),
+        oauth: oauth.clone(),
     });
-    let router = axum::Router::new()
+    let mut router = axum::Router::new()
         .route_service("/mcp", service)
         .layer(axum::middleware::from_fn_with_state(guard, remote_guard));
+    if let Some(o) = oauth {
+        router = router.merge(crate::oauth::router(o));
+    }
     Ok((router, move || cancel.cancel()))
 }
 

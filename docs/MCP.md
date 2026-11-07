@@ -366,25 +366,93 @@ API, and the API token is refused at `/mcp`. Startup refuses an MCP token equal 
 token, a missing token file, and a non-loopback listener without explicit `allowed_hosts`.
 With `allow_non_loopback`, `/mcp` is still never served unauthenticated.
 
-**What this is not (honest scope).**
+**TLS.** The server has no TLS listener. Put an HTTPS reverse proxy or tunnel in front for
+anything beyond loopback and list the public host in `allowed_hosts`.
 
-- It is **static bearer-token** transport for MCP clients that can send an `Authorization`
-  header (rmcp's client, MCP inspectors, many desktop clients). It is **not** an OAuth 2.1
-  protected resource: there is no protected-resource metadata, no authorization-server
-  integration, no JWT/JWKS validation and no per-user scopes.
-- **Not a ChatGPT connector by itself.** ChatGPT's remote connectors require an HTTPS
-  endpoint reachable from the internet and, for authentication, OAuth (authorization code
-  with PKCE against an authorization server). This server has no TLS listener and no OAuth.
-- To put this endpoint behind a cloud connector deliberately, an operator would need: TLS
-  termination and ingress (a reverse proxy or tunnel) with the public host listed in
-  `allowed_hosts`; and an OAuth-protected-resource front (an authenticating proxy that
-  validates the issuer's tokens — audience/resource, scopes, expiry against the issuer's
-  JWKS — and forwards to `/mcp` with the static MCP token). Implementing native JWT
-  validation here (configured issuer + JWKS, resource/audience/scope checks) is a possible
-  next step; it is not implemented.
+### OAuth sign-in (ChatGPT connectors)
+
+A static bearer token cannot be entered in a ChatGPT connector, which signs in with OAuth.
+With an `[mcp.oauth]` section, Arr is the OAuth 2.1 authorization server for `/mcp` and uses
+Google only to prove who is signing in. Without the section nothing changes: only the static
+token works and no OAuth endpoint exists.
+
+```toml
+[mcp.oauth]
+public_url = "https://media.example.org"   # https origin only; its host must be in allowed_hosts
+google_client_id = "1234567890-abc.apps.googleusercontent.com"
+google_client_secret_file = "secrets/google_client_secret"   # 0600, relative to the config dir
+allowed_emails = ["you@example.com"]       # 1 to 32 exact addresses, case-insensitive, no wildcards
+# Optional, defaults shown. Every URL must be https (http only for loopback hosts, for tests).
+# trusted_client_metadata = ["https://chatgpt.com/oauth/"]
+# google_authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
+# google_token_endpoint = "https://oauth2.googleapis.com/token"
+# access_token_ttl_secs = 3600
+# refresh_token_ttl_days = 30
+```
+
+Startup refuses a `public_url` whose host is not in `mcp.allowed_hosts`, a non-https URL, an
+empty or wildcard `allowed_emails` entry, and a group- or world-readable secret file.
+
+**What it serves** (same `Host` allow-list as `/mcp`; every response is `Cache-Control:
+no-store`; POSTs refuse any `Origin` other than `public_url`; bodies are limited to 16 KiB):
+
+| Path | Purpose |
+| --- | --- |
+| `/.well-known/oauth-protected-resource` (and `.../mcp`) | resource `<public_url>/mcp`, issuer `<public_url>/` |
+| `/.well-known/oauth-authorization-server` | endpoints, S256 PKCE, `private_key_jwt` (RS256) or `none`, `client_id_metadata_document_supported`; no registration endpoint |
+| `GET /authorize`, `POST /authorize/consent` | validates the client, shows a consent page, then sends the user to Google |
+| `GET /auth/callback` | Google's redirect target; checks the ID token and issues an authorization code |
+| `POST /token` | `authorization_code` and `refresh_token` grants |
+
+**Flow.** ChatGPT identifies itself with a Client ID Metadata Document: its `client_id` is an
+https URL. Arr fetches the document (no redirects, no proxy, 5 KiB, 5 s, cached for an hour),
+requires the document's `client_id` to equal the URL and the request's `redirect_uri` to be
+one of its `redirect_uris`, and only then shows the consent page naming the client. Until both
+are valid, errors are shown on a plain page and never redirected. After approval the user signs
+in with Google (`openid email`, `prompt=select_account`). Arr exchanges Google's code, checks
+the ID token (issuer, audience and `azp`, expiry, `email_verified`, and that the lowercase
+address is in `allowed_emails`), and returns an authorization code to the connector. At
+`/token` ChatGPT authenticates with a signed `private_key_jwt` assertion verified against the
+`jwks_uri` of its metadata document (same origin as the `client_id`; RS256; `aud`, `exp`,
+`iat`/`nbf` and a never-repeated `jti` are enforced). The code is single use, short lived,
+bound to the client and redirect address, and redeemed with a PKCE verifier. Refresh tokens
+rotate on every use.
+
+**Using it with Google.** In the Google Cloud console, create an OAuth client of type
+**Web application** and add the authorized redirect URI `<public_url>/auth/callback`. Keep the
+OAuth consent screen in **Testing** and add the allowed users as test users. Put the client
+secret in the secret file and the client id in the config.
+
+**Adding the connector in ChatGPT.** Add a custom connector with the URL `<public_url>/mcp` and
+authentication **OAuth**. ChatGPT discovers the rest, opens the consent page, and the user
+signs in with an allowed Google account.
+
+**Security properties and limits.**
+
+- Only addresses listed in `allowed_emails` can sign in, and the list is checked again every
+  time an access token is used and every time a refresh token is redeemed: removing an
+  address (and restarting) ends its access immediately.
+- Dynamic client registration is not supported. Only clients whose `client_id` matches a
+  `trusted_client_metadata` prefix (`<prefix>client.json` or `<prefix><id>/client.json` with
+  `id` of 1 to 128 of `A-Za-z0-9_-`) are accepted; the default trusts ChatGPT only.
+- Access tokens (`arr_at_...`) and refresh tokens (`arr_rt_...`) are random; only their
+  SHA-256 is stored, in `oauth.sqlite` in the state directory (mode 0600), so they survive a
+  restart but cannot be read from disk. Authorization codes, consent transactions and used
+  assertion ids are in memory only and are lost on restart.
+- OAuth access tokens reach `/mcp` only. The REST API refuses them, as it refuses the MCP
+  token; `/mcp` still accepts the static MCP token. A refused `/mcp` request answers `401` with
+  `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource/mcp"`.
+- The ID token's signature is not verified: OIDC Core 3.1.3.7 allows this when the token
+  comes straight from the token endpoint over TLS, which is the only way it reaches Arr. Its
+  claims are still checked.
+- Logs carry outcome codes only: never tokens, codes, assertions, secrets or addresses. A
+  refused sign-in reveals nothing about the allow-list to the client.
 
 **Tests.** `tests/standalone.rs::remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bearer`
 drives the endpoint with rmcp's official Streamable HTTP client (initialize and discover
 lifecycles; list, read, write and typed-error tool calls) and checks with raw HTTP: missing
 token `401` before initialisation, the API token refused, a foreign `Host` and `Origin` `403`,
 an oversized body `413`, `GET` `405`, and the MCP token refused by the REST API.
+`tests/oauth.rs` covers the OAuth sign-in end to end against loopback mocks (discovery, client
+validation, consent, Google round trip, assertions, PKCE, refresh rotation, restart, removal
+of an address).

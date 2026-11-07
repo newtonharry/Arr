@@ -22,8 +22,8 @@ state directory, no Sonarr, Radarr, Prowlarr or qBittorrent needed at runtime:
 - verified import into **your library** (rename off, `ffprobe` validation, hardlink/copy,
   journaled recovery), **Plex** folder refreshes, and a read-only **Plex library bootstrap**
   so already-owned titles are known before anything is requested;
-- **remote MCP** at `/mcp` (Streamable HTTP, separate static bearer token) besides the stdio
-  adapter.
+- **remote MCP** at `/mcp` (Streamable HTTP, separate static bearer token, optional Google
+  OAuth sign-in for ChatGPT connectors) besides the stdio adapter.
 
 The earlier layouts keep working unchanged: an offline import of a Sonarr/Radarr/Prowlarr
 snapshot, search through `[prowlarr]`, downloads through `[qbittorrent]`, coexistence with
