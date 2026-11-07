@@ -183,6 +183,8 @@ fetch -o "$tmp/$asset.sha256" "$DOWNLOAD_BASE/$asset.sha256" || die "checksum do
 [ "$(sha256 "$tmp/$asset")" = "$(cut -d' ' -f1 "$tmp/$asset.sha256")" ] || die "checksum mismatch for $asset"
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$BIN_DIR"
+# The real folder, without symlinks: services and the updater run exactly the path checked.
+BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
 install -m 755 "$tmp/arr-$target/arr" "$BIN_DIR/arr"
 ARR="$BIN_DIR/arr"
 say "Installed $("$ARR" --version) to $ARR"
@@ -689,6 +691,8 @@ sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # by root and not writable by group or others.
 root_safe() {
 	p=$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")
+	# A symlink anywhere in the path could be repointed later: only real paths qualify.
+	[ "$p" = "$1" ] && [ ! -L "$p" ] || return 1
 	while :; do
 		owner=$(stat -c %u "$p" 2>/dev/null) && mode=$(stat -c %a "$p" 2>/dev/null) || return 1
 		[ "$owner" = 0 ] && [ $((0$mode & 022)) -eq 0 ] || return 1
@@ -696,6 +700,10 @@ root_safe() {
 		p=$(dirname "$p")
 	done
 }
+if [ "$AUTO_UPDATE" = 1 ] && ! command -v flock >/dev/null 2>&1 && ! command -v shlock >/dev/null 2>&1; then
+	say "Automatic updates stay off: this system has no flock (util-linux) to keep two updates apart."
+	AUTO_UPDATE=0
+fi
 if [ "$AUTO_UPDATE" = 1 ] && [ "$kind" = system ] && ! root_safe "$ARR"; then
 	say "Automatic updates stay off: $BIN_DIR can be changed by accounts other than root,"
 	say "and root would run the updater from there. Install to a root-owned folder such as"
@@ -743,20 +751,21 @@ healthy() {
 }
 
 # One update at a time: a manual run and the daily job must not share .previous and .new.
-# mkdir is atomic; a lock left by a run that died (its process gone) is taken over.
+# flock (Linux) holds a kernel lock that ends with this process, so it can't go stale;
+# shlock (macOS) writes its pid atomically and replaces a dead holder's lock safely.
 lock="$ARR.update-lock"
 tmp=""
-if ! mkdir "$lock" 2>/dev/null; then
-	pid=$(cat "$lock/pid" 2>/dev/null || true)
-	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-		log "another update is running"
-		exit 0
-	fi
-	rm -rf "$lock"
-	mkdir "$lock" || { log "couldn't take the update lock"; exit 1; }
+if command -v flock >/dev/null 2>&1; then
+	exec 9>"$lock"
+	flock -n 9 || { log "another update is running"; exit 0; }
+	trap 'rm -rf ${tmp:+"$tmp"}' EXIT
+elif command -v shlock >/dev/null 2>&1; then
+	shlock -f "$lock" -p $$ || { log "another update is running"; exit 0; }
+	trap 'rm -f "$lock"; rm -rf ${tmp:+"$tmp"}' EXIT
+else
+	log "no flock or shlock to keep updates apart; not updating"
+	exit 1
 fi
-echo $$ >"$lock/pid"
-trap 'rm -rf "$lock" ${tmp:+"$tmp"}' EXIT
 
 RELEASES=${ARR_RELEASES_URL:-https://github.com/$REPO/releases}
 latest=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" | sed 's#.*/tag/##')
