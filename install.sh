@@ -109,6 +109,8 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
+# Remote settings from environment variables turn remote setup on, as their flags do.
+[ -z "$NGROK_TOKEN$NGROK_DOMAIN$GOOGLE_ID$GOOGLE_SECRET$ALLOW_EMAILS" ] || REMOTE=1
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -501,8 +503,10 @@ remote_setup() {
 		NGROK="$BIN_DIR/ngrok"
 	fi
 	umask 077
-	# The authtoken stays in a private config file, never on a command line.
-	printf 'version: "3"\nagent:\n  authtoken: %s\n' "$NGROK_TOKEN" >"$STATE_DIR/ngrok.yml"
+	# The authtoken stays in a private config file, never on a command line. web_addr: false
+	# turns off ngrok's local inspection API, which would otherwise let any local user read the
+	# sign-in tokens passing through the tunnel.
+	printf 'version: "3"\nagent:\n  authtoken: %s\n  web_addr: false\n' "$NGROK_TOKEN" >"$STATE_DIR/ngrok.yml"
 	"$NGROK" config check --config "$STATE_DIR/ngrok.yml" >/dev/null || die "ngrok rejected its config"
 	printf '%s' "$GOOGLE_SECRET" >"$STATE_DIR/secrets/google_client_secret"
 	[ -f "$STATE_DIR/secrets/mcp_token" ] ||
@@ -511,10 +515,11 @@ remote_setup() {
 	# /mcp must accept the ngrok host; then add the sign-in section.
 	cp "$CONFIG" "$tmp/config.before-remote"
 	hosts="allowed_hosts = [$(toml "$NGROK_DOMAIN"), \"localhost\", \"127.0.0.1\"]"
-	if grep -q '^\[mcp\]' "$CONFIG"; then
-		grep -q '^allowed_hosts' "$CONFIG" &&
+	mcp_header='^[[:space:]]*\[mcp\][[:space:]]*(#.*)?$'
+	if grep -Eq "$mcp_header" "$CONFIG"; then
+		grep -Eq '^[[:space:]]*allowed_hosts[[:space:]]*=' "$CONFIG" &&
 			die "your config already sets allowed_hosts; add [mcp.oauth] by hand (see docs/MCP.md)"
-		awk -v line="$hosts" '{ print } /^\[mcp\]$/ { print line }' "$tmp/config.before-remote" >"$CONFIG"
+		awk -v line="$hosts" -v re="$mcp_header" '{ print } $0 ~ re { print line }' "$tmp/config.before-remote" >"$CONFIG"
 	else
 		printf '\n[mcp]\nenabled = true\ntoken_file = "secrets/mcp_token"\n%s\n' "$hosts" >>"$CONFIG"
 	fi
@@ -531,6 +536,10 @@ EOF
 		cat "$tmp/check.json"
 		cp "$tmp/config.before-remote" "$CONFIG"
 		die "arr check rejected the remote access settings; your previous config is restored"
+	fi
+	if ! grep -q '"mcp_enabled": *true' "$tmp/check.json"; then
+		cp "$tmp/config.before-remote" "$CONFIG"
+		die "your config turns MCP off ([mcp] enabled = false); set it to true and run this again"
 	fi
 	say "Remote access configured for https://$NGROK_DOMAIN"
 }
