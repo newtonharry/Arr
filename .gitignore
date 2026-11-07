@@ -1,0 +1,8 @@
+/target/
+/.private/
+/.claude/
+*.log
+.env
+*.sqlite*
+/config/local*
+!config/local.example.toml

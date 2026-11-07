@@ -1,0 +1,94 @@
+# Standalone example (placeholders only): native indexers, the embedded downloader, your own
+# Plex library and metadata. Copy to STATE/config.toml (chmod 600). Credentials only as files
+# under STATE/secrets (chmod 600). Policy comes from `arr setup` (see
+# config/setup.example.toml). Relative paths resolve against the config file's directory.
+
+[server]
+listen = "127.0.0.1:8787"
+allow_non_loopback = false
+api_token_file = "secrets/api_token"
+
+[state]
+dir = "."
+
+# The Pirate Bay's JSON API, natively. Its magnets carry no trackers unless you list some,
+# so the embedded engine below needs dht = true (or magnet_trackers, or initial_peers).
+[[indexer]]
+id = 1                                  # keep imported ids (Prowlarr id) when migrating
+name = "The Pirate Bay"
+kind = "thepiratebay"
+base_url = "https://apibay.org/"        # the exact API base URL you trust
+recent_feed = true                      # RSS: precompiled/data_top100_recent.json
+timeout_secs = 30
+max_concurrent = 1
+min_interval_ms = 2000                  # spacing between requests
+cache_ttl_secs = 900
+# magnet_trackers = ["udp://tracker.example:1337/announce"]   # public trackers only
+# uploaders = ["trusted-uploader"]       # only results from these uploaders
+# query_limit = 100                      # per limits_unit (Prowlarr queryLimit semantics)
+# grab_limit = 20
+# limits_unit = "day"
+
+# A generic Torznab endpoint (spec 1.3), e.g. a self-hosted Jackett indexer.
+# [[indexer]]
+# id = 2
+# name = "Torznab example"
+# kind = "torznab"
+# base_url = "http://127.0.0.1:9117/api/v2.0/indexers/example/results/torznab/"
+# api_key_file = "secrets/indexer_2_api_key"   # sent only to base_url's origin
+# api_path = "api"
+# download_origins = ["https://downloads.example"]   # .torrent links elsewhere (no key sent)
+# key_origins = ["https://tracker.example"]          # may receive the key in announce URLs
+# prowlarr_definition = "example"                    # stands in for this imported definition
+# max_pages = 2
+# page_size = 100
+
+[tvmaze]
+enabled = true
+base_url = "https://api.tvmaze.com"
+
+[tmdb]
+enabled = true
+base_url = "https://api.themoviedb.org"
+credential_file = "secrets/tmdb_credential"
+
+[execution]
+enabled = false            # enable deliberately after `check` and readiness pass
+download_cleanup = true
+
+[embedded]
+download_dir = "/srv/arr/downloads"
+listen = "0.0.0.0:6881"
+trackers = true
+dht = true                 # public trackerless magnets; private torrents never use the DHT
+local_discovery = false
+max_active_downloads = 3
+# ratio_limit = 2.0        # share limits when no seed goal applies
+# seeding_time_limit_minutes = 4320
+
+[migration]
+mode = "coexistence"
+
+[library]
+movies = "/srv/media/movies"
+tv = "/srv/media/tv"
+ffprobe = "/usr/bin/ffprobe"   # external dependency: apt install ffmpeg (Debian/Ubuntu)
+
+[plex]
+base_url = "http://127.0.0.1:32400"
+token_file = "secrets/plex_token"
+movie_section = 1
+tv_section = 2
+movies_path = "/data/movies"   # [library] movies as Plex sees it
+tv_path = "/data/tv"           # [library] tv as Plex sees it
+
+# Remote MCP (Streamable HTTP, static bearer token; no OAuth, no TLS: put an HTTPS proxy in
+# front for anything beyond loopback, see docs/MCP.md).
+# [mcp]
+# enabled = true
+# token_file = "secrets/mcp_token"
+# allowed_hosts = ["localhost", "127.0.0.1"]
+# allowed_origins = []
+# max_body_bytes = 65536
+# max_concurrent = 4
+# timeout_secs = 120

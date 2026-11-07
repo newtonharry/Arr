@@ -1,0 +1,74 @@
+# Managed settings for a standalone deployment (`arr setup --settings FILE`, or the
+# same document as JSON in POST /api/v1/setup {"document": {...}}). Every key is optional;
+# the values below are the defaults unless noted. Policy only: no URLs or credentials here.
+
+schema_version = 1
+
+[movies]
+# enabled = true                 # default: true when [library] movies is configured
+# root = "/srv/media/movies"     # default: [library] movies
+maximum_size_mb = 0              # 0 = unlimited
+allow_hardcoded_subs = false
+prefer_propers_and_repacks = true
+revision_upgrades = false        # never replace an owned file unless you turn this on
+torrent_delay_minutes = 0
+bypass_delay_if_highest_quality = true
+redownload_failed = true
+redownload_failed_interactive = false
+rss_sync_interval_minutes = 15   # 0 disables RSS (RSS runs only with execution enabled)
+availability_delay_days = 0
+copy_using_hardlinks = true
+minimum_free_space_mb = 100
+replace_illegal_characters = true
+
+[tv]
+rss_sync_interval_minutes = 15
+
+# Default: one "HD 720p/1080p" profile per media kind (movies: original language; TV: any).
+# One profile per kind keeps adds (and MCP add_media) free of a quality_profile choice.
+[[profiles]]
+id = "movies-hd"
+media = "movie"
+name = "HD 720p/1080p (movies)"
+tiers = [["hdtv_720p"], ["webdl_720p", "webrip_720p"], ["bluray_720p"], ["hdtv_1080p"], ["webdl_1080p", "webrip_1080p"], ["bluray_1080p"]]
+language = "original"
+unmarked = "assume_original"
+
+[[profiles]]
+id = "tv-hd"
+media = "series"
+tiers = [["hdtv_720p"], ["webdl_720p", "webrip_720p"], ["bluray_720p"], ["hdtv_1080p"], ["webdl_1080p", "webrip_1080p"], ["bluray_1080p"]]
+language = "any"
+unmarked = "accept"
+
+# Size limits in MiB per minute of runtime. Defaults: minimum 1 (SD), 3 (720p), 4 (1080p),
+# 10 (2160p), 50 (remux); no maximum.
+[[size_limits]]
+media = "both"
+quality = "webdl_1080p"
+min_mib_per_minute = 4.0
+# max_mib_per_minute = 400.0
+# preferred_mib_per_minute = 95.0
+
+[download]
+movie_category = "um-movies"
+tv_category = "um-tv"
+initial_state = "start"          # start | force_start | paused
+remove_completed = true          # after a verified import and the seed goal
+remove_failed = true
+
+# Per-indexer policy (default: every configured [[indexer]] for movies and TV).
+[[indexers]]
+id = 1
+movies = true
+tv = true
+movie_categories = [2000]
+tv_categories = [5000]
+priority = 25
+minimum_seeders = 1
+automatic_search = true
+interactive_search = true
+rss = true
+seed_ratio = 1.0                 # seed goal: ratio OR time, whichever comes first
+seed_time_minutes = 4320         # negative = leave to the download client's limits
+# season_pack_seed_time_minutes = 4320

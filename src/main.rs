@@ -1,0 +1,476 @@
+use anyhow::{Context, Result};
+use arr::{api, config, fsutil, import, library, mcp, setup, store};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+#[derive(Parser)]
+#[command(
+    name = "arr",
+    version,
+    about = "Unified movie/TV API server (shadow by default; execution when enabled)"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create a private state directory, API token and config template (never overwrites).
+    /// The template favours native indexers and the embedded downloader; pass
+    /// --prowlarr-url for the legacy Prowlarr-backed layout.
+    Init {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: String,
+        #[arg(long)]
+        prowlarr_url: Option<String>,
+    },
+    /// Create (or replace) managed settings for a standalone deployment, with an empty
+    /// catalog, from an optional setup document (TOML; defaults otherwise). Validates the
+    /// config without needing its secret files yet. Never enables execution.
+    Setup {
+        #[arg(long)]
+        config: PathBuf,
+        /// Setup document (see config/setup.example.toml). Default: built-in defaults.
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Validate and summarise without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Import a native Radarr/Sonarr/Prowlarr snapshot (offline; no network access).
+    Import {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// When the snapshot was taken (RFC 3339). Defaults to the file's mtime.
+        #[arg(long)]
+        observed_at: Option<String>,
+        /// Validate and summarise without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read-only bootstrap of an existing Plex library into the managed catalog (exact
+    /// provider ids plus validated local files; nothing monitored or searched). Runs bounded
+    /// batches until each media kind is done; resumable. Run it before `serve`, or use
+    /// POST /api/v1/setup/plex/bootstrap on a running server.
+    Bootstrap {
+        #[arg(long)]
+        config: PathBuf,
+        /// movies, tv or all.
+        #[arg(long, default_value = "all")]
+        media: String,
+        #[arg(long)]
+        restart: bool,
+        #[arg(long)]
+        dry_run: bool,
+        /// Items per batch (default 50 movies or 5 shows; at most 200).
+        #[arg(long)]
+        batch: Option<u32>,
+    },
+    /// Validate config, secret file modes, state DB and the active import (no network).
+    Check {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run the HTTP API (and, with [execution] enabled, the background worker).
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Serve MCP tools on stdin/stdout as a client of a running API (stdout carries only MCP).
+    Mcp {
+        /// Base URL of `arr serve` (http or https; no credentials, query or fragment).
+        #[arg(long)]
+        api_url: String,
+        /// File holding the API bearer token (mode 600).
+        #[arg(long)]
+        token_file: PathBuf,
+        /// Timeout for each API call, in seconds.
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=600))]
+        timeout_secs: u64,
+    },
+    /// Generate an authored test release: real playable video files (ffmpeg testsrc) under
+    /// OUT/<name>/ plus OUT/<name>.torrent with correct piece hashes. Never fetches anything.
+    Fixture {
+        #[arg(long)]
+        out: PathBuf,
+        /// Release (torrent) name, e.g. "Parity Feature 2026 1080p WEB-DL-UM".
+        #[arg(long)]
+        name: String,
+        /// Video files inside the release, e.g. "Parity.Show.S01E01.1080p.WEB-DL-UM.mkv"
+        /// (repeatable). Default: one file named after the release.
+        #[arg(long = "file")]
+        files: Vec<String>,
+        #[arg(long, default_value_t = 60)]
+        seconds: u32,
+        #[arg(long, default_value = "/usr/bin/ffmpeg")]
+        ffmpeg: PathBuf,
+    },
+}
+
+fn fixture(
+    out: PathBuf,
+    name: String,
+    files: Vec<String>,
+    seconds: u32,
+    ffmpeg: PathBuf,
+) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        anyhow::bail!("--name must be a plain file name");
+    }
+    std::fs::create_dir_all(&out)?;
+    let names = if files.is_empty() {
+        vec![format!("{name}.mkv")]
+    } else {
+        files
+    };
+    let tmp = out.join(format!(".fixture-{}.mkv", fsutil::random_hex(4)?));
+    let mut contents = vec![];
+    for (i, f) in names.iter().enumerate() {
+        if arr::paths::safe_rel(f).is_none() {
+            anyhow::bail!("--file {f:?} must be a plain relative path");
+        }
+        // Distinct durations make every file (and so every piece) unique.
+        let bytes = arr::fixture::generate_mkv(&ffmpeg, &tmp, (seconds + i as u32).min(600))?;
+        contents.push((f.clone(), bytes));
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let multi = contents.len() > 1 || contents[0].0.contains('/');
+    let t = arr::fixture::write_release(&out, &name, &contents)?;
+    let torrent_path = out.join(format!("{name}.torrent"));
+    std::fs::write(&torrent_path, &t.torrent)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": t.name,
+            "info_hash": t.info_hash,
+            "magnet": t.magnet,
+            "torrent": torrent_path,
+            "data_root": if multi { out.join(&name) } else { out.clone() },
+            "files": t.files,
+            "size": t.size,
+            "note": "place the data where qBittorrent's save path maps (it then verifies the pieces and seeds); serve the .torrent from a mock Prowlarr download endpoint",
+        }))?
+    );
+    Ok(())
+}
+
+fn init(state_dir: PathBuf, listen: String, prowlarr_url: Option<String>) -> Result<()> {
+    if let Some(u) = &prowlarr_url {
+        config::parse_base_url(u, "--prowlarr-url")?;
+    }
+    fsutil::ensure_private_dir(&state_dir)?;
+    let secrets = state_dir.join("secrets");
+    fsutil::ensure_private_dir(&secrets)?;
+    let mut created = vec![];
+    let token = secrets.join("api_token");
+    if !token.exists() {
+        fsutil::write_new_private_file(&token, fsutil::random_hex(32)?.as_bytes())?;
+        created.push(token.display().to_string());
+    }
+    let cfg = state_dir.join("config.toml");
+    if !cfg.exists() {
+        fsutil::write_new_private_file(
+            &cfg,
+            config::template(&listen, prowlarr_url.as_deref()).as_bytes(),
+        )?;
+        created.push(cfg.display().to_string());
+    }
+    let next: Vec<&str> = if prowlarr_url.is_some() {
+        vec![
+            "write the Prowlarr API key to secrets/prowlarr_api_key (chmod 600)",
+            "arr import --state-dir <STATE> --snapshot <native.json>",
+            "arr serve --config <STATE>/config.toml",
+        ]
+    } else {
+        vec![
+            "edit <STATE>/config.toml: [library], [[indexer]], [embedded] (and optionally [tmdb], [tvmaze], [plex], [mcp]); secrets only as files under <STATE>/secrets (chmod 600)",
+            "arr setup --config <STATE>/config.toml [--settings setup.toml]",
+            "arr check --config <STATE>/config.toml",
+            "arr serve --config <STATE>/config.toml",
+            "see docs/STANDALONE.md for the full recipe",
+        ]
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "state_dir": state_dir,
+            "created": created,
+            "next": next,
+        }))?
+    );
+    Ok(())
+}
+
+async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: bool) -> Result<()> {
+    fsutil::check_private_file(&config_path)?;
+    let text = String::from_utf8(fsutil::read_bounded(&config_path, 256 * 1024)?)
+        .context("config is not UTF-8")?;
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let (cfg, pending) = config::parse_config(
+        &text,
+        &base,
+        &config_path.display().to_string(),
+        config::Secrets::Defer,
+    )?;
+    let doc = match &settings {
+        Some(p) => setup::read_doc(p)?,
+        None => setup::SetupDoc::default(),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let prepared = setup::prepare(&doc, &cfg, now).map_err(|errs| {
+        anyhow::anyhow!("the setup document is invalid:\n- {}", errs.join("\n- "))
+    })?;
+    let state_dir = cfg.state_dir.clone();
+    let active = import::load_active(&state_dir)?;
+    let origin = active.as_ref().map(|l| {
+        if l.manifest.files.contains_key(setup::SOURCE_FILE) {
+            "managed_setup"
+        } else {
+            "native_snapshot"
+        }
+    });
+    let (index, grabs) = {
+        let db = state_dir.join("state.sqlite");
+        if db.exists() {
+            let store = store::Store::open(&db)?;
+            let mode = cfg.migration;
+            (
+                store.blocking(|c| library::load_index(c, mode))?,
+                store.blocking(|c| setup::active_grabs(c))?,
+            )
+        } else {
+            (
+                arr::catalog::CatalogIndex::new(arr::catalog::Catalog {
+                    schema_version: arr::catalog::CATALOG_SCHEMA_VERSION,
+                    import_id: String::new(),
+                    observed_at: String::new(),
+                    movies: vec![],
+                    series: vec![],
+                }),
+                vec![],
+            )
+        }
+    };
+    let conflicts = setup::replace_conflicts(origin, &prepared.normalized.settings, &index, &grabs);
+    if !conflicts.is_empty() {
+        anyhow::bail!("managed setup refused:\n- {}", conflicts.join("\n- "));
+    }
+    let mut out = if dry_run {
+        setup::summary(&prepared, "dry_run", None)
+    } else {
+        let (status, dir) = import::write_and_activate(
+            &state_dir,
+            setup::SOURCE_FILE,
+            &prepared.source,
+            &prepared.normalized,
+        )?;
+        setup::summary(&prepared, status, Some(dir))
+    };
+    let ffprobe = match &cfg.library {
+        Some(l) => match arr::probe::preflight(&l.ffprobe).await {
+            Ok(v) => serde_json::json!({ "status": "ok", "version": v }),
+            Err(e) => serde_json::json!({ "status": "failed", "message": e }),
+        },
+        None => serde_json::json!({ "status": "not_configured" }),
+    };
+    out["preflight"] = serde_json::json!({
+        "secret_files_missing": pending,
+        "ffprobe": ffprobe,
+        "search_backend": cfg.search_backend(),
+        "download_backend": cfg.download_backend(),
+        "execution_enabled": cfg.execution_enabled,
+    });
+    out["next"] = serde_json::json!([
+        "create any missing secret files (chmod 600) listed under preflight",
+        "arr check --config <STATE>/config.toml",
+        "arr serve --config <STATE>/config.toml (a running server picks up a new setup only after restart; POST /api/v1/setup activates without one)",
+    ]);
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // Logs go to stderr; the MCP adapter stays quiet unless asked.
+    let default_filter = match cli.command {
+        Command::Mcp { .. } => "warn",
+        _ => "info,arr=info",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    match cli.command {
+        Command::Init {
+            state_dir,
+            listen,
+            prowlarr_url,
+        } => init(state_dir, listen, prowlarr_url),
+        Command::Import {
+            state_dir,
+            snapshot,
+            observed_at,
+            dry_run,
+        } => {
+            let observed_at = observed_at
+                .map(|s| {
+                    OffsetDateTime::parse(&s, &Rfc3339).context("--observed-at must be RFC 3339")
+                })
+                .transpose()?;
+            let summary = tokio::task::spawn_blocking(move || {
+                import::run_import(&import::ImportOptions {
+                    state_dir,
+                    snapshot,
+                    observed_at,
+                    dry_run,
+                })
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
+        Command::Setup {
+            config,
+            settings,
+            dry_run,
+        } => setup_cmd(config, settings, dry_run).await,
+        Command::Bootstrap {
+            config,
+            media,
+            restart,
+            dry_run,
+            batch,
+        } => {
+            let cfg = config::load(&config)?;
+            let state = api::AppState::new(cfg)?;
+            let kinds: Vec<arr::settings::MediaKind> = match media.as_str() {
+                "all" => vec![
+                    arr::settings::MediaKind::Movie,
+                    arr::settings::MediaKind::Series,
+                ],
+                "movies" => vec![arr::settings::MediaKind::Movie],
+                "tv" => vec![arr::settings::MediaKind::Series],
+                other => anyhow::bail!("--media must be movies, tv or all (got {other:?})"),
+            };
+            let mut out = vec![];
+            for m in kinds {
+                let mut first = restart;
+                let mut last = None;
+                for _ in 0..100_000 {
+                    let run = arr::bootstrap::batch(&state, m, first, dry_run, batch)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{:?}: {}", e.code, e.message))?;
+                    first = false;
+                    eprintln!(
+                        "{:?}: {} offset {}/{} titles +{} files +{}",
+                        run.media,
+                        run.status,
+                        run.offset,
+                        run.total.map_or_else(|| "?".to_string(), |t| t.to_string()),
+                        run.counts.titles_created,
+                        run.counts.files_recorded
+                    );
+                    let running = run.status == "running";
+                    let stuck = last
+                        .as_ref()
+                        .is_some_and(|l: &arr::bootstrap::Run| l.offset == run.offset);
+                    last = Some(run);
+                    if !running || stuck {
+                        break;
+                    }
+                }
+                out.extend(last);
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "runs": out }))?
+            );
+            Ok(())
+        }
+        Command::Check { config } => {
+            let cfg = config::load(&config)?;
+            let ffprobe = match &cfg.library {
+                Some(l) => Some(arr::probe::preflight(&l.ffprobe).await),
+                None => None,
+            };
+            if cfg.execution_enabled
+                && let Some(Err(e)) = &ffprobe
+            {
+                anyhow::bail!("media validation preflight failed: {e}");
+            }
+            let state = api::AppState::new(cfg)?;
+            state.store.ping().await?;
+            let index = state.index();
+            let import = state.current().map(|l| {
+                serde_json::json!({
+                    "import_id": l.import_id,
+                    "origin": l.origin,
+                    "observed_at": l.observed_at,
+                    "movies": index.catalog.movies.len(),
+                    "series": index.catalog.series.len(),
+                    "blocking_issues": l.settings.blocking_issues,
+                })
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "config": "ok",
+                    "listen": state.cfg.listen.to_string(),
+                    "prowlarr_configured": state.cfg.prowlarr.is_some(),
+                    "search_backend": state.cfg.search_backend(),
+                    "native_indexers": state.cfg.indexers.iter().map(|i| serde_json::json!({ "id": i.id, "name": i.name, "kind": i.kind })).collect::<Vec<_>>(),
+                    "tvmaze_enabled": state.tvmaze.is_some(),
+                    "tmdb_configured": state.tmdb.is_some(),
+                    "execution_enabled": state.cfg.execution_enabled,
+                    "qbittorrent_configured": state.cfg.qbittorrent.is_some(),
+                    "download_backend": state.cfg.download_backend(),
+                    "library_configured": state.cfg.library.is_some(),
+                    "plex_configured": state.plex.is_some(),
+                    "mcp_enabled": state.cfg.mcp.is_some(),
+                    "ffprobe": ffprobe.map(|r| match r {
+                        Ok(v) => serde_json::json!({ "status": "ok", "version": v }),
+                        Err(e) => serde_json::json!({ "status": "failed", "message": e }),
+                    }),
+                    "indexer_mapping": state.search.as_ref().and_then(|b| b.native()).and_then(|r| state.current().map(|l| r.mapping(&l.settings))),
+                    "active_import": import,
+                }))?
+            );
+            Ok(())
+        }
+        Command::Serve { config } => api::serve(config::load(&config)?).await,
+        Command::Mcp {
+            api_url,
+            token_file,
+            timeout_secs,
+        } => {
+            mcp::run(mcp::Options {
+                api_url,
+                token_file,
+                timeout: std::time::Duration::from_secs(timeout_secs),
+            })
+            .await
+        }
+        Command::Fixture {
+            out,
+            name,
+            files,
+            seconds,
+            ffmpeg,
+        } => fixture(out, name, files, seconds, ffmpeg),
+    }
+}

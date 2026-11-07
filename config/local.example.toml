@@ -1,0 +1,124 @@
+# Example runtime config (placeholders only). Real configs live in the private state
+# directory as STATE/config.toml (mode 0600); `arr init` writes one for you.
+# Relative paths resolve against the directory containing the config file.
+
+[server]
+listen = "127.0.0.1:8787"          # loopback by default
+allow_non_loopback = false         # must be true to bind any non-loopback address
+api_token_file = "secrets/api_token"
+max_body_bytes = 65536
+request_timeout_secs = 180
+max_concurrent_requests = 16
+
+[state]
+dir = "."
+
+[prowlarr]
+base_url = "http://127.0.0.1:9696"        # operator-chosen; never taken from API callers
+api_key_file = "secrets/prowlarr_api_key" # file containing only the key, chmod 600
+timeout_secs = 60
+page_size = 100
+max_pages = 2
+max_concurrent = 2
+cache_ttl_secs = 900
+max_response_bytes = 16777216
+
+[tvmaze]
+enabled = false
+base_url = "https://api.tvmaze.com"
+timeout_secs = 15
+
+[tmdb]
+enabled = false
+base_url = "https://api.themoviedb.org"
+# credential_file = "secrets/tmdb_credential"  # v4 read-access token (eyJ...) or v3 API key
+timeout_secs = 15
+
+[execution]
+# Master switch for writes outside the private state: qBittorrent submission, completed-
+# download import into [library], download cleanup, Torznab RSS sync, scheduled scans and
+# Plex refreshes. Keep false until verified in an isolated sandbox (docs/EXECUTION-SANDBOX.md).
+# Enabling it requires a download client ([qbittorrent] or [embedded]), [library] and a
+# search backend ([prowlarr] or native [[indexer]] entries).
+enabled = false
+# Follow the imported removeCompletedDownloads/removeFailedDownloads policy (after a verified
+# import and a met share limit). false = always keep downloads in qBittorrent.
+download_cleanup = true
+
+# [qbittorrent]
+# base_url = "http://127.0.0.1:8080"
+# username_file = "secrets/qbittorrent_username"   # both files, or neither (auth bypass)
+# password_file = "secrets/qbittorrent_password"
+# save_path = "/downloads"          # download directory as qBittorrent sees it (absolute)
+# local_path = "/data/downloads"    # the same directory as this server sees it
+# movie_category = "um-movies"      # coexistence mode: must differ from every native category
+# tv_category = "um-tv"             # (default: the imported native client category)
+# timeout_secs = 20
+
+# Or the embedded BitTorrent engine (librqbit, in this process) INSTEAD of [qbittorrent]:
+# no qBittorrent URL, credential or API. Never both; there is no fallback between them.
+# A state directory is bound to the first backend it runs with (docs/EMBEDDED-DOWNLOADER.md).
+# [embedded]
+# download_dir = "/data/um-embedded"  # dedicated; not a library root, not the state directory
+# listen = "0.0.0.0:6881"             # BitTorrent TCP listen address (port 0 = random)
+# trackers = true                     # announce to the torrent's trackers
+# dht = false                         # mainline DHT (state under STATE/embedded)
+# local_discovery = false             # LSD multicast
+# max_active_downloads = 3            # further grabs wait in the outbox
+# ratio_limit = 2.0                   # share limits when the indexer sets none (optional)
+# seeding_time_limit_minutes = 4320
+# movie_category = "um-movies"        # labels (default: the imported native client category)
+# tv_category = "um-tv"
+
+[migration]
+# coexistence: Sonarr/Radarr keep running. Imported titles are catalog and ownership evidence
+#   only; nothing imported is acquired until it is adopted with POST /api/v1/library
+#   (native_handoff_confirmed: native monitoring for that scope suspended and no native
+#   download active). qBittorrent categories must differ from every enabled native client
+#   category (both apps).
+# legacy: every imported item is managed and acquires with its native monitoring (earlier
+#   builds; a selected-title catalog).
+# Required explicitly when [execution] enabled = true.
+mode = "coexistence"
+
+# [library]
+# movies = "/data/movies"           # local path of the imported Radarr root
+# tv = "/data/tvshows"              # local path of the imported Sonarr root
+# movies_native_root = "/movies"    # only if the import has several Radarr roots
+# tv_native_root = "/tvshows"       # only if the import has several Sonarr roots
+# ffprobe = "/usr/bin/ffprobe"
+# probe_timeout_secs = 600
+# sample_detection = true           # native minimum durations (15 s .. 600 s by runtime)
+# probes_per_scan = 20
+
+# [automation]
+# rss_interval_minutes = 15         # default: the imported rssSyncInterval (0 disables RSS)
+# searches_per_run = 5              # explicit backlog searches / request retries per pass
+# request_retry_minutes = 60        # first retry of an explicit request that found nothing
+# request_expiry_days = 14
+# metadata_refresh_hours = 12
+# rescan_hours = 6
+# poll_seconds = 30
+# stall_timeout_minutes = 720       # observed time downloading without progress before a download fails
+
+# [plex]
+# base_url = "http://127.0.0.1:32400"
+# token_file = "secrets/plex_token"
+# movie_section = 1
+# tv_section = 2
+# movies_path = "/data/movies"      # [library] movies as Plex sees it (folder refreshes, bootstrap)
+# tv_path = "/data/tvshows"
+# timeout_secs = 15
+
+# Remote MCP at /mcp in this process (Streamable HTTP, static bearer token).
+# [mcp]
+# enabled = true
+# token_file = "secrets/mcp_token"  # different from the API token
+# allowed_hosts = ["localhost", "127.0.0.1"]
+# allowed_origins = []
+# max_body_bytes = 65536
+# max_concurrent = 4
+# timeout_secs = 120
+
+# Native indexers ([[indexer]], see config/standalone.example.toml) replace [prowlarr]
+# entirely; the two are never configured together.
