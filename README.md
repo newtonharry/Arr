@@ -99,9 +99,11 @@ The installer prints this block with your paths filled in:
 }
 ```
 
-The assistant gets six tools: `search_titles`, `add_media`, `media_status`, `requests`,
-`release_choices` and `start_download`. By default it adds what you ask for and Arr picks the
-release. Ask to "choose a release" if you want to pick one yourself.
+The assistant gets seven tools: `search_titles`, `add_media`, `media_status`, `requests`,
+`library`, `release_choices` and `start_download`. Ask "what's in my library" or "which
+seasons of Severance do I have" and it reads your catalog, including everything Arr imported
+from Plex. By default it adds what you ask for and Arr picks the release. Ask to "choose a
+release" if you want to pick one yourself.
 
 ### From ChatGPT on your phone or any device
 

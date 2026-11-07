@@ -660,6 +660,40 @@ impl Adapter {
         }))
     }
 
+    async fn library(&self, a: LibraryArg) -> CallToolResult {
+        let limit = a.limit.unwrap_or(DEFAULT_LIBRARY_PAGE);
+        if !(1..=MAX_LIBRARY_PAGE).contains(&limit) {
+            return invalid(&format!("limit must be between 1 and {MAX_LIBRARY_PAGE}"));
+        }
+        let offset = a.offset.unwrap_or(0);
+        if offset > MAX_LIBRARY_OFFSET {
+            return invalid(&format!("offset must be at most {MAX_LIBRARY_OFFSET}"));
+        }
+        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(q) = a.q.as_deref().map(str::trim) {
+            if q.is_empty()
+                || q.chars().count() > MAX_QUERY_CHARS
+                || q.chars().any(char::is_control)
+            {
+                return invalid(&format!(
+                    "q must be 1 to {MAX_QUERY_CHARS} printable characters"
+                ));
+            }
+            query.push(("q", q.to_string()));
+        }
+        let path = match a.kind {
+            Kind::Movie => "movies",
+            Kind::Series => "series",
+        };
+        match self
+            .call(Effect::Read, &["api", "v1", "library", path], &query, None)
+            .await
+        {
+            Ok(v) => CallToolResult::structured(library_page(&a.kind, &v, offset)),
+            Err(r) => r,
+        }
+    }
+
     async fn release_choices(&self, a: MediaArg) -> CallToolResult {
         let id = match canonical(&a.media_id, Scope::Acquirable) {
             Ok(id) => id,
@@ -710,7 +744,7 @@ impl ServerHandler for Adapter {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Movie and TV requests for the arr server. To add something, find it with search_titles, then call add_media with its canonical media id: that is the default, automatic path (monitored, then searched and downloaded by this server's own policy). Add exactly the scope the user asked for; do not replace a requested season with individual episodes unless the user agrees. release_choices and start_download are a manual mode, only for when the user explicitly asks to choose a release: start_download downloads only the exact release the user chose. Titles still managed by Sonarr/Radarr are refused (native_handoff_required, not_adopted) and are not adopted; adoption is an operator step outside this assistant. An add_media result's automatic field says what happened; a blocked plan with no release yet is normal with execution enabled, and plans are never executed by hand. Repeating an add or a download creates no duplicate. Errors are returned as is with their outcome; there is no fallback, and a write with an unknown outcome is checked with media_status or requests before it is repeated.",
+                "Movie and TV requests for the arr server. To answer what the user already has, use library (their whole catalog, including everything imported from Plex) or media_status for one title. To add something, find it with search_titles, then call add_media with its canonical media id: that is the default, automatic path (monitored, then searched and downloaded by this server's own policy). Add exactly the scope the user asked for; do not replace a requested season with individual episodes unless the user agrees. release_choices and start_download are a manual mode, only for when the user explicitly asks to choose a release: start_download downloads only the exact release the user chose. Titles still managed by Sonarr/Radarr are refused (native_handoff_required, not_adopted) and are not adopted; adoption is an operator step outside this assistant. An add_media result's automatic field says what happened; a blocked plan with no release yet is normal with execution enabled, and plans are never executed by hand. Repeating an add or a download creates no duplicate. Errors are returned as is with their outcome; there is no fallback, and a write with an unknown outcome is checked with media_status or requests before it is repeated.",
             )
     }
 
@@ -743,6 +777,10 @@ impl ServerHandler for Adapter {
             },
             "requests" => match parse(args) {
                 Ok(a) => self.requests(a).await,
+                Err(r) => r,
+            },
+            "library" => match parse(args) {
+                Ok(a) => self.library(a).await,
                 Err(r) => r,
             },
             "release_choices" => match parse(args) {
@@ -820,6 +858,29 @@ struct RequestsArg {
     limit: Option<u32>,
 }
 
+const DEFAULT_LIBRARY_PAGE: u32 = 50;
+const MAX_LIBRARY_PAGE: u32 = 100;
+const MAX_LIBRARY_OFFSET: u32 = 1_000_000;
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LibraryArg {
+    /// Movies or series.
+    kind: Kind,
+    /// Optional title words to narrow the list, e.g. "horses".
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 100))]
+    q: Option<String>,
+    /// Titles per page (default 50).
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 100))]
+    limit: Option<u32>,
+    /// Where the page starts: 0, then the previous page's next_offset.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 1_000_000))]
+    offset: Option<u32>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct StartDownload {
@@ -871,6 +932,11 @@ fn tools() -> Vec<Tool> {
             "Current downloads (the active queue) and pending acquisition requests.",
             read.clone(),
         ),
+        tool::<LibraryArg>(
+            "library",
+            "Lists the user's library: every movie or series this server knows, including everything imported from Plex, alphabetically with paging. Each movie says whether it is owned (a file is present); each series lists owned and total episodes per season. Use it for \"what's in my library\" or \"which seasons do I have\"; use search_titles to find something new.",
+            read.clone(),
+        ),
         tool::<MediaArg>(
             "release_choices",
             "Manual mode only, when the user explicitly asks to see or choose releases (adding something does not need it: use add_media). Searches the indexers for a movie, season or episode and lists releases with this server's decision; approved releases carry a release_ref.",
@@ -885,6 +951,49 @@ fn tools() -> Vec<Tool> {
 }
 
 // ------------------------------------------------------------------ results
+
+/// A compact page of the catalog: what an assistant needs to answer "what do I have".
+fn library_page(kind: &Kind, v: &Value, offset: u32) -> Value {
+    let items: Vec<Value> = v["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|i| match kind {
+                    Kind::Movie => json!({
+                        "media_id": i["id"],
+                        "title": i["title"],
+                        "year": i["year"],
+                        "owned": i["has_file"],
+                        "quality": i["file_quality"],
+                        "monitored": i["monitored"],
+                        "downloading": i["queued"],
+                    }),
+                    Kind::Series => json!({
+                        "media_id": i["id"],
+                        "title": i["title"],
+                        "year": i["year"],
+                        "monitored": i["monitored"],
+                        "episodes": i["episode_counts"],
+                        "seasons": i["seasons"].as_array().map(|s| s.iter().map(|s| json!({
+                            "season": s["number"],
+                            "owned": s["episode_file_count"],
+                            "episodes": s["total_episode_count"],
+                        })).collect::<Vec<_>>()),
+                    }),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let total = v["total"].as_u64().unwrap_or(0);
+    let end = u64::from(offset) + items.len() as u64;
+    json!({
+        "kind": kind.as_str(),
+        "total": total,
+        "offset": offset,
+        "next_offset": if end < total && !items.is_empty() { json!(end) } else { Value::Null },
+        "items": items,
+    })
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Scope {
