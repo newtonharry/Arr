@@ -264,6 +264,7 @@ impl Env {
         let r = self
             .http
             .post(self.url("/authorize/consent"))
+            .header("origin", self.url(""))
             .form(&[("txn", txn.as_str()), ("decision", "approve")])
             .send()
             .await
@@ -588,7 +589,7 @@ async fn sign_in_issues_tokens_that_survive_a_restart_and_refresh_rotates() {
             .contains("form-action")
     );
     assert_eq!(h["x-frame-options"], "DENY");
-    assert_eq!(h["referrer-policy"], "no-referrer");
+    assert_eq!(h["referrer-policy"], "same-origin");
     assert_eq!(h["cache-control"], "no-store");
     let page = r.text().await.unwrap();
     assert!(
@@ -611,6 +612,7 @@ async fn sign_in_issues_tokens_that_survive_a_restart_and_refresh_rotates() {
     let r = env
         .http
         .post(env.url("/authorize/consent"))
+        .header("origin", env.url(""))
         .form(&[("txn", txn.as_str()), ("decision", "approve")])
         .send()
         .await
@@ -629,6 +631,7 @@ async fn sign_in_issues_tokens_that_survive_a_restart_and_refresh_rotates() {
     let again = env
         .http
         .post(env.url("/authorize/consent"))
+        .header("origin", env.url(""))
         .form(&[("txn", txn.as_str()), ("decision", "approve")])
         .send()
         .await
@@ -774,6 +777,7 @@ async fn identities_that_are_not_allowed_never_get_a_code() {
     let r = env
         .http
         .post(env.url("/authorize/consent"))
+        .header("origin", env.url(""))
         .form(&[("txn", txn), ("decision", "approve")])
         .send()
         .await
@@ -814,6 +818,7 @@ async fn denying_consent_returns_access_denied() {
     let r = env
         .http
         .post(env.url("/authorize/consent"))
+        .header("origin", env.url(""))
         .form(&[("txn", txn), ("decision", "deny")])
         .send()
         .await
@@ -1092,6 +1097,7 @@ async fn a_forwarded_google_link_cannot_complete_someone_elses_sign_in() {
         let r = env
             .http
             .post(env.url("/authorize/consent"))
+            .header("origin", env.url(""))
             .form(&[("txn", txn), ("decision", "approve")])
             .send()
             .await
