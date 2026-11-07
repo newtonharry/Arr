@@ -1,6 +1,5 @@
-# Runtime image. Not built or run by the implementer (no Docker access in this phase).
-# Mount the private state directory read-write at /state. Mount download/library
-# directories only for an isolated execution sandbox (never production media).
+# Arr image. Mount your state directory read-write at /state, and your media folders
+# (library and downloads) read-write under one mount so imports can hardlink.
 FROM rust:1.94.1-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

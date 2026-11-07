@@ -1,116 +1,150 @@
 # Arr
 
-Arr is one small program that does the jobs of Sonarr, Radarr, Prowlarr and qBittorrent for
-an existing Plex server. Point it at your Plex libraries and it learns what you already own,
-then finds, downloads, verifies and imports new movies and TV into the same folders, and
-asks Plex to refresh. It has no web UI: you drive it through an authenticated JSON API, or
-from an AI assistant over MCP ("add season 2 of …").
+Arr replaces Sonarr, Radarr, Prowlarr and qBittorrent with one program for your Plex server.
+You ask for a movie or a season. Arr searches, downloads it with its built-in BitTorrent
+engine, checks the file with ffprobe, moves it into your Plex library and tells Plex to
+refresh.
 
-Arr is young. It deliberately refuses what it does not support yet (quality upgrades,
-renaming, custom formats, usenet, anime/daily numbering, specials) instead of guessing. It
-can run alongside an existing Sonarr/Radarr setup, which it never modifies.
+Arr has no web interface. You talk to it through an AI assistant over MCP ("add season 2 of
+Severance") or through its JSON API.
 
-**Status: standalone-capable, shadow by default.** One binary, one `config.toml`, one private
-state directory, no Sonarr, Radarr, Prowlarr or qBittorrent needed at runtime:
+## Install
 
-- **managed setup** (`arr setup` or `POST /api/v1/setup`) creates quality profiles,
-  size limits, per-indexer policy with explicit seed goals, download/cleanup policy and root
-  folders with an empty catalog — no Sonarr/Radarr snapshot needed;
-- **native indexers**: The Pirate Bay's JSON API and generic Torznab, searched directly with
-  per-indexer status, pacing, `Retry-After` backoff, limits and credential confinement;
-- the **embedded BitTorrent engine** (librqbit, in this process);
-- verified import into **your library** (rename off, `ffprobe` validation, hardlink/copy,
-  journaled recovery), **Plex** folder refreshes, and a read-only **Plex library bootstrap**
-  so already-owned titles are known before anything is requested;
-- **remote MCP** at `/mcp` (Streamable HTTP, separate static bearer token, optional Google
-  OAuth sign-in for ChatGPT connectors) besides the stdio adapter.
+On the machine that runs Plex:
 
-The earlier layouts keep working unchanged: an offline import of a Sonarr/Radarr/Prowlarr
-snapshot, search through `[prowlarr]`, downloads through `[qbittorrent]`, coexistence with
-running native apps. The search backend (native or Prowlarr) and the download backend
-(embedded or qBittorrent) are each chosen explicitly; there is never a fallback between them.
-
-With `[execution] enabled = true` the server submits torrents, imports completed downloads,
-follows the cleanup policy, reads RSS feeds and refreshes Plex. Setup never enables it.
-
-**Start here:** [docs/STANDALONE.md](docs/STANDALONE.md) — from zero to automatic adds on a
-fresh state with native providers.
-
-## Build
-
-Requires Rust 1.94+. `ffprobe` is an external runtime dependency (Debian/Ubuntu package
-`ffmpeg`; the Docker runtime image installs it); it is never bundled or downloaded, and
-`check`/`setup` report it. The tests also need `/usr/bin/ffmpeg`. The release binary links
-only the system C library (glibc) dynamically; see [docs/STANDALONE.md](docs/STANDALONE.md).
-
-```bash
-cargo build --release --locked        # binary: target/release/arr
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --locked
+```sh
+curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh
 ```
 
-In a container, mount only the private state directory and publish the port to
-`127.0.0.1`. When execution is enabled in a sandbox, also mount the sandbox's download and
-library directories, and nothing else.
+The script takes a minute or two. It:
 
-## Run (standalone)
+1. downloads the Arr binary for your system and checks its SHA-256 (no compiler needed);
+2. installs FFmpeg if `ffprobe` is missing (it asks first);
+3. finds Plex, reads its token from Plex's own settings, and reads your movie and TV
+   folders from your Plex libraries;
+4. writes the config, starts Arr as a service (systemd on Linux, launchd on macOS);
+5. imports your Plex library, so Arr knows what you own. It downloads nothing at this step.
 
-```bash
-STATE=/srv/arr/state
-arr init  --state-dir "$STATE"                 # standalone config template + API token
-"$EDITOR" "$STATE/config.toml"                            # [[indexer]], [embedded] (dht = true), [library], [plex], [tmdb]
-arr setup --config "$STATE/config.toml"         # managed settings + empty catalog (no execution)
-arr check --config "$STATE/config.toml"         # config, secrets, ffprobe, indexer mapping
-arr serve --config "$STATE/config.toml"
-curl -s -H "Authorization: Bearer $(cat $STATE/secrets/api_token)" -d '{}' -H 'content-type: application/json' \
-     http://127.0.0.1:8787/api/v1/setup/plex/bootstrap   # repeat until done: owned titles, not monitored
+Arr runs on macOS and on Linux with glibc 2.35 or newer (Debian 12, Ubuntu 22.04, Raspberry
+Pi OS 12 and later), on x86_64 and ARM64. On Windows, run it inside WSL2. Plex can run
+natively or in Docker; when the script can see the Plex container, it maps Docker paths back
+to your disk.
+
+Run the script again to update Arr. It keeps your config.
+
+### Let an AI agent install it
+
+Every question has a flag, so an agent can install Arr without prompts. Give your agent this
+README and ask it to install Arr. It needs three things from you:
+
+- **SSH or terminal access** to the machine that runs Plex, as the user that owns your media
+  folders.
+- **A Plex token**, only if the script can't read it from Plex's settings. In Plex Web, open
+  any movie, choose ⋯ > Get Info > View XML, and copy the value after `X-Plex-Token=`.
+- **A TMDB key** (optional, free at <https://www.themoviedb.org/settings/api>). Without one,
+  Arr can't find movies you don't already own. TV works without it.
+
+The agent then runs:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --yes \
+  --tmdb-key "$TMDB_KEY"            # add --plex-token "$PLEX_TOKEN" if asked for one
 ```
 
-## Run (legacy: imported snapshot and Prowlarr)
+`--yes` accepts every default and never waits for input. A failed run ends with one `error:`
+line that names the problem, usually with the flag that fixes it. Fix it and run the script
+again.
+Useful flags: `--movies DIR`, `--tv DIR`, `--downloads DIR`, `--plex-url URL`, `--port N`,
+`--upload-limit-kib N`, `--search-only` (set up without downloading), `--install-only`.
+`install.sh --help` lists them all.
 
-```bash
-STATE=/srv/arr/state        # private, outside this repo; created 0700
-arr init --state-dir "$STATE" --prowlarr-url http://127.0.0.1:9696
-# Put the Prowlarr API key in an owner-only file (no other content):
-install -m 600 /dev/null "$STATE/secrets/prowlarr_api_key" && "$EDITOR" "$STATE/secrets/prowlarr_api_key"
-arr import --state-dir "$STATE" --snapshot /private/native.json --observed-at 2026-10-26T06:56:00Z
-arr check  --config "$STATE/config.toml"
-arr serve  --config "$STATE/config.toml"     # listens on 127.0.0.1:8787
+To confirm the install worked, the agent can run `arr check --config <state dir>/config.toml`;
+it prints JSON with `"config": "ok"`.
 
-TOKEN=$(cat "$STATE/secrets/api_token")
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/api/v1/readiness
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/api/v1/media/season:tvdb:372264:1/releases
-curl -s -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-     -d '{"media_id":"season:tvdb:372264:1"}' http://127.0.0.1:8787/api/v1/plans
+## Use it
+
+### From Claude Desktop, Claude Code or another MCP client on the same machine
+
+The installer prints this block with your paths filled in:
+
+```json
+{
+  "mcpServers": {
+    "arr": {
+      "command": "/home/you/.local/bin/arr",
+      "args": ["mcp", "--api-url", "http://127.0.0.1:8787/",
+               "--token-file", "/home/you/.local/share/arr/secrets/api_token"]
+    }
+  }
+}
 ```
 
-All config keys are listed in `config/local.example.toml` (legacy layout) and
-`config/standalone.example.toml` (standalone); the setup document in `config/setup.example.toml`. TVmaze (free) and TMDB (needs your
-own credential; none is bundled) are optional. Without TMDB, movie discovery is limited to the
-catalog, and movies outside it can be added only with explicit metadata
-(`POST /api/v1/library {"media_id":"movie:tmdb:N","metadata":{"title":…,"year":…}}`). The
-API says so.
+The assistant gets six tools: `search_titles`, `add_media`, `media_status`, `requests`,
+`release_choices` and `start_download`. By default it adds what you ask for and Arr picks the
+release. Ask to "choose a release" if you want to pick one yourself.
 
-Execution (sandbox only until verified): add `[execution] enabled = true` with `[qbittorrent]`
-and `[library]` sections. Then follow
-[docs/EXECUTION-SANDBOX.md](docs/EXECUTION-SANDBOX.md): diagnostics, add-and-search, queue,
-cleanup, RSS, commands and restart checks. `arr fixture` generates authored
-playable test releases with matching `.torrent` files.
+### From ChatGPT
 
-## Documents
+ChatGPT needs a public HTTPS address and a sign-in. Arr signs people in with Google and only
+lets in the addresses you list. [docs/MCP.md](docs/MCP.md) walks through the Google Cloud
+setup, a tunnel such as ngrok, and adding the connector in ChatGPT.
 
-- [docs/STANDALONE.md](docs/STANDALONE.md): the standalone recipe, native indexers, Plex
-  bootstrap, ffprobe dependency, service unit, release binary and limits.
-- [docs/API.md](docs/API.md): endpoints, error codes, examples. The machine-readable schema
-  is `GET /api/v1/openapi.json`.
-- [docs/MCP.md](docs/MCP.md): the stdio adapter and remote Streamable HTTP MCP, and what
-  they do not cover.
-- [docs/EMBEDDED-DOWNLOADER.md](docs/EMBEDDED-DOWNLOADER.md): the embedded librqbit engine:
-  configuration, state binding, durability and metrics, tests and limits.
-- [ARCHITECTURE.md](ARCHITECTURE.md): boundaries, state layout, CLI, snapshot contract,
-  identity, decision and plan semantics.
-- [docs/MIGRATION.md](docs/MIGRATION.md): importing an existing Sonarr/Radarr/Prowlarr
-  configuration, where Arr is stricter than they are, and gaps.
-- [docs/READINESS.md](docs/READINESS.md): what works, what is only mock-tested, and what
-  must be true before replacing Sonarr/Radarr.
-- [docs/EXECUTION-SANDBOX.md](docs/EXECUTION-SANDBOX.md): isolated sandbox setup, API flow,
-  ownership and cleanup rules, restart checks, real-client harness.
+### From the API
+
+```sh
+TOKEN=$(cat ~/.local/share/arr/secrets/api_token)
+curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8787/api/v1/discover?kind=series&q=severance"
+```
+
+`GET /api/v1/openapi.json` returns the full schema, and [docs/API.md](docs/API.md) has
+examples.
+
+## What Arr does, and what it refuses
+
+Arr adds movies, whole seasons and single episodes. It checks each download against what you
+asked for, refuses broken or mismatched files, picks up new episodes of seasons you added
+through RSS, and stops seeding once a torrent reaches its seed goal (ratio 1.0 or 72 hours by
+default). To change the goals or quality profiles, edit a copy of
+[config/setup.example.toml](config/setup.example.toml) and run
+`arr setup --config <config> --settings <file>`.
+
+It refuses things it can't do safely yet: quality upgrades of files you own, renaming,
+custom formats, usenet, anime and daily-show numbering, and specials (season 0). It never
+overwrites a file it didn't download.
+
+Sonarr and Radarr can keep running next to Arr. Arr ignores titles you add there, and they
+ignore titles you add to Arr. If both monitor the same title, both may download it; Arr
+won't replace their file, so you lose bandwidth, not media.
+
+The default search source is The Pirate Bay's public API. You can add any Torznab indexer
+(Jackett, Prowlarr) in `config.toml`. Only download what you have the right to.
+
+## Other ways to run it
+
+- **Your own config.** `arr init`, then edit the template; every option is in
+  [config/standalone.example.toml](config/standalone.example.toml), and
+  [docs/STANDALONE.md](docs/STANDALONE.md) explains each step.
+- **Docker.** The [Dockerfile](Dockerfile) builds an image; mount your state directory at
+  `/state` and your media folders read-write.
+- **From source.** You need Rust 1.94 or newer and FFmpeg:
+
+  ```sh
+  cargo build --release --locked      # target/release/arr
+  cargo test --locked                 # needs /usr/bin/ffmpeg
+  ```
+
+- **Migrating from Sonarr/Radarr, Prowlarr or qBittorrent.** Arr can import their settings
+  and keep using Prowlarr or qBittorrent; see [docs/MIGRATION.md](docs/MIGRATION.md).
+
+## Documentation
+
+- [docs/STANDALONE.md](docs/STANDALONE.md): setting Arr up by hand, step by step.
+- [docs/MCP.md](docs/MCP.md): the MCP tools, remote access and Google sign-in for ChatGPT.
+- [docs/API.md](docs/API.md): endpoints, errors and examples.
+- [docs/EMBEDDED-DOWNLOADER.md](docs/EMBEDDED-DOWNLOADER.md): the BitTorrent engine, seeding
+  and limits.
+- [docs/MIGRATION.md](docs/MIGRATION.md): importing Sonarr/Radarr/Prowlarr settings.
+- [docs/READINESS.md](docs/READINESS.md): what the tests cover and the known limits.
+- [docs/EXECUTION-SANDBOX.md](docs/EXECUTION-SANDBOX.md): testing downloads safely in a
+  sandbox.
+- [ARCHITECTURE.md](ARCHITECTURE.md): how the pieces fit together.

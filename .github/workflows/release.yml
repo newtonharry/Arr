@@ -1,0 +1,73 @@
+# Builds ready-to-run binaries. Pull requests build and smoke-test them; pushing a tag
+# such as v0.3.0 also publishes them as a GitHub release, which install.sh downloads.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --target ${{ matrix.target }}
+          rustup default 1.94.1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: target/${{ matrix.target }}/release/arr --version
+      - name: Package
+        shell: bash
+        run: |
+          name=arr-${{ matrix.target }}
+          mkdir -p dist/$name
+          cp target/${{ matrix.target }}/release/arr README.md dist/$name/
+          tar -C dist -czf dist/$name.tar.gz $name
+          (cd dist && shasum -a 256 $name.tar.gz > $name.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arr-${{ matrix.target }}
+          path: dist/arr-${{ matrix.target }}.tar.gz*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "Arr $GITHUB_REF_NAME" --generate-notes
