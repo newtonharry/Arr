@@ -515,7 +515,8 @@ remote_setup() {
 	# /mcp must accept the ngrok host; then add the sign-in section.
 	cp "$CONFIG" "$tmp/config.before-remote"
 	hosts="allowed_hosts = [$(toml "$NGROK_DOMAIN"), \"localhost\", \"127.0.0.1\"]"
-	mcp_header='^[[:space:]]*\[mcp\][[:space:]]*(#.*)?$'
+	# [[]mcp[]] instead of \[mcp\]: BusyBox awk drops backslashes from -v variables.
+	mcp_header='^[[:space:]]*[[]mcp[]][[:space:]]*(#.*)?$'
 	if grep -Eq "$mcp_header" "$CONFIG"; then
 		grep -Eq '^[[:space:]]*allowed_hosts[[:space:]]*=' "$CONFIG" &&
 			die "your config already sets allowed_hosts; add [mcp.oauth] by hand (see docs/MCP.md)"
