@@ -14,6 +14,10 @@ use std::time::Duration;
 pub struct Secret(String);
 
 impl Secret {
+    pub fn new(value: String) -> Self {
+        Secret(value)
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use arr::{api, config, fsutil, import, library, mcp, setup, store};
+use arr::{api, config, fsutil, import, library, mcp, setup, store, wizard};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use time::OffsetDateTime;
@@ -77,6 +77,37 @@ enum Command {
     Check {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// First-run setup in a web browser: prints a one-time link, then signs in to Plex,
+    /// picks libraries and folders, writes the config and imports what Plex already has.
+    /// Exits when setup is done (the installer then starts the service).
+    Wizard {
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Address the setup page listens on (the installer uses the SSH server address
+        /// when you're connected over SSH).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: std::net::IpAddr,
+        /// Port for the setup page now and Arr's API afterwards.
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        #[arg(long, default_value_t = 50413)]
+        torrent_port: u16,
+        /// Upload limit in KiB/s for all torrents (0 = none).
+        #[arg(long, default_value_t = 0)]
+        upload_limit_kib: u64,
+        #[arg(long)]
+        ffprobe: PathBuf,
+        #[arg(long, hide = true, default_value = "https://plex.tv/")]
+        plex_tv_url: reqwest::Url,
+        #[arg(long, hide = true, default_value = "https://app.plex.tv/auth")]
+        plex_auth_url: reqwest::Url,
+        /// Don't look for a Plex container with `docker`.
+        #[arg(long)]
+        no_docker: bool,
+        /// Also open the link in this computer's web browser.
+        #[arg(long)]
+        open: bool,
     },
     /// Run the HTTP API (and, with [execution] enabled, the background worker).
     Serve {
@@ -305,7 +336,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     // Logs go to stderr; the MCP adapter stays quiet unless asked.
     let default_filter = match cli.command {
-        Command::Mcp { .. } => "warn",
+        Command::Mcp { .. } | Command::Wizard { .. } => "warn",
         _ => "info,arr=info",
     };
     tracing_subscriber::fmt()
@@ -453,6 +484,33 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Serve { config } => api::serve(config::load(&config)?).await,
+        Command::Wizard {
+            state_dir,
+            bind,
+            port,
+            torrent_port,
+            upload_limit_kib,
+            ffprobe,
+            plex_tv_url,
+            plex_auth_url,
+            no_docker,
+            open,
+        } => {
+            wizard::run(wizard::Options {
+                state_dir,
+                bind,
+                port,
+                torrent_port,
+                upload_limit_kib,
+                ffprobe,
+                arr: std::env::current_exe().context("can't find the arr binary")?,
+                plex_tv: plex_tv_url,
+                plex_auth: plex_auth_url,
+                docker: !no_docker,
+                open,
+            })
+            .await
+        }
         Command::Mcp {
             api_url,
             token_file,

@@ -16,14 +16,20 @@ On the machine that runs Plex:
 curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh
 ```
 
-The script takes a minute or two. It:
+The script takes a few minutes. It:
 
 1. downloads the Arr binary for your system and checks its SHA-256 (no compiler needed);
 2. installs FFmpeg if `ffprobe` is missing (it asks first);
-3. finds Plex, reads its token from Plex's own settings, and reads your movie and TV
-   folders from your Plex libraries;
-4. writes the config, starts Arr as a service (systemd on Linux, launchd on macOS);
-5. imports your Plex library, so Arr knows what you own. It downloads nothing at this step.
+3. opens a setup page in your web browser. You sign in to Plex there, and Arr finds your
+   server, your movie and TV libraries and their folders. You confirm the folders, choose
+   where downloads go and whether Arr installs its own updates, then click **Finish setup**;
+4. imports your Plex library, so Arr knows what you own. It downloads nothing at this step;
+5. starts Arr as a service (systemd on Linux, launchd on macOS).
+
+If you're connected to the machine over SSH, the script prints a link to open on the computer
+you're typing on. The link includes a one-time code, so nobody else on your network can use
+the page. To answer the questions in the terminal instead, add `--terminal`:
+`curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --terminal`.
 
 Arr runs on macOS and on Linux with glibc 2.35 or newer (Debian 12, Ubuntu 22.04, Raspberry
 Pi OS 12 and later), on x86_64 and ARM64. On Windows, run it inside WSL2. Plex can run
@@ -45,7 +51,7 @@ the state folder on macOS.
 
 ### Let an AI agent install it
 
-Every question has a flag, so an agent can install Arr without prompts. Give your agent this
+Every question has a flag, so an agent can install Arr without prompts or the setup page. Give your agent this
 README and ask it to install Arr. It needs three things from you:
 
 - **SSH or terminal access** to the machine that runs Plex, as the user that owns your media
