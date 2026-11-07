@@ -1,6 +1,6 @@
 # MCP: stdio adapter and remote Streamable HTTP
 
-Two transports serve the same six tools with the same contracts, both built on rmcp 3.6.0,
+Two transports serve the same seven tools with the same contracts, both built on rmcp 3.6.0,
 the official Rust SDK, which does all JSON-RPC framing, lifecycle and version negotiation:
 
 - **stdio** — `arr mcp`, a separate process that is a client of a running server's
@@ -63,6 +63,7 @@ the SDK:
 | `add_media` | `media_id`: a movie, season or episode | `POST /api/v1/library {"media_id"}` |
 | `media_status` | `media_id`: a movie, series, season or episode | `GET /api/v1/status/{media_id}` |
 | `requests` | `limit`? (1 to 50, default 20) | `GET /api/v1/queue?limit=N`, then `GET /api/v1/requests` (first N shown, with `total` and `omitted`) |
+| `library` | `kind` (`movie`, `series`), `q`? (1 to 100 printable characters), `limit`? (1 to 100, default 50), `offset`? | `GET /api/v1/library/movies` or `/series` with `q`, `limit`, `offset`; returns a compact page (`media_id`, title, year; movies: `owned`, `quality`, `monitored`, `downloading`; series: `episodes` and per-season `owned`/`episodes`) with `total` and `next_offset` |
 | `release_choices` | `media_id`: a movie, season or episode | `GET /api/v1/media/{media_id}/releases` |
 | `start_download` | `media_id`, `release_ref` (`rel_` + 24 lowercase hex) | `POST /api/v1/grabs {"media_id", "release_ref"}` |
 
@@ -203,7 +204,7 @@ to anything but `--api-url` would be seen.
 - **`tools_are_listed_with_strict_schemas_under_every_negotiated_protocol`.**
   - **Lifecycles.** Four of them; the versions above are asserted against the SDK's own
     constants.
-  - **Listing.** The same six tools under each.
+  - **Listing.** The same seven tools under each.
   - **Schemas.** Closed schemas with exact properties and required fields; annotations.
     No forbidden property appears anywhere in any schema. The published `media_id`
     patterns accept exactly the ids each tool takes.
@@ -361,7 +362,7 @@ limit and handlers as any HTTP request, without a loopback socket and without de
 configured listen address (a `0.0.0.0` listen is never dialled). Shutdown stops the MCP service
 with the server; nothing re-enters startup.
 
-**Separate credential.** The MCP token reaches only the six tools; it is refused by the REST
+**Separate credential.** The MCP token reaches only the seven tools; it is refused by the REST
 API, and the API token is refused at `/mcp`. Startup refuses an MCP token equal to the API
 token, a missing token file, and a non-loopback listener without explicit `allowed_hosts`.
 With `allow_non_loopback`, `/mcp` is still never served unauthenticated.

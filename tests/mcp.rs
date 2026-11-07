@@ -24,11 +24,12 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 const BIN: &str = env!("CARGO_BIN_EXE_arr");
-const TOOLS: [&str; 6] = [
+const TOOLS: [&str; 7] = [
     "search_titles",
     "add_media",
     "media_status",
     "requests",
+    "library",
     "release_choices",
     "start_download",
 ];
@@ -303,7 +304,7 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
     let tools = listings[0].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, TOOLS);
-    let expected: [(&str, &[&str], &[&str], bool); 6] = [
+    let expected: [(&str, &[&str], &[&str], bool); 7] = [
         (
             "search_titles",
             &["kind", "q", "year"],
@@ -313,6 +314,12 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
         ("add_media", &["media_id"], &["media_id"], false),
         ("media_status", &["media_id"], &["media_id"], true),
         ("requests", &["limit"], &[], true),
+        (
+            "library",
+            &["kind", "limit", "offset", "q"],
+            &["kind"],
+            true,
+        ),
         ("release_choices", &["media_id"], &["media_id"], true),
         (
             "start_download",
@@ -346,7 +353,15 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
     }
     assert_eq!(
         all.into_iter().collect::<Vec<_>>(),
-        ["kind", "limit", "media_id", "q", "release_ref", "year"],
+        [
+            "kind",
+            "limit",
+            "media_id",
+            "offset",
+            "q",
+            "release_ref",
+            "year"
+        ],
         "no handoff, adoption, monitoring, policy, path, URL, deletion or torrent arguments"
     );
     // The published patterns accept exactly the canonical ids each tool takes.
@@ -454,6 +469,32 @@ async fn a_new_title_is_found_added_and_tracked_and_repeating_creates_no_duplica
     let v = ok(&r);
     assert_eq!(v["acquisition"], "adopted", "{v}");
     assert_eq!(v["downloads"].as_array().map(Vec::len), Some(1), "{v}");
+    // The library lists the new title compactly, downloading and not yet owned.
+    let r = s
+        .call("library", json!({ "kind": "movie", "q": "Leviticus" }))
+        .await;
+    let v = ok(&r);
+    assert_eq!(
+        (v["kind"].as_str(), v["total"].as_u64()),
+        (Some("movie"), Some(1)),
+        "{v}"
+    );
+    let m = &v["items"][0];
+    assert_eq!(m["media_id"], "movie:tmdb:900001", "{v}");
+    assert_eq!(
+        (m["owned"].as_bool(), m["downloading"].as_bool()),
+        (Some(false), Some(true)),
+        "{v}"
+    );
+    assert!(
+        m.get("alternate_titles").is_none(),
+        "compact items only: {v}"
+    );
+    assert_eq!(v["next_offset"], Value::Null, "{v}");
+    let r = s
+        .call("library", json!({ "kind": "movie", "limit": 0 }))
+        .await;
+    assert_eq!(failed(&r).0, "invalid_arguments");
     let r = s.call("requests", json!({ "limit": 5 })).await;
     let v = ok(&r);
     let items = v["queue"]["items"].as_array().unwrap();
@@ -1120,7 +1161,7 @@ async fn an_unreachable_hanging_or_broken_api_fails_closed() {
     }
     assert_eq!(
         s.client.list_all_tools().await.unwrap().len(),
-        6,
+        TOOLS.len(),
         "session stays usable"
     );
     s.finish().await;
