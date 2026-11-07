@@ -165,7 +165,10 @@ case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "Add $BIN_DIR to your PATH to run 'a
 step "Checking for ffprobe (Arr uses it to check every download before import)"
 if ! have ffprobe; then
 	sudo=""
-	[ "$(id -u)" = 0 ] || sudo="sudo"
+	# With --yes, sudo must fail instead of waiting for a password nobody will type.
+	if [ "$(id -u)" != 0 ]; then
+		if [ "$YES" = 1 ]; then sudo="sudo -n"; else sudo="sudo"; fi
+	fi
 	if have apt-get; then cmd="$sudo apt-get install -y ffmpeg"
 	elif have dnf; then cmd="$sudo dnf install -y ffmpeg-free"
 	elif have pacman; then cmd="$sudo pacman -S --noconfirm ffmpeg"
@@ -175,7 +178,7 @@ if ! have ffprobe; then
 	[ -n "$cmd" ] || die "install FFmpeg (it provides ffprobe), then run this again"
 	if confirm "ffprobe is missing. Install it now with '$cmd'?" y; then
 		# shellcheck disable=SC2086
-		$cmd </dev/null || die "could not install FFmpeg; install it yourself and run this again"
+		$cmd </dev/null || die "could not install FFmpeg (run '$cmd' yourself, then run this again)"
 	else
 		die "install FFmpeg (it provides ffprobe), then run this again"
 	fi
@@ -191,12 +194,16 @@ if [ -z "$STATE_DIR" ]; then
 	else STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/arr"; fi
 fi
 CONFIG="$STATE_DIR/config.toml"
-if [ -f "$CONFIG" ]; then
-	say "Arr is already set up in $STATE_DIR. Only the binary was updated."
-	say "To start over, move that folder aside and run this again."
-	exit 0
-fi
 
+# The service runs as the user who ran sudo, so check access as that user.
+writable() {
+	if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then sudo -u "$SUDO_USER" test -w "$1"
+	else [ -w "$1" ]; fi
+}
+
+# Finds Plex and your libraries, then writes and checks a new config. Skipped when a config
+# already exists: running the installer again only updates the binary and restarts Arr.
+configure() {
 # ---------------------------------------------------------------- Plex
 
 step "Finding Plex"
@@ -219,6 +226,7 @@ prefs_candidates() {
 		cfg=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{end}}{{end}}' "$plex_container" 2>/dev/null || true)
 		[ -n "$cfg" ] && printf '%s\n' "$cfg/Library/Application Support/Plex Media Server/Preferences.xml"
 	fi
+	return 0
 }
 if [ -z "$PLEX_TOKEN" ]; then
 	prefs_candidates >"$tmp/prefs"
@@ -237,7 +245,9 @@ if [ -z "$PLEX_TOKEN" ]; then
 	PLEX_TOKEN=$(ask "Plex token" "")
 fi
 [ -n "$PLEX_TOKEN" ] || die "a Plex token is required (use --plex-token)"
-fetch -H "X-Plex-Token: $PLEX_TOKEN" -o "$tmp/sections.xml" "$PLEX_URL/library/sections" ||
+# Tokens go to curl through private header files, never on its command line (visible in ps).
+printf 'X-Plex-Token: %s\n' "$PLEX_TOKEN" >"$tmp/plex.header"
+fetch -H @"$tmp/plex.header" -o "$tmp/sections.xml" "$PLEX_URL/library/sections" ||
 	die "Plex refused the token"
 
 # One line per library location: <type> <section number> <path as Plex sees it>
@@ -265,13 +275,17 @@ tv_loc=$(pick show "$TV_SECTION")
 # A folder as this machine sees it. Plex in Docker sees its own paths, so map them back
 # through the container's mounts.
 local_path() {
-	[ -d "$1" ] && { printf '%s' "$1"; return; }
-	[ -n "$plex_container" ] || return 0
-	docker inspect -f '{{range .Mounts}}{{.Destination}}	{{.Source}}{{println}}{{end}}' "$plex_container" 2>/dev/null |
-		while IFS='	' read -r dst src; do
-			[ -n "$dst" ] || continue
-			case "$1" in "$dst" | "$dst"/*) printf '%s%s' "$src" "${1#"$dst"}"; break ;; esac
-		done
+	if [ -n "$plex_container" ]; then
+		# The most specific mount wins: /media/movies before /media.
+		mapped=$(docker inspect -f '{{range .Mounts}}{{.Destination}}	{{.Source}}{{println}}{{end}}' "$plex_container" 2>/dev/null |
+			awk -F '	' 'NF == 2 { print length($1) "	" $0 }' | sort -rn |
+			while IFS='	' read -r _ dst src; do
+				case "$1" in "$dst" | "$dst"/*) printf '%s%s' "$src" "${1#"$dst"}"; break ;; esac
+			done)
+		[ -n "$mapped" ] && { printf '%s' "$mapped"; return 0; }
+	fi
+	[ -d "$1" ] && printf '%s' "$1"
+	return 0
 }
 MOVIE_SECTION=${movie_loc%% *}; PLEX_MOVIES=${movie_loc#* }
 TV_SECTION=${tv_loc%% *}; PLEX_TV=${tv_loc#* }
@@ -291,9 +305,13 @@ first_root=${MOVIES:-$TV}
 if [ -z "$DOWNLOADS" ]; then
 	DOWNLOADS=$(ask "Download folder" "$(dirname "$first_root")/arr-downloads")
 fi
-mkdir -p "$DOWNLOADS" || die "can't create $DOWNLOADS"
+if [ ! -d "$DOWNLOADS" ]; then
+	mkdir -p "$DOWNLOADS" || die "can't create $DOWNLOADS"
+	[ "$(id -u)" != 0 ] || [ -z "${SUDO_USER:-}" ] || chown "$SUDO_USER" "$DOWNLOADS"
+fi
 for d in "$MOVIES" "$TV" "$DOWNLOADS"; do
-	[ -z "$d" ] || [ -w "$d" ] || die "$(id -un) can't write to $d; fix its permissions or run as the user Plex files belong to"
+	[ -z "$d" ] || writable "$d" ||
+		die "${SUDO_USER:-$(id -un)} can't write to $d; fix its permissions or run as the user your media belongs to"
 done
 
 if [ -z "$TMDB_KEY" ]; then
@@ -393,12 +411,26 @@ failed() { mv "$CONFIG" "$CONFIG.failed"; die "$1 (the config is saved as $CONFI
 "$ARR" setup --config "$CONFIG" >/dev/null || failed "arr setup failed; see the message above"
 "$ARR" check --config "$CONFIG" >"$tmp/check.json" || { cat "$tmp/check.json"; failed "arr check failed"; }
 say "Config checked"
+}
+
+if [ -f "$CONFIG" ]; then
+	step "Keeping your config in $STATE_DIR"
+	PORT=$(sed -n 's/^listen = "[^"]*:\([0-9][0-9]*\)"$/\1/p' "$CONFIG" | head -n1)
+	PORT=${PORT:-8787}
+	grep -A1 '^\[execution\]' "$CONFIG" | grep -q 'enabled = true' || DOWNLOADING=0
+else
+	configure
+fi
 
 # ---------------------------------------------------------------- run it
 
 step "Starting Arr"
 run_cmd="\"$ARR\" serve --config \"$CONFIG\""
 started=0
+# systemd quoting: escape \ and " and double %; arguments (not the program) also expand $.
+sd_exe() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')"; }
+sd() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g; s/\$/$$/g')"; }
+xml() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
 if [ "$SERVICE" = 1 ] && [ "$os" = Linux ] && have systemctl && [ -d /run/systemd/system ]; then
 	unit="[Unit]
 Description=Arr media manager
@@ -406,7 +438,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=\"$ARR\" serve --config \"$CONFIG\"
+ExecStart=$(sd_exe "$ARR") serve --config $(sd "$CONFIG")
 Restart=on-failure
 RestartSec=5
 UMask=0002
@@ -414,19 +446,21 @@ UMask=0002
 	if [ "$(id -u)" = 0 ]; then
 		run_as=${SUDO_USER:-root}
 		if [ "$run_as" != root ]; then
-			chown -R "$run_as" "$STATE_DIR" "$DOWNLOADS"
+			chown -R "$run_as" "$STATE_DIR"
 			unit="$unit
 User=$run_as"
 		fi
 		printf '%s\n[Install]\nWantedBy=multi-user.target\n' "$unit" >/etc/systemd/system/arr.service
-		systemctl daemon-reload && systemctl enable --now arr >/dev/null 2>&1 && started=1
+		systemctl daemon-reload && systemctl enable arr >/dev/null 2>&1 && systemctl restart arr && started=1
 		logs="journalctl -u arr -f"
 	else
 		mkdir -p "$HOME/.config/systemd/user"
 		printf '%s\n[Install]\nWantedBy=default.target\n' "$unit" >"$HOME/.config/systemd/user/arr.service"
-		systemctl --user daemon-reload && systemctl --user enable --now arr >/dev/null 2>&1 && started=1
+		systemctl --user daemon-reload && systemctl --user enable arr >/dev/null 2>&1 &&
+			systemctl --user restart arr && started=1
 		logs="journalctl --user -u arr -f"
-		have loginctl && loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+		# Keeps the user service running after you log out.
+		have loginctl && loginctl --no-ask-password enable-linger "$(id -un)" >/dev/null 2>&1 || true
 	fi
 elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
 	plist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
@@ -437,11 +471,11 @@ elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
 <plist version="1.0"><dict>
   <key>Label</key><string>io.github.newtonharry.arr</string>
   <key>ProgramArguments</key><array>
-    <string>$ARR</string><string>serve</string><string>--config</string><string>$CONFIG</string>
+    <string>$(xml "$ARR")</string><string>serve</string><string>--config</string><string>$(xml "$CONFIG")</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>$STATE_DIR/arr.log</string>
+  <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/arr.log")</string>
 </dict></plist>
 EOF
 	launchctl unload "$plist" 2>/dev/null || true
@@ -463,15 +497,20 @@ until fetch -o /dev/null "$API/api/v1/health" 2>/dev/null; do
 done
 
 step "Learning what you already own from Plex"
-token=$(cat "$STATE_DIR/secrets/api_token")
+printf 'Authorization: Bearer %s\n' "$(cat "$STATE_DIR/secrets/api_token")" >"$tmp/api.header"
 i=0
 while :; do
-	fetch -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d '{}' \
+	fetch -X POST -H @"$tmp/api.header" -H "Content-Type: application/json" -d '{}' \
 		-o "$tmp/boot.json" "$API/api/v1/setup/plex/bootstrap" || die "Plex import failed; see: $logs"
 	grep -q '"done": *true' "$tmp/boot.json" && break
 	i=$((i + 1))
-	[ $i -lt 500 ] || die "Plex import didn't finish; run it again later (see README)"
+	[ $i -lt 500 ] || die "Plex import didn't finish; run this script again to continue it"
 done
+# "done" also covers a library whose import failed: report it instead of claiming success.
+if grep -q '"status": *"failed"' "$tmp/boot.json"; then
+	err=$(sed -n 's/.*"last_error": *"\([^"]*\)".*/\1/p' "$tmp/boot.json" | head -n1)
+	die "the Plex import failed${err:+: $err}; run this script again to retry"
+fi
 say "Done. Titles you already have are marked owned, and nothing was downloaded."
 
 cat <<EOF
