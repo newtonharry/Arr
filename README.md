@@ -30,7 +30,18 @@ Pi OS 12 and later), on x86_64 and ARM64. On Windows, run it inside WSL2. Plex c
 natively or in Docker; when the script can see the Plex container, it maps Docker paths back
 to your disk.
 
-Run the script again to update Arr. It keeps your config.
+### Updates
+
+The installer asks whether Arr should keep itself up to date. Say yes and Arr checks for a new
+release once a day, at a random time overnight. When one appears, it downloads it, checks
+its SHA-256, swaps the binary and restarts. If the new version doesn't start within 30
+seconds, it puts the old one back. It only installs release builds from this repository, and
+it never runs a script fetched from the internet.
+
+To update by hand, run `arr-update` (next to the `arr` binary) or the install command again;
+both keep your config. To stop automatic updates, run the installer with `--no-auto-update`.
+Update logs go to `journalctl -u arr-update` (`--user` for a user install), or `update.log` in
+the state folder on macOS.
 
 ### Let an AI agent install it
 
@@ -54,6 +65,10 @@ curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | s
 `--yes` accepts every default and never waits for input. A failed run ends with one `error:`
 line that names the problem, usually with the flag that fixes it. Fix it and run the script
 again.
+
+With `--yes`, automatic updates stay off unless the agent also passes `--auto-update`. An agent
+should ask you first: updates change the software on your machine without further prompts.
+
 Useful flags: `--movies DIR`, `--tv DIR`, `--downloads DIR`, `--plex-url URL`, `--port N`,
 `--upload-limit-kib N`, `--search-only` (set up without downloading), `--install-only`.
 `install.sh --help` lists them all.

@@ -34,6 +34,7 @@ NGROK_DOMAIN="${ARR_NGROK_DOMAIN:-}"
 GOOGLE_ID="${ARR_GOOGLE_CLIENT_ID:-}"
 GOOGLE_SECRET="${ARR_GOOGLE_CLIENT_SECRET:-}"
 ALLOW_EMAILS="${ARR_ALLOW_EMAILS:-}"
+AUTO_UPDATE="${ARR_AUTO_UPDATE:-}"
 SETUP=1
 SERVICE=1
 DOWNLOADING=1
@@ -62,6 +63,8 @@ Usage: install.sh [options]
   --upload-limit-kib N   upload limit in KiB/s for all torrents (default: 0 = none)
   --search-only          set Arr up without letting it download anything yet
   --no-service           don't install a background service
+  --auto-update          install new releases automatically (a daily check); asked if not given
+  --no-auto-update       don't, and turn automatic updates off if they were on
 
 Use Arr from ChatGPT on your phone or any device (docs/REMOTE.md). Run again with these to
 add it to an existing install:
@@ -98,6 +101,8 @@ while [ $# -gt 0 ]; do
 	--port) PORT="$2"; shift ;;
 	--torrent-port) TORRENT_PORT="$2"; shift ;;
 	--upload-limit-kib) UPLOAD_LIMIT_KIB="$2"; shift ;;
+	--auto-update) AUTO_UPDATE=1 ;;
+	--no-auto-update) AUTO_UPDATE=0 ;;
 	--remote) REMOTE=1 ;;
 	--ngrok-token) NGROK_TOKEN="$2"; REMOTE=1; shift ;;
 	--ngrok-domain) NGROK_DOMAIN="$2"; REMOTE=1; shift ;;
@@ -656,6 +661,142 @@ if [ "$started" != 1 ]; then
 	[ -z "$PUBLIC_URL" ] ||
 		say "  \"$NGROK\" http 127.0.0.1:$PORT --url=$PUBLIC_URL --config \"$STATE_DIR/ngrok.yml\""
 	exit 0
+fi
+
+# ---------------------------------------------------------------- automatic updates
+
+# A daily job installs new releases. It runs a local updater written here, never a script
+# fetched from GitHub, so it trusts only the release binaries CI builds from version tags
+# (checked by SHA-256), and it rolls back if the new version doesn't start.
+if [ "$os" = Darwin ]; then kind=launchd; elif [ "$(id -u)" = 0 ]; then kind=system; else kind=user; fi
+UPDATER="$BIN_DIR/arr-update"
+if [ -z "$AUTO_UPDATE" ]; then
+	if [ -f "$UPDATER" ]; then
+		AUTO_UPDATE=1
+	elif [ "$YES" = 1 ]; then
+		# Updating needs your say-so: with --yes, only --auto-update turns it on.
+		AUTO_UPDATE=0
+	elif confirm "Install new versions of Arr automatically (checked once a day)?" y; then
+		AUTO_UPDATE=1
+	else
+		AUTO_UPDATE=0
+	fi
+fi
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+if [ "$AUTO_UPDATE" = 1 ]; then
+	step "Turning on automatic updates"
+	{
+		printf '#!/bin/sh\n# Arr updater, written by install.sh. A daily job runs it; you can run it by hand too.\n'
+		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\n' \
+			"$(sq "$REPO")" "$(sq "$ARR")" "$(sq "$target")" "$(sq "$kind")" "$(sq "$PORT")"
+		cat <<'EOF'
+set -eu
+log() { printf 'arr-update: %s\n' "$*"; }
+fetch() { curl -fsSL --retry 3 "$@"; }
+sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+# Is version $1 newer than $2? (vX.Y.Z)
+newer() {
+	printf '%s\n%s\n' "${1#v}" "${2#v}" | awk -F. '
+		NR == 1 { for (i = 1; i <= 3; i++) a[i] = $i + 0 }
+		NR == 2 { for (i = 1; i <= 3; i++) b[i] = $i + 0 }
+		END { for (i = 1; i <= 3; i++) { if (a[i] > b[i]) exit 0; if (a[i] < b[i]) exit 1 } exit 1 }'
+}
+# A failed restart must not stop the script before it can roll back: the health check
+# afterwards decides whether the new version runs.
+restart() {
+	case "$KIND" in
+	system) systemctl restart arr || true ;;
+	user) systemctl --user restart arr || true ;;
+	launchd) launchctl kickstart -k "gui/$(id -u)/io.github.newtonharry.arr" || true ;;
+	esac
+}
+# Waits until Arr answers its health check as version $1.
+healthy() {
+	i=0
+	until fetch "http://127.0.0.1:$PORT/api/v1/health" 2>/dev/null | grep -q "\"version\": *\"${1#v}\""; do
+		i=$((i + 1))
+		[ $i -lt 30 ] || return 1
+		sleep 1
+	done
+}
+
+RELEASES=${ARR_RELEASES_URL:-https://github.com/$REPO/releases}
+latest=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" | sed 's#.*/tag/##')
+case "$latest" in v[0-9]*) ;; *) log "couldn't find the latest release"; exit 1 ;; esac
+current="v$("$ARR" --version | awk '{print $2}')"
+if ! newer "$latest" "$current"; then
+	log "up to date ($current)"
+	exit 0
+fi
+log "updating $current to $latest"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+asset="arr-$TARGET.tar.gz"
+base="$RELEASES/download/$latest"
+fetch -o "$tmp/$asset" "$base/$asset"
+fetch -o "$tmp/$asset.sha256" "$base/$asset.sha256"
+if [ "$(sha256 "$tmp/$asset")" != "$(cut -d' ' -f1 "$tmp/$asset.sha256")" ]; then
+	log "checksum mismatch; not updating"
+	exit 1
+fi
+tar -xzf "$tmp/$asset" -C "$tmp"
+"$tmp/arr-$TARGET/arr" --version >/dev/null || { log "$latest doesn't run on this machine; not updating"; exit 1; }
+# Swap the binary in one rename, keeping the old one for a rollback.
+cp -p "$ARR" "$ARR.previous"
+cp "$tmp/arr-$TARGET/arr" "$ARR.new"
+chmod 755 "$ARR.new"
+mv -f "$ARR.new" "$ARR"
+restart
+if healthy "$latest"; then
+	log "now running $latest"
+	exit 0
+fi
+log "$latest didn't start; going back to $current"
+mv -f "$ARR.previous" "$ARR"
+restart
+healthy "$current" || log "$current didn't start either; check Arr's logs"
+exit 1
+EOF
+	} >"$tmp/arr-update"
+	install -m 755 "$tmp/arr-update" "$UPDATER"
+	case "$kind" in
+	system | user)
+		if [ "$kind" = system ]; then udir=/etc/systemd/system; sctl="systemctl"; else udir="$HOME/.config/systemd/user"; sctl="systemctl --user"; fi
+		printf '[Unit]\nDescription=Update Arr to the latest release\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/bin/sh %s\n' \
+			"$(sd "$UPDATER")" >"$udir/arr-update.service"
+		printf '[Unit]\nDescription=Check for Arr updates once a day\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=6h\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' \
+			>"$udir/arr-update.timer"
+		$sctl daemon-reload && $sctl enable --now arr-update.timer >/dev/null 2>&1 ||
+			die "couldn't start the update timer"
+		;;
+	launchd)
+		uplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-update.plist"
+		cat >"$uplist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.github.newtonharry.arr-update</string>
+  <key>ProgramArguments</key><array><string>/bin/sh</string><string>$(xml "$UPDATER")</string></array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>$(($(od -An -N1 -tu1 /dev/urandom) % 60))</integer></dict>
+  <key>StandardOutPath</key><string>$(xml "$STATE_DIR/update.log")</string>
+  <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/update.log")</string>
+</dict></plist>
+EOF
+		launchctl unload "$uplist" 2>/dev/null || true
+		launchctl load "$uplist" || die "couldn't schedule automatic updates"
+		;;
+	esac
+	say "Arr checks for a new release once a day and installs it. Turn this off with --no-auto-update."
+elif [ -f "$UPDATER" ]; then
+	step "Turning off automatic updates"
+	case "$kind" in
+	system) systemctl disable --now arr-update.timer >/dev/null 2>&1 || true ;;
+	user) systemctl --user disable --now arr-update.timer >/dev/null 2>&1 || true ;;
+	launchd) launchctl unload "$HOME/Library/LaunchAgents/io.github.newtonharry.arr-update.plist" 2>/dev/null || true ;;
+	esac
+	rm -f "$UPDATER"
 fi
 
 API="http://127.0.0.1:$PORT"
