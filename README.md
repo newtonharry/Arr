@@ -61,6 +61,11 @@ Useful flags: `--movies DIR`, `--tv DIR`, `--downloads DIR`, `--plex-url URL`, `
 To confirm the install worked, the agent can run `arr check --config <state dir>/config.toml`;
 it prints JSON with `"config": "ok"`.
 
+The agent can also set up access from ChatGPT on your phone. You create the ngrok account and
+the Google OAuth client yourself, since both need your logins, then give the agent five values.
+[docs/REMOTE.md](docs/REMOTE.md#let-an-ai-agent-set-it-up) has the exact command; it passes the
+secrets as environment variables so they stay out of the process list.
+
 ## Use it
 
 ### From Claude Desktop, Claude Code or another MCP client on the same machine
@@ -83,11 +88,22 @@ The assistant gets six tools: `search_titles`, `add_media`, `media_status`, `req
 `release_choices` and `start_download`. By default it adds what you ask for and Arr picks the
 release. Ask to "choose a release" if you want to pick one yourself.
 
-### From ChatGPT
+### From ChatGPT on your phone or any device
 
-ChatGPT needs a public HTTPS address and a sign-in. Arr signs people in with Google and only
-lets in the addresses you list. [docs/MCP.md](docs/MCP.md) walks through the Google Cloud
-setup, a tunnel such as ngrok, and adding the connector in ChatGPT.
+ChatGPT reaches Arr from OpenAI's servers, so Arr needs a public HTTPS address and a sign-in.
+Arr uses a free [ngrok](https://ngrok.com) domain for the address (no router changes) and
+Google sign-in to let in only the accounts you list. Once set up, Arr works in ChatGPT on the
+web, on your phone and on every other device signed in to your ChatGPT account.
+
+You need a free ngrok account and a Google OAuth client, about 15 minutes of clicking that
+[docs/REMOTE.md](docs/REMOTE.md) walks through. Then run the installer again:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --remote
+```
+
+It installs ngrok, configures the sign-in, starts the tunnel as a service, checks the public
+address and prints the steps to add Arr to ChatGPT.
 
 ### From the API
 
@@ -139,7 +155,9 @@ The default search source is The Pirate Bay's public API. You can add any Torzna
 ## Documentation
 
 - [docs/STANDALONE.md](docs/STANDALONE.md): setting Arr up by hand, step by step.
-- [docs/MCP.md](docs/MCP.md): the MCP tools, remote access and Google sign-in for ChatGPT.
+- [docs/REMOTE.md](docs/REMOTE.md): using Arr from ChatGPT on your phone (ngrok and Google
+  sign-in).
+- [docs/MCP.md](docs/MCP.md): the MCP tools, remote access and Google sign-in in detail.
 - [docs/API.md](docs/API.md): endpoints, errors and examples.
 - [docs/EMBEDDED-DOWNLOADER.md](docs/EMBEDDED-DOWNLOADER.md): the BitTorrent engine, seeding
   and limits.

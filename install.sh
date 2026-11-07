@@ -28,6 +28,12 @@ PORT="${ARR_PORT:-8787}"
 TORRENT_PORT="${ARR_TORRENT_PORT:-50413}"
 UPLOAD_LIMIT_KIB="${ARR_UPLOAD_LIMIT_KIB:-0}"
 YES="${ARR_YES:-0}"
+REMOTE="${ARR_REMOTE:-0}"
+NGROK_TOKEN="${ARR_NGROK_TOKEN:-}"
+NGROK_DOMAIN="${ARR_NGROK_DOMAIN:-}"
+GOOGLE_ID="${ARR_GOOGLE_CLIENT_ID:-}"
+GOOGLE_SECRET="${ARR_GOOGLE_CLIENT_SECRET:-}"
+ALLOW_EMAILS="${ARR_ALLOW_EMAILS:-}"
 SETUP=1
 SERVICE=1
 DOWNLOADING=1
@@ -57,7 +63,18 @@ Usage: install.sh [options]
   --search-only          set Arr up without letting it download anything yet
   --no-service           don't install a background service
 
-Each option can also come from an environment variable: ARR_PLEX_TOKEN, ARR_MOVIES, ...
+Use Arr from ChatGPT on your phone or any device (docs/REMOTE.md). Run again with these to
+add it to an existing install:
+
+  --remote                     set up a public HTTPS address (ngrok) and Google sign-in
+  --ngrok-token TOKEN          your ngrok authtoken (dashboard.ngrok.com)
+  --ngrok-domain NAME          your free ngrok domain, e.g. name.ngrok-free.app
+  --google-client-id ID        Google OAuth client ID (Web application)
+  --google-client-secret SECRET
+  --allow-email ADDRESS        a Google account allowed to use Arr; repeat or comma-separate
+
+Each option can also come from an environment variable: ARR_PLEX_TOKEN, ARR_MOVIES,
+ARR_NGROK_TOKEN, ARR_GOOGLE_CLIENT_SECRET, ARR_ALLOW_EMAILS, ...
 EOF
 }
 
@@ -81,6 +98,12 @@ while [ $# -gt 0 ]; do
 	--port) PORT="$2"; shift ;;
 	--torrent-port) TORRENT_PORT="$2"; shift ;;
 	--upload-limit-kib) UPLOAD_LIMIT_KIB="$2"; shift ;;
+	--remote) REMOTE=1 ;;
+	--ngrok-token) NGROK_TOKEN="$2"; REMOTE=1; shift ;;
+	--ngrok-domain) NGROK_DOMAIN="$2"; REMOTE=1; shift ;;
+	--google-client-id) GOOGLE_ID="$2"; REMOTE=1; shift ;;
+	--google-client-secret) GOOGLE_SECRET="$2"; REMOTE=1; shift ;;
+	--allow-email) ALLOW_EMAILS="$ALLOW_EMAILS${ALLOW_EMAILS:+,}$2"; REMOTE=1; shift ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
 	esac
@@ -422,6 +445,105 @@ else
 	configure
 fi
 
+# ---------------------------------------------------------------- phone and ChatGPT access
+
+# ChatGPT (on the web, your phone or any device) needs a public HTTPS address and a sign-in.
+# A free ngrok domain provides the address; Google sign-in limits Arr to the accounts you list.
+remote_setup() {
+	step "Setting up access from ChatGPT on your phone and other devices"
+	if grep -q '^\[mcp\.oauth\]' "$CONFIG"; then
+		say "Your config already has remote access; keeping it."
+		return 0
+	fi
+	say "You need a free ngrok account and a Google OAuth client. The walkthrough:"
+	say "  https://github.com/$REPO/blob/main/docs/REMOTE.md"
+	[ -n "$NGROK_TOKEN" ] || NGROK_TOKEN=$(ask "ngrok authtoken (dashboard.ngrok.com > Your Authtoken)" "")
+	[ -n "$NGROK_DOMAIN" ] || NGROK_DOMAIN=$(ask "ngrok domain (dashboard.ngrok.com > Domains)" "")
+	NGROK_DOMAIN=$(printf '%s' "$NGROK_DOMAIN" | sed 's#^https\{0,1\}://##; s#/.*$##' | tr 'A-Z' 'a-z')
+	[ -n "$NGROK_TOKEN" ] && [ -n "$NGROK_DOMAIN" ] ||
+		die "remote access needs --ngrok-token and --ngrok-domain (see docs/REMOTE.md)"
+	case "$NGROK_TOKEN" in *[!A-Za-z0-9_-]*) die "that doesn't look like an ngrok authtoken" ;; esac
+	case "$NGROK_DOMAIN" in
+	*[!a-z0-9.-]* | .* | *. | *..*) die "that doesn't look like a domain: $NGROK_DOMAIN" ;;
+	*.*) ;;
+	*) die "that doesn't look like a domain: $NGROK_DOMAIN" ;;
+	esac
+	if [ -z "$GOOGLE_ID" ] || [ -z "$GOOGLE_SECRET" ]; then
+		say "Create a Google OAuth client (type: Web application) with this authorized redirect URI:"
+		say "  https://$NGROK_DOMAIN/auth/callback"
+	fi
+	[ -n "$GOOGLE_ID" ] || GOOGLE_ID=$(ask "Google OAuth client ID" "")
+	[ -n "$GOOGLE_SECRET" ] || GOOGLE_SECRET=$(ask "Google OAuth client secret" "")
+	[ -n "$ALLOW_EMAILS" ] || ALLOW_EMAILS=$(ask "Google accounts allowed to use Arr (comma-separated)" "")
+	[ -n "$GOOGLE_ID" ] && [ -n "$GOOGLE_SECRET" ] && [ -n "$ALLOW_EMAILS" ] ||
+		die "remote access needs --google-client-id, --google-client-secret and --allow-email (see docs/REMOTE.md)"
+	emails=""
+	for e in $(printf '%s' "$ALLOW_EMAILS" | tr ',' ' '); do
+		case "$e" in *[!A-Za-z0-9._%+@-]* | *@*@* | @* | *@) die "not an email address: $e" ;; *@*.*) ;; *) die "not an email address: $e" ;; esac
+		emails="$emails${emails:+, }$(toml "$(printf '%s' "$e" | tr 'A-Z' 'a-z')")"
+	done
+
+	NGROK=$(command -v ngrok || true)
+	if [ -z "$NGROK" ]; then
+		say "Installing the ngrok agent"
+		case "$os-$arch" in
+		Linux-x86_64) n=linux-amd64.tgz ;;
+		Linux-aarch64) n=linux-arm64.tgz ;;
+		Darwin-x86_64) n=darwin-amd64.zip ;;
+		*) n=darwin-arm64.zip ;;
+		esac
+		fetch -o "$tmp/ngrok-$n" "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-$n" || die "ngrok download failed"
+		case "$n" in
+		*.zip) (cd "$tmp" && unzip -oq "ngrok-$n") ;;
+		*) tar -xzf "$tmp/ngrok-$n" -C "$tmp" ;;
+		esac
+		install -m 755 "$tmp/ngrok" "$BIN_DIR/ngrok"
+		NGROK="$BIN_DIR/ngrok"
+	fi
+	umask 077
+	# The authtoken stays in a private config file, never on a command line.
+	printf 'version: "3"\nagent:\n  authtoken: %s\n' "$NGROK_TOKEN" >"$STATE_DIR/ngrok.yml"
+	"$NGROK" config check --config "$STATE_DIR/ngrok.yml" >/dev/null || die "ngrok rejected its config"
+	printf '%s' "$GOOGLE_SECRET" >"$STATE_DIR/secrets/google_client_secret"
+	[ -f "$STATE_DIR/secrets/mcp_token" ] ||
+		od -An -N32 -tx1 /dev/urandom | tr -d ' \n' >"$STATE_DIR/secrets/mcp_token"
+
+	# /mcp must accept the ngrok host; then add the sign-in section.
+	cp "$CONFIG" "$tmp/config.before-remote"
+	hosts="allowed_hosts = [$(toml "$NGROK_DOMAIN"), \"localhost\", \"127.0.0.1\"]"
+	if grep -q '^\[mcp\]' "$CONFIG"; then
+		grep -q '^allowed_hosts' "$CONFIG" &&
+			die "your config already sets allowed_hosts; add [mcp.oauth] by hand (see docs/MCP.md)"
+		awk -v line="$hosts" '{ print } /^\[mcp\]$/ { print line }' "$tmp/config.before-remote" >"$CONFIG"
+	else
+		printf '\n[mcp]\nenabled = true\ntoken_file = "secrets/mcp_token"\n%s\n' "$hosts" >>"$CONFIG"
+	fi
+	cat >>"$CONFIG" <<EOF
+
+# Google sign-in for ChatGPT and other remote MCP clients (docs/REMOTE.md).
+[mcp.oauth]
+public_url = $(toml "https://$NGROK_DOMAIN")
+google_client_id = $(toml "$GOOGLE_ID")
+google_client_secret_file = "secrets/google_client_secret"
+allowed_emails = [$emails]
+EOF
+	if ! "$ARR" check --config "$CONFIG" >"$tmp/check.json"; then
+		cat "$tmp/check.json"
+		cp "$tmp/config.before-remote" "$CONFIG"
+		die "arr check rejected the remote access settings; your previous config is restored"
+	fi
+	say "Remote access configured for https://$NGROK_DOMAIN"
+}
+if [ "$REMOTE" = 1 ]; then remote_setup; fi
+
+# A configured tunnel runs as its own service next to Arr.
+PUBLIC_URL=""
+NGROK=${NGROK:-}
+if [ -f "$STATE_DIR/ngrok.yml" ] && grep -q '^\[mcp\.oauth\]' "$CONFIG"; then
+	PUBLIC_URL=$(sed -n 's/^public_url = "\(.*\)"$/\1/p' "$CONFIG" | head -n1)
+	NGROK=${NGROK:-$(command -v ngrok || printf '%s' "$BIN_DIR/ngrok")}
+fi
+
 # ---------------------------------------------------------------- run it
 
 step "Starting Arr"
@@ -443,23 +565,39 @@ Restart=on-failure
 RestartSec=5
 UMask=0002
 "
+	tunnel="[Unit]
+Description=Public HTTPS address for Arr (ngrok)
+After=network-online.target arr.service
+Wants=network-online.target
+
+[Service]
+ExecStart=$(sd_exe "$NGROK") http $(sd "127.0.0.1:$PORT") $(sd "--url=$PUBLIC_URL") --config $(sd "$STATE_DIR/ngrok.yml") --log=stdout --log-level=warn
+Restart=always
+RestartSec=10
+"
 	if [ "$(id -u)" = 0 ]; then
 		run_as=${SUDO_USER:-root}
 		if [ "$run_as" != root ]; then
 			chown -R "$run_as" "$STATE_DIR"
 			unit="$unit
 User=$run_as"
+			tunnel="$tunnel
+User=$run_as"
 		fi
 		printf '%s\n[Install]\nWantedBy=multi-user.target\n' "$unit" >/etc/systemd/system/arr.service
+		[ -z "$PUBLIC_URL" ] || printf '%s\n[Install]\nWantedBy=multi-user.target\n' "$tunnel" >/etc/systemd/system/arr-tunnel.service
 		systemctl daemon-reload && systemctl enable arr >/dev/null 2>&1 && systemctl restart arr && started=1
+		[ -z "$PUBLIC_URL" ] || { systemctl enable arr-tunnel >/dev/null 2>&1 && systemctl restart arr-tunnel; }
 		logs="journalctl -u arr -f"
 	else
 		mkdir -p "$HOME/.config/systemd/user"
 		printf '%s\n[Install]\nWantedBy=default.target\n' "$unit" >"$HOME/.config/systemd/user/arr.service"
+		[ -z "$PUBLIC_URL" ] || printf '%s\n[Install]\nWantedBy=default.target\n' "$tunnel" >"$HOME/.config/systemd/user/arr-tunnel.service"
 		systemctl --user daemon-reload && systemctl --user enable arr >/dev/null 2>&1 &&
 			systemctl --user restart arr && started=1
+		[ -z "$PUBLIC_URL" ] || { systemctl --user enable arr-tunnel >/dev/null 2>&1 && systemctl --user restart arr-tunnel; }
 		logs="journalctl --user -u arr -f"
-		# Keeps the user service running after you log out.
+		# Keeps the user services running after you log out.
 		have loginctl && loginctl --no-ask-password enable-linger "$(id -un)" >/dev/null 2>&1 || true
 	fi
 elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
@@ -481,10 +619,32 @@ EOF
 	launchctl unload "$plist" 2>/dev/null || true
 	launchctl load "$plist" && started=1
 	logs="tail -f \"$STATE_DIR/arr.log\""
+	if [ -n "$PUBLIC_URL" ]; then
+		tplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-tunnel.plist"
+		cat >"$tplist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.github.newtonharry.arr-tunnel</string>
+  <key>ProgramArguments</key><array>
+    <string>$(xml "$NGROK")</string><string>http</string><string>127.0.0.1:$PORT</string>
+    <string>--url=$(xml "$PUBLIC_URL")</string><string>--config</string><string>$(xml "$STATE_DIR/ngrok.yml")</string>
+    <string>--log=stdout</string><string>--log-level=warn</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$(xml "$STATE_DIR/tunnel.log")</string>
+</dict></plist>
+EOF
+		launchctl unload "$tplist" 2>/dev/null || true
+		launchctl load "$tplist"
+	fi
 fi
 if [ "$started" != 1 ]; then
 	say "No background service was installed. Start Arr with:"
 	say "  $run_cmd"
+	[ -z "$PUBLIC_URL" ] ||
+		say "  \"$NGROK\" http 127.0.0.1:$PORT --url=$PUBLIC_URL --config \"$STATE_DIR/ngrok.yml\""
 	exit 0
 fi
 
@@ -535,7 +695,38 @@ To use Arr from Claude Desktop, Claude Code or another MCP client on this machin
     }
   }
 }
+EOF
 
-To use it from ChatGPT you need a public HTTPS address and Google sign-in; see
-https://github.com/$REPO/blob/main/docs/MCP.md
+if [ -z "$PUBLIC_URL" ]; then
+	cat <<EOF
+
+To use Arr from ChatGPT on your phone or any device, run this script again with --remote.
+It needs a free ngrok account and a Google OAuth client; see
+https://github.com/$REPO/blob/main/docs/REMOTE.md
+EOF
+	exit 0
+fi
+
+step "Checking $PUBLIC_URL"
+i=0
+until fetch "$PUBLIC_URL/.well-known/oauth-protected-resource/mcp" 2>/dev/null | grep -q "\"$PUBLIC_URL/mcp\""; do
+	i=$((i + 1))
+	[ $i -lt 30 ] || die "$PUBLIC_URL doesn't reach Arr yet; check the tunnel's log (journalctl -u arr-tunnel, or $STATE_DIR/tunnel.log on macOS)"
+	sleep 2
+done
+cat <<EOF
+Arr is reachable at $PUBLIC_URL
+
+Add it to ChatGPT once, on chatgpt.com in a browser; it then works in the ChatGPT app on
+your phone and every other device signed in to your account:
+
+  1. Settings > Apps & Connectors > Advanced: turn on Developer mode.
+  2. Back in Apps & Connectors, choose Create and fill in:
+       Name:            Arr
+       MCP server URL:  $PUBLIC_URL/mcp
+       Authentication:  OAuth
+  3. Create, then sign in: approve Arr's page and pick your Google account.
+  4. In a new chat, ask "what's in my library?"
+
+ChatGPT's menu names change now and then; docs/REMOTE.md has the current steps.
 EOF
