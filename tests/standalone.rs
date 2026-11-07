@@ -1978,7 +1978,7 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
                 .auth_header(token.to_string()),
         )
     };
-    // The initialize handshake, then the six tools.
+    // The initialize handshake, then the seven tools.
     let client = ClientConfig::default()
         .serve(transport(MCP_TOKEN))
         .await
@@ -1997,6 +1997,7 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
             "add_media",
             "media_status",
             "requests",
+            "library",
             "release_choices",
             "start_download"
         ]
@@ -2079,7 +2080,7 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
         )
         .await
         .expect("discover");
-    assert_eq!(client.list_all_tools().await.unwrap().len(), 6);
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 7);
     let _ = client.cancel().await;
     // Authentication comes before initialisation; the API token is not an MCP token.
     assert!(
