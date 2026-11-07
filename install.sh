@@ -498,9 +498,13 @@ done
 
 step "Learning what you already own from Plex"
 printf 'Authorization: Bearer %s\n' "$(cat "$STATE_DIR/secrets/api_token")" >"$tmp/api.header"
+# Import only the kinds this config has a library for (a movie-only setup has no TV run).
+media=all
+grep -q '^movies = ' "$CONFIG" || media=tv
+grep -q '^tv = ' "$CONFIG" || media=movies
 i=0
 while :; do
-	fetch -X POST -H @"$tmp/api.header" -H "Content-Type: application/json" -d '{}' \
+	fetch -X POST -H @"$tmp/api.header" -H "Content-Type: application/json" -d "{\"media\":\"$media\"}" \
 		-o "$tmp/boot.json" "$API/api/v1/setup/plex/bootstrap" || die "Plex import failed; see: $logs"
 	grep -q '"done": *true' "$tmp/boot.json" && break
 	i=$((i + 1))
