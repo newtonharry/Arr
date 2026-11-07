@@ -666,6 +666,9 @@ impl Adapter {
             return invalid(&format!("limit must be between 1 and {MAX_LIBRARY_PAGE}"));
         }
         let offset = a.offset.unwrap_or(0);
+        if offset > MAX_LIBRARY_OFFSET {
+            return invalid(&format!("offset must be at most {MAX_LIBRARY_OFFSET}"));
+        }
         let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
         if let Some(q) = a.q.as_deref().map(str::trim) {
             if q.is_empty()
@@ -857,6 +860,7 @@ struct RequestsArg {
 
 const DEFAULT_LIBRARY_PAGE: u32 = 50;
 const MAX_LIBRARY_PAGE: u32 = 100;
+const MAX_LIBRARY_OFFSET: u32 = 1_000_000;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -873,7 +877,7 @@ struct LibraryArg {
     limit: Option<u32>,
     /// Where the page starts: 0, then the previous page's next_offset.
     #[serde(default)]
-    #[schemars(range(min = 0, max = 1000000))]
+    #[schemars(range(min = 0, max = 1_000_000))]
     offset: Option<u32>,
 }
 
