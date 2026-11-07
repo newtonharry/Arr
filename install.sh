@@ -673,8 +673,9 @@ UPDATER="$BIN_DIR/arr-update"
 if [ -z "$AUTO_UPDATE" ]; then
 	if [ -f "$UPDATER" ]; then
 		AUTO_UPDATE=1
-	elif [ "$YES" = 1 ]; then
-		# Updating needs your say-so: with --yes, only --auto-update turns it on.
+	elif ! interactive; then
+		# Updating needs your say-so: without a prompt (--yes, or no terminal), only
+		# --auto-update turns it on.
 		AUTO_UPDATE=0
 	elif confirm "Install new versions of Arr automatically (checked once a day)?" y; then
 		AUTO_UPDATE=1
@@ -683,6 +684,24 @@ if [ -z "$AUTO_UPDATE" ]; then
 	fi
 fi
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# For a system-wide install root runs the updater and the binary, so no other account may
+# be able to replace them: the binary and every folder from its own up to / must be owned
+# by root and not writable by group or others.
+root_safe() {
+	p=$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")
+	while :; do
+		owner=$(stat -c %u "$p" 2>/dev/null) && mode=$(stat -c %a "$p" 2>/dev/null) || return 1
+		[ "$owner" = 0 ] && [ $((0$mode & 022)) -eq 0 ] || return 1
+		[ "$p" = / ] && return 0
+		p=$(dirname "$p")
+	done
+}
+if [ "$AUTO_UPDATE" = 1 ] && [ "$kind" = system ] && ! root_safe "$ARR"; then
+	say "Automatic updates stay off: $BIN_DIR can be changed by accounts other than root,"
+	say "and root would run the updater from there. Install to a root-owned folder such as"
+	say "/usr/local/bin (the default) to use them."
+	AUTO_UPDATE=0
+fi
 if [ "$AUTO_UPDATE" = 1 ]; then
 	step "Turning on automatic updates"
 	{
@@ -712,15 +731,32 @@ restart() {
 	launchd) launchctl kickstart -k "gui/$(id -u)/io.github.newtonharry.arr" || true ;;
 	esac
 }
-# Waits until Arr answers its health check as version $1.
+# Waits up to 30 seconds for Arr to answer its health check as version $1. Each request
+# has its own short timeout, so a server that accepts but never answers can't stall this.
 healthy() {
-	i=0
-	until fetch "http://127.0.0.1:$PORT/api/v1/health" 2>/dev/null | grep -q "\"version\": *\"${1#v}\""; do
-		i=$((i + 1))
-		[ $i -lt 30 ] || return 1
+	start=$(date +%s)
+	until curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/v1/health" 2>/dev/null |
+		grep -q "\"version\": *\"${1#v}\""; do
+		[ $(($(date +%s) - start)) -lt 30 ] || return 1
 		sleep 1
 	done
 }
+
+# One update at a time: a manual run and the daily job must not share .previous and .new.
+# mkdir is atomic; a lock left by a run that died (its process gone) is taken over.
+lock="$ARR.update-lock"
+tmp=""
+if ! mkdir "$lock" 2>/dev/null; then
+	pid=$(cat "$lock/pid" 2>/dev/null || true)
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		log "another update is running"
+		exit 0
+	fi
+	rm -rf "$lock"
+	mkdir "$lock" || { log "couldn't take the update lock"; exit 1; }
+fi
+echo $$ >"$lock/pid"
+trap 'rm -rf "$lock" ${tmp:+"$tmp"}' EXIT
 
 RELEASES=${ARR_RELEASES_URL:-https://github.com/$REPO/releases}
 latest=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" | sed 's#.*/tag/##')
@@ -732,7 +768,6 @@ if ! newer "$latest" "$current"; then
 fi
 log "updating $current to $latest"
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
 asset="arr-$TARGET.tar.gz"
 base="$RELEASES/download/$latest"
 fetch -o "$tmp/$asset" "$base/$asset"
