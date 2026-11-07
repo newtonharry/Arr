@@ -614,8 +614,14 @@ User=$run_as"
 			systemctl --user restart arr && started=1
 		[ -z "$PUBLIC_URL" ] || { systemctl --user enable arr-tunnel >/dev/null 2>&1 && systemctl --user restart arr-tunnel; }
 		logs="journalctl --user -u arr -f"
-		# Keeps the user services running after you log out.
+		# Keeps the user services running after you log out and starts them at boot. Over SSH
+		# this often needs an administrator; say so instead of failing quietly.
 		have loginctl && loginctl --no-ask-password enable-linger "$(id -un)" >/dev/null 2>&1 || true
+		if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q '=yes'; then
+			say "Warning: Arr stops when you log out and won't start after a reboot. Fix it with:"
+			say "  sudo loginctl enable-linger $(id -un)"
+			say "or install system-wide by running this script with sudo."
+		fi
 	fi
 elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
 	plist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
