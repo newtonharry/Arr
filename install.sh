@@ -700,8 +700,13 @@ root_safe() {
 		p=$(dirname "$p")
 	done
 }
-if [ "$AUTO_UPDATE" = 1 ] && ! command -v flock >/dev/null 2>&1 && ! command -v shlock >/dev/null 2>&1; then
-	say "Automatic updates stay off: this system has no flock (util-linux) to keep two updates apart."
+# One lock tool per OS, fixed here with its full path: every run (by hand or by the timer,
+# whatever its PATH) must use the same kind of lock to keep the others out.
+if [ "$os" = Darwin ]; then lock_kind=shlock; lock_tool=/usr/bin/shlock
+else lock_kind=flock; lock_tool=$(command -v flock || true); fi
+case "$lock_tool" in /*) ;; *) lock_tool="" ;; esac
+if [ "$AUTO_UPDATE" = 1 ] && ! [ -x "$lock_tool" ]; then
+	say "Automatic updates stay off: this system has no $lock_kind to keep two updates apart."
 	AUTO_UPDATE=0
 fi
 if [ "$AUTO_UPDATE" = 1 ] && [ "$kind" = system ] && ! root_safe "$ARR"; then
@@ -714,8 +719,9 @@ if [ "$AUTO_UPDATE" = 1 ]; then
 	step "Turning on automatic updates"
 	{
 		printf '#!/bin/sh\n# Arr updater, written by install.sh. A daily job runs it; you can run it by hand too.\n'
-		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\n' \
-			"$(sq "$REPO")" "$(sq "$ARR")" "$(sq "$target")" "$(sq "$kind")" "$(sq "$PORT")"
+		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\n' \
+			"$(sq "$REPO")" "$(sq "$ARR")" "$(sq "$target")" "$(sq "$kind")" "$(sq "$PORT")" \
+			"$(sq "$lock_kind")" "$(sq "$lock_tool")"
 		cat <<'EOF'
 set -eu
 log() { printf 'arr-update: %s\n' "$*"; }
@@ -755,17 +761,23 @@ healthy() {
 # shlock (macOS) writes its pid atomically and replaces a dead holder's lock safely.
 lock="$ARR.update-lock"
 tmp=""
-if command -v flock >/dev/null 2>&1; then
+# The installer fixed LOCK_KIND and LOCK_TOOL, so every run takes the same kind of lock.
+[ -x "$LOCK_TOOL" ] || { log "$LOCK_TOOL is missing; not updating"; exit 1; }
+case "$LOCK_KIND" in
+flock)
 	exec 9>"$lock"
-	flock -n 9 || { log "another update is running"; exit 0; }
+	"$LOCK_TOOL" -n 9 || { log "another update is running"; exit 0; }
 	trap 'rm -rf ${tmp:+"$tmp"}' EXIT
-elif command -v shlock >/dev/null 2>&1; then
-	shlock -f "$lock" -p $$ || { log "another update is running"; exit 0; }
+	;;
+shlock)
+	"$LOCK_TOOL" -f "$lock" -p $$ || { log "another update is running"; exit 0; }
 	trap 'rm -f "$lock"; rm -rf ${tmp:+"$tmp"}' EXIT
-else
-	log "no flock or shlock to keep updates apart; not updating"
+	;;
+*)
+	log "unknown lock kind $LOCK_KIND; not updating"
 	exit 1
-fi
+	;;
+esac
 
 RELEASES=${ARR_RELEASES_URL:-https://github.com/$REPO/releases}
 latest=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" | sed 's#.*/tag/##')
