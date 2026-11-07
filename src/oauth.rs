@@ -431,7 +431,9 @@ fn secure_headers(r: &mut Response) {
             "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
         ),
         ("x-frame-options", "DENY"),
-        ("referrer-policy", "no-referrer"),
+        // Not no-referrer: under it browsers send `Origin: null` on the consent form POST,
+        // which the same-origin check refuses. same-origin still sends no referrer elsewhere.
+        ("referrer-policy", "same-origin"),
     ] {
         h.insert(k, HeaderValue::from_static(v));
     }
