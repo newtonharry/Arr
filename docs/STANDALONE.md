@@ -189,5 +189,5 @@ symbol version the binary needs is reported in the implementation report for the
 - The bootstrap reads Plex's view: files Plex does not know are not owned until a scan (an
   add scans the item's folder first). Movies with more than one file are recorded as owned;
   multi-file imports are still refused.
-- Remote MCP uses a static bearer token; it is not an OAuth-protected resource and does not
-  make a ChatGPT cloud connector work by itself (see [MCP.md](MCP.md)).
+- Remote MCP uses a static bearer token, or Google OAuth sign-in when `[mcp.oauth]` is
+  configured (what a ChatGPT connector needs; see [MCP.md](MCP.md)). It has no TLS listener.

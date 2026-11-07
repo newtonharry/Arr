@@ -82,8 +82,8 @@ tv_section = 2
 movies_path = "/data/movies"   # [library] movies as Plex sees it
 tv_path = "/data/tv"           # [library] tv as Plex sees it
 
-# Remote MCP (Streamable HTTP, static bearer token; no OAuth, no TLS: put an HTTPS proxy in
-# front for anything beyond loopback, see docs/MCP.md).
+# Remote MCP (Streamable HTTP, static bearer token; no TLS: put an HTTPS proxy in front for
+# anything beyond loopback, see docs/MCP.md).
 # [mcp]
 # enabled = true
 # token_file = "secrets/mcp_token"
@@ -92,3 +92,17 @@ tv_path = "/data/tv"           # [library] tv as Plex sees it
 # max_body_bytes = 65536
 # max_concurrent = 4
 # timeout_secs = 120
+#
+# Optional OAuth 2.1 sign-in with Google for connectors such as ChatGPT (docs/MCP.md). When
+# present, /mcp also accepts OAuth access tokens issued after a Google sign-in.
+# [mcp.oauth]
+# public_url = "https://media.example.org"   # https origin only; its host must be in allowed_hosts
+# google_client_id = "1234567890-abc.apps.googleusercontent.com"
+# google_client_secret_file = "secrets/google_client_secret"   # 0600
+# allowed_emails = ["you@example.com"]       # 1 to 32 exact addresses, case-insensitive
+# # Optional, defaults shown. All URLs must be https (http only for loopback hosts).
+# trusted_client_metadata = ["https://chatgpt.com/oauth/"]   # client_id URL prefixes trusted
+# google_authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
+# google_token_endpoint = "https://oauth2.googleapis.com/token"
+# access_token_ttl_secs = 3600
+# refresh_token_ttl_days = 30

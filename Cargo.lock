@@ -98,6 +98,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "arr"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "clap",
+ "getrandom 0.4.3",
+ "hex",
+ "libc",
+ "librqbit",
+ "regex",
+ "reqwest",
+ "ring",
+ "rmcp",
+ "roxmltree",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+ "url",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3492,38 +3526,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
 dependencies = [
  "tinyvec",
-]
-
-[[package]]
-name = "arr"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "getrandom 0.4.3",
- "hex",
- "libc",
- "librqbit",
- "regex",
- "reqwest",
- "rmcp",
- "roxmltree",
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "subtle",
- "tempfile",
- "time",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
- "unicode-normalization",
- "url",
 ]
 
 [[package]]

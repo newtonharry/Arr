@@ -3999,7 +3999,8 @@ pub async fn serve(cfg: RuntimeConfig) -> anyhow::Result<()> {
     if state.cfg.mcp.is_some() {
         tracing::info!(
             path = "/mcp",
-            "remote MCP (Streamable HTTP, static bearer token) enabled"
+            oauth = state.cfg.mcp.as_ref().is_some_and(|m| m.oauth.is_some()),
+            "remote MCP (Streamable HTTP, bearer token) enabled"
         );
     }
     let served = axum::serve(listener, app)
@@ -4034,7 +4035,12 @@ pub fn app(state: Arc<AppState>) -> anyhow::Result<(Router, Box<dyn FnOnce() + S
     let api = router(state.clone());
     match &state.cfg.mcp {
         Some(m) => {
-            let (mcp, stop) = crate::mcp::remote(m, api.clone(), state.cfg.api_token.expose())?;
+            let (mcp, stop) = crate::mcp::remote(
+                m,
+                api.clone(),
+                state.cfg.api_token.expose(),
+                &state.cfg.state_dir,
+            )?;
             Ok((mcp.merge(api), Box::new(stop)))
         }
         None => Ok((api, Box::new(|| {}))),
