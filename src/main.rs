@@ -78,7 +78,7 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// First-run setup in a web browser: prints a one-time link, then signs in to Plex,
+    /// First-run setup in a web browser: prints a private link, then signs in to Plex,
     /// picks libraries and folders, writes the config and imports what Plex already has.
     /// Exits when setup is done (the installer then starts the service).
     Wizard {

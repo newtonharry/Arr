@@ -5,7 +5,7 @@
 //! config `install.sh` writes, runs `arr setup`, `arr check` and the Plex import, and exits.
 //! The installer then installs the service as before.
 //!
-//! Access needs the one-time link printed in the terminal: its code is swapped for an
+//! Access needs the link printed in the terminal: its secret code is swapped for an
 //! HttpOnly, SameSite=Strict cookie, and changes also need a custom header, so other sites
 //! can't drive it. Plex tokens stay on this side; the browser only sees the plex.tv sign-in
 //! link. On a machine reached over SSH, the installer binds the address the SSH client used,
@@ -305,7 +305,7 @@ async fn index(State(wiz): St, Query(q): Query<CodeQuery>, headers: HeaderMap) -
     if !has_session(&wiz, &headers) {
         return (
             StatusCode::UNAUTHORIZED,
-            page_text("Open the link printed in the terminal (it includes a one-time code)."),
+            page_text("Open the link printed in the terminal (it includes a secret code)."),
         )
             .into_response();
     }
@@ -440,11 +440,14 @@ fn plex_down(e: upstream::UpstreamError) -> Response {
 
 /// Polls the sign-in once; when it's done, lists the servers this account owns.
 async fn check_signin(State(wiz): St) -> Response {
-    let pin = wiz.inner.lock().unwrap().pin.clone();
-    let Some((id, code)) = pin else {
-        return Json(snapshot(&wiz)).into_response();
+    let (pin, signed_in) = {
+        let inner = wiz.inner.lock().unwrap();
+        (inner.pin.clone(), inner.account.is_some())
     };
-    if wiz.inner.lock().unwrap().account.is_none() {
+    if !signed_in {
+        let Some((id, code)) = pin else {
+            return Json(snapshot(&wiz)).into_response();
+        };
         let url = match wiz
             .opts
             .plex_tv
@@ -472,6 +475,14 @@ async fn check_signin(State(wiz): St) -> Response {
             Some(t) => wiz.inner.lock().unwrap().account = Some(Secret::new(t)),
             None => return Json(snapshot(&wiz)).into_response(),
         }
+    }
+    // Until a server is found, every check asks plex.tv again, so a failed lookup can be
+    // retried.
+    let lookup = {
+        let inner = wiz.inner.lock().unwrap();
+        inner.plex.is_none() && inner.servers.is_empty()
+    };
+    if lookup {
         let servers = match servers(&wiz).await {
             Ok(s) => s,
             Err(e) => return plex_down(e),

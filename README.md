@@ -27,7 +27,7 @@ The script takes a few minutes. It:
 5. starts Arr as a service (systemd on Linux, launchd on macOS).
 
 If you're connected to the machine over SSH, the script prints a link to open on the computer
-you're typing on. The link includes a one-time code, so nobody else on your network can use
+you're typing on. The link includes a secret code, so nobody else on your network can use
 the page. To answer the questions in the terminal instead, add `--terminal`:
 `curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --terminal`.
 

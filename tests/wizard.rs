@@ -22,6 +22,7 @@ const MACHINE: &str = "machine-0123456789";
 #[derive(Default)]
 struct World {
     pin_polls: u32,
+    resources_calls: u32,
     movies_path: String,
     tv_path: String,
     /// The token each request carried, by path.
@@ -86,6 +87,11 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
                 record(&m, "resources", &h);
                 if h.get("x-plex-token").and_then(|v| v.to_str().ok()) != Some(ACCOUNT_TOKEN) {
                     return StatusCode::UNAUTHORIZED.into_response();
+                }
+                // plex.tv has a bad moment on the first lookup.
+                m.lock().unwrap().resources_calls += 1;
+                if m.lock().unwrap().resources_calls == 1 {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
                 let port = addr.port();
                 axum::Json(json!([
@@ -296,6 +302,12 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     let (_, v) = page.post("/api/plex/check", json!({})).await;
     assert_eq!(v["signed_in"], false);
     assert_eq!(v["waiting_for_signin"], true);
+    // Signed in, but the server lookup failed: checking again retries it.
+    let (s, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(v["signed_in"], true);
+    assert_eq!(v["plex"], Value::Null);
     let (s, v) = page.post("/api/plex/check", json!({})).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["signed_in"], true);

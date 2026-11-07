@@ -17,6 +17,7 @@ DOWNLOAD_BASE="${ARR_DOWNLOAD_BASE:-}"
 BIN_DIR="${ARR_BIN_DIR:-}"
 STATE_DIR="${ARR_STATE_DIR:-}"
 PLEX_URL="${ARR_PLEX_URL:-http://127.0.0.1:32400}"
+PLEX_URL_SET=0; [ -z "${ARR_PLEX_URL:-}" ] || PLEX_URL_SET=1
 PLEX_TOKEN="${ARR_PLEX_TOKEN:-}"
 TMDB_KEY="${ARR_TMDB_KEY:-}"
 MOVIES="${ARR_MOVIES:-}"
@@ -93,7 +94,7 @@ while [ $# -gt 0 ]; do
 	--version) VERSION="$2"; shift ;;
 	--bin-dir) BIN_DIR="$2"; shift ;;
 	--state-dir) STATE_DIR="$2"; shift ;;
-	--plex-url) PLEX_URL="$2"; shift ;;
+	--plex-url) PLEX_URL="$2"; PLEX_URL_SET=1; shift ;;
 	--plex-token) PLEX_TOKEN="$2"; shift ;;
 	--movies) MOVIES="$2"; shift ;;
 	--tv) TV="$2"; shift ;;
@@ -462,7 +463,7 @@ lan_ip() {
 browser_setup() {
 	step "Setting up Arr in your web browser"
 	# Over SSH (or on a machine without a screen) the page has to open on another computer,
-	# so it listens on this machine's network address. The link carries a one-time code.
+	# so it listens on this machine's network address. The link carries a secret code.
 	bind=127.0.0.1
 	if [ -n "${SSH_CONNECTION:-}" ]; then
 		bind=$(printf '%s' "$SSH_CONNECTION" | awk '{print $3}')
@@ -495,8 +496,9 @@ if [ -f "$CONFIG" ]; then
 	PORT=$(sed -n 's/^listen = "[^"]*:\([0-9][0-9]*\)"$/\1/p' "$CONFIG" | head -n1)
 	PORT=${PORT:-8787}
 	grep -A1 '^\[execution\]' "$CONFIG" | grep -q 'enabled = true' || DOWNLOADING=0
-elif [ "$TERMINAL" != 1 ] && interactive &&
+elif [ "$TERMINAL" != 1 ] && interactive && [ "$DOWNLOADING" = 1 ] && [ "$PLEX_URL_SET" = 0 ] &&
 	[ -z "$PLEX_TOKEN$MOVIES$TV$MOVIE_SECTION$TV_SECTION$DOWNLOADS$TMDB_KEY" ]; then
+	# Setup options on the command line (or --search-only) mean the terminal setup.
 	browser_setup
 else
 	configure

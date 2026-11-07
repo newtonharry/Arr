@@ -70,8 +70,12 @@ function renderServers(s) {
   if (!s.signed_in) return;
   if (s.servers.length === 0) {
     const p = document.createElement("p");
-    p.textContent = "This Plex account doesn't own a server. Sign in with the account that set up your Plex server, or connect another way below.";
-    box.append(p);
+    p.textContent = "Arr didn't find a Plex server on this account. Check that your server is on and signed in to Plex, then look again, or connect another way below.";
+    const again = document.createElement("button");
+    again.type = "button";
+    again.textContent = "Look again";
+    again.addEventListener("click", () => act(again, () => call("POST", "/api/plex/check")));
+    box.append(p, again);
     $("manual").open = true;
     return;
   }
