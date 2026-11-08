@@ -275,6 +275,7 @@ fn make_shared_dir(dir: &Path, owner: Option<(u32, u32)>) -> Result<()> {
     }
     // Made with its final mode in one step, and handed over without following a link, so
     // nothing swapped in at this path meanwhile gets root's chmod or chown.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o755);
