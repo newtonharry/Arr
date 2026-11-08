@@ -219,6 +219,20 @@ fn wrong_code(code: &str) -> String {
     format!("{}{last}", &code[..code.len() - 1])
 }
 
+/// Debian's ffprobe; on Windows, the first on the PATH.
+fn ffprobe() -> std::path::PathBuf {
+    if cfg!(unix) {
+        return "/usr/bin/ffprobe".into();
+    }
+    std::env::var_os("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("ffprobe.exe"))
+                .find(|f| f.is_file())
+        })
+        .unwrap_or_else(|| "ffprobe.exe".into())
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -272,7 +286,8 @@ async fn start_wizard(
         .args(["wizard", "--no-docker", "--port", &port.to_string()])
         .arg("--state-dir")
         .arg(state_dir)
-        .args(["--ffprobe", "/usr/bin/ffprobe"])
+        .arg("--ffprobe")
+        .arg(ffprobe())
         .arg(format!("--plex-tv-url=http://{mock}/"))
         .arg(format!("--plex-auth-url=http://{mock}/auth"))
         .args(extra)
@@ -517,7 +532,7 @@ async fn an_existing_config_is_never_replaced() {
             "wizard",
             "--no-docker",
             "--ffprobe",
-            "/usr/bin/ffprobe",
+            ffprobe().to_str().unwrap(),
             "--port",
         ])
         .arg(free_port().to_string())

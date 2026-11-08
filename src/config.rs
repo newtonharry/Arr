@@ -440,7 +440,18 @@ fn d_probes_per_scan() -> u32 {
     20
 }
 
+/// Debian's ffprobe; on Windows, the first `ffprobe.exe` on the PATH.
 fn d_ffprobe() -> String {
+    if cfg!(windows) {
+        return std::env::var_os("PATH")
+            .and_then(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.join("ffprobe.exe"))
+                    .find(|f| f.is_absolute() && f.is_file())
+            })
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ffprobe.exe".into());
+    }
     "/usr/bin/ffprobe".into()
 }
 fn d_probe_timeout() -> u64 {
@@ -2054,6 +2065,7 @@ mod tests {
         (tmp, cfg)
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn embedded_section_is_explicit_exclusive_and_validated() {
         let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n";
@@ -2091,7 +2103,7 @@ mod tests {
             ),
             (
                 format!(
-                    "{base}[embedded]\ndownload_dir = \"{around_state}\"\nlisten = \"127.0.0.1:0\"\n"
+                    "{base}[embedded]\ndownload_dir = '{around_state}'\nlisten = \"127.0.0.1:0\"\n"
                 ),
                 "state directory",
             ),
@@ -2174,6 +2186,7 @@ mod tests {
         assert!(fc.execution.download_cleanup && !fc.execution.enabled);
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn execution_sections_are_validated() {
         let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n";
@@ -2439,6 +2452,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn deferred_secrets_list_missing_files_without_reading_values() {
         let text = "[server]\napi_token_file = \"secrets/api_token\"\n[plex]\nbase_url = \"http://127.0.0.1:32400\"\ntoken_file = \"secrets/plex_token\"\nmovies_path = \"/data/movies/\"\n";

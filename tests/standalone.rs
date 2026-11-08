@@ -548,7 +548,7 @@ credential_file = "secrets/tmdb"
 enabled = {execution}
 download_cleanup = true
 [embedded]
-download_dir = "{dl}"
+download_dir = '{dl}'
 listen = "127.0.0.1:0"
 trackers = false
 dht = {dht}
@@ -556,8 +556,8 @@ local_discovery = false
 {peers}[migration]
 mode = "coexistence"
 [library]
-movies = "{movies}"
-tv = "{tv}"
+movies = '{movies}'
+tv = '{tv}'
 sample_detection = false
 probe_timeout_secs = 30
 [automation]

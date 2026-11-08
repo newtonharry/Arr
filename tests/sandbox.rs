@@ -53,7 +53,7 @@ impl Sandbox {
         fsutil::write_new_private_file(&dir.join("secrets/qb_pass"), pass.trim().as_bytes())
             .unwrap();
         let extra = format!(
-            "[execution]\nenabled = true\n[qbittorrent]\nbase_url = \"{qb_url}\"\nusername_file = \"secrets/qb_user\"\npassword_file = \"secrets/qb_pass\"\nsave_path = \"{save_path}\"\nlocal_path = \"{}\"\nmovie_category = \"{}\"\ntv_category = \"{}\"\n[library]\nmovies = \"{}\"\ntv = \"{}\"\nsample_detection = false\n[automation]\npoll_seconds = 3600\n[migration]\nmode = \"{mode}\"\n",
+            "[execution]\nenabled = true\n[qbittorrent]\nbase_url = '{qb_url}'\nusername_file = \"secrets/qb_user\"\npassword_file = \"secrets/qb_pass\"\nsave_path = '{save_path}'\nlocal_path = '{}'\nmovie_category = '{}'\ntv_category = '{}'\n[library]\nmovies = '{}'\ntv = '{}'\nsample_detection = false\n[automation]\npoll_seconds = 3600\n[migration]\nmode = '{mode}'\n",
             downloads.display(),
             categories.0,
             categories.1,

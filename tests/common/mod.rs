@@ -920,7 +920,7 @@ pub fn mkv(seconds: u32) -> Vec<u8> {
     }
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("clip.mkv");
-    let bytes = arr::fixture::generate_mkv(Path::new("/usr/bin/ffmpeg"), &out, seconds)
+    let bytes = arr::fixture::generate_mkv(&ff("ffmpeg"), &out, seconds)
         .expect("these tests need /usr/bin/ffmpeg and /usr/bin/ffprobe (Debian package ffmpeg)");
     cache.lock().unwrap().insert(seconds, bytes.clone());
     bytes
@@ -937,9 +937,7 @@ pub fn mkv_sized(seconds: u32, width: u32, height: u32) -> Vec<u8> {
     }
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("clip.mkv");
-    let bytes =
-        arr::fixture::generate_video(Path::new("/usr/bin/ffmpeg"), &out, seconds, width, height)
-            .unwrap();
+    let bytes = arr::fixture::generate_video(&ff("ffmpeg"), &out, seconds, width, height).unwrap();
     cache
         .lock()
         .unwrap()
@@ -947,11 +945,26 @@ pub fn mkv_sized(seconds: u32, width: u32, height: u32) -> Vec<u8> {
     bytes
 }
 
+/// ffmpeg or ffprobe: Debian's on Unix; on Windows, the first on the PATH (CI puts FFmpeg's
+/// real bin folder there).
+pub fn ff(tool: &str) -> PathBuf {
+    if cfg!(unix) {
+        return PathBuf::from(format!("/usr/bin/{tool}"));
+    }
+    std::env::var_os("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join(format!("{tool}.exe")))
+                .find(|f| f.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from(format!("{tool}.exe")))
+}
+
 /// An audio-only Matroska file (no video stream).
 pub fn audio_only() -> Vec<u8> {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("a.mka");
-    let ok = std::process::Command::new("/usr/bin/ffmpeg")
+    let ok = std::process::Command::new(ff("ffmpeg"))
         .args([
             "-v",
             "error",
@@ -1163,9 +1176,9 @@ pub async fn start_exec(o: ExecOptions) -> Exec {
     };
     let extra = format!(
         "[execution]\nenabled = true\ndownload_cleanup = {cleanup}\n\
-         [qbittorrent]\nbase_url = \"http://{qb_addr}/\"\nusername_file = \"{QB_USER_FILE}\"\npassword_file = \"secrets/qb_pass\"\nsave_path = \"/downloads\"\nlocal_path = \"{dl}\"\ntimeout_secs = 5\n{cats}\
-         [migration]\nmode = \"{mode}\"\n\
-         [library]\nmovies = \"{movies}\"\ntv = \"{tv}\"\nsample_detection = {sample}\nprobe_timeout_secs = 30\n\
+         [qbittorrent]\nbase_url = \"http://{qb_addr}/\"\nusername_file = '{QB_USER_FILE}'\npassword_file = \"secrets/qb_pass\"\nsave_path = \"/downloads\"\nlocal_path = '{dl}'\ntimeout_secs = 5\n{cats}\
+         [migration]\nmode = '{mode}'\n\
+         [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = {sample}\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 3600\n{stall}\
          [plex]\nbase_url = \"http://{mock_addr}/plex\"\ntoken_file = \"secrets/plex_token\"\nmovie_section = 1\ntv_section = 2\n{tmdb}{extra}",
         cleanup = o.cleanup,
@@ -1182,7 +1195,7 @@ pub async fn start_exec(o: ExecOptions) -> Exec {
             .unwrap_or_default(),
         cats = o
             .categories
-            .map(|(m, t)| format!("movie_category = \"{m}\"\ntv_category = \"{t}\"\n"))
+            .map(|(m, t)| format!("movie_category = '{m}'\ntv_category = '{t}'\n"))
             .unwrap_or_default(),
     );
     write_state(&dir, &o.snapshot, &extra, Some(mock_addr), o.tvmaze);
@@ -1213,13 +1226,9 @@ pub async fn start_exec(o: ExecOptions) -> Exec {
 pub async fn playable(path: &Path) -> bool {
     let root = path.parent().unwrap();
     let canonical = arr::probe::validate(path, &[root]).unwrap();
-    arr::probe::run(
-        Path::new("/usr/bin/ffprobe"),
-        &canonical,
-        Duration::from_secs(30),
-    )
-    .await
-    .is_ok()
+    arr::probe::run(&ff("ffprobe"), &canonical, Duration::from_secs(30))
+        .await
+        .is_ok()
 }
 
 pub fn ino(path: &Path) -> u64 {

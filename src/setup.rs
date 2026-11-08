@@ -1190,6 +1190,7 @@ mod tests {
         (tmp, c)
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn defaults_are_complete_explicit_and_stable() {
         let (_t, c) = cfg("");
@@ -1251,6 +1252,7 @@ mod tests {
         normalize(&example, &c).unwrap();
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn invalid_documents_report_every_problem() {
         let (_t, c) = cfg("");
@@ -1271,6 +1273,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn replacements_keep_what_the_catalog_and_downloads_use() {
         let (_t, c) = cfg("");

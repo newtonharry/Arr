@@ -241,7 +241,21 @@ function Add-ToPath($dir) {
 
 function Find-FFprobe {
 	$c = Get-Command ffprobe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-	if ($c) { return $c.Source }
+	if ($c) {
+		# Chocolatey's and Scoop's ffprobe.exe are launchers that start the real one as a
+		# second process, which Arr's one-process sandbox refuses: use the real one.
+		$p = $c.Source
+		if ($p -like '*\chocolatey\bin\ffprobe.exe') {
+			$lib = Join-Path (Split-Path (Split-Path $p)) 'lib'
+			$real = Get-ChildItem $lib -Directory -Filter 'ffmpeg*' -ErrorAction SilentlyContinue |
+				Get-ChildItem -Recurse -Filter ffprobe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+			if ($real) { return $real.FullName }
+		} elseif ($p -like '*\scoop\shims\ffprobe.exe') {
+			$real = Join-Path (Split-Path (Split-Path $p)) 'apps\ffmpeg\current\bin\ffprobe.exe'
+			if (Test-Path $real) { return $real }
+		}
+		return $p
+	}
 	# winget's FFmpeg, before this window's PATH knows about it.
 	$link = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\ffprobe.exe'
 	if (Test-Path $link) { return $link }

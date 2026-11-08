@@ -40,6 +40,10 @@ jobs:
           rustup toolchain install 1.94.1 --profile minimal --component clippy
           rustup default 1.94.1
           choco install ffmpeg -y --no-progress
+          # Chocolatey's ffprobe is a launcher that starts the real one as a second process,
+          # which Arr's one-process sandbox refuses: put the real folder first on the PATH.
+          $ff = Get-ChildItem C:\ProgramData\chocolatey\lib\ffmpeg -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          $ff.DirectoryName | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - uses: actions/cache@v4
         with:
           path: |
