@@ -341,7 +341,9 @@ local_path() {
 		mapped=$(docker inspect -f '{{range .Mounts}}{{.Destination}}	{{.Source}}{{println}}{{end}}' "$plex_container" 2>/dev/null |
 			awk -F '	' 'NF == 2 { print length($1) "	" $0 }' | sort -rn |
 			while IFS='	' read -r _ dst src; do
-				case "$1" in "$dst" | "$dst"/*) printf '%s%s' "$src" "${1#"$dst"}"; break ;; esac
+				# "(pattern)": macOS's /bin/sh (bash 3.2) takes a bare "pattern)" inside $(...)
+				# for the end of the substitution and fails to parse this script.
+				case "$1" in ("$dst" | "$dst"/*) printf '%s%s' "$src" "${1#"$dst"}"; break ;; esac
 			done)
 		[ -n "$mapped" ] && { printf '%s' "$mapped"; return 0; }
 	fi
