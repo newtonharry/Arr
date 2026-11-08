@@ -81,9 +81,9 @@ grep -q -- '--movies only applies to the first setup' refused.out || fail "the r
 still_running "a refused rerun"
 
 echo "== a rerun applies a setting it's given"
-sudo -E sh install.sh --yes --no-auto-update --upload-limit-kib 100 >limit.out 2>&1 || true
-sudo grep -q '^upload_limit_bytes_per_sec = 102400$' "$state/config.toml" || { cat limit.out; fail "--upload-limit-kib wasn't applied"; }
-still_running "a rerun with --upload-limit-kib"
+sudo -E sh install.sh --yes --no-auto-update --no-error-reports >setting.out 2>&1 || true
+sudo grep -A1 '^\[reporting\]$' "$state/config.toml" | grep -q '^enabled = false$' || { cat setting.out; fail "--no-error-reports wasn't applied"; }
+still_running "a rerun with --no-error-reports"
 
 echo "== uninstall Arr and its data"
 sudo sh uninstall.sh --yes --arr --delete-data

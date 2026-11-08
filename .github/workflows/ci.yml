@@ -207,11 +207,11 @@ jobs:
           function Healthy { try { [bool](Invoke-RestMethod http://127.0.0.1:8787/api/v1/health -TimeoutSec 5) } catch { $false } }
           if (-not (Healthy) -or -not (ArrPid)) { Fail 'Arr is not running after a rerun' }
           # A setting given on a rerun is applied; the rest are kept.
-          $env:ARR_UPLOAD_LIMIT_KIB = '100'
-          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "upload limit rerun said: $($_.Exception.Message)" }
-          $env:ARR_UPLOAD_LIMIT_KIB = $null
-          if (-not (Get-Content "$state\config.toml" -Raw).Contains('upload_limit_bytes_per_sec = 102400')) { Fail 'ARR_UPLOAD_LIMIT_KIB was not applied' }
-          if (-not (Healthy)) { Fail 'Arr is not running after the upload limit rerun' }
+          $env:ARR_ERROR_REPORTS = '0'
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "error reports rerun said: $($_.Exception.Message)" }
+          $env:ARR_ERROR_REPORTS = $null
+          if ((Get-Content "$state\config.toml" -Raw) -notmatch '(?m)^\[reporting\]\r?\nenabled = false') { Fail 'ARR_ERROR_REPORTS was not applied' }
+          if (-not (Healthy)) { Fail 'Arr is not running after the error reports rerun' }
           # A rerun that fails leaves Arr running as it was: a refused option, then a broken config.
           $running = ArrPid
           $good = [IO.File]::ReadAllText("$state\config.toml")
