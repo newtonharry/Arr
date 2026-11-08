@@ -53,10 +53,55 @@ curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "arr doesn't an
 echo "tunnel log:"; tail -n 3 "$state/tunnel.log"
 before=$(cat "$state/config.toml")
 
+# After every rerun Arr runs and answers, and its config is still the runner's.
+still_running() {
+	launchctl list io.github.newtonharry.arr >/dev/null || fail "arr isn't loaded after $1"
+	curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "arr doesn't answer after $1"
+	[ "$(stat -f %Su "$state/config.toml")" = "$(id -un)" ] || fail "config.toml isn't $(id -un)'s after $1"
+}
+still_running "the install"
+# Arr's process: a rerun that applies something restarts it, a refused one doesn't.
+arr_pid() { launchctl list io.github.newtonharry.arr | sed -n 's/.*"PID" = \([0-9]*\);.*/\1/p'; }
+# Remote access is set up (with the made-up ngrok account), so a rerun that otherwise works
+# ends at the public check: it must fail there, after Arr is running, and nowhere else.
+ends_at_public_check() { # ends_at_public_check OUTPUT_FILE WHAT
+	grep -q '^Arr is running at ' "$1" && grep -q "doesn't reach Arr yet" "$1" ||
+		{ cat "$1"; fail "$2 failed before the public check"; }
+}
+
 echo "== a rerun keeps remote access"
-sh install.sh "$@" >rerun.out 2>&1 || true
+if sh install.sh "$@" >rerun.out 2>&1; then cat rerun.out; fail "the public check passed on a rerun"; fi
+ends_at_public_check rerun.out "a rerun"
 grep -q 'already has remote access; keeping it' rerun.out || { cat rerun.out; fail "rerun didn't keep remote access"; }
 [ "$(cat "$state/config.toml")" = "$before" ] || fail "a rerun changed the config"
+[ -x "$HOME/.local/bin/arr.previous" ] || fail "the rerun didn't keep the previous binary"
+still_running "a rerun"
+
+echo "== a rerun with a first-setup-only option is refused, and changes nothing"
+pid=$(arr_pid)
+[ -n "$pid" ] || fail "launchctl shows no PID for Arr"
+if sh install.sh --yes --no-auto-update --movies /elsewhere >refused.out 2>&1; then
+	cat refused.out; fail "--movies on an existing install was accepted"
+fi
+cat refused.out
+grep -q -- '--movies only applies to the first setup' refused.out || fail "the refusal doesn't say why"
+[ "$(cat "$state/config.toml")" = "$before" ] || fail "a refused rerun changed the config"
+[ "$(arr_pid)" = "$pid" ] || fail "a refused rerun restarted Arr"
+still_running "a refused rerun"
+
+echo "== a rerun applies a setting it's given"
+pid=$(arr_pid)
+if sh install.sh --yes --no-auto-update --no-error-reports >setting.out 2>&1; then
+	cat setting.out; fail "the public check passed on a rerun"
+fi
+ends_at_public_check setting.out "a rerun with --no-error-reports"
+grep -A1 '^\[reporting\]$' "$state/config.toml" | grep -q '^enabled = false$' || { cat setting.out; fail "--no-error-reports wasn't applied"; }
+[ "$(arr_pid)" != "$pid" ] || fail "a rerun that changed a setting didn't restart Arr"
+still_running "a rerun with --no-error-reports"
+
+echo "== running as root on a Mac is refused"
+if sudo sh install.sh --yes >root.out 2>&1; then cat root.out; fail "install.sh ran as root on a Mac"; fi
+grep -q 'without sudo' root.out || { cat root.out; fail "the refusal doesn't say to run it without sudo"; }
 
 echo "== uninstall Arr and Plex, keeping media"
 sh uninstall.sh --yes --all --delete-data

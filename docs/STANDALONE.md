@@ -12,10 +12,9 @@ unchanged; see the main [README](../README.md).
 
 ## Requirements
 
-- **Linux x86_64 with glibc 2.39 or newer** for the release binary built here (it links only
-  the system C library dynamically: `libc`, `libm`, `libgcc_s`; no OpenSSL, TLS is rustls).
-  Build from source (`cargo build --release --locked`, Rust 1.94+) for other glibc versions
-  or architectures. Other operating systems are not supported.
+- **A supported system:** see the [README's install section](../README.md#install) for the
+  operating systems and versions the release binaries run on, or build from source
+  (`cargo build --release --locked`, Rust 1.94+).
 - **`ffprobe`** (FFmpeg) — an external dependency, never bundled or downloaded. Debian/Ubuntu:
   `apt install ffmpeg`; Fedora: `dnf install ffmpeg-free`; Alpine: `apk add ffmpeg`. Set
   `[library] ffprobe` if it is not `/usr/bin/ffprobe`. `arr check` and `setup`
@@ -49,8 +48,8 @@ arr init --state-dir "$STATE"  # API token + standalone config template (never o
    install -m 600 /dev/null "$STATE/secrets/plex_token"     && "$EDITOR" "$STATE/secrets/plex_token"
    install -m 600 /dev/null "$STATE/secrets/tmdb_credential" && "$EDITOR" "$STATE/secrets/tmdb_credential"
    ```
-   For TMDB, `arr tmdb-key --config "$STATE/config.toml"` does both steps: it reads the key from
-   stdin, checks it with TMDB, saves it and turns on `[tmdb]` (restart Arr afterwards).
+   For TMDB, `arr set --config "$STATE/config.toml" tmdb-key` does both steps: it reads the key
+   from stdin, checks it with TMDB, saves it and turns on `[tmdb]` (restart Arr afterwards).
 3. **Managed settings** (profiles, size limits, per-indexer policy with explicit seed goals,
    download/cleanup policy, root folders) and an empty catalog:
    ```bash
@@ -62,7 +61,9 @@ arr init --state-dir "$STATE"  # API token + standalone config template (never o
    revision upgrades off, RSS every 15 minutes (only once execution is enabled). The output
    lists missing secret files and the ffprobe preflight. `setup` validates the config without
    needing secrets yet, never enables execution and never queues a search. Re-running it
-   with the same document is a no-op (`unchanged`).
+   with the same document is a no-op (`unchanged`). Run again without `--settings`, it keeps
+   the current document (so after adding an `[[indexer]]` it adds the new indexer and keeps
+   your profiles and seed goals). A running `serve` uses new settings only after a restart.
 4. **Check** (config, secret modes, ffprobe, indexer mapping): `arr check --config "$STATE/config.toml"`.
 5. **Serve** (shadow mode: searches and plans only): `arr serve --config "$STATE/config.toml"`.
 6. **Plex discovery and the existing library** (read-only):
@@ -70,6 +71,7 @@ arr init --state-dir "$STATE"  # API token + standalone config template (never o
    TOKEN=$(cat "$STATE/secrets/api_token"); API=http://127.0.0.1:8787/api/v1
    curl -s -H "Authorization: Bearer $TOKEN" $API/setup/plex      # sections, mapping status
    # Repeat until "done": true. Each call is one bounded batch; the cursor is durable.
+   # Then each run's "status" is "done" ("failed" means it stopped; its issues say why).
    curl -s -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{}' $API/setup/plex/bootstrap
    ```
    (or `arr bootstrap --config "$STATE/config.toml"` before `serve`). Owned movies
@@ -88,7 +90,8 @@ arr init --state-dir "$STATE"  # API token + standalone config template (never o
    items are counted and listed; a missing section, unmapped path or unavailable root fails
    the run and changes nothing. Nothing is searched, monitored or downloaded. Searches still
    query the canonical (TVmaze) title.
-7. **Enable execution deliberately** (`[execution] enabled = true`), restart, and check
+7. **Enable execution deliberately** (`[execution] enabled = true`, or
+   `arr set --config "$STATE/config.toml" downloading on`), restart, and check
    `GET /api/v1/readiness` (`search_backend`, `peer_discovery`, `execution_*`).
 8. **Add what you want** (one call: add, scan the folder, search, download, import):
    ```bash
@@ -100,6 +103,12 @@ arr init --state-dir "$STATE"  # API token + standalone config template (never o
    An owned title gives `already_satisfied`; a season of a bootstrapped show searches only the
    missing episodes. RSS then picks up new releases of monitored items; unmet requests are
    retried with backoff.
+
+To change one setting later (a key or token, Plex's address, downloading on or off, the
+upload limit, the torrent port, error reports), use `arr set --config "$STATE/config.toml"
+NAME [VALUE]`: it checks the change and changes nothing if that fails. Restart afterwards.
+`arr set --help` lists the names; the README's
+[`arr set` section](../README.md#changing-one-setting-by-hand-arr-set) has examples.
 
 API-only setup is possible too: with a config but no settings, `GET /api/v1/setup` lists
 what is missing and `POST /api/v1/setup {"document": {...}}` creates and activates managed

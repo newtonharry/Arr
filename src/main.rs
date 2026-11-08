@@ -9,7 +9,7 @@ use time::format_description::well_known::Rfc3339;
 #[command(
     name = "arr",
     version,
-    about = "Unified movie/TV API server (shadow by default; execution when enabled)"
+    about = "Finds, downloads and imports movies and TV for Plex."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -17,6 +17,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once at startup; its size doesn't matter
 enum Command {
     /// Create a private state directory, API token and config template (never overwrites).
     /// The template favours native indexers and the embedded downloader; pass
@@ -25,20 +26,22 @@ enum Command {
         #[arg(long)]
         state_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8787")]
-        listen: String,
+        listen: std::net::SocketAddr,
         #[arg(long)]
         prowlarr_url: Option<String>,
     },
     /// Create (or replace) managed settings for a standalone deployment, with an empty
-    /// catalog, from an optional setup document (TOML; defaults otherwise). Validates the
-    /// config without needing its secret files yet. Never enables execution.
+    /// catalog, from an optional setup document (TOML; otherwise the current setup's, or
+    /// defaults). Validates the config without needing its secret files yet. Never enables
+    /// execution.
     Setup {
         #[arg(long)]
         config: PathBuf,
-        /// Setup document (see config/setup.example.toml). Default: built-in defaults.
+        /// Setup document (see config/setup.example.toml). Default: the one the current
+        /// setup used, or built-in defaults.
         #[arg(long)]
         settings: Option<PathBuf>,
-        /// Validate and summarise without writing anything.
+        /// Validate and summarise without changing the settings.
         #[arg(long)]
         dry_run: bool,
     },
@@ -62,9 +65,9 @@ enum Command {
     Bootstrap {
         #[arg(long)]
         config: PathBuf,
-        /// movies, tv or all.
-        #[arg(long, default_value = "all")]
-        media: String,
+        /// movies, tv or all (default: the ones [plex] has a library section for).
+        #[arg(long)]
+        media: Option<String>,
         #[arg(long)]
         restart: bool,
         #[arg(long)]
@@ -73,7 +76,8 @@ enum Command {
         #[arg(long)]
         batch: Option<u32>,
     },
-    /// Validate config, secret file modes, state DB and the active import (no network).
+    /// Check the config, secret file modes, state database and active import (no network;
+    /// creates or updates the state database).
     Check {
         #[arg(long)]
         config: PathBuf,
@@ -93,8 +97,8 @@ enum Command {
         port: u16,
         #[arg(long, default_value_t = 50413)]
         torrent_port: u16,
-        /// Upload limit in KiB/s for all torrents (0 = none).
-        #[arg(long, default_value_t = 0)]
+        /// Upload limit in KiB/s for all torrents (0 = none; at most 4194303, as `arr set`).
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=u64::from(u32::MAX / 1024)))]
         upload_limit_kib: u64,
         #[arg(long)]
         ffprobe: PathBuf,
@@ -117,10 +121,14 @@ enum Command {
         /// Start with error reports ticked (the installer's --error-reports).
         #[arg(long)]
         error_reports: bool,
+        /// Tests: where TMDB's API is, for checking keys.
+        #[arg(long, hide = true, default_value = arr::tmdbkey::API_URL)]
+        tmdb_url: reqwest::Url,
     },
     /// Install Plex Media Server from Plex's package source, and make a media folder Plex and
     /// you can both use (Movies, TV Shows). Needs administrator rights; the setup page runs it
     /// through the system's password dialog.
+    #[command(hide = true)]
     PlexInstall {
         /// Owner of the folders it creates, as UID:GID.
         #[arg(long)]
@@ -129,6 +137,21 @@ enum Command {
         #[arg(long)]
         media: Option<PathBuf>,
     },
+    /// Sign in to Plex again after Plex stopped accepting Arr's sign-in: prints a plex.tv
+    /// link, then replaces only the saved Plex token (the config isn't changed). With
+    /// --check, only says whether Plex still accepts it (exit 1 if not, 2 if unreachable).
+    PlexSignin {
+        /// Arr's config.toml.
+        #[arg(long)]
+        config: PathBuf,
+        /// Only check the saved sign-in; change nothing.
+        #[arg(long)]
+        check: bool,
+        #[arg(long, hide = true, default_value = "https://plex.tv/")]
+        plex_tv_url: reqwest::Url,
+        #[arg(long, hide = true, default_value = "https://app.plex.tv/auth")]
+        plex_auth_url: reqwest::Url,
+    },
     /// Run the HTTP API (and, with [execution] enabled, the background worker).
     Serve {
         #[arg(long)]
@@ -136,6 +159,7 @@ enum Command {
     },
     /// Send one error report, if this install's config allows it ([reporting] enabled; see
     /// docs/PRIVACY.md). The installers and updaters use it; it never fails.
+    #[command(hide = true)]
     Report {
         #[arg(long)]
         config: PathBuf,
@@ -145,11 +169,41 @@ enum Command {
         #[arg(long)]
         message: String,
     },
-    /// Add or replace the TMDB key (read from stdin) of an existing install, so Arr can find
-    /// movies you don't own yet. Checks it with TMDB first; restart Arr afterwards.
-    TmdbKey {
+    /// Change one setting of an existing install; restart Arr afterwards.
+    ///
+    /// Arr checks the change first (keys and Plex's address are tried for real) and
+    /// changes nothing if it doesn't work.
+    ///
+    /// Settings:
+    ///   tmdb-key, plex-token      a key or token, read from stdin
+    ///   plex-url URL              Plex's address, like http://127.0.0.1:32400
+    ///   downloading on|off
+    ///   upload-limit-kib N        KiB/s for all torrents; 0 for no limit
+    ///   torrent-port N            1 to 65535
+    ///   error-reports on|off
+    ///   api-token, mcp-token      make a new random token
+    #[command(verbatim_doc_comment)]
+    Set {
+        /// The install's config.toml.
         #[arg(long)]
         config: PathBuf,
+        /// The setting to change.
+        name: String,
+        /// Its new value.
+        value: Option<String>,
+    },
+    /// The TMDB key (read from stdin): `arr set tmdb-key`, or with --check, only checks it.
+    #[command(hide = true)]
+    TmdbKey {
+        #[arg(long, required_unless_present = "check", conflicts_with = "check")]
+        config: Option<PathBuf>,
+        /// Only check the key with TMDB; save nothing.
+        #[arg(long)]
+        check: bool,
+        /// Tests: where TMDB's API is (with --check). `requires = "check"` can't work: a
+        /// flag's default counts as present.
+        #[arg(long, hide = true, conflicts_with = "config")]
+        tmdb_url: Option<reqwest::Url>,
     },
     /// Serve MCP tools on stdin/stdout as a client of a running API (stdout carries only MCP).
     Mcp {
@@ -165,6 +219,7 @@ enum Command {
     },
     /// Generate an authored test release: real playable video files (ffmpeg testsrc) under
     /// OUT/<name>/ plus OUT/<name>.torrent with correct piece hashes. Never fetches anything.
+    #[command(hide = true)]
     Fixture {
         #[arg(long)]
         out: PathBuf,
@@ -229,9 +284,19 @@ fn fixture(
     Ok(())
 }
 
-fn init(state_dir: PathBuf, listen: String, prowlarr_url: Option<String>) -> Result<()> {
+fn init(
+    state_dir: PathBuf,
+    listen: std::net::SocketAddr,
+    prowlarr_url: Option<String>,
+) -> Result<()> {
     if let Some(u) = &prowlarr_url {
         config::parse_base_url(u, "--prowlarr-url")?;
+    }
+    // The template keeps server.allow_non_loopback off.
+    if !listen.ip().is_loopback() {
+        anyhow::bail!(
+            "--listen must be a loopback address like 127.0.0.1:8787 (set server.allow_non_loopback in the config to expose the API)"
+        );
     }
     fsutil::ensure_private_dir(&state_dir)?;
     let secrets = state_dir.join("secrets");
@@ -246,7 +311,7 @@ fn init(state_dir: PathBuf, listen: String, prowlarr_url: Option<String>) -> Res
     if !cfg.exists() {
         fsutil::write_new_private_file(
             &cfg,
-            config::template(&listen, prowlarr_url.as_deref()).as_bytes(),
+            config::template(&listen.to_string(), prowlarr_url.as_deref()).as_bytes(),
         )?;
         created.push(cfg.display().to_string());
     }
@@ -291,23 +356,28 @@ async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: boo
         &config_path.display().to_string(),
         config::Secrets::Defer,
     )?;
-    let doc = match &settings {
-        Some(p) => setup::read_doc(p)?,
-        None => setup::SetupDoc::default(),
-    };
-    let now = time::OffsetDateTime::now_utc();
-    let prepared = setup::prepare(&doc, &cfg, now).map_err(|errs| {
-        anyhow::anyhow!("the setup document is invalid:\n- {}", errs.join("\n- "))
-    })?;
     let state_dir = cfg.state_dir.clone();
     let active = import::load_active(&state_dir)?;
-    let origin = active.as_ref().map(|l| {
-        if l.manifest.files.contains_key(setup::SOURCE_FILE) {
+    let managed = active
+        .as_ref()
+        .filter(|l| l.manifest.files.contains_key(setup::SOURCE_FILE));
+    let origin = active.as_ref().map(|_| {
+        if managed.is_some() {
             "managed_setup"
         } else {
             "native_snapshot"
         }
     });
+    let doc = match (&settings, managed) {
+        (Some(p), _) => setup::read_doc(p)?,
+        // Running setup again (say, after adding an indexer) keeps custom profiles and goals.
+        (None, Some(l)) => setup::stored_doc(&state_dir, &l.manifest.import_id)?,
+        (None, None) => setup::SetupDoc::default(),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let prepared = setup::prepare(&doc, &cfg, now).map_err(|errs| {
+        anyhow::anyhow!("the setup document is invalid:\n- {}", errs.join("\n- "))
+    })?;
     let (index, grabs) = {
         let db = state_dir.join("state.sqlite");
         if db.exists() {
@@ -368,15 +438,54 @@ async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: boo
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Reads a secret from stdin, so it stays out of the process list. At a terminal, asks for it.
+fn read_secret(what: &str) -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Read};
+    let stdin = std::io::stdin();
+    let mut s = String::new();
+    if stdin.is_terminal() {
+        eprintln!("Paste the {what}, then press Enter");
+        stdin.lock().take(4096).read_line(&mut s)
+    } else {
+        stdin.lock().take(4096).read_to_string(&mut s)
+    }
+    .with_context(|| format!("couldn't read the {what}"))?;
+    Ok(s.trim().to_string())
+}
+
+// The runtime is shut down (not `process::exit`), so kill_on_drop children stop; with a
+// timeout, because the MCP adapter's stdin read can't be cancelled and would otherwise keep
+// a failed `arr mcp` waiting for its client's next line.
+fn main() -> std::process::ExitCode {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: couldn't start: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let code = match rt.block_on(run()) {
+        Ok(code) => code,
+        Err(e) => {
+            // One line, so installers can show it as it is.
+            eprintln!("Error: {}", arr::fsutil::one_line(&format!("{e:#}")));
+            std::process::ExitCode::FAILURE
+        }
+    };
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    code
+}
+
+async fn run() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     // Logs go to stderr; the MCP adapter stays quiet unless asked.
     let default_filter = match cli.command {
         Command::Mcp { .. }
         | Command::Wizard { .. }
         | Command::Report { .. }
-        | Command::TmdbKey { .. } => "warn",
+        | Command::Set { .. }
+        | Command::TmdbKey { .. }
+        | Command::PlexSignin { .. } => "warn",
         _ => "info,arr=info",
     };
     tracing_subscriber::fmt()
@@ -386,7 +495,7 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    match cli.command {
+    let result = match cli.command {
         Command::Init {
             state_dir,
             listen,
@@ -429,14 +538,29 @@ async fn main() -> Result<()> {
         } => {
             let cfg = config::load(&config)?;
             let state = api::AppState::new(cfg)?;
-            let kinds: Vec<arr::settings::MediaKind> = match media.as_str() {
-                "all" => vec![
-                    arr::settings::MediaKind::Movie,
-                    arr::settings::MediaKind::Series,
-                ],
-                "movies" => vec![arr::settings::MediaKind::Movie],
-                "tv" => vec![arr::settings::MediaKind::Series],
-                other => anyhow::bail!("--media must be movies, tv or all (got {other:?})"),
+            use arr::settings::MediaKind::{Movie, Series};
+            let kinds: Vec<arr::settings::MediaKind> = match media.as_deref() {
+                Some("all") => vec![Movie, Series],
+                Some("movies") => vec![Movie],
+                Some("tv") => vec![Series],
+                Some(other) => anyhow::bail!("--media must be movies, tv or all (got {other:?})"),
+                // The libraries this install has; an asked-for one that isn't there fails.
+                None => {
+                    let plex = state.cfg.plex.as_ref();
+                    let kinds: Vec<_> = [
+                        (Movie, plex.and_then(|p| p.movie_section)),
+                        (Series, plex.and_then(|p| p.tv_section)),
+                    ]
+                    .into_iter()
+                    .filter_map(|(m, s)| s.map(|_| m))
+                    .collect();
+                    if kinds.is_empty() {
+                        anyhow::bail!(
+                            "no Plex library is configured ([plex] movie_section or tv_section)"
+                        );
+                    }
+                    kinds
+                }
             };
             let mut out = vec![];
             for m in kinds {
@@ -471,6 +595,21 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({ "runs": out }))?
             );
+            let failed: Vec<String> = out
+                .iter()
+                .filter(|r| r.status != "done")
+                .map(|r| {
+                    let what = match r.media {
+                        arr::settings::MediaKind::Movie => "movies",
+                        arr::settings::MediaKind::Series => "TV",
+                    };
+                    let why = r.last_error.as_deref().unwrap_or("it didn't finish");
+                    format!("{what}: {why}")
+                })
+                .collect();
+            if !failed.is_empty() {
+                anyhow::bail!("reading Plex's library failed ({})", failed.join("; "));
+            }
             Ok(())
         }
         Command::Check { config } => {
@@ -541,15 +680,41 @@ async fn main() -> Result<()> {
             arr::report::error(&component, &message);
             Ok(())
         }
-        Command::TmdbKey { config } => {
-            // From stdin, so the key stays out of the process list.
-            let mut key = String::new();
-            std::io::Read::read_to_string(
-                &mut std::io::Read::take(std::io::stdin(), 4096),
-                &mut key,
-            )
-            .context("couldn't read the key")?;
-            arr::tmdbkey::set(&config, &key).await
+        Command::Set {
+            config,
+            name,
+            value,
+        } => {
+            let value = match arr::set::secret(&name)? {
+                Some(what) if value.is_some() => {
+                    anyhow::bail!("give the {what} on stdin, not on the command line")
+                }
+                Some(what) => Some(read_secret(what)?),
+                None => value,
+            };
+            println!("{}", arr::set::run(&config, &name, value.as_deref()).await?);
+            Ok(())
+        }
+        Command::TmdbKey {
+            config,
+            check: _,
+            tmdb_url,
+        } => {
+            let tmdb_url = match tmdb_url {
+                Some(u) => u,
+                None => arr::tmdbkey::API_URL.parse()?,
+            };
+            let key = read_secret("TMDB key")?;
+            match config {
+                Some(config) => {
+                    println!("{}", arr::set::run(&config, "tmdb-key", Some(&key)).await?)
+                }
+                None => {
+                    arr::tmdbkey::verify(&tmdb_url, &key).await?;
+                    println!("TMDB accepted that key.");
+                }
+            }
+            Ok(())
         }
         Command::Wizard {
             state_dir,
@@ -565,6 +730,7 @@ async fn main() -> Result<()> {
             plex_installer,
             plex_port,
             error_reports,
+            tmdb_url,
         } => {
             wizard::run(wizard::Options {
                 state_dir,
@@ -581,6 +747,7 @@ async fn main() -> Result<()> {
                 plex_installer,
                 plex_port,
                 error_reports,
+                tmdb_url,
             })
             .await
         }
@@ -594,6 +761,24 @@ async fn main() -> Result<()> {
             };
             let media = media.unwrap_or_else(arr::plexinstall::default_media);
             arr::plexinstall::run(arr::plexinstall::Options { owner, media }).await
+        }
+        Command::PlexSignin {
+            config,
+            check,
+            plex_tv_url,
+            plex_auth_url,
+        } => {
+            // 0 accepted, 1 refused (or sign-in failed), 2 unreachable.
+            let code = arr::plexsignin::main(arr::plexsignin::Options {
+                config,
+                check,
+                plex_tv: plex_tv_url,
+                plex_auth: plex_auth_url,
+            })
+            .await;
+            return Ok(std::process::ExitCode::from(
+                u8::try_from(code).unwrap_or(1),
+            ));
         }
         Command::Mcp {
             api_url,
@@ -614,5 +799,6 @@ async fn main() -> Result<()> {
             seconds,
             ffmpeg,
         } => fixture(out, name, files, seconds, ffmpeg),
-    }
+    };
+    result.map(|()| std::process::ExitCode::SUCCESS)
 }

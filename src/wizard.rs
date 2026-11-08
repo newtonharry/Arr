@@ -12,9 +12,10 @@
 //! link. On a machine reached over SSH, the installer binds the address the SSH client used,
 //! so the link opens from the computer you're typing on.
 
-use crate::config::{PlexConfig, Secret};
+use crate::config::Secret;
 use crate::fsutil;
-use crate::plex::{Plex, Section};
+use crate::plex::Section;
+use crate::plexsignin::{self, PLEX_TIMEOUT, PinState, PlexTv, Server, sections};
 use crate::upstream;
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -44,8 +45,6 @@ const CHANGE_HEADER: &str = "x-arr-setup";
 const LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 /// After setup finishes, the wizard waits this long for the page to say goodbye.
 const LINGER: Duration = Duration::from_secs(60);
-const PLEX_TIMEOUT: Duration = Duration::from_secs(8);
-const MAX_PLEX_JSON: usize = 2 * 1024 * 1024;
 /// Between looks at plex.tv after linking a new Plex.
 const CLAIM_WAIT: Duration = Duration::from_secs(1);
 
@@ -71,15 +70,20 @@ pub struct Options {
     pub plex_port: u16,
     /// The installer was told yes (`--error-reports`): the page starts with reports on.
     pub error_reports: bool,
+    /// Where TMDB's API is, for checking keys (overridden in tests).
+    pub tmdb_url: Url,
 }
 
 struct Wizard {
     opts: Options,
     code: String,
     session: String,
-    client_id: String,
+    tv: PlexTv,
     http: reqwest::Client,
     inner: Mutex<Inner>,
+    /// Held while looking for (and claiming) this computer's Plex, so two looks at once
+    /// can't claim it twice.
+    lookup: tokio::sync::Mutex<()>,
     finished: Notify,
     /// Error reports, from the moment the user ticks the box (docs/PRIVACY.md).
     reporting: Mutex<Option<crate::report::Reporting>>,
@@ -127,14 +131,6 @@ enum Missing {
     Unclaimed,
 }
 
-/// A Plex server the signed-in account owns.
-struct Server {
-    id: String,
-    name: String,
-    token: Secret,
-    ports: Vec<u16>,
-}
-
 #[derive(Clone)]
 struct Connected {
     name: String,
@@ -155,7 +151,8 @@ enum Phase {
         detail: String,
     },
     Done {
-        downloading: bool,
+        /// A movie library was set up without a TMDB key, so Arr can't find new movies.
+        no_tmdb: bool,
     },
     Failed {
         message: String,
@@ -165,22 +162,27 @@ enum Phase {
 type St = State<Arc<Wizard>>;
 
 /// Runs the wizard until setup finishes (Ok) or is abandoned (Err).
-pub async fn run(opts: Options) -> Result<()> {
+pub async fn run(mut opts: Options) -> Result<()> {
     let config = opts.state_dir.join("config.toml");
     if config.exists() {
+        // Not "remove it": Arr's catalog still points at the old folders.
         bail!(
-            "{} already exists; Arr is set up (remove it to start over)",
+            "{} already exists; Arr is set up (to start over, run the uninstaller and choose to delete Arr's data first)",
             config.display()
         );
     }
     fsutil::ensure_private_dir(&opts.state_dir)?;
-    fsutil::ensure_private_dir(&opts.state_dir.join("secrets"))?;
-    // Plex lists Arr once under Authorized Devices, however often setup runs.
-    let id_file = opts.state_dir.join("secrets/plex_client_id");
-    if !id_file.exists() {
-        fsutil::write_new_private_file(&id_file, fsutil::random_hex(16)?.as_bytes())?;
+    let client_id = plexsignin::client_id(&opts.state_dir)?;
+    if !opts.bind.is_loopback() && !private_lan(opts.bind) {
+        // The page would be open to the internet, protected only by its link.
+        println!(
+            "\n{} isn't a private network address, so the setup page stays on this computer. To open it from yours, first run: ssh -L {port}:localhost:{port} <user>@<this server>",
+            opts.bind,
+            port = opts.port
+        );
+        opts.bind = IpAddr::from([127, 0, 0, 1]);
     }
-    let client_id = fsutil::read_secret_file(&id_file)?;
+    let http = upstream::http_client(PLEX_TIMEOUT, reqwest::redirect::Policy::none());
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(opts.bind, opts.port))
         .await
         .with_context(|| {
@@ -192,9 +194,15 @@ pub async fn run(opts: Options) -> Result<()> {
     let wiz = Arc::new(Wizard {
         code: fsutil::random_hex(16)?,
         session: fsutil::random_hex(32)?,
-        client_id,
-        http: upstream::http_client(PLEX_TIMEOUT, reqwest::redirect::Policy::none()),
+        tv: PlexTv {
+            base: opts.plex_tv.clone(),
+            auth: opts.plex_auth.clone(),
+            client_id,
+            http: http.clone(),
+        },
+        http,
         inner: Mutex::new(Inner::default()),
+        lookup: tokio::sync::Mutex::new(()),
         finished: Notify::new(),
         reporting: Mutex::new(
             opts.error_reports
@@ -236,7 +244,13 @@ pub async fn run(opts: Options) -> Result<()> {
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = done.finished.notified() => {}
-                _ = tokio::time::sleep(LIFETIME) => {}
+                _ = async {
+                    tokio::time::sleep(LIFETIME).await;
+                    // Never in the middle of setting up: that would leave it half done.
+                    while working(&done) {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                } => {}
                 _ = tokio::signal::ctrl_c() => {}
             }
         })
@@ -244,6 +258,26 @@ pub async fn run(opts: Options) -> Result<()> {
     match wiz.inner.lock().unwrap().phase.clone() {
         Phase::Done { .. } => Ok(()),
         _ => bail!("setup wasn't finished"),
+    }
+}
+
+fn working(wiz: &Wizard) -> bool {
+    matches!(wiz.inner.lock().unwrap().phase, Phase::Working { .. })
+}
+
+/// A private network address (home or office network, link-local, carrier-grade NAT): one
+/// only nearby computers can reach, so the setup page may listen on it.
+fn private_lan(ip: IpAddr) -> bool {
+    let v4 = |v4: std::net::Ipv4Addr| {
+        let o = v4.octets();
+        v4.is_private() || v4.is_link_local() || (o[0] == 100 && o[1] & 0xc0 == 64)
+    };
+    match ip {
+        IpAddr::V4(a) => v4(a),
+        IpAddr::V6(a) => {
+            let s = a.segments()[0];
+            s & 0xfe00 == 0xfc00 || s & 0xffc0 == 0xfe80 || a.to_ipv4_mapped().is_some_and(v4)
+        }
     }
 }
 
@@ -255,6 +289,7 @@ fn router(wiz: Arc<Wizard>) -> Router {
         .route("/api/plex/install", post(install_plex))
         .route("/api/plex/libraries", post(create_libraries))
         .route("/api/reporting", post(set_reporting))
+        .route("/api/tmdb/check", post(check_tmdb))
         .route("/api/folder", post(folder))
         .route("/api/apply", post(apply))
         .route("/api/finish", post(finish))
@@ -416,7 +451,6 @@ fn snapshot(wiz: &Wizard) -> Value {
         "install": inner.install,
         "can_install": install_command(wiz).is_some(),
         "install_command": manual_install_command(wiz),
-        "media_folder": crate::plexinstall::default_media(),
         "media_movies": crate::plexinstall::default_media().join("Movies"),
         "media_tv": crate::plexinstall::default_media().join("TV Shows"),
         "phase": inner.phase,
@@ -441,52 +475,24 @@ fn local_path(p: &Connected, plex_path: &str) -> Option<String> {
 
 // ------------------------------------------------------------------ Plex sign-in
 
-fn plex_tv(wiz: &Wizard, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    rb.header("Accept", "application/json")
-        .header("X-Plex-Product", "Arr")
-        .header("X-Plex-Version", env!("CARGO_PKG_VERSION"))
-        .header("X-Plex-Client-Identifier", &wiz.client_id)
-}
-
-#[derive(Deserialize)]
-struct Pin {
-    id: u64,
-    code: String,
-    #[serde(rename = "authToken", default)]
-    auth_token: Option<String>,
-}
-
+/// Starts a (new) sign-in. Whatever the last one found is forgotten, so signing in with a
+/// different account starts clean.
 async fn signin(State(wiz): St) -> Response {
-    let url = match wiz.opts.plex_tv.join("api/v2/pins?strong=true") {
-        Ok(u) => u,
-        Err(_) => return problem(StatusCode::INTERNAL_SERVER_ERROR, "bad plex.tv address"),
-    };
-    let pin: Pin = match upstream::send(plex_tv(&wiz, wiz.http.post(url))).await {
-        Ok(r) => match upstream::read_json(r, MAX_PLEX_JSON).await {
-            Ok(p) => p,
-            Err(e) => return plex_down(e),
-        },
+    let pin = match wiz.tv.new_pin().await {
+        Ok(p) => p,
         Err(e) => return plex_down(e),
     };
-    let mut auth = wiz.opts.plex_auth.clone();
-    auth.set_fragment(Some(&format!(
-        "?clientID={}&code={}&context%5Bdevice%5D%5Bproduct%5D=Arr",
-        urlencode(&wiz.client_id),
-        urlencode(&pin.code)
-    )));
-    wiz.inner.lock().unwrap().pin = Some((pin.id, pin.code));
-    Json(json!({ "url": auth.as_str() })).into_response()
-}
-
-fn urlencode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
+    // After any look in progress, so it can't connect the old account's Plex afterwards.
+    let _lookup = wiz.lookup.lock().await;
+    {
+        let mut inner = wiz.inner.lock().unwrap();
+        inner.pin = Some((pin.id, pin.code));
+        inner.account = None;
+        inner.plex = None;
+        inner.missing = None;
+        inner.unclaimed_port = None;
+    }
+    Json(json!({ "url": pin.url })).into_response()
 }
 
 fn plex_down(e: upstream::UpstreamError) -> Response {
@@ -496,8 +502,12 @@ fn plex_down(e: upstream::UpstreamError) -> Response {
     )
 }
 
-/// Polls the sign-in once; once signed in, looks for this computer's Plex.
+/// Polls the sign-in once; once signed in, looks for this computer's Plex, or reads its
+/// libraries again (ones added in Plex meanwhile show up).
 async fn check_signin(State(wiz): St) -> Response {
+    // Held from reading the PIN to the last state change, so a new sign-in (which waits for
+    // it) always comes after, and a late reply for the old PIN can't sign the old account in.
+    let _lookup = wiz.lookup.lock().await;
     let (pin, signed_in) = {
         let inner = wiz.inner.lock().unwrap();
         (inner.pin.clone(), inner.account.is_some())
@@ -506,60 +516,67 @@ async fn check_signin(State(wiz): St) -> Response {
         let Some((id, code)) = pin else {
             return Json(snapshot(&wiz)).into_response();
         };
-        let url = match wiz
-            .opts
-            .plex_tv
-            .join(&format!("api/v2/pins/{id}?code={}", urlencode(&code)))
-        {
-            Ok(u) => u,
-            Err(_) => return problem(StatusCode::INTERNAL_SERVER_ERROR, "bad plex.tv address"),
-        };
-        let resp = match upstream::send(plex_tv(&wiz, wiz.http.get(url))).await {
-            Ok(r) => r,
-            Err(e) => return plex_down(e),
-        };
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            wiz.inner.lock().unwrap().pin = None;
-            return problem(
-                StatusCode::GONE,
-                "the Plex sign-in expired; click Sign in again",
-            );
+        let reply = wiz.tv.check_pin(id, &code).await;
+        let mut inner = wiz.inner.lock().unwrap();
+        if inner.pin.as_ref() != Some(&(id, code)) {
+            drop(inner);
+            return Json(snapshot(&wiz)).into_response();
         }
-        let pin: Pin = match upstream::read_json(resp, MAX_PLEX_JSON).await {
-            Ok(p) => p,
+        match reply {
+            Ok(PinState::SignedIn(t)) => inner.account = Some(t),
+            Ok(PinState::Waiting) => {
+                drop(inner);
+                return Json(snapshot(&wiz)).into_response();
+            }
+            Ok(PinState::Expired) => {
+                inner.pin = None;
+                return problem(
+                    StatusCode::GONE,
+                    "the Plex sign-in expired; click Sign in again",
+                );
+            }
             Err(e) => return plex_down(e),
-        };
-        match pin.auth_token.filter(|t| !t.is_empty()) {
-            Some(t) => wiz.inner.lock().unwrap().account = Some(Secret::new(t)),
-            None => return Json(snapshot(&wiz)).into_response(),
         }
+    }
+    let plex = wiz.inner.lock().unwrap().plex.clone();
+    if let Some(plex) = plex {
+        return match sections(plex.base_url.clone(), plex.token.clone()).await {
+            Ok(s) => {
+                if let Some(p) = wiz.inner.lock().unwrap().plex.as_mut() {
+                    p.sections = s;
+                }
+                Json(snapshot(&wiz)).into_response()
+            }
+            Err(e) => problem(
+                StatusCode::BAD_GATEWAY,
+                &format!("couldn't read Plex's libraries: {}", e.describe()),
+            ),
+        };
     }
     // Until Plex is found, every check looks again, so a failed lookup or a Plex
     // installed meanwhile is picked up.
-    if wiz.inner.lock().unwrap().plex.is_none() {
-        let servers = match servers(&wiz).await {
-            Ok(s) => s,
-            Err(e) => return plex_down(e),
-        };
-        let mut missing = find_local(&wiz, &servers).await.err();
-        if let Some(Missing::Unclaimed) = missing {
-            // A new Plex: link it to this account, then wait for plex.tv to list it.
-            if let Err(msg) = claim(&wiz).await {
-                return problem(StatusCode::BAD_GATEWAY, &msg);
-            }
-            for _ in 0..15 {
-                tokio::time::sleep(CLAIM_WAIT).await;
-                let Ok(now) = self::servers(&wiz).await else {
-                    continue;
-                };
-                missing = find_local(&wiz, &now).await.err();
-                if !matches!(missing, Some(Missing::Unclaimed | Missing::NotLinked)) {
-                    break;
-                }
+    let servers = match servers(&wiz).await {
+        Ok(s) => s,
+        Err(e) => return plex_down(e),
+    };
+    let mut missing = find_local(&wiz, &servers).await.err();
+    if let Some(Missing::Unclaimed) = missing {
+        // A new Plex: link it to this account, then wait for plex.tv to list it.
+        if let Err(msg) = claim(&wiz).await {
+            return problem(StatusCode::BAD_GATEWAY, &msg);
+        }
+        for _ in 0..15 {
+            tokio::time::sleep(CLAIM_WAIT).await;
+            let Ok(now) = self::servers(&wiz).await else {
+                continue;
+            };
+            missing = find_local(&wiz, &now).await.err();
+            if !matches!(missing, Some(Missing::Unclaimed | Missing::NotLinked)) {
+                break;
             }
         }
-        wiz.inner.lock().unwrap().missing = missing;
     }
+    wiz.inner.lock().unwrap().missing = missing;
     Json(snapshot(&wiz)).into_response()
 }
 
@@ -575,12 +592,13 @@ async fn claim(wiz: &Wizard) -> Result<(), String> {
         return Err("sign in to Plex first".into());
     };
     let url = wiz
-        .opts
-        .plex_tv
-        .join("api/claim/token.json")
+        .tv
+        .url("api/claim/token.json")
         .map_err(|_| "bad plex.tv address".to_string())?;
     let token: ClaimToken = match upstream::send(
-        plex_tv(wiz, wiz.http.get(url)).header("X-Plex-Token", account.expose()),
+        wiz.tv
+            .headers(wiz.http.get(url))
+            .header("X-Plex-Token", account.expose()),
     )
     .await
     {
@@ -597,9 +615,9 @@ async fn claim(wiz: &Wizard) -> Result<(), String> {
         .unwrap_or(wiz.opts.plex_port);
     let url = format!(
         "http://127.0.0.1:{port}/myplex/claim?token={}",
-        urlencode(&token.token)
+        plexsignin::urlencode(&token.token)
     );
-    let r = upstream::send(plex_tv(wiz, wiz.http.post(url)))
+    let r = upstream::send(wiz.tv.headers(wiz.http.post(url)))
         .await
         .map_err(|e| format!("couldn't link Plex to your account: {}", e.describe()))?;
     if !r.status().is_success() {
@@ -611,83 +629,13 @@ async fn claim(wiz: &Wizard) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct Resource {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    provides: String,
-    #[serde(default)]
-    owned: bool,
-    #[serde(rename = "clientIdentifier", default)]
-    client_identifier: String,
-    #[serde(rename = "accessToken", default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    connections: Vec<Connection>,
-}
-
-#[derive(Deserialize)]
-struct Connection {
-    #[serde(default)]
-    port: u16,
-}
-
-/// The Plex servers this account owns, with the ports they listen on.
+/// The signed-in account's Plex servers (none before signing in).
 async fn servers(wiz: &Wizard) -> Result<Vec<Server>, upstream::UpstreamError> {
     let account = wiz.inner.lock().unwrap().account.clone();
-    let Some(account) = account else {
-        return Ok(vec![]);
-    };
-    let url = wiz
-        .opts
-        .plex_tv
-        .join("api/v2/resources?includeHttps=1&includeRelay=0")
-        .map_err(|_| upstream::UpstreamError::BadResponse {
-            reason: "bad plex.tv address".into(),
-        })?;
-    let resp =
-        upstream::send(plex_tv(wiz, wiz.http.get(url)).header("X-Plex-Token", account.expose()))
-            .await?;
-    let list: Vec<Resource> = upstream::read_json(resp, MAX_PLEX_JSON).await?;
-    Ok(list
-        .into_iter()
-        .filter(|r| r.owned && r.provides.split(',').any(|p| p.trim() == "server"))
-        .filter_map(|r| {
-            let token = r.access_token.filter(|t| !t.is_empty())?;
-            Some(Server {
-                id: r.client_identifier,
-                name: if r.name.is_empty() {
-                    "Plex".into()
-                } else {
-                    r.name
-                },
-                token: Secret::new(token),
-                ports: r
-                    .connections
-                    .iter()
-                    .map(|c| c.port)
-                    .filter(|p| *p > 0)
-                    .collect(),
-            })
-        })
-        .take(20)
-        .collect())
-}
-
-#[derive(Deserialize)]
-struct Identity {
-    #[serde(rename = "MediaContainer")]
-    container: IdentityContainer,
-}
-
-#[derive(Deserialize)]
-struct IdentityContainer {
-    #[serde(rename = "machineIdentifier", default)]
-    machine_identifier: String,
-    /// False on a new Plex that no account owns yet.
-    #[serde(default)]
-    claimed: Option<bool>,
+    match account {
+        Some(a) => wiz.tv.servers(&a).await,
+        None => Ok(vec![]),
+    }
 }
 
 /// Connects to the Plex running on this computer, if it's one of the account's servers.
@@ -706,25 +654,15 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
         let Ok(base) = Url::parse(&format!("http://127.0.0.1:{port}/")) else {
             continue;
         };
-        let Ok(url) = base.join("identity") else {
-            continue;
-        };
-        let Ok(r) = upstream::send(wiz.http.get(url).header("Accept", "application/json")).await
-        else {
-            continue;
-        };
-        let Ok(id) = upstream::read_json::<Identity>(r, 64 * 1024).await else {
+        let Ok(id) = plexsignin::identity(&wiz.http, &base).await else {
             continue;
         };
         answered = true;
-        if id.container.claimed == Some(false) {
+        if id.claimed == Some(false) {
             wiz.inner.lock().unwrap().unclaimed_port = Some(port);
             return Err(Missing::Unclaimed);
         }
-        let Some(server) = servers
-            .iter()
-            .find(|s| s.id == id.container.machine_identifier)
-        else {
+        let Some(server) = servers.iter().find(|s| s.id == id.machine_identifier) else {
             continue;
         };
         let Ok(sections) = sections(base.clone(), server.token.clone()).await else {
@@ -754,25 +692,24 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
     })
 }
 
-async fn sections(base_url: Url, token: Secret) -> Result<Vec<Section>, upstream::UpstreamError> {
-    Plex::new(PlexConfig {
-        base_url,
-        token,
-        movie_section: None,
-        tv_section: None,
-        movies_path: None,
-        tv_path: None,
-        timeout: PLEX_TIMEOUT,
-    })
-    .sections()
-    .await
-}
-
 // ------------------------------------------------------------------ error reports
 
 #[derive(Deserialize)]
 struct ReportingChoice {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct TmdbKey {
+    key: String,
+}
+
+/// Checks a TMDB key as it's pasted, so the page can say straight away whether it works.
+async fn check_tmdb(State(wiz): St, Json(k): Json<TmdbKey>) -> Response {
+    match crate::tmdbkey::verify(&wiz.opts.tmdb_url, &k.key).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => problem(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
 }
 
 /// The "Send error reports" box: reporting starts the moment it's ticked, so a failure
@@ -893,7 +830,7 @@ fn set_install_step(wiz: &Wizard, step: &str) {
     wiz.inner.lock().unwrap().install = Install::Running { step: step.into() };
 }
 
-const NO_PASSWORD: &str = "Plex wasn't installed, because the password wasn't entered. Click Install Plex again to retry.";
+const NO_PASSWORD: &str = "Plex wasn't installed, because the password wasn't entered. Click Install Plex for me to try again.";
 
 async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -954,7 +891,7 @@ async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    bail!("Plex was installed but hasn't started yet. Restart the computer, then click Look again.")
+    bail!("Plex was installed but hasn't started yet. Wait a minute, then click Look again.")
 }
 
 #[derive(Deserialize)]
@@ -974,7 +911,7 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
     if !plex.mounts.is_empty() {
         return problem(
             StatusCode::BAD_REQUEST,
-            "Plex runs in Docker here: add the libraries in Plex itself, then reload this page",
+            "Plex runs in Docker here: add the libraries in Plex itself, then click Look again",
         );
     }
     let ok_lang = n.language.len() <= 8
@@ -1020,7 +957,7 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
     let mut todo = vec![];
     for (folder, kind, name, agent, scanner) in wanted {
         let Some(folder) = folder
-            .map(|f| f.trim().trim_end_matches('/').to_string())
+            .map(|f| trim_sep(f.trim()).to_string())
             .filter(|f| !f.is_empty())
         else {
             continue;
@@ -1187,7 +1124,11 @@ async fn folder(Json(q): Json<FolderQuery>) -> Json<Value> {
 fn check_folder(raw: &str, create: bool) -> Result<(), String> {
     let p = Path::new(raw);
     if raw.is_empty() || !p.is_absolute() || raw.chars().any(|c| c.is_control()) {
-        return Err("enter a full path, starting with /".into());
+        return Err(if cfg!(windows) {
+            "enter a full path, like D:\\Media\\Movies".into()
+        } else {
+            "enter a full path, starting with /".into()
+        });
     }
     if !p.exists() {
         if create {
@@ -1208,6 +1149,18 @@ fn check_folder(raw: &str, create: bool) -> Result<(), String> {
         return Err("that's a file, not a folder".into());
     }
     writable(p).map_err(|_| "Arr can't save files here; check the folder's permissions".into())
+}
+
+/// A folder without the separator at its end (`/srv/media/` -> `/srv/media`), but never
+/// a bare root (`/`, `D:\`).
+fn trim_sep(p: &str) -> &str {
+    let seps: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    let t = p.trim_end_matches(seps);
+    if t.is_empty() || t.ends_with(':') {
+        p
+    } else {
+        t
+    }
 }
 
 fn writable(dir: &Path) -> std::io::Result<()> {
@@ -1232,7 +1185,6 @@ struct Choices {
     downloads: String,
     #[serde(default)]
     tmdb: String,
-    downloading: bool,
     auto_update: bool,
     /// Send error reports (written as `[reporting] enabled`).
     #[serde(default)]
@@ -1253,16 +1205,25 @@ struct Library {
 }
 
 async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
+    // Checked and claimed in one go, so two tabs can't both start setup.
     let plex = {
-        let inner = wiz.inner.lock().unwrap();
+        let mut inner = wiz.inner.lock().unwrap();
         if matches!(inner.phase, Phase::Working { .. } | Phase::Done { .. }) {
             return problem(StatusCode::CONFLICT, "setup is already running");
         }
-        inner.plex.clone()
+        let Some(plex) = inner.plex.clone() else {
+            return problem(StatusCode::BAD_REQUEST, "connect to Plex first");
+        };
+        inner.phase = Phase::Working {
+            step: "Checking your choices".into(),
+            detail: String::new(),
+        };
+        plex
     };
-    let Some(plex) = plex else {
-        return problem(StatusCode::BAD_REQUEST, "connect to Plex first");
-    };
+    // Until setup is handed to its own task, any way out of here (a refusal, or the page
+    // going away mid-check, which drops this handler) goes back to editing.
+    let mut editing = BackToEditing(Some(&wiz));
+    let refuse = |msg: &str| problem(StatusCode::BAD_REQUEST, msg);
     let pick = |choice: &Option<LibraryChoice>, kind: &str| -> Result<Option<Library>, String> {
         let Some(ch) = choice else { return Ok(None) };
         let (key, idx) = ch
@@ -1279,33 +1240,41 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
         check_folder(&ch.folder, false).map_err(|m| format!("{}: {m}", ch.folder))?;
         Ok(Some(Library {
             section: key,
-            plex_path: loc.trim_end_matches('/').to_string(),
-            folder: ch.folder.trim_end_matches('/').to_string(),
+            plex_path: trim_sep(loc).to_string(),
+            folder: trim_sep(&ch.folder).to_string(),
         }))
     };
     let (movies, tv) = match (pick(&c.movies, "movie"), pick(&c.tv, "show")) {
         (Ok(m), Ok(t)) => (m, t),
-        (Err(e), _) | (_, Err(e)) => return problem(StatusCode::BAD_REQUEST, &e),
+        (Err(e), _) | (_, Err(e)) => return refuse(&e),
     };
     if movies.is_none() && tv.is_none() {
-        return problem(StatusCode::BAD_REQUEST, "choose a movie or TV library");
+        return refuse("choose a movie or TV library");
     }
     if let Err(m) = check_folder(&c.downloads, true) {
-        return problem(StatusCode::BAD_REQUEST, &format!("download folder: {m}"));
+        return refuse(&format!("download folder: {m}"));
     }
-    let tmdb = c.tmdb.trim().to_string();
-    if tmdb.len() > 1024 || tmdb.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
-        return problem(StatusCode::BAD_REQUEST, "that TMDB key doesn't look right");
+    // The key only finds movies, so without a movie library it isn't asked for.
+    let tmdb = match movies {
+        Some(_) => c.tmdb.trim().to_string(),
+        None => String::new(),
+    };
+    if !tmdb.is_empty() {
+        // Checked again here, not only as it's typed: a key saved has worked once.
+        set_phase(&wiz, "Checking your TMDB key", "");
+        if let Err(e) = crate::tmdbkey::verify(&wiz.opts.tmdb_url, &tmdb).await {
+            return refuse(&format!("{e:#}"));
+        }
     }
     set_phase(&wiz, "Saving your settings", "");
+    editing.0 = None;
+    let no_tmdb = movies.is_some() && tmdb.is_empty();
     let w = wiz.clone();
     tokio::spawn(async move {
         let result = finish_setup(&w, &plex, movies, tv, &c, &tmdb).await;
         let mut inner = w.inner.lock().unwrap();
         inner.phase = match result {
-            Ok(()) => Phase::Done {
-                downloading: c.downloading,
-            },
+            Ok(()) => Phase::Done { no_tmdb },
             Err(e) => {
                 crate::report::error("setup", &crate::report::reportable(&e));
                 Phase::Failed {
@@ -1322,6 +1291,17 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
         }
     });
     Json(snapshot(&wiz)).into_response()
+}
+
+/// Puts the phase back to editing when dropped, unless emptied first.
+struct BackToEditing<'a>(Option<&'a Wizard>);
+
+impl Drop for BackToEditing<'_> {
+    fn drop(&mut self) {
+        if let Some(w) = self.0 {
+            w.inner.lock().unwrap().phase = Phase::Editing;
+        }
+    }
 }
 
 fn set_phase(wiz: &Wizard, step: &str, detail: &str) {
@@ -1355,7 +1335,9 @@ async fn finish_setup(
     }
     std::fs::create_dir_all(&c.downloads)
         .with_context(|| format!("can't create {}", c.downloads))?;
-    let config = dir.join("config.toml");
+    // Under another name until everything has worked: the installers take config.toml to
+    // mean "Arr is set up".
+    let config = dir.join("config.toml.new");
     let text = render_config(
         &wiz.opts,
         plex,
@@ -1366,34 +1348,34 @@ async fn finish_setup(
     );
     fsutil::atomic_replace_private(&config, text.as_bytes())?;
 
-    set_phase(wiz, "Checking everything works", "");
-    let checked = async {
+    let result = async {
+        set_phase(wiz, "Checking everything works", "");
         arr(wiz, &["setup", "--config"], &config).await?;
-        arr(wiz, &["check", "--config"], &config).await
+        arr(wiz, &["check", "--config"], &config).await?;
+        set_phase(
+            wiz,
+            "Learning what you already own",
+            "Reading your Plex libraries",
+        );
+        let media = match (&movies, &tv) {
+            (Some(_), Some(_)) => "all",
+            (Some(_), None) => "movies",
+            _ => "tv",
+        };
+        bootstrap(wiz, &config, media).await?;
+        fsutil::atomic_replace_private(
+            &dir.join("setup-choices"),
+            format!("auto_update={}\n", u8::from(c.auto_update)).as_bytes(),
+        )
     }
     .await;
-    if let Err(e) = checked {
-        // The installer starts over when there's no config; keep this one for reference.
+    if let Err(e) = result {
+        // Kept for reference; Finish writes a new one.
         let _ = std::fs::rename(&config, dir.join("config.toml.failed"));
         return Err(e);
     }
-
-    set_phase(
-        wiz,
-        "Learning what you already own",
-        "Reading your Plex libraries",
-    );
-    let media = match (&movies, &tv) {
-        (Some(_), Some(_)) => "all",
-        (Some(_), None) => "movies",
-        _ => "tv",
-    };
-    bootstrap(wiz, &config, media).await?;
-    fsutil::atomic_replace_private(
-        &dir.join("setup-choices"),
-        format!("auto_update={}\n", u8::from(c.auto_update)).as_bytes(),
-    )?;
-    Ok(())
+    std::fs::rename(&config, dir.join("config.toml")).context("can't save config.toml")?;
+    fsutil::fsync_dir(dir)
 }
 
 /// Runs `arr <args> <config>` and fails with the end of its error output.
@@ -1402,6 +1384,7 @@ async fn arr(wiz: &Wizard, args: &[&str], config: &Path) -> Result<()> {
         .args(args)
         .arg(config)
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("can't run {}", wiz.opts.arr.display()))?;
@@ -1435,6 +1418,7 @@ async fn bootstrap(wiz: &Wizard, config: &Path, media: &str) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("can't run {}", wiz.opts.arr.display()))?;
     let stdout = child.stdout.take().context("no stdout")?;
@@ -1459,9 +1443,8 @@ async fn bootstrap(wiz: &Wizard, config: &Path, media: &str) -> Result<()> {
     let stdout = collect.await.unwrap_or_default();
     // The import's own words (log lines, titles) are shown on the page but not reported.
     let private = |m: String| anyhow::Error::new(crate::report::Private(m));
-    if !status.success() {
-        return Err(private(tail(last.join("\n").as_bytes())).context("the Plex import failed"));
-    }
+    let errors = || tail(last.join("\n").as_bytes());
+    // An unfinished run is in the report on stdout, whether or not the exit says so.
     let out: Value = serde_json::from_slice(&stdout).unwrap_or(Value::Null);
     if let Some(run) = out["runs"]
         .as_array()
@@ -1469,10 +1452,15 @@ async fn bootstrap(wiz: &Wizard, config: &Path, media: &str) -> Result<()> {
         .flatten()
         .find(|r| r["status"] != "done")
     {
-        let why = run["last_error"]
-            .as_str()
-            .unwrap_or("run the installer again to continue it");
-        return Err(private(why.to_string()).context("the Plex import didn't finish"));
+        let why = match run["last_error"].as_str() {
+            Some(e) => e.to_string(),
+            None if status.success() => "it stopped before the end".into(),
+            None => errors(),
+        };
+        return Err(private(why).context("the Plex import didn't finish"));
+    }
+    if !status.success() {
+        return Err(private(errors()).context("the Plex import failed"));
     }
     Ok(())
 }
@@ -1516,7 +1504,7 @@ fn render_config(
     let s = |v: &str| toml::Value::String(v.to_string()).to_string();
     let mut out = format!(
         r#"# Arr configuration, written by the setup page. Secrets live in secrets/ (mode 600).
-# All options: https://github.com/newtonharry/Arr/blob/main/config/standalone.example.toml
+# More options: https://github.com/newtonharry/Arr/blob/main/config/standalone.example.toml
 
 [server]
 listen = {listen}
@@ -1546,7 +1534,7 @@ enabled = {tmdb}
     out.push_str(&format!(
         r#"
 [execution]
-enabled = {downloading}
+enabled = true
 download_cleanup = true
 
 # Sonarr/Radarr can keep running: Arr only acquires what you add to Arr.
@@ -1560,8 +1548,7 @@ trackers = true
 dht = true
 max_active_downloads = 3
 "#,
-        downloading = c.downloading,
-        downloads = s(c.downloads.trim_end_matches('/')),
+        downloads = s(trim_sep(&c.downloads)),
         torrent = s(&format!("0.0.0.0:{}", opts.torrent_port)),
     ));
     if opts.upload_limit_kib > 0 {
@@ -1654,6 +1641,44 @@ mod tests {
         );
         assert_eq!(local_path(&p, "/data/tv").as_deref(), Some("/srv/tv"));
         assert_eq!(local_path(&p, "/datasets").as_deref(), None);
+    }
+
+    #[test]
+    fn the_page_listens_only_on_private_addresses() {
+        for ip in [
+            "192.168.1.20",
+            "10.0.0.5",
+            "172.16.4.1",
+            "169.254.10.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "fd12:3456::1",
+            "fe80::1",
+            "::ffff:192.168.1.20",
+        ] {
+            assert!(private_lan(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "0.0.0.0",
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "::",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(!private_lan(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn trailing_separators_go_but_roots_stay() {
+        assert_eq!(trim_sep("/srv/media/"), "/srv/media");
+        assert_eq!(trim_sep("/"), "/");
+        if cfg!(windows) {
+            assert_eq!(trim_sep("D:\\Media\\"), "D:\\Media");
+            assert_eq!(trim_sep("D:\\"), "D:\\");
+        }
     }
 
     #[test]

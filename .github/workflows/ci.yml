@@ -109,8 +109,9 @@ jobs:
           if ($p.ExitCode -ne 7) { "arr-background --hidden exited with $($p.ExitCode)"; exit 1 }
           $path = (Get-ItemProperty HKCU:\Environment).Path
           if (($path -split ';') -notcontains $env:ARR_BIN_DIR) { "not on PATH: $path"; exit 1 }
-          # Running again replaces the files in place.
+          # Running again replaces the files in place, keeping the old ones to go back to.
           Get-Content install.ps1 -Raw | Invoke-Expression
+          if (-not (Test-Path "$env:ARR_BIN_DIR\arr-background.exe.previous")) { 'no .previous kept'; exit 1 }
           # And the uninstaller takes it all away again.
           [System.Management.Automation.Language.Parser]::ParseFile("$pwd\uninstall.ps1", [ref]$null, [ref]$errors) | Out-Null
           if ($errors) { $errors; exit 1 }
@@ -196,9 +197,57 @@ jobs:
           "tunnel.log:"; Get-Content "$state\tunnel.log" | Select-Object -First 5
           # A rerun keeps remote access as it is.
           $before = $config
-          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "rerun said: $($_.Exception.Message)" }
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "rerun said: $msg"
+          # The made-up ngrok account fails only the last step, the public check.
+          if ($msg -notlike "*doesn't reach Arr yet*") { Fail "the rerun failed before the public check: $msg" }
           if ((Get-Content "$state\config.toml" -Raw) -ne $before) { Fail 'a rerun changed the config' }
           if (-not (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue)) { Fail 'a rerun lost the tunnel task' }
+          # This install's Arr (not any other on the runner): its command line names this config.
+          function ArrPid {
+            Get-CimInstance Win32_Process -Filter "Name LIKE 'arr-background%'" |
+              Where-Object { "$($_.CommandLine)".Contains("$state\config.toml") -and $_.CommandLine -notlike '*--hidden*' } | ForEach-Object { $_.ProcessId }
+          }
+          function Healthy { try { [bool](Invoke-RestMethod http://127.0.0.1:8787/api/v1/health -TimeoutSec 5) } catch { $false } }
+          if (-not (Healthy) -or -not (ArrPid)) { Fail 'Arr is not running after a rerun' }
+          # A setting given on a rerun is applied; the rest are kept. Without ARR_BIN_DIR the
+          # program folder still comes from the Arr task (only ARR_STATE_DIR is given).
+          $env:ARR_ERROR_REPORTS = '0'; $env:ARR_BIN_DIR = $null
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "error reports rerun said: $msg"
+          if ($msg -notlike "*doesn't reach Arr yet*") { Fail "the error reports rerun failed before the public check: $msg" }
+          $env:ARR_ERROR_REPORTS = $null; $env:ARR_BIN_DIR = $bin
+          if ((Get-ScheduledTask -TaskName 'Arr').Actions[0].Execute -ne "$bin\arr-background.exe") { Fail 'ARR_STATE_DIR alone moved the program folder' }
+          if (Test-Path "$env:LOCALAPPDATA\Programs\Arr\arr.exe") { Fail 'ARR_STATE_DIR alone installed to the default folder' }
+          if ((Get-Content "$state\config.toml" -Raw) -notmatch '(?m)^\[reporting\]\r?\nenabled = false') { Fail 'ARR_ERROR_REPORTS was not applied' }
+          if (-not (Healthy)) { Fail 'Arr is not running after the error reports rerun' }
+          # A rerun that fails leaves Arr running as it was: a refused option, then a broken config.
+          $running = ArrPid
+          $good = [IO.File]::ReadAllText("$state\config.toml")
+          $env:ARR_TORRENT_PORT = '70000'
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          $env:ARR_TORRENT_PORT = $null
+          "bad option said: $msg"
+          if ($msg -notmatch 'ARR_TORRENT_PORT') { Fail 'ARR_TORRENT_PORT=70000 was not refused' }
+          $env:ARR_PORT = '8788'
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          $env:ARR_PORT = $null
+          "other port said: $msg"
+          if ($msg -notmatch 'ARR_PORT') { Fail 'a different ARR_PORT with ARR_YES was not refused' }
+          if (-not (Healthy) -or "$(ArrPid)" -ne "$running") { Fail 'a refused option stopped or restarted Arr' }
+          [IO.File]::AppendAllText("$state\config.toml", "`n[[[ not toml`n")
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          [IO.File]::WriteAllText("$state\config.toml", $good)
+          "broken config said: $msg"
+          if ($msg -notmatch 'keeps running') { Fail 'a broken config did not stop the rerun' }
+          if (-not (Healthy) -or "$(ArrPid)" -ne "$running") { Fail 'a failed rerun stopped or restarted Arr' }
+          # ... and the previous programs are back in place, for Arr's next start.
+          if (Test-Path "$bin\arr-background.exe.previous") { Fail 'the failed rerun left the new arr-background.exe in place' }
           # Uninstalled but data kept, then installed again: ngrok and the tunnel come back.
           $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '0'
           Get-Content uninstall.ps1 -Raw | Invoke-Expression

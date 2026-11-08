@@ -38,6 +38,7 @@
       <div id="missing" hidden>
         <p id="missing-text"></p>
         <button type="button" id="look-again">Look again</button>
+        <button type="button" id="switch-account" hidden>Sign in with a different account</button>
       </div>
       <div id="install" hidden>
         <p>Plex isn't on this computer yet. Plex is the free app that plays your movies and shows on your TV, phone and browser, and Arr can install it for you.</p>
@@ -48,8 +49,8 @@
         <div id="install-manual" hidden>
           <p>To install it, open a terminal, paste this line and press Enter, then come back and click <strong>Look again</strong>:</p>
           <pre><code id="install-cmd"></code></pre>
-          <button type="button" id="install-look">Look again</button>
         </div>
+        <button type="button" id="install-look" hidden>Look again</button>
         <div id="install-progress" hidden>
           <div class="spinner" aria-hidden="true"></div>
           <p id="install-step" class="muted" aria-live="polite"></p>
@@ -75,6 +76,8 @@
         <label>Movies <input id="new-movies" autocomplete="off"></label>
         <label>TV shows <input id="new-tv" autocomplete="off"></label>
         <button type="button" id="create-libs" class="primary">Create my libraries</button>
+        <p class="hint">Or add them in Plex yourself, then click <strong>Look again</strong>.</p>
+        <button type="button" id="libs-look">Look again</button>
       </div>
       <p class="hint bad" id="libs-warning" hidden></p>
     </section>
@@ -84,17 +87,27 @@
       <label>Download folder <input id="downloads" autocomplete="off"></label>
       <p class="hint" id="downloads-hint">Downloads finish here, then move into your library. Keep it on the same drive as your library to save space.</p>
 
-      <label class="check"><input type="checkbox" id="downloading" checked> Let Arr download what you ask for</label>
-      <p class="hint">Turn this off to try Arr out first: it will search and plan, but not download.</p>
-
       <label class="check"><input type="checkbox" id="auto-update"> Install Arr updates automatically</label>
       <p class="hint">Recommended. Arr checks once a day for a new version and installs it, and goes back to the old one if the new one doesn't start.</p>
 
-      <details>
-        <summary>Optional: a TMDB key, to find movies you don't have yet</summary>
-        <p class="muted">TV shows work without it. Get a free key at <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener noreferrer">themoviedb.org/settings/api</a> (choose “Developer”, any app name is fine), then paste the API key or the read access token.</p>
-        <label>TMDB key <input id="tmdb" type="password" autocomplete="off"></label>
-      </details>
+      <div id="tmdb-box" class="tmdb">
+        <h3>Finding new movies</h3>
+        <p>Arr finds TV shows on its own. To find <strong>movies you don't have yet</strong>, it needs a free key from TMDB, the movie database. It takes about five minutes, on a computer rather than a phone.</p>
+        <ol class="steps">
+          <li><a href="https://www.themoviedb.org/signup" target="_blank" rel="noopener noreferrer">Create a free TMDB account</a>, and confirm your email if TMDB asks.</li>
+          <li>Open <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener noreferrer">your account's API page</a>, request a key and accept TMDB's terms. If it asks about your app, it's personal, non-commercial use, and these answers are fine:
+            <dl class="answers">
+              <dt>Application name</dt><dd><code>Arr</code> <button type="button" class="copy" data-copy="Arr" hidden>Copy</button></dd>
+              <dt>Application URL</dt><dd><code>https://github.com/newtonharry/Arr</code> <button type="button" class="copy" data-copy="https://github.com/newtonharry/Arr" hidden>Copy</button></dd>
+              <dt>Application summary</dt><dd><code>Personal media server that finds movies for my Plex library</code> <button type="button" class="copy" data-copy="Personal media server that finds movies for my Plex library" hidden>Copy</button></dd>
+            </dl>
+          </li>
+          <li>Copy the <strong>API Read Access Token</strong> (the long one) or the <strong>API Key</strong>, and paste it here:</li>
+        </ol>
+        <label>TMDB key <input id="tmdb" type="password" autocomplete="off" spellcheck="false"></label>
+        <p class="hint" id="tmdb-hint" aria-live="polite">No key yet? You can skip this: everything else works, and you can add a key later by running the install command again. <a href="https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md" target="_blank" rel="noopener noreferrer">Help with this step</a>.</p>
+        <p class="muted small">Arr uses TMDB and the TMDB APIs but is not endorsed, certified or otherwise approved by TMDB.</p>
+      </div>
 
       <button type="submit" id="apply" class="primary big">Finish setup</button>
     </section>
@@ -109,7 +122,7 @@
   <section id="done" class="card" hidden>
     <h2>Arr is set up</h2>
     <p>Arr knows what's already in your Plex libraries. The installer is finishing up in the terminal, starting Arr in the background.</p>
-    <p id="done-downloading"></p>
+    <p id="done-movies" hidden>Arr can't find movies you don't have yet: that needs a free TMDB key. When you have one, run the install command again and it will ask for it (<a href="https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md" target="_blank" rel="noopener noreferrer">how to get a key</a>).</p>
     <p>You can close this tab.</p>
   </section>
 </main>

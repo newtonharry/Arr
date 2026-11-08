@@ -7,6 +7,10 @@
 listen = "127.0.0.1:8787"
 allow_non_loopback = false
 api_token_file = "secrets/api_token"
+# Limits, defaults shown:
+# max_body_bytes = 65536                 # 1024 to 1048576
+# request_timeout_secs = 180             # 1 to 900
+# max_concurrent_requests = 16           # 1 to 1024
 
 [state]
 dir = "."
@@ -56,6 +60,14 @@ credential_file = "secrets/tmdb_credential"
 enabled = false            # enable deliberately after `check` and readiness pass
 download_cleanup = true
 
+# Overrides the RSS interval from `arr setup` (rss_sync_interval_minutes) for both kinds.
+# [automation]
+# rss_interval_minutes = 15  # 10 to 1440; 0 turns RSS off
+
+# Opt-in error reports (docs/PRIVACY.md); off without this section.
+# [reporting]
+# enabled = true
+
 [embedded]
 download_dir = "/srv/arr/downloads"
 listen = "0.0.0.0:6881"
@@ -63,7 +75,9 @@ trackers = true
 dht = true                 # public trackerless magnets; private torrents never use the DHT
 local_discovery = false
 max_active_downloads = 3
-# ratio_limit = 2.0        # share limits when no seed goal applies
+# upload_limit_bytes_per_sec = 524288     # 512 KiB/s for all torrents; leave out for no limit
+# download_limit_bytes_per_sec = 10485760 # 10 MiB/s; leave out for no limit
+# ratio_limit = 2.0       # share limits when no seed goal applies
 # seeding_time_limit_minutes = 4320
 
 [migration]

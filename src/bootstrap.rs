@@ -310,7 +310,8 @@ pub async fn batch(
             .map_err(|e| ApiError::internal("bootstrap state", format!("{e:#}")))?
     };
     let mut run = match stored {
-        Some(r) if !restart && r.status != "failed" => r,
+        // A run for another library (setup was retried with a different one) starts over.
+        Some(r) if !restart && r.status != "failed" && r.section == section => r,
         _ => Run::new(media, section, dry_run, &now_s),
     };
     if run.status == "done" {

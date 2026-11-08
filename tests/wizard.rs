@@ -18,10 +18,15 @@ const BIN: &str = env!("CARGO_BIN_EXE_arr");
 const ACCOUNT_TOKEN: &str = "account-token-0123456789";
 const SERVER_TOKEN: &str = "server-token-0123456789";
 const MACHINE: &str = "machine-0123456789";
+const TMDB_KEY: &str = "tmdb-key-0123456789";
 
 #[derive(Default)]
 struct World {
     pin_polls: u32,
+    /// Sign-ins started: the first gets PIN 42, the next 43, and so on.
+    pins_made: u64,
+    /// plex.tv answers for PIN 42 late, signing in another account.
+    slow_first_pin: bool,
     resources_calls: u32,
     movies_path: String,
     tv_path: String,
@@ -32,6 +37,10 @@ struct World {
     /// A new Plex isn't linked to any account (and plex.tv doesn't list it).
     unclaimed: bool,
     claims: u32,
+    /// A movie library added in Plex after the page connected.
+    added_library: Option<String>,
+    /// Plex fails to list a library's items, so the import fails.
+    import_fails: bool,
     /// Libraries added through the API: (type, location, language).
     created: Vec<(String, String, String)>,
     /// The token each request carried, by path.
@@ -64,11 +73,27 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = Router::new()
+        // TMDB, for checking keys: only TMDB_KEY works.
+        .route(
+            "/3/movie/603",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                if q.get("api_key").map(String::as_str) == Some(TMDB_KEY) {
+                    (StatusCode::OK, r#"{"id":603,"title":"The Matrix"}"#)
+                } else {
+                    (StatusCode::UNAUTHORIZED, r#"{"status_code":7}"#)
+                }
+            }),
+        )
         .route(
             "/api/v2/pins",
             post(|State(m): State<Mock>, h: HeaderMap| async move {
                 record(&m, "pins", &h);
-                axum::Json(json!({ "id": 42, "code": "pin-code", "authToken": null }))
+                let id = {
+                    let mut w = m.lock().unwrap();
+                    w.pins_made += 1;
+                    41 + w.pins_made
+                };
+                axum::Json(json!({ "id": id, "code": "pin-code", "authToken": null }))
             }),
         )
         .route(
@@ -79,8 +104,16 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
                  AxPath(id): AxPath<u64>,
                  Query(q): Query<HashMap<String, String>>| async move {
                     record(&m, "pin", &h);
-                    if id != 42 || q.get("code").map(String::as_str) != Some("pin-code") {
+                    let made = m.lock().unwrap().pins_made;
+                    if !(42..42 + made).contains(&id)
+                        || q.get("code").map(String::as_str) != Some("pin-code")
+                    {
                         return StatusCode::NOT_FOUND.into_response();
+                    }
+                    if id == 42 && m.lock().unwrap().slow_first_pin {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        return axum::Json(json!({ "id": 42, "code": "pin-code", "authToken": "old-account" }))
+                            .into_response();
                     }
                     let mut w = m.lock().unwrap();
                     w.pin_polls += 1;
@@ -178,6 +211,10 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
                         json!({ "key": "3", "title": "Music", "type": "artist", "Location": [{ "path": "/music" }] }),
                     ]
                 };
+                let mut dirs = dirs;
+                if let Some(path) = &w.added_library {
+                    dirs.push(json!({ "key": "4", "title": "Films", "type": "movie", "Location": [{ "path": path }] }));
+                }
                 axum::Json(json!({ "MediaContainer": { "Directory": dirs } })).into_response()
             })
             .post(|State(m): State<Mock>, h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
@@ -200,6 +237,9 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
         .route(
             "/library/sections/{id}/all",
             get(|State(m): State<Mock>, h: HeaderMap| async move {
+                if m.lock().unwrap().import_fails {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 record(&m, "all", &h);
                 if h.get("x-plex-token").and_then(|v| v.to_str().ok()) != Some(SERVER_TOKEN) {
                     return StatusCode::UNAUTHORIZED.into_response();
@@ -241,6 +281,7 @@ fn free_port() -> u16 {
         .port()
 }
 
+#[derive(Clone)]
 struct Page {
     base: String,
     cookie: String,
@@ -290,6 +331,7 @@ async fn start_wizard(
         .arg(ffprobe())
         .arg(format!("--plex-tv-url=http://{mock}/"))
         .arg(format!("--plex-auth-url=http://{mock}/auth"))
+        .arg(format!("--tmdb-url=http://{mock}/"))
         .args(extra)
         // Error reports never leave a test: nothing listens on port 9.
         .env("ARR_SENTRY_DSN", "http://key@127.0.0.1:9/1")
@@ -446,7 +488,6 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
             "tv": { "id": "2:0", "folder": tv },
             "downloads": downloads,
             "tmdb": "",
-            "downloading": false,
             "auto_update": true,
             "reporting": true,
         })
@@ -455,18 +496,71 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     assert!(!state_dir.join("config.toml").exists());
 
+    // A TMDB key is checked as it's pasted, and again on Finish: a refused one saves nothing.
+    let (s, v) = page
+        .post("/api/tmdb/check", json!({ "key": "not-the-key" }))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("TMDB didn't accept"),
+        "{v}"
+    );
+    let (s, v) = page
+        .post("/api/tmdb/check", json!({ "key": TMDB_KEY }))
+        .await;
+    assert_eq!((s, &v["ok"]), (StatusCode::OK, &json!(true)), "{v}");
+    let mut wrong = choices("1:0");
+    wrong["tmdb"] = json!("not-the-key");
+    let (s, v) = page.post("/api/apply", wrong).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(!state_dir.join("config.toml").exists());
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(v["phase"]["state"], "editing", "{v}");
+
+    let finished = || async {
+        let mut last = Value::Null;
+        for _ in 0..120 {
+            let (_, v) = page.get("/api/state").await;
+            last = v["phase"].clone();
+            if last["state"] != "working" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        last
+    };
+
+    // Finish clicked in two tabs at once: only one starts setup. Here the import fails, so
+    // no config.toml appears (the installers would take it as set up).
+    world.lock().unwrap().import_fails = true;
+    let (a, b) = tokio::join!(
+        page.post("/api/apply", choices("1:0")),
+        page.post("/api/apply", choices("1:0"))
+    );
+    let mut codes = [a.0, b.0];
+    codes.sort();
+    assert_eq!(codes, [StatusCode::OK, StatusCode::CONFLICT], "{a:?} {b:?}");
+    let last = finished().await;
+    assert_eq!(last["state"], "failed", "{last}");
+    assert!(
+        last["message"]
+            .as_str()
+            .unwrap()
+            .contains("the Plex import failed"),
+        "{last}"
+    );
+    assert!(!state_dir.join("config.toml").exists());
+    assert!(state_dir.join("config.toml.failed").exists());
+
+    // Finish again tries again.
+    world.lock().unwrap().import_fails = false;
     let (s, v) = page.post("/api/apply", choices("1:0")).await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    let mut last = Value::Null;
-    for _ in 0..120 {
-        let (_, v) = page.get("/api/state").await;
-        last = v["phase"].clone();
-        if last["state"] != "working" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let last = finished().await;
     assert_eq!(last["state"], "done", "{last}");
+    assert!(!state_dir.join("config.toml.new").exists());
+    // No key: the page says how to add one later.
+    assert_eq!(last["no_tmdb"], true, "{last}");
     let (s, _) = page.post("/api/apply", choices("1:0")).await;
     assert_eq!(s, StatusCode::CONFLICT);
     let (s, _) = page.post("/api/finish", json!({})).await;
@@ -484,7 +578,7 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         format!("base_url = \"http://127.0.0.1:{}/\"", mock.port()),
         "movie_section = 1".into(),
         "tv_section = 2".into(),
-        "[execution]\nenabled = false".into(),
+        "[execution]\nenabled = true".into(),
         "[tmdb]\nenabled = false".into(),
         "[reporting]\nenabled = true".into(),
     ] {
@@ -568,7 +662,11 @@ async fn an_existing_config_is_never_replaced() {
         .await
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("already exists"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("already exists") && err.contains("choose to delete Arr's data"),
+        "{err}"
+    );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
         "# mine\n"
@@ -611,14 +709,27 @@ async fn only_the_accounts_plex_on_this_computer_is_used() {
     assert_eq!(v["signed_in"], true);
     assert_eq!(v["plex"], Value::Null);
     assert_eq!(v["missing"], "not_linked");
+    // Signing in again (with another account, say) starts over.
+    let (s, v) = page.post("/api/plex/signin", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(v["signed_in"], false, "{v}");
+    assert_eq!(v["missing"], Value::Null, "{v}");
+    let (_, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(v["missing"], "not_linked", "{v}");
     // Once that Plex is signed in to this account, looking again connects.
     world.lock().unwrap().identity = MACHINE.into();
     let (_, v) = page.post("/api/plex/check", json!({})).await;
     assert_eq!(v["missing"], Value::Null);
     assert_eq!(v["plex"]["name"], "Living Room");
+    assert_eq!(v["plex"]["movies"].as_array().unwrap().len(), 1);
+    // A library added in Plex shows up on the next look.
+    world.lock().unwrap().added_library = Some("/films".into());
+    let (s, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["plex"]["movies"][1]["title"], "Films", "{v}");
 }
 
-#[cfg(unix)] // only the Unix-only install test uses it
 /// Opens the page with the link's code; returns a client holding the session cookie.
 async fn open_page(link: &str, port: u16) -> Page {
     let http = reqwest::Client::builder()
@@ -688,11 +799,16 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
     }
     assert_eq!(install["state"], "done", "{install}");
 
-    // The next look finds a new, unlinked Plex, links it to the account and connects.
-    let (s, v) = page.post("/api/plex/check", json!({})).await;
-    assert_eq!(s, StatusCode::OK, "{v}");
+    // The next look finds a new, unlinked Plex, links it to the account and connects. Two
+    // looks at once (two tabs) link it only once.
+    let ((s, v), (s2, v2)) = tokio::join!(
+        page.post("/api/plex/check", json!({})),
+        page.post("/api/plex/check", json!({}))
+    );
+    assert_eq!((s, s2), (StatusCode::OK, StatusCode::OK), "{v} {v2}");
     assert_eq!(world.lock().unwrap().claims, 1);
     assert_eq!(v["plex"]["name"], "Living Room", "{v}");
+    assert_eq!(v2["plex"]["name"], "Living Room", "{v2}");
     assert_eq!(v["plex"]["movies"], json!([]));
 
     // It has no libraries, so the page makes them. Here they're in a private folder (like a
@@ -742,4 +858,39 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
             .contains("Plex may not be able to see"),
         "{v}"
     );
+}
+
+#[tokio::test]
+async fn a_late_answer_for_an_earlier_signin_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mock, world) = start_mock(tmp.path(), tmp.path()).await;
+    world.lock().unwrap().slow_first_pin = true;
+    let (_child, link, port) = start_wizard(&tmp.path().join("state"), mock, &[]).await;
+    let page = open_page(&link, port).await;
+    page.post("/api/plex/signin", json!({})).await;
+    // plex.tv is slow to say PIN 42 signed in; meanwhile the user signs in again.
+    let slow = {
+        let page = page.clone();
+        tokio::spawn(async move { page.post("/api/plex/check", json!({})).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (s, v) = page.post("/api/plex/signin", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    slow.await.unwrap();
+    // The old account isn't signed in: the page waits for the new sign-in.
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(v["signed_in"], false, "{v}");
+    assert_eq!(v["waiting_for_signin"], true, "{v}");
+}
+
+#[test]
+fn an_upload_limit_the_config_cant_hold_is_refused() {
+    // 4194303 KiB/s is the most bytes per second a u32 holds, as with `arr set`.
+    let out = std::process::Command::new(BIN)
+        .args(["wizard", "--state-dir", "s", "--ffprobe", "f"])
+        .args(["--upload-limit-kib", "4194304"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("4194304"));
 }

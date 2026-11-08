@@ -16,7 +16,8 @@ enabled = true
 
 Without that section, Arr sends nothing. An agent install (`--yes`) leaves it off unless it
 also passes `--error-reports`. On Windows, `$env:ARR_ERROR_REPORTS = '1'` before the install
-line starts the setup page with the box ticked.
+line starts the setup page with the box ticked, and on an existing install turns reports on
+(`'0'` turns them off).
 
 Reports leave out other programs' output and the Plex import's own error details, since those
 can name titles and folders; you still see them on the setup page.
@@ -62,13 +63,19 @@ sees the address a report comes from, as any website does.
 
 ## Turning reports off (or on) later
 
-Edit Arr's config (`config.toml` in Arr's state folder):
+Run `arr set` with Arr's config (`config.toml` in Arr's state folder; the installer printed its
+path as `Config:`):
 
-- off: set `enabled = false` under `[reporting]`, or delete that section;
-- on: add the section shown above.
+```sh
+arr set --config <state folder>/config.toml error-reports off   # or: on
+```
 
-Then restart Arr (`systemctl restart arr`, `systemctl --user restart arr` for a user install,
-log out and in on macOS, or restart the "Arr" task in Task Scheduler on Windows).
+It sets `enabled` under `[reporting]`. Then restart Arr: `sudo systemctl restart arr` (Linux,
+installed with `sudo`), `systemctl --user restart arr` (Linux, installed without),
+`launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr` (macOS), or
+`Stop-ScheduledTask Arr; Start-ScheduledTask Arr` in PowerShell (Windows). Running the install
+command again with `--error-reports` or `--no-error-reports` (on Windows,
+`$env:ARR_ERROR_REPORTS = '1'` or `'0'`) does both steps.
 
 ## Sending reports somewhere else
 

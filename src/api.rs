@@ -1064,7 +1064,7 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
             None => "no release search backend: add [[indexer]] entries (native) or [prowlarr]".into(),
         } },
         Cap { name: "release_decisions", implemented: true, configured: imported, tested: "unit_tests", detail: "independent evaluation of imported quality/size/seeder/language/scope/delay/revision rules".into() },
-        Cap { name: "movie_discovery", implemented: true, configured: st.tmdb.is_some(), tested: "loopback_mocks", detail: if st.tmdb.is_some() { "TMDB search and details".into() } else { "no TMDB credential configured: movies can be added only from the catalog or with explicit operator metadata (POST /library metadata)".into() } },
+        Cap { name: "movie_discovery", implemented: true, configured: st.tmdb.is_some(), tested: "loopback_mocks", detail: if st.tmdb.is_some() { "TMDB search and details".into() } else { crate::tmdbkey::MISSING.into() } },
         Cap { name: "tv_discovery", implemented: true, configured: st.tvmaze.is_some(), tested: "loopback_mocks", detail: "TVmaze search and episode lists (enable [tvmaze])".into() },
         Cap { name: "plans", implemented: true, configured: imported, tested: "loopback_mocks", detail: "durable idempotent plans; executable when execution is enabled".into() },
         Cap { name: name("download_submission", "embedded_download_submission"), implemented: true, configured: exec && qb, tested, detail: if embedded { "embedded engine (no qBittorrent API): .torrent bytes or magnet metadata fetched from peers, names validated by the engine's parser before anything is written, durable record before the add, reconciliation by hash, never overwrites existing files, outbox queue limit".into() } else { "qBittorrent WebAPI 2.8.2 (4.3.9) to 2.11 (5.x): hash identity persisted before add, ambiguous-add reconciliation, category + unified-media tag ownership".into() } },
@@ -1239,7 +1239,7 @@ fn migration_readiness(st: &AppState, counts: &BTreeMap<String, usize>) -> Value
     if st.tmdb.is_none() {
         broad
             .configuration_blockers
-            .push("TMDB is not configured: new movies need operator metadata".into());
+            .push(crate::tmdbkey::MISSING.into());
     }
     if st.tvmaze.is_none() {
         broad.configuration_blockers.push(
@@ -1955,7 +1955,10 @@ async fn new_movie_record(
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 ErrorCode::MetadataUnavailable,
-                "TMDB is not configured (no credential); supply metadata {title, year, runtime_minutes?, digital_release?/physical_release?/in_cinemas? (YYYY-MM-DD)} for this TMDB id explicitly, or configure [tmdb]",
+                format!(
+                    "{} (An operator can instead supply metadata {{title, year, runtime_minutes?, digital_release?/physical_release?/in_cinemas? (YYYY-MM-DD)}} for this TMDB id.)",
+                    crate::tmdbkey::MISSING
+                ),
             ));
         }
     };
@@ -2921,7 +2924,7 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
             },
         },
         DiscoverKind::Movie => match &st.tmdb {
-            None => providers.push(json!({ "name": "tmdb", "status": "not_configured", "message": "no TMDB credential configured; movie discovery is limited to the catalog (add known TMDB ids with explicit metadata via POST /api/v1/library)" })),
+            None => providers.push(json!({ "name": "tmdb", "status": "not_configured", "message": crate::tmdbkey::MISSING })),
             Some(t) => match t.search(&text, q.year).await {
                 Ok(movies) => {
                     providers.push(json!({ "name": "tmdb", "status": "ok", "results": movies.len() }));
@@ -3756,7 +3759,7 @@ async fn setup_status(State(st): St) -> ApiResult {
         );
     }
     if st.tmdb.is_none() {
-        next.push("optional: [tmdb] with credential_file for movie discovery (without it, movies need explicit metadata)".into());
+        next.push(format!("optional: {}", crate::tmdbkey::MISSING));
     }
     if st.tvmaze.is_none() {
         next.push(

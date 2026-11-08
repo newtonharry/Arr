@@ -1106,6 +1106,14 @@ pub fn read_doc(path: &Path) -> anyhow::Result<SetupDoc> {
         .map_err(|e| anyhow::anyhow!("invalid setup document {}: {e}", path.display()))
 }
 
+/// The document the managed setup `import_id` was made from (its verified `source-setup.json`).
+pub fn stored_doc(state_dir: &Path, import_id: &str) -> anyhow::Result<SetupDoc> {
+    let path = state_dir.join("imports").join(import_id).join(SOURCE_FILE);
+    let bytes = crate::fsutil::read_bounded(&path, 256 * 1024)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("the current setup's document is invalid: {e}"))
+}
+
 /// Read-only Plex mapping check: each configured section exists, has the right type, and
 /// one of its folders covers the library root as Plex sees it.
 pub fn plex_check(plex: &PlexConfig, cfg: &RuntimeConfig, sections: &[Section]) -> Value {

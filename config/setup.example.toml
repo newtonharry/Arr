@@ -26,20 +26,23 @@ rss_sync_interval_minutes = 15
 
 # Default: one "HD 720p/1080p" profile per media kind (movies: original language; TV: any).
 # One profile per kind keeps adds (and MCP add_media) free of a quality_profile choice.
-[[profiles]]
-id = "movies-hd"
-media = "movie"
-name = "HD 720p/1080p (movies)"
-tiers = [["hdtv_720p"], ["webdl_720p", "webrip_720p"], ["bluray_720p"], ["hdtv_1080p"], ["webdl_1080p", "webrip_1080p"], ["bluray_1080p"]]
-language = "original"
-unmarked = "assume_original"
-
-[[profiles]]
-id = "tv-hd"
-media = "series"
-tiers = [["hdtv_720p"], ["webdl_720p", "webrip_720p"], ["bluray_720p"], ["hdtv_1080p"], ["webdl_1080p", "webrip_1080p"], ["bluray_1080p"]]
-language = "any"
-unmarked = "accept"
+# To use your own, uncomment the block for each kind Arr manages: a profile for a kind your
+# config has no [library] folder for is refused. A kind without a profile here keeps the
+# default.
+# [[profiles]]
+# id = "movies-hd"
+# media = "movie"
+# name = "HD 720p/1080p (movies)"
+# tiers = [["hdtv_720p"], ["webdl_720p", "webrip_720p"], ["bluray_720p"], ["hdtv_1080p"], ["webdl_1080p", "webrip_1080p"], ["bluray_1080p"]]
+# language = "original"
+# unmarked = "assume_original"
+#
+# [[profiles]]
+# id = "tv-hd"
+# media = "series"
+# tiers = [["hdtv_720p"], ["webdl_720p", "webrip_720p"], ["bluray_720p"], ["hdtv_1080p"], ["webdl_1080p", "webrip_1080p"], ["bluray_1080p"]]
+# language = "any"
+# unmarked = "accept"
 
 # Size limits in MiB per minute of runtime. Defaults: minimum 1 (SD), 3 (720p), 4 (1080p),
 # 10 (2160p), 50 (remux); no maximum.
@@ -57,18 +60,21 @@ initial_state = "start"          # start | force_start | paused
 remove_completed = true          # after a verified import and the seed goal
 remove_failed = true
 
-# Per-indexer policy (default: every configured [[indexer]] for movies and TV).
-[[indexers]]
-id = 1
-movies = true
-tv = true
-movie_categories = [2000]
-tv_categories = [5000]
-priority = 25
-minimum_seeders = 1
-automatic_search = true
-interactive_search = true
-rss = true
-seed_ratio = 1.0                 # seed goal: ratio OR time, whichever comes first
-seed_time_minutes = 4320         # negative = leave to the download client's limits
+# Per-indexer policy. Default: every [[indexer]] in config.toml, for each kind Arr manages,
+# with the values below. To change them, uncomment the block and repeat it for each indexer
+# Arr should use (one left out isn't used). Leave movies and tv out to use the indexer for
+# every kind Arr manages; true for a kind your config has no [library] folder for is refused.
+# [[indexers]]
+# id = 1                           # the [[indexer]] id in config.toml
+# movies = true
+# tv = true
+# movie_categories = [2000]
+# tv_categories = [5000]
+# priority = 25                    # 1 (first) to 50
+# minimum_seeders = 1
+# automatic_search = true
+# interactive_search = true
+# rss = true
+# seed_ratio = 1.0                 # seed goal: ratio OR time, whichever comes first
+# seed_time_minutes = 4320         # negative = leave to the download client's limits
 # season_pack_seed_time_minutes = 4320

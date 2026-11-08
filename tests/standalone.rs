@@ -890,7 +890,26 @@ async fn fresh_standalone_deployment_end_to_end_with_native_indexers_only() {
         setup_file.to_str().unwrap(),
     ]);
     assert!(ok && again["status"] == "unchanged" && again["import_id"] == import_id.as_str());
+    // Without --settings, setup keeps the current document instead of going back to defaults.
+    let (ok, again, again_text) = cli(&["setup", "--config", cfg_path.to_str().unwrap()]);
+    assert!(ok, "{again_text}");
+    assert!(
+        again["status"] == "unchanged" && again["import_id"] == import_id.as_str(),
+        "{again}"
+    );
     no_leaks(&text);
+    // A --listen that isn't an address, or isn't loopback, creates nothing.
+    let bad = tmp.path().join("bad-init");
+    for listen in ["localhost:1\"\nx = \"", "0.0.0.0:8787"] {
+        let (ok, _, _) = cli(&[
+            "init",
+            "--state-dir",
+            bad.to_str().unwrap(),
+            "--listen",
+            listen,
+        ]);
+        assert!(!ok && !bad.exists(), "{listen}");
+    }
     let (ok, v, text) = cli(&["check", "--config", cfg_path.to_str().unwrap()]);
     assert!(ok, "{text}");
     assert_eq!(v["search_backend"], "native");
