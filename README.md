@@ -53,6 +53,21 @@ both keep your config. To stop automatic updates, run the installer with `--no-a
 Update logs go to `journalctl -u arr-update` (`--user` for a user install), or `update.log` in
 the state folder on macOS.
 
+### Uninstall
+
+To remove Arr, Plex Media Server, or both:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.sh | sh
+```
+
+It shows what it found, asks what to remove and whether to delete each one's data (Arr's
+config, secrets and database; Plex's library database, watch history and settings), and asks
+once more before changing anything. It never deletes your movie and TV files or the download
+folder. Plex is removed however it was installed: the system package, snap, a Docker container
+or the macOS app. Add `--dry-run` to see what it would do, or `--yes --all --delete-data` to
+remove everything without questions (`--help` lists the options).
+
 ### Let an AI agent install it
 
 Every question has a flag, so an agent can install Arr without prompts or the setup page. Give your agent this
