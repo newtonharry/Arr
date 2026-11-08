@@ -29,6 +29,10 @@ async fn start_plex(accept: &'static str) -> SocketAddr {
     serve(
         Router::new()
             .route(
+                "/identity",
+                get(|| async { r#"{"MediaContainer":{"machineIdentifier":"machine-1"}}"# }),
+            )
+            .route(
                 "/library/sections",
                 get(move |h: HeaderMap| async move {
                     if ok(&h) {
@@ -208,6 +212,12 @@ async fn plex_token_and_address_are_tried_before_they_are_kept() {
     refused(
         &set(&config, &["plex-url", "ftp://x"], None),
         "http or https",
+    );
+    // A wrong port or a protected proxy refuses the token too, but isn't Plex.
+    let proxy = serve(Router::new().fallback(|| async { StatusCode::UNAUTHORIZED })).await;
+    refused(
+        &set(&config, &["plex-url", &format!("http://{proxy}/")], None),
+        "didn't answer like a Plex server",
     );
     assert_eq!(std::fs::read(&config).unwrap(), before);
 

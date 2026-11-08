@@ -453,17 +453,27 @@ fn read_secret(what: &str) -> Result<String> {
     Ok(s.trim().to_string())
 }
 
-// Returning (not `process::exit`) lets the runtime drop, so kill_on_drop children stop.
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
-    match run().await {
+// The runtime is shut down (not `process::exit`), so kill_on_drop children stop; with a
+// timeout, because the MCP adapter's stdin read can't be cancelled and would otherwise keep
+// a failed `arr mcp` waiting for its client's next line.
+fn main() -> std::process::ExitCode {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: couldn't start: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let code = match rt.block_on(run()) {
         Ok(code) => code,
         Err(e) => {
             // One line, so installers can show it as it is.
             eprintln!("Error: {}", arr::fsutil::one_line(&format!("{e:#}")));
             std::process::ExitCode::FAILURE
         }
-    }
+    };
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    code
 }
 
 async fn run() -> Result<std::process::ExitCode> {
