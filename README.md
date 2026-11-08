@@ -5,9 +5,9 @@ Website: <https://newtonharry.github.io/Arr/>
 Arr turns a computer at home into a complete movie and TV setup, in one program. You ask for
 a movie or a season. Arr searches, downloads it with its built-in BitTorrent engine, checks the
 file with ffprobe, files it into your Plex library and tells Plex to refresh, so it's ready on
-your TV. It replaces the usual Sonarr, Radarr, Prowlarr and qBittorrent stack. New to Plex? The
-setup page checks for it and points you to it (installing it for you is coming next); already
-run Plex? Arr fits into your existing libraries.
+your TV. It replaces the usual Sonarr, Radarr, Prowlarr and qBittorrent stack. New to Plex? On
+Linux the setup page installs it for you, links it to your Plex account and creates your
+libraries; already run Plex? Arr fits into your existing libraries.
 
 Arr has no web interface. You talk to it through an AI assistant over MCP ("add season 2 of
 Severance") or through its JSON API.
@@ -28,7 +28,10 @@ The script takes a few minutes. It:
    Plex on this computer, your movie and TV libraries and their folders (Arr moves files
    into Plex's folders, so it runs on the same computer as Plex). You confirm the folders,
    choose where downloads go and whether Arr installs its own updates, then click
-   **Finish setup**;
+   **Finish setup**. No Plex yet? On Linux (apt or dnf) the page offers **Install Plex for
+   me**: your computer asks for your password, Arr installs Plex Media Server from Plex's own
+   package source, makes `/srv/media` with `Movies` and `TV Shows` (yours, and readable by
+   Plex), links the new Plex to your account and creates the two libraries;
 4. imports your Plex library, so Arr knows what you own. It downloads nothing at this step;
 5. starts Arr as a service (systemd on Linux, launchd on macOS).
 

@@ -29,6 +29,7 @@ pub mod openapi;
 pub mod paths;
 pub mod plan;
 pub mod plex;
+pub mod plexinstall;
 pub mod probe;
 pub mod prowlarr;
 pub mod qbit;

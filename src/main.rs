@@ -108,6 +108,22 @@ enum Command {
         /// Also open the link in this computer's web browser.
         #[arg(long)]
         open: bool,
+        /// Tests: a shell command that stands in for installing Plex as administrator.
+        #[arg(long, hide = true)]
+        plex_installer: Option<String>,
+        /// Where Plex listens on this computer.
+        #[arg(long, hide = true, default_value_t = 32400)]
+        plex_port: u16,
+    },
+    /// Install Plex Media Server from Plex's package source, and make a media folder Plex and
+    /// you can both use (Movies, TV Shows). Needs administrator rights; the setup page runs it
+    /// through the system's password dialog.
+    PlexInstall {
+        /// Owner of the folders it creates, as UID:GID.
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, default_value = "/srv/media")]
+        media: PathBuf,
     },
     /// Run the HTTP API (and, with [execution] enabled, the background worker).
     Serve {
@@ -495,6 +511,8 @@ async fn main() -> Result<()> {
             plex_auth_url,
             no_docker,
             open,
+            plex_installer,
+            plex_port,
         } => {
             wizard::run(wizard::Options {
                 state_dir,
@@ -508,8 +526,20 @@ async fn main() -> Result<()> {
                 plex_auth: plex_auth_url,
                 docker: !no_docker,
                 open,
+                plex_installer,
+                plex_port,
             })
             .await
+        }
+        Command::PlexInstall { owner, media } => {
+            let owner = match owner {
+                Some(o) => {
+                    let (u, g) = o.split_once(':').context("--owner is UID:GID")?;
+                    Some((u.parse()?, g.parse()?))
+                }
+                None => None,
+            };
+            arr::plexinstall::run(arr::plexinstall::Options { owner, media }).await
         }
         Command::Mcp {
             api_url,
