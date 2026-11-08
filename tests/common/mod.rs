@@ -1223,6 +1223,5 @@ pub async fn playable(path: &Path) -> bool {
 }
 
 pub fn ino(path: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).unwrap().ino()
+    arr::fsutil::file_id(path).unwrap().1
 }
