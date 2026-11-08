@@ -1504,7 +1504,7 @@ fn render_config(
     let s = |v: &str| toml::Value::String(v.to_string()).to_string();
     let mut out = format!(
         r#"# Arr configuration, written by the setup page. Secrets live in secrets/ (mode 600).
-# All options: https://github.com/newtonharry/Arr/blob/main/config/standalone.example.toml
+# More options: https://github.com/newtonharry/Arr/blob/main/config/standalone.example.toml
 
 [server]
 listen = {listen}
