@@ -389,7 +389,14 @@ if [ "$DO_PLEX" = 1 ]; then
 			else run launchctl unload "$agent" 2>/dev/null || true; fi
 			remove_file "$agent"
 		fi
-		remove_dir "$PLEX_APP" "the Plex app"
+		# The app bundle ships small sample videos of its own, so the media guard for data
+		# folders doesn't apply; it's removed only when it really is Plex's app.
+		if grep -q 'com.plexapp.plexmediaserver' "$PLEX_APP/Contents/Info.plist" 2>/dev/null; then
+			if [ -w "$(dirname "$PLEX_APP")" ]; then run rm -rf -- "$PLEX_APP"; else run $SUDO rm -rf -- "$PLEX_APP"; fi
+			[ "$DRY_RUN" = 1 ] || say "  deleted $PLEX_APP (the Plex app)"
+		else
+			say "  not deleting $PLEX_APP: it doesn't look like Plex's app"
+		fi
 		;;
 	esac
 	if [ "$PLEX_WIPE" = 1 ] && [ -n "$PLEX_DATA" ]; then

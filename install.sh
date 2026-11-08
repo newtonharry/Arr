@@ -241,6 +241,9 @@ if ! have ffprobe; then
 		die "install FFmpeg (it provides ffprobe), then run this again"
 	fi
 fi
+# Homebrew's folders may not be on this shell's PATH yet (a fresh Homebrew, or a shell that
+# never loaded its setup).
+[ "$os" != Darwin ] || PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 FFPROBE=$(command -v ffprobe)
 say "Found $FFPROBE"
 
@@ -567,11 +570,14 @@ open_page() {
 		have xdg-open || return 0
 		if [ "$(id -u)" = 0 ]; then
 			[ -n "${SUDO_USER:-}" ] || return 0
-			DESKTOP_ENV=""
-			desktop_env
-			[ -n "$DESKTOP_ENV" ] ||
-				DESKTOP_ENV="${DISPLAY:+DISPLAY=$DISPLAY} ${WAYLAND_DISPLAY:+WAYLAND_DISPLAY=$WAYLAND_DISPLAY}"
-			case "$DESKTOP_ENV" in *=*) ;; *) return 0 ;; esac
+			# The desktop session the setup page found, if it ran; otherwise find it now. Either
+			# way the browser gets the user's runtime folder and session bus, not just a display.
+			[ -n "${DESKTOP_ENV:-}" ] || desktop_env
+			if [ -z "${DESKTOP_ENV:-}" ]; then
+				[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+				rt="/run/user/$(id -u "$SUDO_USER")"
+				DESKTOP_ENV="XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus${DISPLAY:+ DISPLAY=$DISPLAY}${WAYLAND_DISPLAY:+ WAYLAND_DISPLAY=$WAYLAND_DISPLAY}"
+			fi
 			# shellcheck disable=SC2086 # NAME=value words without spaces
 			set -- sudo -u "$SUDO_USER" env $DESKTOP_ENV xdg-open "$url"
 		else
