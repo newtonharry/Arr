@@ -2,9 +2,8 @@
 
 const $ = (id) => document.getElementById(id);
 let state = null;
-let polling = null;
-let formFilled = false;
-let listening = false;
+// The library lists the form was last filled from.
+let filled = null;
 let linking = false;
 
 async function call(method, path, body) {
@@ -40,13 +39,11 @@ function render(s) {
     return;
   }
   if (phase === "done") {
-    $("done-downloading").textContent = s.phase.downloading
-      ? "Ask for a movie or show and Arr will download it into Plex."
-      : "Downloading is off for now. Run the installer again or edit Arr's config to turn it on.";
     $("done-movies").hidden = !!s.phase.movies;
     return;
   }
-  if (phase === "failed") showError(s.phase.message);
+  // The form is back, and Finish starts again where it stopped (the import resumes).
+  if (phase === "failed") showError(`${s.phase.message}\n\nClick Finish setup to try again.`);
 
   $("signin").hidden = s.signed_in;
   $("signed-in").hidden = !s.signed_in;
@@ -61,7 +58,9 @@ function render(s) {
   const noLibraries = ready && s.plex.movies.length === 0 && s.plex.tv.length === 0;
   $("step-libraries").hidden = !ready;
   $("step-options").hidden = !ready || noLibraries;
-  if (ready && !formFilled) fillLibraries(s.plex);
+  // Refilled when Plex's libraries change (added in Plex, then Look again).
+  const lists = ready ? JSON.stringify([s.plex.movies, s.plex.tv]) : null;
+  if (ready && lists !== filled) { fillLibraries(s.plex); filled = lists; }
 }
 
 const MISSING = {
@@ -90,10 +89,11 @@ function renderServer(s) {
   $("connected").hidden = !s.plex;
   if (s.plex) $("connected").textContent = `Found ${s.plex.name} on this computer.`;
   const install = s.install.state;
-  // No Plex here (or it's being installed): offer to install it.
+  // No Plex here (or it's being installed): offer to install it, where there's a way to.
   const busy = install === "running" || linking;
-  const installing = !s.plex && s.signed_in &&
-    (busy || install === "failed" || (s.missing === "not_installed" && install !== "done"));
+  const canOffer = s.can_install || !!s.install_command;
+  const installing = !s.plex && s.signed_in && (busy || install === "failed" ||
+    (canOffer && s.missing === "not_installed" && install !== "done"));
   $("install").hidden = !installing;
   if (installing) {
     $("missing").hidden = true;
@@ -102,6 +102,8 @@ function renderServer(s) {
     $("install-ask").hidden = busy || !s.can_install;
     $("install-manual").hidden = busy || s.can_install;
     $("install-cmd").textContent = s.install_command || "";
+    // After a failed install, Plex may be there anyway (or be installed by hand).
+    $("install-look").hidden = busy || (s.can_install && install !== "failed");
     if (install === "failed" && !busy) showError(s.install.message);
     return;
   }
@@ -109,6 +111,7 @@ function renderServer(s) {
   // failed before it could say why (plex.tv unreachable, say).
   $("missing").hidden = !s.signed_in || !!s.plex;
   if (s.plex || !s.signed_in) return;
+  $("switch-account").hidden = s.missing !== "not_linked";
   const [before, label, href, after] = MISSING[s.missing] ||
     ["Arr couldn't check your Plex account just now. Check this computer's internet connection, then look again.", "", "", ""];
   const parts = [before];
@@ -121,7 +124,6 @@ function renderServer(s) {
 }
 
 function fillLibraries(plex) {
-  formFilled = true;
   const none = plex.movies.length === 0 && plex.tv.length === 0;
   $("new-libraries").hidden = !none;
   $("libraries-intro").hidden = none;
@@ -129,12 +131,13 @@ function fillLibraries(plex) {
   $("step-options").hidden = none;
   $("apply").disabled = none;
   if (none) {
-    $("new-movies").value = state.media_movies;
-    $("new-tv").value = state.media_tv;
+    if (!$("new-movies").value) $("new-movies").value = state.media_movies;
+    if (!$("new-tv").value) $("new-tv").value = state.media_tv;
     return;
   }
   for (const kind of ["movies", "tv"]) {
     const sel = $(`${kind}-lib`);
+    const before = sel.options.length ? sel.value : null;
     sel.replaceChildren();
     for (const lib of plex[kind]) {
       const o = document.createElement("option");
@@ -147,28 +150,34 @@ function fillLibraries(plex) {
     skip.value = "";
     skip.textContent = kind === "movies" ? "Don't add movies" : "Don't add TV shows";
     sel.append(skip);
-    if (!listening) {
-      sel.addEventListener("change", () => libraryChanged(kind));
-      $(`${kind}-folder`).addEventListener("change", () => checkFolder(`${kind}-folder`, `${kind}-hint`, false));
-    }
-    libraryChanged(kind);
+    // Keep what was chosen (and its folder) while it's still in the list.
+    if (before !== null && [...sel.options].some((o) => o.value === before)) sel.value = before;
+    else libraryChanged(kind);
   }
-  if (!listening) $("downloads").addEventListener("change", () => checkFolder("downloads", "downloads-hint", true));
-  listening = true;
 }
+
+for (const kind of ["movies", "tv"]) {
+  $(`${kind}-lib`).addEventListener("change", () => libraryChanged(kind));
+  $(`${kind}-folder`).addEventListener("change", () => checkFolder(`${kind}-folder`, `${kind}-hint`, false));
+}
+$("downloads").addEventListener("change", () => checkFolder("downloads", "downloads-hint", true));
 
 function libraryChanged(kind) {
   const lib = state.plex[kind].find((l) => l.id === $(`${kind}-lib`).value);
   const folder = $(`${kind}-folder`);
+  const hint = $(`${kind}-hint`);
   folder.closest(".folder").hidden = !lib;
-  $(`${kind}-hint`).textContent = "";
-  if (!lib) { suggestDownloads(); return; }
-  folder.value = lib.local_path || "";
-  $(`${kind}-hint`).textContent = lib.local_path
-    ? (lib.local_path === lib.plex_path ? "" : `Plex sees this folder as ${lib.plex_path}.`)
-    : `Plex keeps this library in ${lib.plex_path}. Enter where that folder is on this computer.`;
-  if (lib.local_path) checkFolder(`${kind}-folder`, `${kind}-hint`, false);
+  hint.textContent = "";
+  if (lib) {
+    folder.value = lib.local_path || "";
+    hint.textContent = lib.local_path
+      ? (lib.local_path === lib.plex_path ? "" : `Plex sees this folder as ${lib.plex_path}.`)
+      : `Plex keeps this library in ${lib.plex_path}. Enter where that folder is on this computer.`;
+    if (lib.local_path) checkFolder(`${kind}-folder`, `${kind}-hint`, false);
+  }
   suggestDownloads();
+  // The TMDB key only finds movies. A key typed in stays, in case movies come back.
+  $("tmdb-box").hidden = !$("movies-lib").value;
 }
 
 function suggestDownloads() {
@@ -210,42 +219,56 @@ async function act(button, fn) {
   }
 }
 
+let pollId = 0;
+
+// Calls step every `ms` until it returns false. Each call waits for the one before, and
+// starting another poll ends this one.
+function poll(step, ms) {
+  const id = ++pollId;
+  const tick = async () => {
+    if (id !== pollId) return;
+    let more = true;
+    try { more = await step(); } catch (_) { /* try again next time */ }
+    if (more !== false && id === pollId) setTimeout(tick, ms);
+  };
+  setTimeout(tick, ms);
+}
+
+// Until signed in, or the sign-in expires (the server then forgets it): a failed look,
+// plex.tv having a bad moment, doesn't end it.
 function startSigninPolling() {
-  clearInterval(polling);
-  polling = setInterval(async () => {
+  poll(async () => {
+    let s;
     try {
-      const s = await call("POST", "/api/plex/check");
-      if (s.signed_in || !s.waiting_for_signin) { clearInterval(polling); polling = null; }
-      render(s);
+      s = await call("POST", "/api/plex/check");
+      showError("");
     } catch (e) {
-      clearInterval(polling); polling = null;
       showError(e.message);
-      render(await call("GET", "/api/state"));
+      s = await call("GET", "/api/state");
     }
+    render(s);
+    return !s.signed_in && s.waiting_for_signin;
   }, 2000);
 }
 
 function startProgressPolling() {
-  clearInterval(polling);
-  polling = setInterval(async () => {
-    let s;
-    try { s = await call("GET", "/api/state"); } catch (_) { return; }
+  poll(async () => {
+    const s = await call("GET", "/api/state");
     render(s);
-    if (s.phase.state === "done") {
-      clearInterval(polling); polling = null;
-      call("POST", "/api/finish").catch(() => {});
-    } else if (s.phase.state !== "working") {
-      clearInterval(polling); polling = null;
-    }
+    if (s.phase.state === "done") call("POST", "/api/finish").catch(() => {});
+    return s.phase.state === "working";
   }, 1000);
 }
 
-$("signin-btn").addEventListener("click", async () => {
+// A new sign-in starts over, so it can be with a different account.
+async function startSignin() {
   showError("");
   // Open the tab now, while the click still counts: browsers block pop-ups opened later.
   const tab = window.open("about:blank", "_blank");
   try {
     const r = await call("POST", "/api/plex/signin");
+    filled = null;
+    for (const kind of ["movies", "tv"]) $(`${kind}-lib`).replaceChildren();
     $("signin-link").href = r.url;
     if (tab) tab.location.href = r.url; else window.open(r.url, "_blank");
     render(await call("GET", "/api/state"));
@@ -254,16 +277,18 @@ $("signin-btn").addEventListener("click", async () => {
     if (tab) tab.close();
     showError(e.message);
   }
-});
+}
+
+$("signin-btn").addEventListener("click", startSignin);
+$("switch-account").addEventListener("click", startSignin);
 
 // Reports start as soon as the box is ticked, so a problem later in setup is covered too.
 $("reporting").addEventListener("change", (ev) =>
   act(null, () => call("POST", "/api/reporting", { enabled: ev.target.checked })));
 
-$("look-again").addEventListener("click", (ev) =>
-  act(ev.target, () => call("POST", "/api/plex/check")));
-$("install-look").addEventListener("click", (ev) =>
-  act(ev.target, () => call("POST", "/api/plex/check")));
+for (const id of ["look-again", "install-look", "libs-look"]) {
+  $(id).addEventListener("click", (ev) => act(ev.target, () => call("POST", "/api/plex/check")));
+}
 
 // Install Plex, then link it to the account (the check does that), showing each step.
 $("install-btn").addEventListener("click", async (ev) => {
@@ -273,13 +298,11 @@ $("install-btn").addEventListener("click", async (ev) => {
 
 // Shows the install's steps until it ends, then links the new Plex (the check does that).
 function followInstall() {
-  clearInterval(polling);
-  polling = setInterval(async () => {
-    let s;
-    try { s = await call("GET", "/api/state"); } catch (_) { return; }
-    if (s.install.state === "running") { render(s); return; }
-    clearInterval(polling); polling = null;
+  poll(async () => {
+    const s = await call("GET", "/api/state");
+    if (s.install.state === "running") { render(s); return true; }
     if (s.install.state === "done") await linkPlex(s); else render(s);
+    return false;
   }, 1000);
 }
 
@@ -293,12 +316,10 @@ async function linkPlex(s) {
 
 $("create-libs").addEventListener("click", async (ev) => {
   const body = { movies: $("new-movies").value, tv: $("new-tv").value, language: navigator.language || "" };
-  formFilled = false;
   await act(ev.target, () => call("POST", "/api/plex/libraries", body));
   const warnings = (state && state.warnings) || [];
   $("libs-warning").textContent = warnings.join(" ");
   $("libs-warning").hidden = warnings.length === 0;
-  if (state && state.plex && !formFilled) fillLibraries(state.plex);
 });
 
 // The TMDB key is checked with TMDB as it's pasted, so a wrong one shows up straight away.
@@ -341,11 +362,12 @@ $("form").addEventListener("submit", async (ev) => {
     movies: lib("movies"),
     tv: lib("tv"),
     downloads: $("downloads").value.trim(),
-    tmdb: $("tmdb").value.trim(),
-    downloading: $("downloading").checked,
+    tmdb: $("tmdb-box").hidden ? "" : $("tmdb").value.trim(),
     auto_update: $("auto-update").checked,
     reporting: $("reporting").checked,
   };
+  // From the click, not the answer, so "Checking your TMDB key" shows too.
+  startProgressPolling();
   await act($("apply"), () => call("POST", "/api/apply", body));
   if (state && state.phase.state === "working") startProgressPolling();
 });

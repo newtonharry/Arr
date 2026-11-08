@@ -38,6 +38,7 @@
       <div id="missing" hidden>
         <p id="missing-text"></p>
         <button type="button" id="look-again">Look again</button>
+        <button type="button" id="switch-account" hidden>Sign in with a different account</button>
       </div>
       <div id="install" hidden>
         <p>Plex isn't on this computer yet. Plex is the free app that plays your movies and shows on your TV, phone and browser, and Arr can install it for you.</p>
@@ -48,8 +49,8 @@
         <div id="install-manual" hidden>
           <p>To install it, open a terminal, paste this line and press Enter, then come back and click <strong>Look again</strong>:</p>
           <pre><code id="install-cmd"></code></pre>
-          <button type="button" id="install-look">Look again</button>
         </div>
+        <button type="button" id="install-look" hidden>Look again</button>
         <div id="install-progress" hidden>
           <div class="spinner" aria-hidden="true"></div>
           <p id="install-step" class="muted" aria-live="polite"></p>
@@ -75,6 +76,8 @@
         <label>Movies <input id="new-movies" autocomplete="off"></label>
         <label>TV shows <input id="new-tv" autocomplete="off"></label>
         <button type="button" id="create-libs" class="primary">Create my libraries</button>
+        <p class="hint">Or add them in Plex yourself, then click <strong>Look again</strong>.</p>
+        <button type="button" id="libs-look">Look again</button>
       </div>
       <p class="hint bad" id="libs-warning" hidden></p>
     </section>
@@ -83,9 +86,6 @@
       <h2><span class="num">4</span> Downloads</h2>
       <label>Download folder <input id="downloads" autocomplete="off"></label>
       <p class="hint" id="downloads-hint">Downloads finish here, then move into your library. Keep it on the same drive as your library to save space.</p>
-
-      <label class="check"><input type="checkbox" id="downloading" checked> Let Arr download what you ask for</label>
-      <p class="hint">Turn this off to try Arr out first: it will search and plan, but not download.</p>
 
       <label class="check"><input type="checkbox" id="auto-update"> Install Arr updates automatically</label>
       <p class="hint">Recommended. Arr checks once a day for a new version and installs it, and goes back to the old one if the new one doesn't start.</p>
@@ -122,7 +122,6 @@
   <section id="done" class="card" hidden>
     <h2>Arr is set up</h2>
     <p>Arr knows what's already in your Plex libraries. The installer is finishing up in the terminal, starting Arr in the background.</p>
-    <p id="done-downloading"></p>
     <p id="done-movies" hidden>Arr can find TV shows, but not movies you don't have yet: that needs a free TMDB key. When you have one, run the install command again and it will ask for it (<a href="https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md" target="_blank" rel="noopener noreferrer">how to get a key</a>).</p>
     <p>You can close this tab.</p>
   </section>
