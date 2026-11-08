@@ -6,18 +6,26 @@
 # Nothing here needs administrator rights. `irm | iex` can't pass options, so they come
 # from environment variables, for example: $env:ARR_VERSION = "v0.4.0"; irm ... | iex
 #
-#   ARR_VERSION       a release tag such as v0.4.0 (default: the latest release)
-#   ARR_AUTO_UPDATE   1 to install new versions automatically, 0 to turn that off
-#   ARR_ERROR_REPORTS 1 to start the setup page with error reports ticked (docs/PRIVACY.md)
-#   ARR_TMDB_KEY      a TMDB key, added to an existing install so Arr can find new movies
-#   ARR_PORT          Arr's port on this computer (default 8787)
-#   ARR_STATE_DIR     Arr's folder: config, secrets, database (default %LOCALAPPDATA%\Arr)
-#   ARR_BIN_DIR       where arr.exe goes (default %LOCALAPPDATA%\Programs\Arr)
-#   ARR_NO_SETUP      1 to install the program only
-#   ARR_YES           1 to never ask (FFmpeg is installed without asking)
+#   ARR_VERSION          a release tag such as v0.4.0 (default: the latest release)
+#   ARR_AUTO_UPDATE      1 to install new versions automatically, 0 to turn that off
+#   ARR_ERROR_REPORTS    1 to send error reports, 0 not to (docs/PRIVACY.md)
+#   ARR_TMDB_KEY         a TMDB key, so Arr can find new movies
+#   ARR_UPLOAD_LIMIT_KIB upload limit for downloads in KiB/s (0 = no limit)
+#   ARR_TORRENT_PORT     the port downloads use (default 50413)
+#   ARR_PORT             Arr's port on this computer (default 8787; first setup only)
+#   ARR_STATE_DIR        Arr's folder: config, secrets, database (default: where Arr is
+#                        installed, else %LOCALAPPDATA%\Arr)
+#   ARR_BIN_DIR          where arr.exe goes (default: where it is, else %LOCALAPPDATA%\Programs\Arr)
+#   ARR_NO_SETUP         1 to install the program only
+#   ARR_YES              1 to never ask (FFmpeg is installed without asking); first setup
+#                        needs the setup page, so it needs someone at the browser
+#
+# Running this again keeps your settings and updates Arr; the options above that you give
+# are applied, the rest are kept.
 #
 # Use Arr from ChatGPT on your phone or any device (docs/REMOTE.md): set ARR_REMOTE=1, or
-# answer yes when asked. These skip the questions (an AI agent can pass them all):
+# answer yes when asked. These skip the questions (an AI agent can pass them all); they are
+# used only while adding remote access, and ignored once it's set up:
 #
 #   ARR_NGROK_TOKEN, ARR_NGROK_DOMAIN                     your ngrok authtoken and free domain
 #   ARR_GOOGLE_CLIENT_ID, ARR_GOOGLE_CLIENT_SECRET        your Google OAuth client
@@ -36,13 +44,22 @@ function Install-Arr {
 		$DownloadBase = if ($Version -eq 'latest') { "https://github.com/$Repo/releases/latest/download" }
 		else { "https://github.com/$Repo/releases/download/$Version" }
 	}
-	$BinDir = if ($env:ARR_BIN_DIR) { $env:ARR_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\Arr' }
-	$StateDir = if ($env:ARR_STATE_DIR) { $env:ARR_STATE_DIR } else { Join-Path $env:LOCALAPPDATA 'Arr' }
+	$BinDir, $StateDir = Get-ArrDirs
+	# A given option is checked before anything changes, so it either applies or stops here.
+	foreach ($o in @(@('ARR_PORT', 1, 65535), @('ARR_TORRENT_PORT', 1, 65535), @('ARR_UPLOAD_LIMIT_KIB', 0, 4194304),
+			@('ARR_ERROR_REPORTS', 0, 1), @('ARR_AUTO_UPDATE', 0, 1))) {
+		$v = [Environment]::GetEnvironmentVariable($o[0])
+		if ($v -and -not ($v -match '^\d{1,7}$' -and [int]$v -ge $o[1] -and [int]$v -le $o[2])) {
+			$what = if ($o[2] -eq 1) { '0 or 1' } else { "a number from $($o[1]) to $($o[2])" }
+			throw "$($o[0]) must be $what, not '$v'; nothing was changed"
+		}
+	}
 	$Port = if ($env:ARR_PORT) { [int]$env:ARR_PORT } else { 8787 }
 	$TorrentPort = if ($env:ARR_TORRENT_PORT) { [int]$env:ARR_TORRENT_PORT } else { 50413 }
 	$UploadLimit = if ($env:ARR_UPLOAD_LIMIT_KIB) { [int]$env:ARR_UPLOAD_LIMIT_KIB } else { 0 }
 	$AutoUpdate = $env:ARR_AUTO_UPDATE
 	$Yes = $env:ARR_YES -eq '1'
+	$script:ArrStopped = $false # set by Stop-Arr: if this run fails, Arr is started again
 	$Config = Join-Path $StateDir 'config.toml'
 	$Arr = Join-Path $BinDir 'arr.exe'
 	$Background = Join-Path $BinDir 'arr-background.exe'
@@ -59,6 +76,20 @@ function Install-Arr {
 		$a = Read-Host "$question $hint"
 		if (-not $a) { $a = $default }
 		return $a -match '^[Yy]'
+	}
+
+	# Runs arr with any piped text on its stdin; returns its output, stderr too, as text, and
+	# $LASTEXITCODE says how it went. (Windows PowerShell turns a native program's stderr
+	# into errors, hence Continue.)
+	function Run-Arr {
+		$ErrorActionPreference = 'Continue'
+		$input | & $Arr @args 2>&1 | ForEach-Object { "$_" }
+	}
+	# Changes one setting through `arr set`, which checks it and changes nothing if it's refused.
+	function Set-Arr {
+		$out = $input | Run-Arr set --config $Config @args
+		if ($LASTEXITCODE -ne 0) { throw "couldn't set $($args[0]): $(($out -join ' ') -replace '^Error: ', '')" }
+		Say $out
 	}
 
 	# Whether TMDB accepts a key, asked through arr with the key on stdin; $script:TmdbWhy says
@@ -96,6 +127,10 @@ function Install-Arr {
 	if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
 		Say 'This PC has an ARM processor; Arr runs through Windows 11''s x64 emulation.'
 	}
+	if ($Yes -and $env:ARR_NO_SETUP -ne '1' -and -not (Test-Path $Config)) {
+		throw 'Windows setup needs the setup page in a browser; run this without ARR_YES'
+	}
+	if ($StateDir -ne (Join-Path $env:LOCALAPPDATA 'Arr') -and -not $env:ARR_STATE_DIR) { Say "Found Arr installed in $StateDir" }
 
 	# ------------------------------------------------------------ install the program
 
@@ -110,18 +145,39 @@ function Install-Arr {
 		$got = (Get-FileHash "$tmp\$asset" -Algorithm SHA256).Hash.ToLower()
 		if ($got -ne $want) { throw "checksum mismatch for $asset; nothing was installed" }
 		Expand-Archive "$tmp\$asset" -DestinationPath $tmp -Force
-		Stop-Arr $Background
+		$new = "$tmp\arr-$Target"
+		# Try it before touching the installed one.
+		$version = $null
+		try { $version = & "$new\arr.exe" --version } catch {}
+		if ($LASTEXITCODE -ne 0 -or -not $version) { throw "the downloaded Arr doesn't run on this computer; nothing was changed" }
 		New-Item -ItemType Directory -Force $BinDir | Out-Null
-		foreach ($exe in 'arr.exe', 'arr-background.exe') {
-			Replace-File (Join-Path "$tmp\arr-$Target" $exe) (Join-Path $BinDir $exe)
+		# Arr keeps running meanwhile (Windows can rename a running program); a re-run keeps the
+		# old programs as .previous, to go back to if the new ones don't start.
+		$swapped = @()
+		try {
+			foreach ($exe in 'arr.exe', 'arr-background.exe') {
+				$dst = Join-Path $BinDir $exe
+				$had = Test-Path $dst
+				Replace-File "$new\$exe" $dst -Keep
+				if ($had) { $swapped += $exe }
+			}
+		} catch {
+			Restore-Previous $BinDir $swapped
+			throw "couldn't put the new version in place ($($_.Exception.Message)); the old one is still there"
 		}
 	} finally {
 		Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 	}
-	Say "Installed $(& $Arr --version) to $Arr"
+	Say "Installed $version to $Arr"
 	Add-ToPath $BinDir
 
-	if ($env:ARR_NO_SETUP -eq '1') { return }
+	if ($env:ARR_NO_SETUP -eq '1') {
+		if (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue) {
+			Say 'Restart Arr to use the new version: log out and back in, or run'
+			Say '  Stop-ScheduledTask Arr; Start-ScheduledTask Arr'
+		}
+		return
+	}
 
 	# ------------------------------------------------------------ ffprobe
 
@@ -150,8 +206,35 @@ function Install-Arr {
 
 	if (Test-Path $Config) {
 		Step "Keeping your config in $StateDir"
+		# A config the new version can't use stops here, with Arr still running as it was.
+		$check = Run-Arr check --config $Config
+		if ($LASTEXITCODE -ne 0) {
+			$check | ForEach-Object { Say $_ }
+			throw "Arr can't use $Config (see above), so Arr keeps running as it was. Fix the file, or move it aside and run this again to set up again."
+		}
 		$m = Select-String -Path $Config -Pattern '^listen = "[^"]*:(\d+)"$' | Select-Object -First 1
 		if ($m) { $Port = [int]$m.Matches[0].Groups[1].Value }
+		# Options left set in this window from an earlier run shouldn't stop this one.
+		if ($env:ARR_PORT -and [int]$env:ARR_PORT -ne $Port) {
+			Write-Warning "ARR_PORT is ignored: Arr keeps port $Port from its config"
+		}
+		if (Select-String -Path $Config -Pattern '^\[plex\]' -Quiet) {
+			$null = Run-Arr plex-signin --config $Config --check
+			if ($LASTEXITCODE -eq 1 -and (Interactive)) {
+				Step 'Signing Arr in to Plex again'
+				Say 'Plex no longer accepts Arr''s sign-in, for example after "sign out of all devices".'
+				# Its link is opened as soon as it's printed; it then waits for you to sign in.
+				& { $ErrorActionPreference = 'Continue'; & $Arr plex-signin --config $Config 2>&1 } | ForEach-Object {
+					Say "$_"
+					if ($_ -match '(https?://\S+)') { Open-Page $Matches[1] }
+				}
+				if ($LASTEXITCODE -ne 0) { Write-Warning 'Arr isn''t signed in to Plex; run this again to retry.' }
+			} elseif ($LASTEXITCODE -eq 1) {
+				Write-Warning 'Plex no longer accepts Arr''s sign-in; run this again in PowerShell to sign in again.'
+			} elseif ($LASTEXITCODE -ne 0) {
+				Write-Warning 'couldn''t reach Plex to check Arr''s sign-in; carrying on.'
+			}
+		}
 		# A TMDB key can be added on any later run: $env:ARR_TMDB_KEY, or asked here.
 		$tmdbKey = $env:ARR_TMDB_KEY
 		$tmdbOn = (Get-Content $Config -Raw) -match '(?ms)^\[tmdb\][^\[]*?^enabled *= *true'
@@ -159,34 +242,38 @@ function Install-Arr {
 			Step 'Arr can''t find new movies yet'
 			$tmdbKey = Read-TmdbKey
 		}
-		if ($tmdbKey) {
-			# Arr is already set up (and stopped for the update), so a refused key warns, never stops.
-			Step 'Adding your TMDB key'
-			$tmdbKey.Trim() | & $Arr tmdb-key --config $Config
-			if ($LASTEXITCODE -eq 0) { Say 'Arr can now find movies you don''t own yet.' }
-			else { Write-Warning "the TMDB key wasn't added; Arr carries on without it. Run this again to retry." }
-		}
+		# Given options change only those settings; each is checked, and a refused one stops
+		# here, before Arr is restarted. The TMDB key goes first: it's the one likely refused.
+		if ($tmdbKey) { $tmdbKey.Trim() | Set-Arr tmdb-key }
+		if ($env:ARR_UPLOAD_LIMIT_KIB) { Set-Arr upload-limit-kib $UploadLimit }
+		if ($env:ARR_TORRENT_PORT) { Set-Arr torrent-port $TorrentPort }
+		if ($env:ARR_ERROR_REPORTS) { Set-Arr error-reports $(if ($env:ARR_ERROR_REPORTS -eq '1') { 'on' } else { 'off' }) }
 	} else {
 		Step 'Setting up Arr in your web browser'
+		if (Test-Path "$Config.failed") { Say "(config.toml.failed in $StateDir is the last setup attempt that failed; this starts over)" }
 		$reports = @(if ($env:ARR_ERROR_REPORTS -eq '1') { '--error-reports' })
 		& $Arr wizard --state-dir $StateDir --port $Port --torrent-port $TorrentPort `
 			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open @reports
-		if ($LASTEXITCODE -ne 0) { throw "setup wasn't finished; run this again to start over" }
-		# The page asked about automatic updates; the answer is used once, below.
-		$choices = Join-Path $StateDir 'setup-choices'
-		if (-not $AutoUpdate -and (Test-Path $choices)) {
-			$c = Select-String -Path $choices -Pattern '^auto_update=([01])$' | Select-Object -First 1
-			if ($c) { $AutoUpdate = $c.Matches[0].Groups[1].Value }
-		}
-		Remove-Item $choices -Force -ErrorAction SilentlyContinue
+		if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Config)) { throw "setup wasn't finished; run this again to start over" }
 	}
+	# The setup page asked about automatic updates (maybe on a run that stopped before here);
+	# the answer is used once, below.
+	$choices = Join-Path $StateDir 'setup-choices'
+	if (-not $AutoUpdate -and (Test-Path $choices)) {
+		$c = Select-String -Path $choices -Pattern '^auto_update=([01])$' | Select-Object -First 1
+		if ($c) { $AutoUpdate = $c.Matches[0].Groups[1].Value }
+	}
+	Remove-Item $choices -Force -ErrorAction SilentlyContinue
 	$downloading = (Get-Content $Config -Raw) -match '\[execution\]\r?\nenabled = true'
 
 	# ------------------------------------------------------------ phone and ChatGPT access
 
 	$hasRemote = Select-String -Path $Config -Pattern '^\[mcp\.oauth\]' -Quiet
-	$wantRemote = $env:ARR_REMOTE -eq '1' -or
-		"$env:ARR_NGROK_TOKEN$env:ARR_NGROK_DOMAIN$env:ARR_GOOGLE_CLIENT_ID$env:ARR_GOOGLE_CLIENT_SECRET$env:ARR_ALLOW_EMAILS"
+	$remoteValues = "$env:ARR_NGROK_TOKEN$env:ARR_NGROK_DOMAIN$env:ARR_GOOGLE_CLIENT_ID$env:ARR_GOOGLE_CLIENT_SECRET$env:ARR_ALLOW_EMAILS"
+	$wantRemote = $env:ARR_REMOTE -eq '1' -or $remoteValues
+	if ($hasRemote -and $remoteValues) {
+		Write-Warning 'remote access is already set up, so the ARR_NGROK_*, ARR_GOOGLE_* and ARR_ALLOW_EMAILS values are ignored (docs/REMOTE.md says how to change it)'
+	}
 	if (-not $wantRemote -and -not $hasRemote -and (Interactive)) {
 		Say ''
 		Say 'Arr can also work from ChatGPT on your phone and other devices. That needs a free ngrok'
@@ -209,12 +296,24 @@ function Install-Arr {
 		-ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
 		-StartWhenAvailable -MultipleInstances IgnoreNew
 	$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+	# Only now is Arr stopped: everything that could fail without it running is done.
+	Stop-Arr $Background
 	Register-ScheduledTask -TaskName 'Arr' -Description 'Arr media manager (installed by install.ps1)' -Force `
 		-Action (New-ScheduledTaskAction -Execute $Background -Argument "--config `"$Config`"") `
 		-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
 	Start-ScheduledTask -TaskName 'Arr'
+	$script:ArrStopped = $false
 	$api = "http://127.0.0.1:$Port"
-	if (-not (Wait-Healthy $api '' 30)) { throw "Arr didn't start; see $(Join-Path $StateDir 'arr.log')" }
+	$log = Join-Path $StateDir 'arr.log'
+	if (-not (Wait-Healthy $api '' 30)) {
+		if (-not $swapped) { throw "Arr didn't start; see $log" }
+		Stop-Arr $Background
+		Restore-Previous $BinDir $swapped
+		Start-ScheduledTask -TaskName 'Arr'
+		$script:ArrStopped = $false
+		$back = if (Wait-Healthy $api '' 30) { 'and it is running' } else { 'but it didn''t start either' }
+		throw "the new version of Arr didn't start, so the previous version is back, $back; see $log"
+	}
 
 	# A configured tunnel runs as its own log-on task next to Arr, without a window.
 	$PublicUrl = $null
@@ -231,12 +330,18 @@ function Install-Arr {
 			-Action (New-ScheduledTaskAction -Execute $Background -Argument $tunnelArgs) `
 			-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
 		Start-ScheduledTask -TaskName 'Arr tunnel'
+	} elseif (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) {
+		Step 'Removing the tunnel (remote access isn''t set up any more)'
+		Stop-Tunnel $NgrokYml
+		Unregister-ScheduledTask -TaskName 'Arr tunnel' -Confirm:$false
 	}
 
 	# ------------------------------------------------------------ automatic updates
 
+	$updateTask = Get-ScheduledTask -TaskName 'Arr update' -ErrorAction SilentlyContinue
 	if (-not $AutoUpdate) {
-		if (Test-Path $Updater) { $AutoUpdate = '1' }
+		# Already on (its script may be gone, for example removed by antivirus): repaired below.
+		if ((Test-Path $Updater) -or $updateTask) { $AutoUpdate = '1' }
 		elseif (-not (Interactive)) { $AutoUpdate = '0' } # only ARR_AUTO_UPDATE=1 turns it on
 		elseif (Confirm 'Install new versions of Arr automatically (checked once a day)?' 'y') { $AutoUpdate = '1' }
 		else { $AutoUpdate = '0' }
@@ -253,10 +358,10 @@ function Install-Arr {
 			-Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew) `
 			-Principal $principal | Out-Null
 		Say 'Arr checks for a new release once a day and installs it. Turn this off with $env:ARR_AUTO_UPDATE = "0" and running this again.'
-	} elseif (Test-Path $Updater) {
+	} elseif ((Test-Path $Updater) -or $updateTask) {
 		Step 'Turning off automatic updates'
 		Unregister-ScheduledTask -TaskName 'Arr update' -Confirm:$false -ErrorAction SilentlyContinue
-		Remove-Item $Updater -Force
+		Remove-Item $Updater -Force -ErrorAction SilentlyContinue
 	}
 
 	# ------------------------------------------------------------ what you already own
@@ -288,7 +393,8 @@ function Install-Arr {
 	Say "  API token:   $(Join-Path $StateDir 'secrets\api_token')"
 	Say "  Config:      $Config"
 	Say "  Logs:        $(Join-Path $StateDir 'arr.log')"
-	Say "  Downloading: $(if ($downloading) { 'on' } else { 'off (set [execution] enabled = true to turn it on)' })"
+	$dl = if ($downloading) { 'on' } else { "off (turn it on: arr set --config `"$Config`" downloading on)" }
+	Say "  Downloading: $dl"
 	Say ''
 	Say 'To use Arr from Claude Desktop or another MCP client on this computer, add:'
 	Say ''
@@ -491,26 +597,70 @@ function Stop-Tunnel($ngrokYml) {
 		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
-# Stops the running Arr (the log-on task and its program) so its files can be replaced.
+# Stops the running Arr (the log-on task and its program), to restart it on the new version.
 function Stop-Arr($background) {
+	$script:ArrStopped = $true
 	if (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue) {
 		Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
 	}
-	Get-CimInstance Win32_Process -Filter "Name = 'arr-background.exe'" -ErrorAction SilentlyContinue |
-		Where-Object { $_.ExecutablePath -eq $background -and $_.CommandLine -like '*--config*' -and $_.CommandLine -notlike '*--hidden*' } |
+	# It may run from a renamed file (.previous) by now; its command line still names $background.
+	Get-CimInstance Win32_Process -Filter "Name LIKE 'arr-background%'" -ErrorAction SilentlyContinue |
+		Where-Object { ("$($_.ExecutablePath)".StartsWith($background, 'OrdinalIgnoreCase') -or "$($_.CommandLine)".Contains($background)) -and
+			$_.CommandLine -like '*--config*' -and $_.CommandLine -notlike '*--hidden*' } |
 		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 # Puts $src at $dst even while $dst runs (Claude Desktop may be running `arr mcp`):
-# Windows can rename a running program, just not overwrite it.
-function Replace-File($src, $dst) {
+# Windows can rename a running program, just not overwrite it. The copy goes next to $dst
+# first, so a failed copy leaves $dst as it was. -Keep keeps the old file as $dst.previous.
+function Replace-File($src, $dst, [switch]$Keep) {
+	Get-ChildItem "$dst*.old-*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+	Copy-Item $src "$dst.new" -Force
 	if (Test-Path $dst) {
-		$old = "$dst.old-" + [guid]::NewGuid().ToString('N').Substring(0, 8)
-		Move-Item $dst $old -Force
-		Remove-Item $old -Force -ErrorAction SilentlyContinue # still running: left for next time
+		$old = if ($Keep) { Remove-Aside "$dst.previous"; "$dst.previous" } else { Old-Name $dst }
+		Move-Item $dst $old
+		try { Move-Item "$dst.new" $dst } catch { Move-Item $old $dst; throw }
+		if (-not $Keep) { Remove-Item $old -Force -ErrorAction SilentlyContinue } # still running: left for next time
+	} else {
+		Move-Item "$dst.new" $dst
 	}
-	Get-ChildItem "$dst.old-*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-	Copy-Item $src $dst -Force
+}
+
+function Old-Name($path) { "$path.old-" + [guid]::NewGuid().ToString('N').Substring(0, 8) }
+
+# Deletes $path, or, while it runs, renames it out of the way for a later run to delete.
+function Remove-Aside($path) {
+	if (-not (Test-Path $path)) { return }
+	$old = Old-Name $path
+	Move-Item $path $old
+	Remove-Item $old -Force -ErrorAction SilentlyContinue
+}
+
+# Puts back the programs Replace-File -Keep kept, for each name in $names.
+function Restore-Previous($binDir, $names) {
+	foreach ($e in $names) {
+		$p = Join-Path $binDir $e
+		if (-not (Test-Path "$p.previous")) { continue }
+		Remove-Aside $p
+		Move-Item "$p.previous" $p
+	}
+}
+
+# Arr's folders: from ARR_BIN_DIR and ARR_STATE_DIR, else those of the install that the "Arr"
+# log-on task runs (it may not be in the default folders), else the defaults.
+function Get-ArrDirs {
+	$bin = Join-Path $env:LOCALAPPDATA 'Programs\Arr'
+	$state = Join-Path $env:LOCALAPPDATA 'Arr'
+	if (-not $env:ARR_STATE_DIR) {
+		$a = (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue).Actions | Select-Object -First 1
+		if ($a -and $a.Arguments -match '--config "([^"]+)"') {
+			$state = Split-Path $Matches[1]
+			$bin = Split-Path $a.Execute
+		}
+	}
+	if ($env:ARR_BIN_DIR) { $bin = $env:ARR_BIN_DIR }
+	if ($env:ARR_STATE_DIR) { $state = $env:ARR_STATE_DIR }
+	return $bin, $state
 }
 
 # Adds $dir to your PATH (new terminals see it), keeping %VARIABLES% in the PATH as they are.
@@ -676,9 +826,13 @@ try {
 } catch {
 	$failure = $_
 	Write-Host "error: $($failure.Exception.Message)" -ForegroundColor Red
+	# Arr was stopped to restart it on the new version, and that didn't happen: start it again.
+	if ($script:ArrStopped -and (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)) {
+		Write-Host 'Starting Arr again.'
+		try { Start-ScheduledTask -TaskName 'Arr' } catch {}
+	}
 	# Told to Arr's developer only if this install's config says so (docs/PRIVACY.md).
-	$bin = if ($env:ARR_BIN_DIR) { $env:ARR_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\Arr' }
-	$state = if ($env:ARR_STATE_DIR) { $env:ARR_STATE_DIR } else { Join-Path $env:LOCALAPPDATA 'Arr' }
+	try { $bin, $state = Get-ArrDirs } catch { $bin, $state = 'none', 'none' }
 	if ((Test-Path (Join-Path $bin 'arr.exe')) -and (Test-Path (Join-Path $state 'config.toml'))) {
 		try {
 			& (Join-Path $bin 'arr.exe') report --config (Join-Path $state 'config.toml') --component installer `
