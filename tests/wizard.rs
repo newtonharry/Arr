@@ -598,6 +598,7 @@ async fn only_the_accounts_plex_on_this_computer_is_used() {
     assert_eq!(v["plex"]["name"], "Living Room");
 }
 
+#[cfg(unix)] // only the Unix-only install test uses it
 /// Opens the page with the link's code; returns a client holding the session cookie.
 async fn open_page(link: &str, port: u16) -> Page {
     let http = reqwest::Client::builder()
