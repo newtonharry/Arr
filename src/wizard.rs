@@ -876,10 +876,11 @@ async fn install_plex(State(wiz): St) -> Response {
         let result = run_install(&w, cmd).await;
         w.inner.lock().unwrap().install = match result {
             Ok(()) => Install::Done,
-            Err(message) => {
+            Err(e) => {
+                let message = format!("{e:#}");
                 // Closing the password dialog is a choice, not a failure.
                 if message != NO_PASSWORD {
-                    crate::report::error("plex-install", &message);
+                    crate::report::error("plex-install", &crate::report::reportable(&e));
                 }
                 Install::Failed { message }
             }
@@ -894,7 +895,7 @@ fn set_install_step(wiz: &Wizard, step: &str) {
 
 const NO_PASSWORD: &str = "Plex wasn't installed, because the password wasn't entered. Click Install Plex again to retry.";
 
-async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
+async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
@@ -903,9 +904,9 @@ async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("couldn't start the Plex installer: {e}"))?;
+        .context("couldn't start the Plex installer")?;
     let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        return Err("couldn't start the Plex installer".into());
+        bail!("couldn't start the Plex installer");
     };
     let errors = tokio::spawn(async move {
         let mut buf = Vec::new();
@@ -915,7 +916,7 @@ async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
     // Steps until the installer exits. Not until its output closes: a program it starts
     // (Plex, on Windows) may keep that open.
     let mut lines = BufReader::new(stdout).lines();
-    let failed = |e: std::io::Error| format!("the Plex installer failed: {e}");
+    let failed = |e: std::io::Error| anyhow::Error::new(e).context("the Plex installer failed");
     let status = loop {
         tokio::select! {
             line = lines.next_line() => match line {
@@ -937,13 +938,14 @@ async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
     if !status.success() {
         // pkexec: 126 when the password dialog is closed, 127 when it isn't authorized.
         return Err(match status.code() {
-            Some(126 | 127) if cmd[0].ends_with("pkexec") => NO_PASSWORD.into(),
-            _ => format!("Plex couldn't be installed: {}", tail(&errors)),
+            Some(126 | 127) if cmd[0].ends_with("pkexec") => anyhow::anyhow!(NO_PASSWORD),
+            // Its output is shown on the page but not reported: it can name anything.
+            _ => anyhow::Error::new(crate::report::Private(tail(&errors)))
+                .context("Plex couldn't be installed"),
         });
     }
     set_install_step(wiz, "Waiting for Plex to start");
-    let identity = Url::parse(&format!("http://127.0.0.1:{}/identity", wiz.opts.plex_port))
-        .map_err(|e| e.to_string())?;
+    let identity = Url::parse(&format!("http://127.0.0.1:{}/identity", wiz.opts.plex_port))?;
     for _ in 0..90 {
         if let Ok(r) = upstream::send(wiz.http.get(identity.clone())).await
             && r.status().is_success()
@@ -952,10 +954,7 @@ async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err(
-        "Plex was installed but hasn't started yet. Restart the computer, then click Look again."
-            .into(),
-    )
+    bail!("Plex was installed but hasn't started yet. Restart the computer, then click Look again.")
 }
 
 #[derive(Deserialize)]

@@ -75,7 +75,50 @@ fn start_to(dsn: sentry::types::Dsn, component: &str) -> Reporting {
     let hub = sentry::Hub::main();
     hub.bind_client(Some(client.clone()));
     hub.configure_scope(|s| s.set_tag("component", component));
+    report_panics();
     Reporting(Some(client))
+}
+
+/// Panics are reported through the main hub as well; sentry's own panic hook uses the
+/// panicking thread's hub, which may predate reporting.
+fn report_panics() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let next = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let hub = sentry::Hub::main();
+            if let Some(client) = hub.client().filter(|c| c.is_enabled()) {
+                hub.capture_event(panic_event(info));
+                client.flush(Some(Duration::from_secs(2)));
+            }
+            next(info);
+        }));
+    });
+}
+
+#[allow(clippy::field_reassign_with_default)] // Event is non_exhaustive: no struct literal
+fn panic_event(info: &std::panic::PanicHookInfo<'_>) -> Event<'static> {
+    let p = info.payload();
+    let message = p
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("Box<Any>");
+    let x = sentry::protocol::Exception {
+        ty: "panic".into(),
+        value: Some(message.to_string()),
+        stacktrace: sentry::integrations::backtrace::current_stacktrace(),
+        mechanism: Some(sentry::protocol::Mechanism {
+            ty: "panic".into(),
+            handled: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut e = Event::default();
+    e.exception = vec![x].into();
+    e.level = sentry::Level::Fatal;
+    e
 }
 
 /// Reports an error that stopped something the user was doing. Does nothing unless
@@ -298,16 +341,21 @@ mod tests {
             let _ = sentry::Hub::current(); // this thread's hub, made before reporting is on
             wait.recv().unwrap();
             error("setup", "failed on another thread");
+            panic!("panicked on another thread");
         });
         let dsn = parse_dsn(&format!("http://key@{addr}/1")).unwrap();
         let reporting = start_to(dsn, "setup");
         go.send(()).unwrap();
-        worker.join().unwrap();
+        assert!(worker.join().is_err());
         drop(reporting);
-        let body = got
-            .recv_timeout(Duration::from_secs(5))
-            .expect("nothing was sent");
-        assert!(body.contains("failed on another thread"), "{body}");
+        let mut bodies = String::new();
+        for _ in 0..2 {
+            bodies += &got
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("not everything was sent: {bodies}"));
+        }
+        assert!(bodies.contains("failed on another thread"), "{bodies}");
+        assert!(bodies.contains("panicked on another thread"), "{bodies}");
     }
 
     #[test]
