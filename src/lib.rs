@@ -35,6 +35,7 @@ pub mod prowlarr;
 pub mod qbit;
 pub mod quality;
 pub mod release;
+pub mod report;
 pub mod rss;
 pub mod scan;
 pub mod search;

@@ -609,6 +609,8 @@ try {
 	Log "$latest didn't start; going back to $current"
 	Roll-Back
 	if (-not (Healthy $current)) { Log "$current didn't start either; check $(Join-Path $StateDir 'arr.log')" }
+	# Told to Arr's developer only if the config says so (docs/PRIVACY.md).
+	try { & $arr report --config (Join-Path $StateDir 'config.toml') --component updater --message "$latest didn't start, so Arr went back to $current" 2>&1 | Out-Null } catch {}
 	exit 1
 } catch {
 	Log "update failed: $($_.Exception.Message)"
@@ -624,6 +626,16 @@ try {
 try {
 	Install-Arr
 } catch {
-	Write-Host "error: $($_.Exception.Message)" -ForegroundColor Red
-	if ($env:ARR_INSTALL_STRICT -eq '1') { throw } # tests want a failing exit code
+	$failure = $_
+	Write-Host "error: $($failure.Exception.Message)" -ForegroundColor Red
+	# Told to Arr's developer only if this install's config says so (docs/PRIVACY.md).
+	$bin = if ($env:ARR_BIN_DIR) { $env:ARR_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\Arr' }
+	$state = if ($env:ARR_STATE_DIR) { $env:ARR_STATE_DIR } else { Join-Path $env:LOCALAPPDATA 'Arr' }
+	if ((Test-Path (Join-Path $bin 'arr.exe')) -and (Test-Path (Join-Path $state 'config.toml'))) {
+		try {
+			& (Join-Path $bin 'arr.exe') report --config (Join-Path $state 'config.toml') --component installer `
+				--message $failure.Exception.Message 2>&1 | Out-Null
+		} catch {}
+	}
+	if ($env:ARR_INSTALL_STRICT -eq '1') { throw $failure } # tests want a failing exit code
 }

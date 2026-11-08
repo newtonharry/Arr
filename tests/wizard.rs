@@ -291,6 +291,8 @@ async fn start_wizard(
         .arg(format!("--plex-tv-url=http://{mock}/"))
         .arg(format!("--plex-auth-url=http://{mock}/auth"))
         .args(extra)
+        // Error reports never leave a test: nothing listens on port 9.
+        .env("ARR_SENTRY_DSN", "http://key@127.0.0.1:9/1")
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -412,6 +414,22 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     );
     assert_eq!(v["plex"]["tv"][0]["id"], "2:0");
 
+    // Error reports: offered, off until ticked, and switchable before Finish.
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(
+        v["reporting"],
+        json!({ "available": true, "enabled": false })
+    );
+    let (s, v) = page
+        .post("/api/reporting", json!({ "enabled": true }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["reporting"]["enabled"], true);
+    let (_, v) = page
+        .post("/api/reporting", json!({ "enabled": false }))
+        .await;
+    assert_eq!(v["reporting"]["enabled"], false);
+
     // Folder checks.
     let (_, v) = page
         .post("/api/folder", json!({ "path": "media/movies" }))
@@ -430,6 +448,7 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
             "tmdb": "",
             "downloading": false,
             "auto_update": true,
+            "reporting": true,
         })
     };
     let (s, v) = page.post("/api/apply", choices("3:0")).await;
@@ -467,6 +486,7 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         "tv_section = 2".into(),
         "[execution]\nenabled = false".into(),
         "[tmdb]\nenabled = false".into(),
+        "[reporting]\nenabled = true".into(),
     ] {
         assert!(config.contains(&want), "missing {want:?} in:\n{config}");
     }

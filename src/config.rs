@@ -54,6 +54,16 @@ struct FileConfig {
     #[serde(default)]
     indexer: Vec<IndexerSection>,
     mcp: Option<McpSection>,
+    #[serde(default)]
+    reporting: ReportingSection,
+}
+
+/// Opt-in error reports (docs/PRIVACY.md): off unless the user said yes during setup.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ReportingSection {
+    #[serde(default)]
+    enabled: bool,
 }
 
 /// One native indexer: The Pirate Bay's JSON API or a generic Torznab endpoint.
@@ -928,6 +938,8 @@ pub struct RuntimeConfig {
     /// Native indexers (exclusive with `prowlarr`).
     pub indexers: Vec<IndexerConfig>,
     pub mcp: Option<McpConfig>,
+    /// Send scrubbed error reports (`[reporting] enabled`, docs/PRIVACY.md).
+    pub reporting: bool,
 }
 
 impl RuntimeConfig {
@@ -1572,6 +1584,7 @@ pub fn parse_config(
             plex,
             indexers,
             mcp,
+            reporting: fc.reporting.enabled,
         },
         pending,
     ))

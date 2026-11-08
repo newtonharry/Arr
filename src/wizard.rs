@@ -79,6 +79,8 @@ struct Wizard {
     http: reqwest::Client,
     inner: Mutex<Inner>,
     finished: Notify,
+    /// Error reports, from the moment the user ticks the box (docs/PRIVACY.md).
+    reporting: Mutex<Option<crate::report::Reporting>>,
 }
 
 #[derive(Default)]
@@ -192,6 +194,7 @@ pub async fn run(opts: Options) -> Result<()> {
         http: upstream::http_client(PLEX_TIMEOUT, reqwest::redirect::Policy::none()),
         inner: Mutex::new(Inner::default()),
         finished: Notify::new(),
+        reporting: Mutex::new(None),
         opts,
     });
     let host = if wiz.opts.bind.is_loopback() {
@@ -246,6 +249,7 @@ fn router(wiz: Arc<Wizard>) -> Router {
         .route("/api/plex/check", post(check_signin))
         .route("/api/plex/install", post(install_plex))
         .route("/api/plex/libraries", post(create_libraries))
+        .route("/api/reporting", post(set_reporting))
         .route("/api/folder", post(folder))
         .route("/api/apply", post(apply))
         .route("/api/finish", post(finish))
@@ -411,6 +415,10 @@ fn snapshot(wiz: &Wizard) -> Value {
         "media_movies": crate::plexinstall::default_media().join("Movies"),
         "media_tv": crate::plexinstall::default_media().join("TV Shows"),
         "phase": inner.phase,
+        "reporting": {
+            "available": crate::report::available(),
+            "enabled": wiz.reporting.lock().unwrap().as_ref().is_some_and(|r| r.is_on()),
+        },
     })
 }
 
@@ -755,6 +763,24 @@ async fn sections(base_url: Url, token: Secret) -> Result<Vec<Section>, upstream
     .await
 }
 
+// ------------------------------------------------------------------ error reports
+
+#[derive(Deserialize)]
+struct ReportingChoice {
+    enabled: bool,
+}
+
+/// The "Send error reports" box: reporting starts the moment it's ticked, so a failure
+/// later in setup is reported too, and stops when it's unticked.
+async fn set_reporting(State(wiz): St, Json(r): Json<ReportingChoice>) -> Response {
+    let next = r.enabled.then(|| crate::report::start(true, "setup"));
+    // The old client is dropped outside the lock, and off the async threads: dropping
+    // waits up to two seconds for queued reports.
+    let old = std::mem::replace(&mut *wiz.reporting.lock().unwrap(), next);
+    tokio::task::spawn_blocking(move || drop(old));
+    Json(snapshot(&wiz)).into_response()
+}
+
 // ------------------------------------------------------------------ installing Plex
 
 /// How this page installs Plex as administrator: the system's password dialog running
@@ -845,7 +871,10 @@ async fn install_plex(State(wiz): St) -> Response {
         let result = run_install(&w, cmd).await;
         w.inner.lock().unwrap().install = match result {
             Ok(()) => Install::Done,
-            Err(message) => Install::Failed { message },
+            Err(message) => {
+                crate::report::error("plex-install", &message);
+                Install::Failed { message }
+            }
         };
     });
     Json(snapshot(&wiz)).into_response()
@@ -1198,6 +1227,9 @@ struct Choices {
     tmdb: String,
     downloading: bool,
     auto_update: bool,
+    /// Send error reports (written as `[reporting] enabled`).
+    #[serde(default)]
+    reporting: bool,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1267,9 +1299,11 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
             Ok(()) => Phase::Done {
                 downloading: c.downloading,
             },
-            Err(e) => Phase::Failed {
-                message: format!("{e:#}"),
-            },
+            Err(e) => {
+                let message = format!("{e:#}");
+                crate::report::error("setup", &message);
+                Phase::Failed { message }
+            }
         };
         if matches!(inner.phase, Phase::Done { .. }) {
             let w = w.clone();
@@ -1563,6 +1597,11 @@ enabled = true
 token_file = "secrets/mcp_token"
 "#,
     );
+    if c.reporting {
+        out.push_str(
+            "\n# Error reports with names, paths, addresses and tokens removed; see docs/PRIVACY.md.\n[reporting]\nenabled = true\n",
+        );
+    }
     out
 }
 

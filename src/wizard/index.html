@@ -85,6 +85,11 @@
       <label class="check"><input type="checkbox" id="auto-update"> Install Arr updates automatically</label>
       <p class="hint">Recommended. Arr checks once a day for a new version and installs it, and goes back to the old one if the new one doesn't start.</p>
 
+      <div id="reporting-box" hidden>
+        <label class="check"><input type="checkbox" id="reporting"> Send error reports to help fix Arr</label>
+        <p class="hint">If something goes wrong, Arr sends a short note about the error to its developer (through Sentry, stored in the EU). Names, folders, addresses and passwords are removed first, and nothing about your library or what you watch is sent. <a href="https://github.com/newtonharry/Arr/blob/main/docs/PRIVACY.md" target="_blank" rel="noopener noreferrer">What's sent</a>.</p>
+      </div>
+
       <details>
         <summary>Optional: a TMDB key, to find movies you don't have yet</summary>
         <p class="muted">TV shows work without it. Get a free key at <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener noreferrer">themoviedb.org/settings/api</a> (choose “Developer”, any app name is fine), then paste the API key or the read access token.</p>

@@ -131,6 +131,17 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Send one error report, if this install's config allows it ([reporting] enabled; see
+    /// docs/PRIVACY.md). The installers and updaters use it; it never fails.
+    Report {
+        #[arg(long)]
+        config: PathBuf,
+        /// What failed: installer, updater, ...
+        #[arg(long)]
+        component: String,
+        #[arg(long)]
+        message: String,
+    },
     /// Serve MCP tools on stdin/stdout as a client of a running API (stdout carries only MCP).
     Mcp {
         /// Base URL of `arr serve` (http or https; no credentials, query or fragment).
@@ -353,7 +364,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     // Logs go to stderr; the MCP adapter stays quiet unless asked.
     let default_filter = match cli.command {
-        Command::Mcp { .. } | Command::Wizard { .. } => "warn",
+        Command::Mcp { .. } | Command::Wizard { .. } | Command::Report { .. } => "warn",
         _ => "info,arr=info",
     };
     tracing_subscriber::fmt()
@@ -500,7 +511,24 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Serve { config } => api::serve(config::load(&config)?).await,
+        Command::Serve { config } => {
+            let cfg = config::load(&config)?;
+            let _reporting = arr::report::start(cfg.reporting, "server");
+            let result = api::serve(cfg).await;
+            if let Err(e) = &result {
+                arr::report::error("server", &format!("Arr stopped: {e:#}"));
+            }
+            result
+        }
+        Command::Report {
+            config,
+            component,
+            message,
+        } => {
+            let _reporting = arr::report::start(arr::report::enabled_in(&config), &component);
+            arr::report::error(&component, &message);
+            Ok(())
+        }
         Command::Wizard {
             state_dir,
             bind,
