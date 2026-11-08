@@ -1685,13 +1685,16 @@ mod tests {
         let hash = t.info_hash.clone();
         // An admitted, active record of this torrent with its complete file in place, as the
         // engine itself left them: the engine finds every piece and the transfer completes.
-        let (h, out) = (hash.clone(), cfg.save_path.clone());
+        // The save path is client-style; the output folder is the real folder (they differ
+        // on Windows: /C:/x and C:\x).
+        let (h, save) = (hash.clone(), cfg.save_path.clone());
+        let out = cfg.download_dir.to_string_lossy().into_owned();
         store
             .blocking(|c| {
                 c.execute(
                     "INSERT INTO embedded_torrents (info_hash, name, category, tags, save_path, output_folder, multi_file, ratio_limit, seeding_time_limit, admitted_at, added_at, updated_at)
-                     VALUES (?1, ?2, 'um-movies', 'unified-media', ?3, ?3, 0, -2.0, -2, 'x', 'x', 'x')",
-                    params![h, name, out],
+                     VALUES (?1, ?2, 'um-movies', 'unified-media', ?3, ?4, 0, -2.0, -2, 'x', 'x', 'x')",
+                    params![h, name, save, out],
                 )?;
                 Ok(())
             })

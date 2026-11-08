@@ -1,7 +1,8 @@
 //! `arr plex-install`: installs Plex Media Server from Plex's official package source and
-//! makes a media folder that Plex and you can both use. The setup page runs it as
-//! administrator through the system's password dialog (`pkexec`); it does only this, and
-//! prints `step: ...` lines for the page to show.
+//! makes a media folder that Plex and you can both use. On Linux the setup page runs it as
+//! administrator through the system's password dialog (`pkexec`); on Windows it runs as you
+//! and Plex's own installer asks Windows for permission. It does only this, and prints
+//! `step: ...` lines for the page to show.
 
 use anyhow::{Context, Result, bail};
 use std::io::Write;
@@ -12,6 +13,9 @@ const KEY_URL: &str = "https://downloads.plex.tv/plex-keys/PlexSign.v2.key";
 const APT_KEY: &str = "/usr/share/keyrings/plexmediaserver.v2.asc";
 const APT_LIST: &str = "/etc/apt/sources.list.d/plex.list";
 const DNF_REPO: &str = "/etc/yum.repos.d/plex.repo";
+/// Plex's machine-readable list of public builds (URL and SHA-1 per platform).
+#[cfg(windows)]
+const DOWNLOADS_JSON: &str = "https://plex.tv/api/downloads/5.json";
 
 pub struct Options {
     /// Who owns the media folders Arr creates (the user running the setup page).
@@ -25,8 +29,12 @@ fn step(s: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// The package manager this installer knows how to use here, if any.
+/// The package manager this installer knows how to use here, if any ("windows": Plex's
+/// own installer).
 pub fn package_manager() -> Option<&'static str> {
+    if cfg!(windows) {
+        return Some("windows");
+    }
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -35,6 +43,16 @@ pub fn package_manager() -> Option<&'static str> {
             .iter()
             .any(|d| Path::new(d).join(p).is_file())
     })
+}
+
+/// Where a Plex installed by Arr keeps movies and shows: /srv/media on Linux (Plex runs as
+/// its own user there), your own Media folder on Windows (Plex runs as you).
+pub fn default_media() -> PathBuf {
+    if cfg!(windows) {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        return home.unwrap_or_else(|| PathBuf::from("C:\\")).join("Media");
+    }
+    PathBuf::from("/srv/media")
 }
 
 pub async fn run(opts: Options) -> Result<()> {
@@ -54,6 +72,19 @@ pub async fn run(opts: Options) -> Result<()> {
             "this computer has neither apt nor dnf; install Plex from https://www.plex.tv/media-server-downloads/"
         );
     };
+    #[cfg(windows)]
+    if pm == "windows" {
+        install_windows().await?;
+        step("Making your media folder");
+        for d in [
+            opts.media.clone(),
+            opts.media.join("Movies"),
+            opts.media.join("TV Shows"),
+        ] {
+            make_shared_dir(&d, opts.owner)?;
+        }
+        return Ok(());
+    }
     step("Adding Plex's package source");
     match pm {
         "apt-get" => {
@@ -113,6 +144,116 @@ pub async fn run(opts: Options) -> Result<()> {
     step("Starting Plex");
     // The package starts it already; this makes sure it also starts with the computer.
     let _ = run_cmd("systemctl", &["enable", "--now", "plexmediaserver"]);
+    Ok(())
+}
+
+/// Downloads Plex's Windows installer from Plex's list, checks it, runs it silently (it asks
+/// Windows for permission itself) and makes sure Plex is running afterwards.
+#[cfg(windows)]
+async fn install_windows() -> Result<()> {
+    use sha1::{Digest, Sha1};
+    use std::process::{Command, Stdio};
+    step("Downloading Plex Media Server");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()?;
+    let list: serde_json::Value = http
+        .get(DOWNLOADS_JSON)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .context("couldn't reach plex.tv for the Plex installer")?
+        .json()
+        .await
+        .context("plex.tv's download list didn't read correctly")?;
+    let release = list["computer"]["Windows"]["releases"]
+        .as_array()
+        .and_then(|a| a.iter().find(|r| r["build"] == "windows-x86_64"))
+        .context("plex.tv's download list has no 64-bit Windows build")?;
+    let (Some(url), Some(sum)) = (release["url"].as_str(), release["checksum"].as_str()) else {
+        bail!("plex.tv's download list has no installer address");
+    };
+    if !url.starts_with("https://downloads.plex.tv/") {
+        bail!("plex.tv pointed somewhere unexpected for the installer: {url}");
+    }
+    let bytes = http
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .context("couldn't download the Plex installer")?
+        .bytes()
+        .await
+        .context("couldn't download the Plex installer")?;
+    if hex::encode(Sha1::digest(&bytes)) != sum.to_ascii_lowercase() {
+        bail!(
+            "the Plex installer didn't download correctly (its checksum doesn't match); try again"
+        );
+    }
+    let exe = std::env::temp_dir().join(format!(
+        "PlexMediaServer-{}.exe",
+        crate::fsutil::random_hex(4)?
+    ));
+    std::fs::write(&exe, &bytes).with_context(|| format!("cannot write {}", exe.display()))?;
+    step("Installing Plex Media Server (Windows asks for permission: choose Yes)");
+    let args = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"];
+    // Nothing of this process is handed down: Plex, started by its installer, must not
+    // hold the setup page's pipe open.
+    let quiet = |c: &mut Command| {
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    };
+    let mut c = Command::new(&exe);
+    c.args(args);
+    quiet(&mut c);
+    let status = match c.status() {
+        // The installer must be started elevated: ask Windows to.
+        Err(e) if e.raw_os_error() == Some(740) => {
+            let path = exe.to_string_lossy().replace('\'', "''");
+            let mut ps = Command::new("powershell.exe");
+            ps.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$p = Start-Process -FilePath '{path}' -ArgumentList '{}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
+                    args.join("','")
+                ),
+            ]);
+            quiet(&mut ps);
+            ps.status()
+        }
+        other => other,
+    };
+    let _ = std::fs::remove_file(&exe);
+    let status = status.context("couldn't start the Plex installer")?;
+    if !status.success() {
+        bail!(
+            "the Plex installer stopped ({status}); if Windows asked for permission, choose Yes, then try again"
+        );
+    }
+    step("Starting Plex");
+    for _ in 0..10 {
+        let up = http.get("http://127.0.0.1:32400/identity").send().await;
+        if up.is_ok_and(|r| r.status().is_success()) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // The installer didn't start it: start it as you, as signing in to Windows does.
+    let program = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Program Files"))
+        .join("Plex\\Plex Media Server\\Plex Media Server.exe");
+    let mut c = Command::new(&program);
+    quiet(&mut c);
+    c.spawn().with_context(|| {
+        format!(
+            "Plex is installed but couldn't be started ({})",
+            program.display()
+        )
+    })?;
     Ok(())
 }
 

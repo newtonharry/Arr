@@ -126,8 +126,8 @@ function fillLibraries(plex) {
   $("step-options").hidden = none;
   $("apply").disabled = none;
   if (none) {
-    $("new-movies").value = `${state.media_folder}/Movies`;
-    $("new-tv").value = `${state.media_folder}/TV Shows`;
+    $("new-movies").value = state.media_movies;
+    $("new-tv").value = state.media_tv;
     return;
   }
   for (const kind of ["movies", "tv"]) {

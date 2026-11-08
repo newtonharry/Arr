@@ -92,3 +92,25 @@ jobs:
           if (Test-Path $env:ARR_BIN_DIR) { "still there: $env:ARR_BIN_DIR"; exit 1 }
           $path = (Get-ItemProperty HKCU:\Environment).Path
           if (($path -split ';') -contains $env:ARR_BIN_DIR) { "still on PATH: $path"; exit 1 }
+      # The real Plex install the setup page runs (this runner is an administrator, so
+      # Windows doesn't need to ask), then the uninstaller removes Plex again.
+      - name: Plex install and removal
+        shell: powershell
+        run: |
+          $out = & target\release\arr.exe plex-install 2>&1
+          $out
+          if ($LASTEXITCODE) { exit 1 }
+          if (-not ($out -match '^step: Installing Plex Media Server')) { 'no install step reported'; exit 1 }
+          $id = $null
+          for ($i = 0; $i -lt 60 -and -not $id; $i++) {
+            try { $id = Invoke-RestMethod http://127.0.0.1:32400/identity -Headers @{ Accept = 'application/json' } -TimeoutSec 3 } catch { Start-Sleep 2 }
+          }
+          if (-not $id) { 'Plex never answered on 32400'; exit 1 }
+          "Plex $($id.MediaContainer.version) is running, claimed: $($id.MediaContainer.claimed)"
+          foreach ($d in 'Movies', 'TV Shows') { if (-not (Test-Path "$env:USERPROFILE\Media\$d")) { "no $d folder"; exit 1 } }
+          $env:ARR_YES = '1'; $env:ARR_REMOVE = 'plex'; $env:ARR_DELETE_DATA = '1'; $env:ARR_INSTALL_STRICT = '1'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          $left = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like 'Plex Media Server*' }
+          if ($left) { 'Plex is still installed'; exit 1 }
+          if (-not (Test-Path "$env:USERPROFILE\Media\Movies")) { 'the media folder was removed'; exit 1 }
