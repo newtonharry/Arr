@@ -147,6 +147,11 @@ function Install-Arr {
 			# Options left set in this window from an earlier run shouldn't stop this one.
 			Write-Warning "ARR_PORT is ignored: Arr keeps port $Port from its config"
 		}
+		# Torrent settings need Arr's own downloader; refuse before anything changes.
+		if (($env:ARR_UPLOAD_LIMIT_KIB -or $env:ARR_TORRENT_PORT) -and
+			-not (Select-String -Path $Config -Pattern '^\[embedded\]' -Quiet)) {
+			throw "ARR_UPLOAD_LIMIT_KIB and ARR_TORRENT_PORT need Arr's own downloader ([embedded] in $Config); nothing was changed"
+		}
 	}
 
 	# ------------------------------------------------------------ install the program
@@ -663,7 +668,10 @@ function Assert-OwnTask {
 	$sid = if ($who -match '^S-1-') { $who } else {
 		try { (New-Object Security.Principal.NTAccount $who).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $null }
 	}
-	$mine = if ($sid) { $sid -eq $me.User.Value } else { ($who -split '\\')[-1] -eq ($me.Name -split '\\')[-1] }
+	# Without a SID, compare whole names when the task has a domain, so OTHERPC\alex isn't alex.
+	$mine = if ($sid) { $sid -eq $me.User.Value }
+		elseif ($who -match '\\') { $who -eq $me.Name }
+		else { $who -eq ($me.Name -split '\\')[-1] }
 	if (-not $mine) { throw "Arr is installed for $who; run this as that user" }
 }
 
@@ -682,6 +690,8 @@ function Save-Settings($stateDir) {
 # settings Save-Settings saved, copied over the files in place so they keep their permissions.
 # Doing it twice is harmless.
 function Undo-Run {
+	# Stop on the first failure, so a restore that didn't work keeps its backup and is reported.
+	$ErrorActionPreference = 'Stop'
 	if ($script:Swapped) { Restore-Previous $script:SwapDir $script:Swapped; $script:Swapped = @() }
 	$snap = $script:Snapshot
 	if (-not $snap) { return }
@@ -907,4 +917,7 @@ try {
 		} catch {}
 	}
 	if ($env:ARR_INSTALL_STRICT -eq '1') { throw $failure } # tests want a failing exit code
+} finally {
+	# Ctrl-C at a prompt skips catch: put back what this run changed all the same.
+	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) { try { Undo-Run } catch {} }
 }

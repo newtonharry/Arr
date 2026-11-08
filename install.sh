@@ -262,21 +262,25 @@ fetch() { curl -fsSL --retry 3 "$@"; }
 # as they were stay in SNAP (inside this run's private temp folder), until the new one
 # answers. A run that stops before then puts them back (restarting Arr if this run had
 # restarted it), so a failed re-run leaves the install as it found it.
-UNDO_BIN=0 RESTART="" SNAP=""
+UNDO_BIN=0 RESTART="" SNAP="" KEEP=""
 undo_bin() {
 	undone=0
 	if [ -n "${SNAP:-}" ]; then
-		s=$SNAP; SNAP=""
+		s=$SNAP; SNAP=""; failed=0
 		# Settings first, so the Arr restarted below reads them as they were.
 		if [ -d "$s/secrets" ]; then
 			rm -rf "$STATE_DIR/secrets.undo"
 			cp -Rp "$s/secrets" "$STATE_DIR/secrets.undo" && rm -rf "$STATE_DIR/secrets" &&
-				mv "$STATE_DIR/secrets.undo" "$STATE_DIR/secrets" ||
-				printf 'warning: could not put back %s/secrets as it was\n' "$STATE_DIR" >&2
+				mv "$STATE_DIR/secrets.undo" "$STATE_DIR/secrets" || failed=1
 		fi
-		if cp -p "$s/config.toml" "$CONFIG"; then
+		cp -p "$s/config.toml" "$CONFIG" || failed=1
+		if [ "$failed" = 0 ]; then
 			printf 'Put your previous settings back in %s.\n' "$CONFIG" >&2
 			undone=1
+		else
+			# The only good copy: keep it (the temp folder stays) and say where it is.
+			KEEP=$s
+			printf 'warning: could not put your previous settings back; they are in %s (copy config.toml and secrets/ into %s)\n' "$s" "$STATE_DIR" >&2
 		fi
 	fi
 	if [ "${UNDO_BIN:-0}" = 1 ]; then
@@ -513,8 +517,12 @@ step "Downloading Arr ($VERSION, $target)"
 tmp=$(mktemp -d)
 # A run stopped by any error after the swap below (set -e too) rolls back as die does. Once
 # Arr answers, UNDO_BIN and SNAP are cleared and this only removes the temp folder; the
-# script's exit status stays its own.
-trap 'rc=$?; set +e; undo_bin; rm -rf "$tmp"; exit "$rc"' EXIT
+# script's exit status stays its own. A folder holding settings that couldn't be put back
+# stays. dash skips EXIT on a signal, so Ctrl-C or a dropped SSH session exits through it.
+trap 'rc=$?; set +e; undo_bin; [ -n "$KEEP" ] || rm -rf "$tmp"; exit "$rc"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 asset="arr-$target.tar.gz"
 fetch -o "$tmp/$asset" "$DOWNLOAD_BASE/$asset" || die "download failed: $DOWNLOAD_BASE/$asset"
 fetch -o "$tmp/$asset.sha256" "$DOWNLOAD_BASE/$asset.sha256" || die "checksum download failed"

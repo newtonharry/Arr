@@ -197,7 +197,11 @@ jobs:
           "tunnel.log:"; Get-Content "$state\tunnel.log" | Select-Object -First 5
           # A rerun keeps remote access as it is.
           $before = $config
-          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "rerun said: $($_.Exception.Message)" }
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "rerun said: $msg"
+          # The made-up ngrok account fails only the last step, the public check.
+          if ($msg -notlike "*doesn't reach Arr yet*") { Fail "the rerun failed before the public check: $msg" }
           if ((Get-Content "$state\config.toml" -Raw) -ne $before) { Fail 'a rerun changed the config' }
           if (-not (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue)) { Fail 'a rerun lost the tunnel task' }
           # This install's Arr (not any other on the runner): its command line names this config.
@@ -210,7 +214,10 @@ jobs:
           # A setting given on a rerun is applied; the rest are kept. Without ARR_BIN_DIR the
           # program folder still comes from the Arr task (only ARR_STATE_DIR is given).
           $env:ARR_ERROR_REPORTS = '0'; $env:ARR_BIN_DIR = $null
-          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "error reports rerun said: $($_.Exception.Message)" }
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "error reports rerun said: $msg"
+          if ($msg -notlike "*doesn't reach Arr yet*") { Fail "the error reports rerun failed before the public check: $msg" }
           $env:ARR_ERROR_REPORTS = $null; $env:ARR_BIN_DIR = $bin
           if ((Get-ScheduledTask -TaskName 'Arr').Actions[0].Execute -ne "$bin\arr-background.exe") { Fail 'ARR_STATE_DIR alone moved the program folder' }
           if (Test-Path "$env:LOCALAPPDATA\Programs\Arr\arr.exe") { Fail 'ARR_STATE_DIR alone installed to the default folder' }
