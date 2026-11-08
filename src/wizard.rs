@@ -764,8 +764,9 @@ fn install_command(wiz: &Wizard) -> Option<Vec<String>> {
         return Some(vec!["sh".into(), "-c".into(), cmd.clone()]);
     }
     let pm = crate::plexinstall::package_manager()?;
-    if pm == "windows" {
-        // Plex's installer asks Windows for permission itself.
+    if pm == "windows" || pm == "macos" {
+        // As you: Plex's Windows installer asks Windows for permission itself, and on macOS
+        // the app goes into Applications.
         return Some(vec![
             wiz.opts.arr.to_string_lossy().into_owned(),
             "plex-install".into(),
@@ -795,7 +796,7 @@ fn install_command(wiz: &Wizard) -> Option<Vec<String>> {
 
 /// The same, for pasting into a terminal where the page can't ask for the password itself.
 fn manual_install_command(wiz: &Wizard) -> Option<String> {
-    if crate::plexinstall::package_manager()? == "windows" {
+    if matches!(crate::plexinstall::package_manager()?, "windows" | "macos") {
         return None;
     }
     let arr = wiz.opts.arr.to_string_lossy();
@@ -1050,7 +1051,8 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
 
 /// Whether a user other than the owner can open `dir` (Plex runs as its own user on Linux).
 fn plex_can_read(dir: &Path) -> bool {
-    #[cfg(unix)]
+    // Only Linux runs Plex as its own user; on Windows and macOS it runs as you.
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| {
@@ -1063,7 +1065,7 @@ fn plex_can_read(dir: &Path) -> bool {
         }
         dir.ancestors().skip(1).all(|a| mode(a) & 0o001 != 0)
     }
-    #[cfg(not(unix))]
+    #[cfg(any(not(unix), target_os = "macos"))]
     {
         let _ = dir;
         true

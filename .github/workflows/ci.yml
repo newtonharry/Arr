@@ -28,6 +28,33 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast
+      # install.sh and uninstall.sh as a user runs them (sudo, systemd), with remote access.
+      - name: Installer
+        run: |
+          cargo build --release --locked
+          sh tests/installer/linux.sh
+
+  # The macOS installer path: the real "Install Plex for me", install.sh with remote access
+  # (launchd), and uninstalling Arr and Plex while keeping media.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and FFmpeg
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          rustup default 1.94.1
+          brew install ffmpeg
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-macos-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --release --locked
+      - name: Installer
+        run: sh tests/installer/macos.sh
 
   windows:
     runs-on: windows-2025

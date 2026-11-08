@@ -23,17 +23,24 @@ curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | s
 The script takes a few minutes. It:
 
 1. downloads the Arr binary for your system and checks its SHA-256 (no compiler needed);
-2. installs FFmpeg if `ffprobe` is missing (it asks first);
+2. installs FFmpeg if `ffprobe` is missing (it asks first; on a Mac without Homebrew it offers
+   to install Homebrew first, which asks for your password);
 3. opens a setup page in your web browser. You sign in to Plex there, and Arr finds your
    Plex on this computer, your movie and TV libraries and their folders (Arr moves files
    into Plex's folders, so it runs on the same computer as Plex). You confirm the folders,
    choose where downloads go and whether Arr installs its own updates, then click
-   **Finish setup**. No Plex yet? On Linux (apt or dnf) the page offers **Install Plex for
-   me**: your computer asks for your password, Arr installs Plex Media Server from Plex's own
-   package source, makes `/srv/media` with `Movies` and `TV Shows` (yours, and readable by
-   Plex), links the new Plex to your account and creates the two libraries;
+   **Finish setup**. No Plex yet? The page offers **Install Plex for me**, then links the new
+   Plex to your account and creates your Movies and TV Shows libraries:
+   - Linux (apt or dnf): your computer asks for your password, and Arr installs Plex Media
+     Server from Plex's own package source and makes `/srv/media/Movies` and
+     `/srv/media/TV Shows` (yours, and readable by Plex);
+   - macOS: Arr downloads Plex from plex.tv (checked), puts it in Applications, starts it and
+     starts it at every log-in, and makes `~/Media/Movies` and `~/Media/TV Shows`;
+   - Windows: see below;
 4. imports your Plex library, so Arr knows what you own. It downloads nothing at this step;
-5. starts Arr as a service (systemd on Linux, launchd on macOS).
+5. starts Arr as a service (systemd on Linux, launchd on macOS);
+6. offers to set up access from ChatGPT on your phone (see below; you can say no and do it
+   later).
 
 If you're connected to the machine over SSH, the script prints a link to open on the computer
 you're typing on. The link includes a secret code, so nobody else on your network can use
@@ -160,7 +167,8 @@ Google sign-in to let in only the accounts you list. Once set up, Arr works in C
 web, on your phone and on every other device signed in to your ChatGPT account.
 
 You need a free ngrok account and a Google OAuth client, about 15 minutes of clicking that
-[docs/REMOTE.md](docs/REMOTE.md) walks through. Then run the installer again:
+[docs/REMOTE.md](docs/REMOTE.md) walks through. A first install offers it at the end; to add
+it later, run the installer again:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --remote
@@ -172,8 +180,8 @@ On Windows, in PowerShell:
 $env:ARR_REMOTE = '1'; irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex
 ```
 
-It asks for each value in turn (on Windows it also opens the ngrok and Google pages where you
-find them). Then it installs ngrok, configures the sign-in, starts the tunnel in the background (a service on
+It asks for each value in turn, opening the ngrok and Google pages where you find them and
+saying what to copy; secrets you paste stay hidden. Then it installs ngrok, configures the sign-in, starts the tunnel in the background (a service on
 Linux, a launchd agent on macOS, a log-on task on Windows), checks the public address and
 prints the steps to add Arr to ChatGPT.
 
