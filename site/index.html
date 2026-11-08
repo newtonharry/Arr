@@ -29,7 +29,7 @@
   <div class="install" id="install">
     <div class="tabs" role="tablist" aria-label="Operating system">
       <button type="button" role="tab" id="tab-unix" aria-controls="panel-unix" aria-selected="true" data-os="unix">Linux &amp; macOS</button>
-      <button type="button" role="tab" id="tab-win" aria-controls="panel-win" aria-selected="false" data-os="win" tabindex="-1">Windows <span class="pill">Coming soon</span></button>
+      <button type="button" role="tab" id="tab-win" aria-controls="panel-win" aria-selected="false" data-os="win" tabindex="-1">Windows</button>
     </div>
 
     <div role="tabpanel" id="panel-unix" aria-labelledby="tab-unix">
@@ -41,11 +41,11 @@
     </div>
 
     <div role="tabpanel" id="panel-win" aria-labelledby="tab-win">
-      <div class="cmd" data-coming-soon>
+      <div class="cmd">
         <code id="cmd-win">irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex</code>
         <button class="copy" type="button" data-target="cmd-win" hidden>Copy</button>
       </div>
-      <p class="hint soon-note">Windows support is on its way and this line doesn't work yet. Watch the <a href="https://github.com/newtonharry/Arr">repo</a> for news.</p>
+      <p class="hint">Open PowerShell (Start menu, type “PowerShell”), paste this and press Enter, on the PC that will keep your movies and shows. No administrator rights needed.</p>
     </div>
   </div>
   <p class="small">Free, with all the code on GitHub. Takes a minute or two.</p>
@@ -84,7 +84,7 @@
 <section class="section need">
   <h2>What you need</h2>
   <ul class="ticks">
-    <li>A computer to keep your movies and shows on: <strong>Linux or macOS</strong> today, <strong>Windows</strong> soon.</li>
+    <li>A computer to keep your movies and shows on: <strong>Windows</strong>, <strong>Linux</strong> or <strong>macOS</strong>.</li>
     <li>A free Plex account. No Plex yet? Arr installs it for you.</li>
     <li>An AI assistant that can talk to Arr, such as ChatGPT or Claude.</li>
   </ul>
@@ -92,13 +92,13 @@
 
 <section id="faq" class="section">
   <h2>Questions</h2>
-  <details><summary>I've never used Plex. Can I still use Arr?</summary><p>Yes. Plex is the free app that plays your collection on your TV, phone and browser, and Arr fills it for you. If this computer doesn't have Plex, the setup page installs it (your computer asks for your password), links it to your Plex account and creates your Movies and TV Shows libraries. That works on Linux today; on a Mac, the page links you to Plex's download.</p></details>
+  <details><summary>I've never used Plex. Can I still use Arr?</summary><p>Yes. Plex is the free app that plays your collection on your TV, phone and browser, and Arr fills it for you. If this computer doesn't have Plex, the setup page installs it (your computer asks for permission), links it to your Plex account and creates your Movies and TV Shows libraries. That works on Windows and Linux; on a Mac, the page links you to Plex's download.</p></details>
   <details><summary>Does it replace Sonarr and Radarr?</summary><p>It does the same job with one program: it replaces Sonarr, Radarr, Prowlarr and qBittorrent. If you'd rather keep them, they can run alongside Arr. Each ignores the titles you add to the other.</p></details>
   <details><summary>How does it download things?</summary><p>With a built-in BitTorrent downloader. By default it searches a public torrent source, and you can add your own indexers. Only download what you have the right to.</p></details>
   <details><summary>Will it update itself?</summary><p>Only if you say so during setup. It checks once a day, verifies the download, swaps it in, and goes back to the old version if the new one doesn't start within 30 seconds. You can also update by hand.</p></details>
   <details><summary>What can't it do yet?</summary><p>No quality upgrades of files you already own, no renaming of your existing files, no usenet, and no anime or daily-show numbering. The README has the full list.</p></details>
   <details><summary>How do I remove it?</summary><p>Paste <code>curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.sh | sh</code> into a terminal. It asks whether to remove Arr, Plex or both, and whether to delete their settings too. Your movies and shows are never touched.</p></details>
-  <details><summary>Which systems does it run on?</summary><p>macOS, and Linux on x86_64 or ARM64 (including Raspberry Pi OS). Native Windows support is being built.</p></details>
+  <details><summary>Which systems does it run on?</summary><p>Windows 10 and 11 (64-bit), macOS, and Linux on x86_64 or ARM64 (including Raspberry Pi OS).</p></details>
 </section>
 </main>
 
