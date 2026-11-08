@@ -108,7 +108,7 @@ remove_dir() { # remove_dir <dir> <why>
 	esac
 	[ -e "$d" ] || return 0
 	if [ "$CONFIG_UNREADABLE" = 1 ]; then
-		say "  not deleting $1: Arr's config ($ARR_CONFIG) can't be read, so its media folders aren't known; run this with sudo"
+		say "  not deleting $1: couldn't work out Arr's media folders from $ARR_CONFIG (unreadable, or paths written with escapes); delete it yourself if you're sure"
 		return 0
 	fi
 	held=""
@@ -214,17 +214,23 @@ CONFIG_UNREADABLE=0
 if [ -n "$ARR_CONFIG" ] && [ -e "$ARR_CONFIG" ] && ! [ -r "$ARR_CONFIG" ]; then
 	CONFIG_UNREADABLE=1
 elif [ -n "$ARR_CONFIG" ] && [ -r "$ARR_CONFIG" ]; then
+	# Literal strings ('...') are taken as written. A basic string ("...") with an escape in
+	# it can't be decoded safely here, so it marks the config as unreadable instead.
 	PROTECT=$(awk '{
 		line = $0
 		while (match(line, /"([^"\\]|\\.)*"|\047[^\047]*\047/)) {
+			q = substr(line, RSTART, 1)
 			s = substr(line, RSTART + 1, RLENGTH - 2)
 			line = substr(line, RSTART + RLENGTH)
-			gsub(/\\\\/, "\001", s); gsub(/\\"/, "\"", s); gsub(/\001/, "\\", s)
+			if (q == "\"" && index(s, "\\") > 0 && (substr(s, 1, 1) == "/" || substr(s, 1, 1) == "\\")) {
+				print "\001escaped"; continue
+			}
 			if (substr(s, 1, 1) == "/") print s
 		}
 	}' "$ARR_CONFIG" | while IFS= read -r p; do
-		if [ -d "$p" ]; then printf '%s\n' "${p%/}"; fi
+		if [ "$p" = "$(printf '\001')escaped" ] || [ -d "$p" ]; then printf '%s\n' "${p%/}"; fi
 	done)
+	case "$PROTECT" in *"$(printf '\001')escaped"*) CONFIG_UNREADABLE=1 ;; esac
 fi
 
 # Plex: a system package, a snap, Docker containers, or the macOS app.
