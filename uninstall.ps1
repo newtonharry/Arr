@@ -9,12 +9,19 @@
 #   ARR_DELETE_DATA   1 to delete their data too, 0 to keep it
 #   ARR_YES           1 to never ask (removes Arr only, keeping data, unless the two above say otherwise)
 #   ARR_DRY_RUN       1 to only show what would be done
-#   ARR_BIN_DIR, ARR_STATE_DIR   if Arr isn't in the default folders
+#   ARR_BIN_DIR, ARR_STATE_DIR   if Arr isn't where its "Arr" task or the default folders say
 
 function Uninstall-Arr {
 	$ErrorActionPreference = 'Stop'
-	$BinDir = if ($env:ARR_BIN_DIR) { $env:ARR_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\Arr' }
-	$StateDir = if ($env:ARR_STATE_DIR) { $env:ARR_STATE_DIR } else { Join-Path $env:LOCALAPPDATA 'Arr' }
+	$BinDir = Join-Path $env:LOCALAPPDATA 'Programs\Arr'
+	$StateDir = Join-Path $env:LOCALAPPDATA 'Arr'
+	# Arr may be installed elsewhere: its log-on task says where.
+	if (-not $env:ARR_STATE_DIR) {
+		$a = (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue).Actions | Select-Object -First 1
+		if ($a -and $a.Arguments -match '--config "([^"]+)"') { $StateDir = Split-Path $Matches[1]; $BinDir = Split-Path $a.Execute }
+	}
+	if ($env:ARR_BIN_DIR) { $BinDir = $env:ARR_BIN_DIR }
+	if ($env:ARR_STATE_DIR) { $StateDir = $env:ARR_STATE_DIR }
 	$Target = $env:ARR_REMOVE
 	$DeleteData = $env:ARR_DELETE_DATA
 	$Yes = $env:ARR_YES -eq '1'
