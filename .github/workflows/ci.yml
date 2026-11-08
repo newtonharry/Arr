@@ -80,3 +80,11 @@ jobs:
           if (($path -split ';') -notcontains $env:ARR_BIN_DIR) { "not on PATH: $path"; exit 1 }
           # Running again replaces the files in place.
           Get-Content install.ps1 -Raw | Invoke-Expression
+          # And the uninstaller takes it all away again.
+          [System.Management.Automation.Language.Parser]::ParseFile("$pwd\uninstall.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
+          $env:ARR_YES = '1'; $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '1'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          if (Test-Path $env:ARR_BIN_DIR) { "still there: $env:ARR_BIN_DIR"; exit 1 }
+          $path = (Get-ItemProperty HKCU:\Environment).Path
+          if (($path -split ';') -contains $env:ARR_BIN_DIR) { "still on PATH: $path"; exit 1 }
