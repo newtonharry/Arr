@@ -258,16 +258,36 @@ sha256() {
 }
 fetch() { curl -fsSL --retry 3 "$@"; }
 
-# On a re-run the arr this run replaced stays as arr.previous until the new one answers. A
-# run that stops before then puts it back (restarting Arr if this run had restarted it), so a
-# failed re-run leaves the install as it found it.
-UNDO_BIN=0 RESTART=""
+# On a re-run the arr this run replaced stays as arr.previous, and config.toml and secrets/
+# as they were stay in SNAP (inside this run's private temp folder), until the new one
+# answers. A run that stops before then puts them back (restarting Arr if this run had
+# restarted it), so a failed re-run leaves the install as it found it.
+UNDO_BIN=0 RESTART="" SNAP=""
 undo_bin() {
-	[ "${UNDO_BIN:-0}" = 1 ] || return 0
-	UNDO_BIN=0
-	mv -f "$BIN_DIR/arr.previous" "$BIN_DIR/arr" || return 0
-	printf 'Put the previous version of Arr back in %s.\n' "$BIN_DIR" >&2
-	[ -z "$RESTART" ] || $RESTART >/dev/null 2>&1 || true
+	undone=0
+	if [ -n "${SNAP:-}" ]; then
+		s=$SNAP; SNAP=""
+		# Settings first, so the Arr restarted below reads them as they were.
+		if [ -d "$s/secrets" ]; then
+			rm -rf "$STATE_DIR/secrets.undo"
+			cp -Rp "$s/secrets" "$STATE_DIR/secrets.undo" && rm -rf "$STATE_DIR/secrets" &&
+				mv "$STATE_DIR/secrets.undo" "$STATE_DIR/secrets" ||
+				printf 'warning: could not put back %s/secrets as it was\n' "$STATE_DIR" >&2
+		fi
+		if cp -p "$s/config.toml" "$CONFIG"; then
+			printf 'Put your previous settings back in %s.\n' "$CONFIG" >&2
+			undone=1
+		fi
+	fi
+	if [ "${UNDO_BIN:-0}" = 1 ]; then
+		UNDO_BIN=0
+		if mv -f "$BIN_DIR/arr.previous" "$BIN_DIR/arr"; then
+			printf 'Put the previous version of Arr back in %s.\n' "$BIN_DIR" >&2
+			undone=1
+		fi
+	fi
+	[ "$undone" = 1 ] && [ -n "$RESTART" ] || return 0
+	$RESTART >/dev/null 2>&1 || true
 }
 # An option this run can't apply to an existing install: with nobody to ask, stop; at a
 # terminal, say so and carry on without it.
@@ -358,8 +378,9 @@ esac
 # ---------------------------------------------------------------- an existing install
 
 # Running this again must update the Arr that's already here, not set up a second one next to
-# it: its service says where its binary and config are, and which user it runs as.
-EXPLICIT_DIRS="$STATE_DIR$BIN_DIR"
+# it: its service says where its binary and config are, and which user it runs as. A folder
+# given with --bin-dir or --state-dir (or ARR_BIN_DIR, ARR_STATE_DIR) wins over its own only.
+BIN_GIVEN=$BIN_DIR STATE_GIVEN=$STATE_DIR
 FOUND="" FOUND_BIN="" FOUND_CONFIG="" FOUND_USER=""
 # Under sudo, HOME may be root's: a per-user Arr is in the home of whoever ran sudo.
 U_HOME=$HOME
@@ -380,31 +401,38 @@ from_plist() {
 	strings=$(awk '{ while (match($0, /<string>[^<]*<\/string>/)) {
 			print substr($0, RSTART + 8, RLENGTH - 17); $0 = substr($0, RSTART + RLENGTH) } }' "$1" |
 		sed 's/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&amp;/\&/g')
-	FOUND_BIN=$(printf '%s\n' "$strings" | sed -n 2p)
-	FOUND_CONFIG=$(printf '%s\n' "$strings" | sed -n 5p)
-}
-if [ -z "$EXPLICIT_DIRS" ]; then
-	sys_unit=/etc/systemd/system/arr.service
-	user_unit="$U_HOME/.config/systemd/user/arr.service"
-	plist="$U_HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
-	if [ "$os" = Darwin ]; then
-		[ ! -f "$plist" ] || { from_plist "$plist"; FOUND=launchd; }
-	elif [ "$(id -u)" = 0 ]; then
-		if [ -f "$sys_unit" ]; then
-			from_unit "$sys_unit"; FOUND=system
-		elif [ "$U_HOME" != "$HOME" ] && [ -f "$user_unit" ]; then
-			from_unit "$user_unit"
-			die "Arr is already installed for $SUDO_USER (config $FOUND_CONFIG); run this again without sudo"
-		fi
-	elif [ -f "$user_unit" ]; then
-		from_unit "$user_unit"; FOUND=user
-	elif [ -f "$sys_unit" ]; then
-		from_unit "$sys_unit"
-		die "Arr is already installed system-wide (config $FOUND_CONFIG); run this again with sudo"
+	# Only the layout this script writes: <arr> serve --config <config>.
+	if [ "$(printf '%s\n' "$strings" | sed -n '3,4p' | tr '\n' ' ')" = "serve --config " ]; then
+		FOUND_BIN=$(printf '%s\n' "$strings" | sed -n 2p)
+		FOUND_CONFIG=$(printf '%s\n' "$strings" | sed -n 5p)
 	fi
-	[ -z "$FOUND_BIN" ] || BIN_DIR=$(dirname "$FOUND_BIN")
-	[ -z "$FOUND_CONFIG" ] || STATE_DIR=$(dirname "$FOUND_CONFIG")
+}
+sys_unit=/etc/systemd/system/arr.service
+user_unit="$U_HOME/.config/systemd/user/arr.service"
+plist="$U_HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
+found_file=""
+if [ "$os" = Darwin ]; then
+	[ ! -f "$plist" ] || { from_plist "$plist"; FOUND=launchd; found_file=$plist; }
+elif [ "$(id -u)" = 0 ]; then
+	if [ -f "$sys_unit" ]; then
+		from_unit "$sys_unit"; FOUND=system; found_file=$sys_unit
+	elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && [ -f "$user_unit" ]; then
+		# Whatever HOME sudo kept: U_HOME is the sudo user's own home, looked up above.
+		from_unit "$user_unit"
+		die "Arr is already installed for $SUDO_USER (${FOUND_CONFIG:+config $FOUND_CONFIG, }service $user_unit); run this again without sudo"
+	fi
+elif [ -f "$user_unit" ]; then
+	from_unit "$user_unit"; FOUND=user; found_file=$user_unit
+elif [ -f "$sys_unit" ]; then
+	from_unit "$sys_unit"
+	die "Arr is already installed system-wide (${FOUND_CONFIG:+config $FOUND_CONFIG, }service $sys_unit); run this again with sudo"
 fi
+# A service this script can't read (written by hand, say) is never replaced by a fresh setup.
+if [ -n "$FOUND" ] && { { [ -z "$FOUND_BIN" ] && [ -z "$BIN_GIVEN" ]; } || { [ -z "$FOUND_CONFIG" ] && [ -z "$STATE_GIVEN" ]; }; }; then
+	die "an Arr service not written by this installer exists ($found_file); pass --bin-dir and --state-dir to use it"
+fi
+[ -n "$BIN_DIR" ] || [ -z "$FOUND_BIN" ] || BIN_DIR=$(dirname "$FOUND_BIN")
+[ -n "$STATE_DIR" ] || [ -z "$FOUND_CONFIG" ] || STATE_DIR=$(dirname "$FOUND_CONFIG")
 if [ -z "$BIN_DIR" ]; then
 	if [ "$(id -u)" = 0 ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="$HOME/.local/bin"; fi
 fi
@@ -435,9 +463,16 @@ fi
 
 # Settings left out stay as they are. A setting given is applied further down (arr set), or
 # refused here, before anything changes.
-case "$UPLOAD_LIMIT_KIB" in "" | *[!0-9]*) die "--upload-limit-kib needs a whole number of KiB/s (0 = no limit)" ;; esac
-case "$TORRENT_PORT" in "" | *[!0-9]* | 0) die "--torrent-port needs a port number" ;; esac
-case "$PORT" in "" | *[!0-9]* | 0) die "--port needs a port number" ;; esac
+# in_range VALUE MIN MAX: a whole number from MIN to MAX (the length check keeps test's
+# arithmetic from overflowing).
+in_range() {
+	case "$1" in "" | *[!0-9]*) return 1 ;; esac
+	[ "${#1}" -le 9 ] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+in_range "$UPLOAD_LIMIT_KIB" 0 4194303 ||
+	die "--upload-limit-kib needs a whole number of KiB/s from 0 (no limit) to 4194303"
+in_range "$TORRENT_PORT" 1 65535 || die "--torrent-port needs a port number from 1 to 65535"
+in_range "$PORT" 1 65535 || die "--port needs a port number from 1 to 65535"
 if [ "$SETUP" = 1 ] && [ -f "$CONFIG" ]; then
 	first_only() { # first_only OPTION VALUE SECTION KEY
 		[ -z "$2" ] || [ "$2" = "$(conf "$3" "$4")" ] ||
@@ -451,6 +486,16 @@ if [ "$SETUP" = 1 ] && [ -f "$CONFIG" ]; then
 	first_only --movie-section "$MOVIE_SECTION" plex movie_section
 	first_only --tv-section "$TV_SECTION" plex tv_section
 	[ "$TERMINAL" = 0 ] || reject "--terminal only applies to the first setup, and Arr is set up already"
+	# Settings for a part of Arr this install doesn't use (at a terminal: carry on without them).
+	if { [ -n "$PLEX_TOKEN" ] || { [ "$PLEX_URL_SET" = 1 ] && [ "$PLEX_URL" != "$(conf plex base_url)" ]; }; } &&
+		! grep -q '^\[plex\]' "$CONFIG"; then
+		reject "--plex-token and --plex-url need Plex in Arr's config ([plex] in $CONFIG), and this install has none"
+		PLEX_TOKEN="" PLEX_URL_SET=0
+	fi
+	if { [ "$UPLOAD_SET" = 1 ] || [ "$TORRENT_PORT_SET" = 1 ]; } && ! grep -q '^\[embedded\]' "$CONFIG"; then
+		reject "--upload-limit-kib and --torrent-port need Arr's own downloader ([embedded] in $CONFIG), and this install doesn't use it"
+		UPLOAD_SET=0 TORRENT_PORT_SET=0
+	fi
 	if grep -q '^\[mcp\.oauth\]' "$CONFIG" && ! remote_same; then
 		reject "remote access is set up already; to change it, edit [mcp.oauth] in $CONFIG as docs/REMOTE.md explains, then run this again"
 	fi
@@ -466,7 +511,10 @@ fi
 
 step "Downloading Arr ($VERSION, $target)"
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# A run stopped by any error after the swap below (set -e too) rolls back as die does. Once
+# Arr answers, UNDO_BIN and SNAP are cleared and this only removes the temp folder; the
+# script's exit status stays its own.
+trap 'rc=$?; set +e; undo_bin; rm -rf "$tmp"; exit "$rc"' EXIT
 asset="arr-$target.tar.gz"
 fetch -o "$tmp/$asset" "$DOWNLOAD_BASE/$asset" || die "download failed: $DOWNLOAD_BASE/$asset"
 fetch -o "$tmp/$asset.sha256" "$DOWNLOAD_BASE/$asset.sha256" || die "checksum download failed"
@@ -479,10 +527,16 @@ mkdir -p "$BIN_DIR"
 # The real folder, without symlinks: services and the updater run exactly the path checked.
 BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
 ARR="$BIN_DIR/arr"
-# On a re-run the old binary stays as arr.previous. The new one goes in with one rename, so
-# nothing ever runs a half-written arr.
+# On a re-run the old binary stays as arr.previous. It and the new one each go in with one
+# rename, so nothing ever runs a half-written arr, and an old arr.previous that's still
+# running can't block the copy ("Text file busy").
 prev=0
-if [ -f "$CONFIG" ] && [ -x "$ARR" ]; then cp -p "$ARR" "$ARR.previous"; prev=1; fi
+if [ -f "$CONFIG" ] && [ -x "$ARR" ]; then
+	rm -f "$ARR.previous.new"
+	cp -p "$ARR" "$ARR.previous.new"
+	mv -f "$ARR.previous.new" "$ARR.previous"
+	prev=1
+fi
 cp "$tmp/arr-$target/arr" "$ARR.new"
 chmod 755 "$ARR.new"
 mv -f "$ARR.new" "$ARR"
@@ -696,7 +750,7 @@ tmdb=false; [ -n "$TMDB_KEY" ] && tmdb=true
 {
 	cat <<EOF
 # Arr configuration, written by install.sh. Secrets live in secrets/ (mode 600).
-# All options: https://github.com/$REPO/blob/main/config/standalone.example.toml
+# More options: https://github.com/$REPO/blob/main/config/standalone.example.toml
 
 [server]
 listen = $(toml "127.0.0.1:$PORT")
@@ -906,12 +960,19 @@ if [ -f "$CONFIG" ]; then
 	fi
 	PORT=$(conf_port)
 	setup_choices
+	# The settings as they are, for undo_bin to put back if this run stops before Arr answers.
+	# The temp folder is private (mktemp -d); cp -p keeps each file's owner and mode.
+	mkdir "$tmp/snap"
+	cp -p "$CONFIG" "$tmp/snap/config.toml"
+	[ ! -d "$STATE_DIR/secrets" ] || cp -Rp "$STATE_DIR/secrets" "$tmp/snap/secrets"
+	SNAP="$tmp/snap"
+	# The address first: Plex checks the token (and Arr's sign-in) at the address saved.
+	[ "$PLEX_URL_SET" = 0 ] || [ "$PLEX_URL" = "$(conf plex base_url)" ] || set_conf plex-url "$PLEX_URL"
 	if [ -n "$PLEX_TOKEN" ]; then
 		set_secret plex-token "$PLEX_TOKEN"
 	elif grep -q '^\[plex\]' "$CONFIG"; then
 		plex_signin
 	fi
-	[ "$PLEX_URL_SET" = 0 ] || [ "$PLEX_URL" = "$(conf plex base_url)" ] || set_conf plex-url "$PLEX_URL"
 	# A TMDB key can be added on any later run: --tmdb-key, ARR_TMDB_KEY, or asked here.
 	if [ -z "$TMDB_KEY" ] && interactive && [ "$(conf tmdb enabled)" != true ]; then
 		step "Arr can't find new movies yet"
@@ -1044,6 +1105,9 @@ if [ "$REMOTE" != 1 ] && ! grep -q '^\[mcp\.oauth\]' "$CONFIG" && interactive; t
 	if confirm "Set that up now?" n; then REMOTE=1; fi
 fi
 if [ "$REMOTE" = 1 ]; then remote_setup; fi
+# Files written above as root (ngrok.yml, a secret) are the service user's too, with or
+# without a service.
+[ "$(id -u)" != 0 ] || [ "$RUN_AS" = root ] || chown -R "$RUN_AS" "$STATE_DIR"
 
 # A configured tunnel runs as its own service next to Arr, and needs the ngrok agent.
 PUBLIC_URL=""
@@ -1155,8 +1219,10 @@ elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
   <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/arr.log")</string>
 </dict></plist>
 PLIST
+	# Once unloaded, the job can't be kickstarted: a rollback loads it again instead.
+	launchd_restart() { launchctl unload "$plist" 2>/dev/null; launchctl load "$plist"; }
+	RESTART=launchd_restart
 	launchctl unload "$plist" 2>/dev/null || true
-	RESTART="launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr"
 	svc launchctl load "$plist"
 	started=1
 	tplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-tunnel.plist"
@@ -1185,7 +1251,7 @@ PLIST
 	fi
 fi
 if [ "$started" != 1 ]; then
-	UNDO_BIN=0
+	UNDO_BIN=0 SNAP=""
 	say "No background service was installed. Start Arr with:"
 	say "  $run_cmd"
 	[ -z "$PUBLIC_URL" ] ||
@@ -1211,7 +1277,8 @@ if ! healthy; then
 	fi
 	die "Arr didn't start; see: $logs"
 fi
-UNDO_BIN=0
+UNDO_BIN=0 SNAP=""
+rm -rf "$tmp/snap"
 
 # ---------------------------------------------------------------- automatic updates
 
@@ -1352,8 +1419,11 @@ if [ "$(sha256 "$tmp/$asset")" != "$(cut -d' ' -f1 "$tmp/$asset.sha256")" ]; the
 fi
 tar -xzf "$tmp/$asset" -C "$tmp"
 "$tmp/arr-$TARGET/arr" --version >/dev/null || { log "$latest doesn't run on this machine; not updating"; exit 1; }
-# Swap the binary in one rename, keeping the old one for a rollback.
-cp -p "$ARR" "$ARR.previous"
+# Swap the binary in one rename, keeping the old one for a rollback (copied under a fresh
+# name first: an old arr.previous may still be running).
+rm -f "$ARR.previous.new"
+cp -p "$ARR" "$ARR.previous.new"
+mv -f "$ARR.previous.new" "$ARR.previous"
 cp "$tmp/arr-$TARGET/arr" "$ARR.new"
 chmod 755 "$ARR.new"
 mv -f "$ARR.new" "$ARR"
