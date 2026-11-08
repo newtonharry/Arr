@@ -107,6 +107,10 @@ remove_dir() { # remove_dir <dir> <why>
 		;;
 	esac
 	[ -e "$d" ] || return 0
+	if [ "$CONFIG_UNREADABLE" = 1 ]; then
+		say "  not deleting $1: Arr's config ($ARR_CONFIG) can't be read, so its media folders aren't known; run this with sudo"
+		return 0
+	fi
 	held=""
 	while IFS= read -r p; do
 		[ -n "$p" ] || continue
@@ -203,9 +207,22 @@ ARR_STATE=""
 DOWNLOADS=""
 [ -z "$ARR_CONFIG" ] || [ ! -r "$ARR_CONFIG" ] ||
 	DOWNLOADS=$(toml_paths "$ARR_CONFIG" download_dir | head -n1)
-# Every folder the config names (libraries, downloads) is protected from deletion.
-if [ -n "$ARR_CONFIG" ] && [ -r "$ARR_CONFIG" ]; then
-	PROTECT=$(toml_paths "$ARR_CONFIG" '[A-Za-z0-9_-]*' | while IFS= read -r p; do
+# Every folder the config mentions (libraries, downloads) is protected from deletion: any
+# quoted absolute path anywhere in it, whatever its key, so no TOML spelling slips past.
+# If the config can't be read, nothing is deleted.
+CONFIG_UNREADABLE=0
+if [ -n "$ARR_CONFIG" ] && [ -e "$ARR_CONFIG" ] && ! [ -r "$ARR_CONFIG" ]; then
+	CONFIG_UNREADABLE=1
+elif [ -n "$ARR_CONFIG" ] && [ -r "$ARR_CONFIG" ]; then
+	PROTECT=$(awk '{
+		line = $0
+		while (match(line, /"([^"\\]|\\.)*"|\047[^\047]*\047/)) {
+			s = substr(line, RSTART + 1, RLENGTH - 2)
+			line = substr(line, RSTART + RLENGTH)
+			gsub(/\\\\/, "\001", s); gsub(/\\"/, "\"", s); gsub(/\001/, "\\", s)
+			if (substr(s, 1, 1) == "/") print s
+		}
+	}' "$ARR_CONFIG" | while IFS= read -r p; do
 		if [ -d "$p" ]; then printf '%s\n' "${p%/}"; fi
 	done)
 fi
