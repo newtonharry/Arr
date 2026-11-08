@@ -122,18 +122,20 @@ fn write_public(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Creates `dir` readable by everyone (Plex runs as its own user) and owned by `owner`, so
 /// Arr can write to it. A folder that already exists is left exactly as it is.
 fn make_shared_dir(dir: &Path, owner: Option<(u32, u32)>) -> Result<()> {
-    if dir.exists() {
+    if std::fs::symlink_metadata(dir).is_ok() {
         return Ok(());
     }
-    std::fs::create_dir(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    // Made with its final mode in one step, and handed over without following a link, so
+    // nothing swapped in at this path meanwhile gets root's chmod or chown.
+    let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
-        if let Some((uid, gid)) = owner {
-            std::os::unix::fs::chown(dir, Some(uid), Some(gid))
-                .with_context(|| format!("cannot give {} to you", dir.display()))?;
-        }
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o755);
+    b.create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+    #[cfg(unix)]
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::lchown(dir, Some(uid), Some(gid))
+            .with_context(|| format!("cannot give {} to you", dir.display()))?;
     }
     #[cfg(not(unix))]
     let _ = owner;

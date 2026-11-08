@@ -656,6 +656,15 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
     }
     let movies = tmp.path().join("media/Movies");
     let tv = tmp.path().join("media/TV Shows");
+    // A bad folder is refused before Plex is asked for anything, so a retry can't duplicate.
+    let (s, v) = page
+        .post(
+            "/api/plex/libraries",
+            json!({ "movies": movies, "tv": "media/TV Shows" }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(world.lock().unwrap().created.is_empty());
     let (s, v) = page
         .post(
             "/api/plex/libraries",

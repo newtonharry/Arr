@@ -945,6 +945,12 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
             "choose a folder for movies or TV shows",
         );
     }
+    // What Plex has now, so a retry never makes a second library of a kind.
+    match sections(plex.base_url.clone(), plex.token.clone()).await {
+        Ok(s) => plex.sections = s,
+        Err(e) => return plex_down(e),
+    }
+    let mut todo = vec![];
     for (folder, kind, name, agent, scanner) in wanted {
         let Some(folder) = folder
             .map(|f| f.trim().trim_end_matches('/').to_string())
@@ -955,10 +961,18 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
         if plex.sections.iter().any(|s| s.kind == kind) {
             continue;
         }
-        if let Err(m) = check_folder(&folder, true).and_then(|()| {
-            std::fs::create_dir_all(&folder).map_err(|e| format!("can't create it: {}", e.kind()))
-        }) {
+        // Every folder is checked before Plex is asked for anything.
+        if let Err(m) = check_folder(&folder, true) {
             return problem(StatusCode::BAD_REQUEST, &format!("{folder}: {m}"));
+        }
+        todo.push((folder, kind, name, agent, scanner));
+    }
+    for (folder, kind, name, agent, scanner) in todo {
+        if let Err(e) = std::fs::create_dir_all(&folder) {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                &format!("{folder}: can't create it: {}", e.kind()),
+            );
         }
         if !plex_can_read(Path::new(&folder)) {
             warnings.push(format!(

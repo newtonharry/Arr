@@ -73,6 +73,10 @@ const MISSING = {
     "Open Plex", `http://${location.hostname}:32400/web`,
     " on this computer and sign in with the same account, then look again.",
   ],
+  unclaimed: [
+    "Plex is installed but isn't linked to your Plex account yet. Click Look again to link it.",
+    "", "", "",
+  ],
   unreadable: [
     "Arr found Plex on this computer but couldn't read its libraries. If Plex is still starting, wait a minute, then look again.",
     "", "", "",
@@ -84,14 +88,14 @@ function renderServer(s) {
   if (s.plex) $("connected").textContent = `Found ${s.plex.name} on this computer.`;
   const install = s.install.state;
   // No Plex here (or it's being installed): offer to install it.
-  const installing = !s.plex && s.signed_in && (s.missing === "not_installed" || install !== "idle");
+  const busy = install === "running" || linking;
+  const installing = !s.plex && s.signed_in &&
+    (busy || install === "failed" || (s.missing === "not_installed" && install !== "done"));
   $("install").hidden = !installing;
   if (installing) {
     $("missing").hidden = true;
-    const busy = install === "running" || install === "done" || linking;
     $("install-progress").hidden = !busy;
-    $("install-step").textContent = linking ? "Linking Plex to your account…"
-      : install === "done" ? "Plex is installed." : (s.install.step || "");
+    $("install-step").textContent = linking ? "Linking Plex to your account…" : (s.install.step || "");
     $("install-ask").hidden = busy || !s.can_install;
     $("install-manual").hidden = busy || s.can_install;
     $("install-cmd").textContent = s.install_command || "";
@@ -253,27 +257,36 @@ $("install-look").addEventListener("click", (ev) =>
 // Install Plex, then link it to the account (the check does that), showing each step.
 $("install-btn").addEventListener("click", async (ev) => {
   await act(ev.target, () => call("POST", "/api/plex/install"));
-  if (!state || state.install.state !== "running") return;
+  if (state && state.install.state === "running") followInstall();
+});
+
+// Shows the install's steps until it ends, then links the new Plex (the check does that).
+function followInstall() {
   clearInterval(polling);
   polling = setInterval(async () => {
     let s;
     try { s = await call("GET", "/api/state"); } catch (_) { return; }
     if (s.install.state === "running") { render(s); return; }
     clearInterval(polling); polling = null;
-    if (s.install.state !== "done") { render(s); return; }
-    linking = true;
-    render(s);
-    try { render(await call("POST", "/api/plex/check")); }
-    catch (e) { showError(e.message); }
-    finally { linking = false; render(state); }
+    if (s.install.state === "done") await linkPlex(s); else render(s);
   }, 1000);
-});
+}
+
+async function linkPlex(s) {
+  linking = true;
+  render(s);
+  try { render(await call("POST", "/api/plex/check")); }
+  catch (e) { showError(e.message); }
+  finally { linking = false; render(state); }
+}
 
 $("create-libs").addEventListener("click", async (ev) => {
   const body = { movies: $("new-movies").value, tv: $("new-tv").value, language: navigator.language || "" };
   formFilled = false;
   await act(ev.target, () => call("POST", "/api/plex/libraries", body));
-  if (state && state.warnings && state.warnings.length) $("new-libs-hint").textContent = state.warnings.join(" ");
+  const warnings = (state && state.warnings) || [];
+  $("libs-warning").textContent = warnings.join(" ");
+  $("libs-warning").hidden = warnings.length === 0;
   if (state && state.plex && !formFilled) fillLibraries(state.plex);
 });
 
@@ -298,5 +311,8 @@ $("form").addEventListener("submit", async (ev) => {
 call("GET", "/api/state").then((s) => {
   render(s);
   if (s.waiting_for_signin) startSigninPolling();
+  // Reloaded during or just after installing Plex: pick up where it was.
+  if (s.install.state === "running") followInstall();
+  else if (s.install.state === "done" && !s.plex && s.signed_in) linkPlex(s);
   if (s.phase.state === "working") startProgressPolling();
 }).catch((e) => showError(e.message));
