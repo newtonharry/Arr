@@ -59,8 +59,8 @@ in `%LOCALAPPDATA%\Arr` (only your account can open it), and its log in
 `%LOCALAPPDATA%\Arr\arr.log`. Windows Firewall may ask whether `arr-background` may accept
 connections: allowing it lets other torrent peers reach you, which makes downloads faster.
 Options are environment variables, listed at the top of
-[`install.ps1`](install.ps1). Setting up access from ChatGPT on your phone (`--remote`) isn't
-in the Windows installer yet.
+[`install.ps1`](install.ps1). At the end it offers to set up access from ChatGPT on your phone
+(see below).
 
 ### Updates
 
@@ -166,8 +166,16 @@ You need a free ngrok account and a Google OAuth client, about 15 minutes of cli
 curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --remote
 ```
 
-It installs ngrok, configures the sign-in, starts the tunnel as a service, checks the public
-address and prints the steps to add Arr to ChatGPT.
+On Windows, in PowerShell:
+
+```powershell
+$env:ARR_REMOTE = '1'; irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex
+```
+
+It asks for each value in turn (on Windows it also opens the ngrok and Google pages where you
+find them). Then it installs ngrok, configures the sign-in, starts the tunnel in the background (a service on
+Linux, a launchd agent on macOS, a log-on task on Windows), checks the public address and
+prints the steps to add Arr to ChatGPT.
 
 ### From the API
 

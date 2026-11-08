@@ -36,6 +36,8 @@ function Uninstall-Arr {
 
 	$arrTask = Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
 	$updateTask = Get-ScheduledTask -TaskName 'Arr update' -ErrorAction SilentlyContinue
+	$tunnelTask = Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue
+	$ngrokYml = Join-Path $StateDir 'ngrok.yml'
 	$arrHere = $arrTask -or (Test-Path (Join-Path $BinDir 'arr.exe')) -or (Test-Path (Join-Path $StateDir 'config.toml'))
 	$downloads = $null
 	$config = Join-Path $StateDir 'config.toml'
@@ -94,14 +96,18 @@ function Uninstall-Arr {
 
 	if ($doArr) {
 		Step 'Removing Arr'
-		foreach ($t in @($arrTask, $updateTask) | Where-Object { $_ }) {
+		foreach ($t in @($arrTask, $updateTask, $tunnelTask) | Where-Object { $_ }) {
 			Do-It "remove the task `"$($t.TaskName)`"" {
 				Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue
 				Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false
 			}
 		}
-		$running = Get-CimInstance Win32_Process -Filter "Name = 'arr-background.exe' OR Name = 'arr.exe'" -ErrorAction SilentlyContinue |
-			Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($BinDir, [StringComparison]::OrdinalIgnoreCase) }
+		# Arr's programs, ngrok installed beside them, and an ngrok running Arr's tunnel.
+		$running = Get-CimInstance Win32_Process -Filter "Name = 'arr-background.exe' OR Name = 'arr.exe' OR Name = 'ngrok.exe'" -ErrorAction SilentlyContinue |
+			Where-Object {
+				($_.ExecutablePath -and $_.ExecutablePath.StartsWith($BinDir, [StringComparison]::OrdinalIgnoreCase)) -or
+				($_.Name -eq 'ngrok.exe' -and $_.CommandLine -and $_.CommandLine.Contains($ngrokYml))
+			}
 		foreach ($p in $running) {
 			Do-It "stop $($p.Name) (process $($p.ProcessId))" { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
 		}

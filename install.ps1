@@ -13,6 +13,13 @@
 #   ARR_BIN_DIR       where arr.exe goes (default %LOCALAPPDATA%\Programs\Arr)
 #   ARR_NO_SETUP      1 to install the program only
 #   ARR_YES           1 to never ask (FFmpeg is installed without asking)
+#
+# Use Arr from ChatGPT on your phone or any device (docs/REMOTE.md): set ARR_REMOTE=1, or
+# answer yes when asked. These skip the questions (an AI agent can pass them all):
+#
+#   ARR_NGROK_TOKEN, ARR_NGROK_DOMAIN                     your ngrok authtoken and free domain
+#   ARR_GOOGLE_CLIENT_ID, ARR_GOOGLE_CLIENT_SECRET        your Google OAuth client
+#   ARR_ALLOW_EMAILS                                      Google accounts allowed in, comma-separated
 
 function Install-Arr {
 	$ErrorActionPreference = 'Stop'
@@ -38,6 +45,8 @@ function Install-Arr {
 	$Arr = Join-Path $BinDir 'arr.exe'
 	$Background = Join-Path $BinDir 'arr-background.exe'
 	$Updater = Join-Path $BinDir 'arr-update.ps1'
+	$NgrokYml = Join-Path $StateDir 'ngrok.yml'
+	$TunnelLog = Join-Path $StateDir 'tunnel.log'
 
 	function Step($m) { Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
 	function Say($m) { Write-Host $m }
@@ -125,6 +134,24 @@ function Install-Arr {
 	}
 	$downloading = (Get-Content $Config -Raw) -match '\[execution\]\r?\nenabled = true'
 
+	# ------------------------------------------------------------ phone and ChatGPT access
+
+	$hasRemote = Select-String -Path $Config -Pattern '^\[mcp\.oauth\]' -Quiet
+	$wantRemote = $env:ARR_REMOTE -eq '1' -or
+		"$env:ARR_NGROK_TOKEN$env:ARR_NGROK_DOMAIN$env:ARR_GOOGLE_CLIENT_ID$env:ARR_GOOGLE_CLIENT_SECRET$env:ARR_ALLOW_EMAILS"
+	if (-not $wantRemote -and -not $hasRemote -and (Interactive)) {
+		Say ''
+		Say 'Arr can also work from ChatGPT on your phone and other devices. That needs a free ngrok'
+		Say 'account and a Google sign-in app; this guide walks you through both (about 15 minutes).'
+		$wantRemote = Confirm 'Set that up now?' 'n'
+	}
+	if ($wantRemote -and $hasRemote) {
+		Step 'Setting up access from ChatGPT on your phone and other devices'
+		Say 'Your config already has remote access; keeping it.'
+	} elseif ($wantRemote) {
+		Set-RemoteAccess
+	}
+
 	# ------------------------------------------------------------ run it
 
 	Step 'Starting Arr'
@@ -140,6 +167,23 @@ function Install-Arr {
 	Start-ScheduledTask -TaskName 'Arr'
 	$api = "http://127.0.0.1:$Port"
 	if (-not (Wait-Healthy $api '' 30)) { throw "Arr didn't start; see $(Join-Path $StateDir 'arr.log')" }
+
+	# A configured tunnel runs as its own log-on task next to Arr, without a window.
+	$PublicUrl = $null
+	$m = Select-String -Path $Config -Pattern '^public_url = "(https://[^"]+)"$' | Select-Object -First 1
+	if ($m -and (Test-Path $NgrokYml) -and (Select-String -Path $Config -Pattern '^\[mcp\.oauth\]' -Quiet)) {
+		$PublicUrl = $m.Matches[0].Groups[1].Value
+		# Also after an uninstall that kept Arr's data: the tunnel needs ngrok back.
+		$ngrok = Find-Ngrok $BinDir
+		if (-not $ngrok) { $ngrok = Install-Ngrok $BinDir }
+		Step "Starting the tunnel for $PublicUrl"
+		Stop-Tunnel $NgrokYml
+		$tunnelArgs = "--hidden `"$ngrok`" http 127.0.0.1:$Port `"--url=$PublicUrl`" --config `"$NgrokYml`" `"--log=$TunnelLog`" --log-level=warn"
+		Register-ScheduledTask -TaskName 'Arr tunnel' -Description 'Public HTTPS address for Arr, ngrok (installed by install.ps1)' -Force `
+			-Action (New-ScheduledTaskAction -Execute $Background -Argument $tunnelArgs) `
+			-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
+		Start-ScheduledTask -TaskName 'Arr tunnel'
+	}
 
 	# ------------------------------------------------------------ automatic updates
 
@@ -169,23 +213,25 @@ function Install-Arr {
 
 	# ------------------------------------------------------------ what you already own
 
-	Step 'Learning what you already own from Plex'
-	$token = (Get-Content (Join-Path $StateDir 'secrets\api_token') -Raw).Trim()
-	$media = 'all'
-	if (-not (Select-String -Path $Config -Pattern '^movies = ' -Quiet)) { $media = 'tv' }
-	if (-not (Select-String -Path $Config -Pattern '^tv = ' -Quiet)) { $media = 'movies' }
-	$boot = $null
-	for ($i = 0; $i -lt 500; $i++) {
-		$boot = Invoke-RestMethod -Method Post "$api/api/v1/setup/plex/bootstrap" `
-			-Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' `
-			-Body (@{ media = $media } | ConvertTo-Json)
-		if ($boot.done) { break }
+	if (Select-String -Path $Config -Pattern '^\[plex\]' -Quiet) {
+		Step 'Learning what you already own from Plex'
+		$token = (Get-Content (Join-Path $StateDir 'secrets\api_token') -Raw).Trim()
+		$media = 'all'
+		if (-not (Select-String -Path $Config -Pattern '^movies = ' -Quiet)) { $media = 'tv' }
+		if (-not (Select-String -Path $Config -Pattern '^tv = ' -Quiet)) { $media = 'movies' }
+		$boot = $null
+		for ($i = 0; $i -lt 500; $i++) {
+			$boot = Invoke-RestMethod -Method Post "$api/api/v1/setup/plex/bootstrap" `
+				-Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' `
+				-Body (@{ media = $media } | ConvertTo-Json)
+			if ($boot.done) { break }
+		}
+		if (-not $boot.done) { throw "the Plex import didn't finish; run this again to continue it" }
+		# "done" also covers a library whose import failed: report it instead of claiming success.
+		$failed = @($boot.runs | Where-Object { $_.status -eq 'failed' }) | Select-Object -First 1
+		if ($failed) { throw "the Plex import failed: $($failed.last_error); run this again to retry" }
+		Say 'Done. Titles you already have are marked owned, and nothing was downloaded.'
 	}
-	if (-not $boot.done) { throw "the Plex import didn't finish; run this again to continue it" }
-	# "done" also covers a library whose import failed: report it instead of claiming success.
-	$failed = @($boot.runs | Where-Object { $_.status -eq 'failed' }) | Select-Object -First 1
-	if ($failed) { throw "the Plex import failed: $($failed.last_error); run this again to retry" }
-	Say 'Done. Titles you already have are marked owned, and nothing was downloaded.'
 
 	$mcp = @{ mcpServers = @{ arr = @{ command = $Arr; args = @('mcp', '--api-url', "$api/", '--token-file', (Join-Path $StateDir 'secrets\api_token')) } } } |
 		ConvertTo-Json -Depth 5
@@ -199,9 +245,202 @@ function Install-Arr {
 	Say 'To use Arr from Claude Desktop or another MCP client on this computer, add:'
 	Say ''
 	Say $mcp
+	if (-not $PublicUrl) {
+		Say ''
+		Say 'To use Arr from ChatGPT on your phone or any device, run the install line again after'
+		Say "`$env:ARR_REMOTE = '1' (guide: https://github.com/$Repo/blob/main/docs/REMOTE.md)."
+		return
+	}
+
+	Step "Checking $PublicUrl"
+	$ok = $false
+	$tries = if ($env:ARR_REMOTE_CHECK_SECONDS) { [int]([int]$env:ARR_REMOTE_CHECK_SECONDS / 2) } else { 30 }
+	for ($i = 0; $i -lt $tries -and -not $ok; $i++) {
+		try {
+			# The header skips ngrok's "You are about to visit" page, shown to browser-like clients.
+			$r = Invoke-WebRequest -UseBasicParsing "$PublicUrl/.well-known/oauth-protected-resource/mcp" `
+				-Headers @{ 'ngrok-skip-browser-warning' = '1' } -TimeoutSec 10
+			$ok = $r.Content -match [regex]::Escape("`"$PublicUrl/mcp`"")
+		} catch {}
+		if (-not $ok) { Start-Sleep -Seconds 2 }
+	}
+	if (-not $ok) {
+		throw "$PublicUrl doesn't reach Arr yet. The tunnel's log says why (an ERR_NGROK_... code names the problem, often a wrong authtoken or a domain from another account): $TunnelLog"
+	}
+	Say "Arr is reachable at $PublicUrl"
 	Say ''
-	Say 'Using Arr from ChatGPT on your phone needs remote access, which the Windows installer'
-	Say "doesn't set up yet: https://github.com/$Repo/blob/main/docs/REMOTE.md"
+	Say 'Add it to ChatGPT once, on chatgpt.com in a browser; it then works in the ChatGPT app on'
+	Say 'your phone and every other device signed in to your account:'
+	Say ''
+	Say '  1. Settings > Apps & Connectors > Advanced: turn on Developer mode.'
+	Say '  2. Back in Apps & Connectors, choose Create and fill in:'
+	Say '       Name:            Arr'
+	Say "       MCP server URL:  $PublicUrl/mcp"
+	Say '       Authentication:  OAuth'
+	Say '  3. Create, then sign in: choose Visit Site on the ngrok page, approve Arr, and pick your'
+	Say '     Google account.'
+	Say '  4. In a new chat, ask "what''s in my library?"'
+	Say ''
+	Say "ChatGPT's menu names change now and then; docs/REMOTE.md has the current steps."
+}
+
+# Sets up the public address (ngrok) and Google sign-in, so ChatGPT on any device can reach
+# Arr (docs/REMOTE.md). Uses Install-Arr's variables. Account sign-ups and Google's pages
+# are yours to click through; this asks for what they give you, opening each page for you.
+function Set-RemoteAccess {
+	Step 'Setting up access from ChatGPT on your phone and other devices'
+	Say 'You need a free ngrok account and a Google OAuth client. The full guide:'
+	Say "  https://github.com/$Repo/blob/main/docs/REMOTE.md"
+
+	Say ''
+	Say 'Step 1 of 2: ngrok gives Arr a public HTTPS address (free, no router changes).'
+	Say '  Sign up or log in, then copy "Your Authtoken", and on the Domains page copy your free'
+	Say '  domain (create one if the list is empty).'
+	Open-Page 'https://dashboard.ngrok.com/get-started/your-authtoken'
+	$token = Read-Value 'ngrok authtoken' $env:ARR_NGROK_TOKEN 'ARR_NGROK_TOKEN' -Secret
+	if ($token -notmatch '^[A-Za-z0-9_-]+$') { throw "that doesn't look like an ngrok authtoken" }
+	Open-Page 'https://dashboard.ngrok.com/domains'
+	$domain = Read-Value 'ngrok domain, like quiet-river-1234.ngrok-free.app' $env:ARR_NGROK_DOMAIN 'ARR_NGROK_DOMAIN'
+	$domain = ($domain -replace '^https?://', '' -replace '/.*$', '').ToLowerInvariant()
+	if ($domain -notmatch '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { throw "that doesn't look like a domain: $domain" }
+
+	Say ''
+	Say 'Step 2 of 2: Google sign-in decides who may use Arr. In Google Cloud:'
+	Say '  - create a project (any name, for example arr);'
+	Say '  - Google Auth Platform > Get started: app name Arr, audience External, your email;'
+	Say '  - Audience: keep it in Testing and add each Google account that may use Arr as a test user;'
+	Say '  - Clients > Create client: type "Web application", with this authorized redirect URI:'
+	Say "      https://$domain/auth/callback"
+	Say '  - copy the client ID and client secret.'
+	Open-Page 'https://console.cloud.google.com/auth/clients'
+	$clientId = Read-Value 'Google OAuth client ID' $env:ARR_GOOGLE_CLIENT_ID 'ARR_GOOGLE_CLIENT_ID'
+	if ($clientId -notmatch '^[A-Za-z0-9._-]+$') { throw "that doesn't look like a Google client ID" }
+	$secret = Read-Value 'Google OAuth client secret' $env:ARR_GOOGLE_CLIENT_SECRET 'ARR_GOOGLE_CLIENT_SECRET' -Secret
+	if ($secret -notmatch '^[\x21-\x7e]+$') { throw "that doesn't look like a Google client secret" }
+	$emailsRaw = Read-Value 'Google accounts allowed to use Arr (comma-separated)' $env:ARR_ALLOW_EMAILS 'ARR_ALLOW_EMAILS'
+	$emails = @($emailsRaw -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
+	foreach ($e in $emails) {
+		if ($e -notmatch '^[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$') { throw "not an email address: $e" }
+	}
+	if ($emails.Count -eq 0) { throw 'remote access needs at least one allowed Google account' }
+
+	$ngrok = Find-Ngrok $BinDir
+	if (-not $ngrok) { $ngrok = Install-Ngrok $BinDir }
+
+	# The authtoken stays in a private file, never on a command line. web_addr: false turns
+	# off ngrok's local inspection page, which would show the sign-in tokens passing through.
+	Write-Private $NgrokYml "version: `"3`"`nagent:`n  authtoken: $token`n  web_addr: false`n"
+	& $ngrok config check --config $NgrokYml | Out-Null
+	if ($LASTEXITCODE -ne 0) { throw 'ngrok rejected its config' }
+	$secrets = Join-Path $StateDir 'secrets'
+	New-Item -ItemType Directory -Force $secrets | Out-Null
+	Write-Private (Join-Path $secrets 'google_client_secret') $secret
+	$mcpToken = Join-Path $secrets 'mcp_token'
+	if (-not (Test-Path $mcpToken)) {
+		$bytes = New-Object byte[] 32
+		[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+		Write-Private $mcpToken (-join ($bytes | ForEach-Object { $_.ToString('x2') }))
+	}
+
+	# /mcp must accept the ngrok host; then add the sign-in section. Restored if Arr rejects it.
+	$before = [IO.File]::ReadAllText($Config)
+	$hosts = "allowed_hosts = [`"$domain`", `"localhost`", `"127.0.0.1`"]"
+	$lines = $before -split "`r?`n"
+	$header = $lines | Where-Object { $_ -match '^\s*\[mcp\]\s*(#.*)?$' } | Select-Object -First 1
+	if ($header) {
+		if ($lines | Where-Object { $_ -match '^\s*allowed_hosts\s*=' }) {
+			throw 'your config already sets allowed_hosts; add [mcp.oauth] by hand (see docs/MCP.md)'
+		}
+		$out = foreach ($l in $lines) { $l; if ($l -eq $header) { $hosts } }
+		$text = ($out -join "`n")
+	} else {
+		$text = $before.TrimEnd() + "`n`n[mcp]`nenabled = true`ntoken_file = `"secrets/mcp_token`"`n$hosts`n"
+	}
+	$list = ($emails | ForEach-Object { "`"$_`"" }) -join ', '
+	$text = $text.TrimEnd() + "`n`n# Google sign-in for ChatGPT and other remote MCP clients (docs/REMOTE.md).`n[mcp.oauth]`npublic_url = `"https://$domain`"`ngoogle_client_id = `"$clientId`"`ngoogle_client_secret_file = `"secrets/google_client_secret`"`nallowed_emails = [$list]`n"
+	Write-Private $Config $text
+	# Whatever goes wrong from here, the config goes back as it was. (Windows PowerShell can
+	# turn arr's error output into an exception before its exit code is even read.)
+	try {
+		$ErrorActionPreference = 'Continue'
+		$check = & $Arr check --config $Config 2>&1 | Out-String
+		$failed = $LASTEXITCODE -ne 0
+		$ErrorActionPreference = 'Stop'
+		if ($failed) { throw "arr check rejected the remote access settings:`n$check" }
+		if ($check -notmatch '"mcp_enabled":\s*true') {
+			throw 'your config turns MCP off ([mcp] enabled = false); set it to true and run this again'
+		}
+	} catch {
+		$ErrorActionPreference = 'Stop'
+		Write-Private $Config $before
+		throw "$($_.Exception.Message) (your previous config is restored)"
+	}
+	Say "Remote access configured for https://$domain"
+}
+
+# A value from its environment variable, or asked for (typed hidden for secrets).
+function Read-Value($label, $value, $envName, [switch]$Secret) {
+	if ($value) { return $value.Trim() }
+	if (-not (Interactive)) { throw "remote access needs `$env:$envName (see docs/REMOTE.md)" }
+	if ($Secret) {
+		$s = Read-Host "  $label" -AsSecureString
+		$p = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
+		try { $value = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($p) }
+		finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) }
+	} else {
+		$value = Read-Host "  $label"
+	}
+	if (-not $value.Trim()) { throw "$label is needed for remote access" }
+	return $value.Trim()
+}
+
+# Opens a page in the browser while someone is at the keyboard.
+function Open-Page($url) {
+	if (Interactive) {
+		Say "  (opening $url)"
+		try { Start-Process $url } catch { Say "  Open it yourself: $url" }
+	}
+}
+
+# Writes text as UTF-8 without a byte-order mark (Arr and ngrok read the bytes as they are);
+# Arr's folder is private, so the file is too.
+function Write-Private($path, $text) {
+	[IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false))
+}
+
+# Installs the ngrok agent into Arr's program folder; returns its path.
+function Install-Ngrok($binDir) {
+	Say 'Installing the ngrok agent'
+	$n = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'windows-arm64' } else { 'windows-amd64' }
+	$tmp = Join-Path ([IO.Path]::GetTempPath()) ('arr-ngrok-' + [guid]::NewGuid().ToString('N'))
+	New-Item -ItemType Directory $tmp | Out-Null
+	try {
+		Invoke-WebRequest -UseBasicParsing "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-$n.zip" -OutFile "$tmp\ngrok.zip"
+		Expand-Archive "$tmp\ngrok.zip" -DestinationPath $tmp -Force
+		New-Item -ItemType Directory -Force $binDir | Out-Null
+		Replace-File "$tmp\ngrok.exe" (Join-Path $binDir 'ngrok.exe')
+	} finally {
+		Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+	}
+	return (Join-Path $binDir 'ngrok.exe')
+}
+
+function Find-Ngrok($binDir) {
+	$own = Join-Path $binDir 'ngrok.exe'
+	if (Test-Path $own) { return $own }
+	$c = Get-Command ngrok.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+	if ($c) { return $c.Source }
+	return $null
+}
+
+# Stops the tunnel task and any ngrok it started (its launcher can go while ngrok stays).
+function Stop-Tunnel($ngrokYml) {
+	if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) {
+		Stop-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue
+	}
+	Get-CimInstance Win32_Process -Filter "Name = 'ngrok.exe'" -ErrorAction SilentlyContinue |
+		Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ngrokYml) } |
+		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 # Stops the running Arr (the log-on task and its program) so its files can be replaced.
@@ -210,7 +449,7 @@ function Stop-Arr($background) {
 		Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
 	}
 	Get-CimInstance Win32_Process -Filter "Name = 'arr-background.exe'" -ErrorAction SilentlyContinue |
-		Where-Object { $_.ExecutablePath -eq $background -and $_.CommandLine -like '*--config*' } |
+		Where-Object { $_.ExecutablePath -eq $background -and $_.CommandLine -like '*--config*' -and $_.CommandLine -notlike '*--hidden*' } |
 		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
@@ -301,7 +540,7 @@ $api = "http://127.0.0.1:$Port"
 function Restart-Arr {
 	Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
 	Get-CimInstance Win32_Process -Filter "Name = 'arr-background.exe'" -ErrorAction SilentlyContinue |
-		Where-Object { $_.CommandLine -like '*--config*' } |
+		Where-Object { $_.CommandLine -like '*--config*' -and $_.CommandLine -notlike '*--hidden*' } |
 		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 	Start-ScheduledTask -TaskName 'Arr'
 }

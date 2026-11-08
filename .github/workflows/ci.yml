@@ -114,3 +114,78 @@ jobs:
             Where-Object { $_.DisplayName -like 'Plex Media Server*' }
           if ($left) { 'Plex is still installed'; exit 1 }
           if (-not (Test-Path "$env:USERPROFILE\Media\Movies")) { 'the media folder was removed'; exit 1 }
+      # Remote access the way an agent sets it up (every value from the environment), with
+      # the real ngrok agent but a made-up account: everything up to the public check runs
+      # for real, and the check must fail pointing at the tunnel's log.
+      - name: Remote access (ngrok and Google sign-in)
+        shell: powershell
+        run: |
+          function Fail($m) { "FAIL: $m"; exit 1 }
+          $name = 'arr-x86_64-pc-windows-msvc'
+          Start-Process python -ArgumentList '-m', 'http.server', '8998', '--bind', '127.0.0.1', '--directory', 'dist'
+          Start-Sleep -Seconds 3
+          $state = "$env:RUNNER_TEMP\arr remote state"
+          $bin = "$env:RUNNER_TEMP\arr remote bin"
+          & target\release\arr.exe init --state-dir $state | Out-Null
+          $env:ARR_DOWNLOAD_BASE = 'http://127.0.0.1:8998'
+          $env:ARR_BIN_DIR = $bin; $env:ARR_STATE_DIR = $state
+          $env:ARR_YES = '1'; $env:ARR_AUTO_UPDATE = '0'; $env:ARR_INSTALL_STRICT = '1'
+          $env:ARR_REMOTE_CHECK_SECONDS = '20'
+          $env:ARR_NGROK_TOKEN = '2abcDEF_ciNotARealToken'
+          $env:ARR_NGROK_DOMAIN = 'https://Arr-CI-Test.ngrok-free.app/'
+          $env:ARR_GOOGLE_CLIENT_ID = '123-ci.apps.googleusercontent.com'
+          $env:ARR_GOOGLE_CLIENT_SECRET = 'GOCSPX-ci_secret'
+          $env:ARR_ALLOW_EMAILS = 'CI@Example.com, other@example.com'
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "install said: $msg"
+          if (-not $msg) { Fail 'the public check passed with a made-up ngrok account' }
+          if ($msg -notmatch [regex]::Escape("$state\tunnel.log")) { Fail "the failure doesn't point at the tunnel log" }
+          $config = Get-Content "$state\config.toml" -Raw
+          foreach ($want in 'public_url = "https://arr-ci-test.ngrok-free.app"',
+              'allowed_emails = ["ci@example.com", "other@example.com"]',
+              'allowed_hosts = ["arr-ci-test.ngrok-free.app", "localhost", "127.0.0.1"]',
+              'google_client_secret_file = "secrets/google_client_secret"') {
+            if (-not $config.Contains($want)) { Fail "config lacks $want" }
+          }
+          if ($config.Contains('GOCSPX')) { Fail 'the client secret is in the config' }
+          $check = & "$bin\arr.exe" check --config "$state\config.toml" | Out-String | ConvertFrom-Json
+          if (-not $check.mcp_enabled) { Fail 'arr check: MCP is off' }
+          if ([IO.File]::ReadAllText("$state\secrets\google_client_secret") -ne 'GOCSPX-ci_secret') { Fail 'client secret file' }
+          $yml = Get-Content "$state\ngrok.yml" -Raw
+          if ($yml -notmatch 'web_addr: false' -or $yml -notmatch '2abcDEF_ciNotARealToken') { Fail "ngrok.yml: $yml" }
+          if (-not (Test-Path "$bin\ngrok.exe")) { Fail 'ngrok was not installed' }
+          # Only you, Windows and administrators can open Arr's folder.
+          $acl = (Get-Acl $state).Access | ForEach-Object { $_.IdentityReference.Value }
+          if ($acl | Where-Object { $_ -match 'Users$|Everyone' }) { Fail "state folder is shared: $($acl -join ', ')" }
+          $task = Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue
+          if (-not $task) { Fail 'no Arr tunnel task' }
+          $a = $task.Actions[0]
+          "tunnel task: $($a.Execute) $($a.Arguments)"
+          if ($a.Execute -ne "$bin\arr-background.exe" -or $a.Arguments -notmatch '--hidden' -or
+              $a.Arguments -notmatch [regex]::Escape('--url=https://arr-ci-test.ngrok-free.app')) { Fail 'tunnel task action' }
+          if ($task.Triggers[0].CimClass.CimClassName -ne 'MSFT_TaskLogonTrigger') { Fail 'the tunnel does not start at log-on' }
+          if (-not (Test-Path "$state\tunnel.log") -or -not (Get-Content "$state\tunnel.log" -Raw)) { Fail 'ngrok wrote no log' }
+          "tunnel.log:"; Get-Content "$state\tunnel.log" | Select-Object -First 5
+          # A rerun keeps remote access as it is.
+          $before = $config
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "rerun said: $($_.Exception.Message)" }
+          if ((Get-Content "$state\config.toml" -Raw) -ne $before) { Fail 'a rerun changed the config' }
+          if (-not (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue)) { Fail 'a rerun lost the tunnel task' }
+          # Uninstalled but data kept, then installed again: ngrok and the tunnel come back.
+          $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '0'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          if (Test-Path "$bin\ngrok.exe") { Fail 'uninstall left ngrok behind' }
+          if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) { Fail 'uninstall left the tunnel task' }
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "reinstall said: $($_.Exception.Message)" }
+          if (-not (Test-Path "$bin\ngrok.exe")) { Fail 'the reinstall did not bring ngrok back' }
+          if (-not (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue)) { Fail 'the reinstall did not bring the tunnel back' }
+          # Uninstalling takes the tunnel with it.
+          $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '1'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) { Fail 'the tunnel task is still there' }
+          $ng = Get-CimInstance Win32_Process -Filter "Name = 'ngrok.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($state) }
+          if ($ng) { Fail 'ngrok is still running' }
+          if (Test-Path $bin) { Fail 'the program folder is still there' }
+          if (Test-Path $state) { Fail 'the state folder is still there' }
+          'remote access: all checks passed'
