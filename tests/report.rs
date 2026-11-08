@@ -60,6 +60,17 @@ async fn a_report_is_sent_scrubbed_only_when_the_config_allows_it() {
     assert!(got.lock().unwrap().is_empty(), "sent without consent");
 
     std::fs::write(&config, "[reporting]\nenabled = true\n").unwrap();
+    // A DSN that isn't one turns reporting off; it never fails the caller.
+    let status = tokio::process::Command::new(BIN)
+        .args(["report", "--component", "installer", "--message", "x"])
+        .arg("--config")
+        .arg(&config)
+        .env("ARR_SENTRY_DSN", "not a dsn")
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+
     report(&config, sentry, MESSAGE).await;
     // `arr report` waits for the send before exiting, so it's already here.
     tokio::time::sleep(Duration::from_millis(200)).await;

@@ -114,6 +114,9 @@ enum Command {
         /// Where Plex listens on this computer.
         #[arg(long, hide = true, default_value_t = 32400)]
         plex_port: u16,
+        /// Start with error reports ticked (the installer's --error-reports).
+        #[arg(long)]
+        error_reports: bool,
     },
     /// Install Plex Media Server from Plex's package source, and make a media folder Plex and
     /// you can both use (Movies, TV Shows). Needs administrator rights; the setup page runs it
@@ -542,6 +545,7 @@ async fn main() -> Result<()> {
             open,
             plex_installer,
             plex_port,
+            error_reports,
         } => {
             wizard::run(wizard::Options {
                 state_dir,
@@ -557,6 +561,7 @@ async fn main() -> Result<()> {
                 open,
                 plex_installer,
                 plex_port,
+                error_reports,
             })
             .await
         }

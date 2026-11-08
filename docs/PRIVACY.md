@@ -15,7 +15,11 @@ enabled = true
 ```
 
 Without that section, Arr sends nothing. An agent install (`--yes`) leaves it off unless it
-also passes `--error-reports`.
+also passes `--error-reports`. On Windows, `$env:ARR_ERROR_REPORTS = '1'` before the install
+line starts the setup page with the box ticked.
+
+Reports leave out other programs' output and the Plex import's own error details, since those
+can name titles and folders; you still see them on the setup page.
 
 ## What a report contains
 

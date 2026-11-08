@@ -8,6 +8,7 @@
 #
 #   ARR_VERSION       a release tag such as v0.4.0 (default: the latest release)
 #   ARR_AUTO_UPDATE   1 to install new versions automatically, 0 to turn that off
+#   ARR_ERROR_REPORTS 1 to start the setup page with error reports ticked (docs/PRIVACY.md)
 #   ARR_PORT          Arr's port on this computer (default 8787)
 #   ARR_STATE_DIR     Arr's folder: config, secrets, database (default %LOCALAPPDATA%\Arr)
 #   ARR_BIN_DIR       where arr.exe goes (default %LOCALAPPDATA%\Programs\Arr)
@@ -121,8 +122,9 @@ function Install-Arr {
 		if ($m) { $Port = [int]$m.Matches[0].Groups[1].Value }
 	} else {
 		Step 'Setting up Arr in your web browser'
+		$reports = @(if ($env:ARR_ERROR_REPORTS -eq '1') { '--error-reports' })
 		& $Arr wizard --state-dir $StateDir --port $Port --torrent-port $TorrentPort `
-			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open
+			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open @reports
 		if ($LASTEXITCODE -ne 0) { throw "setup wasn't finished; run this again to start over" }
 		# The page asked about automatic updates; the answer is used once, below.
 		$choices = Join-Path $StateDir 'setup-choices'

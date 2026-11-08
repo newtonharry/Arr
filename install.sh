@@ -546,6 +546,7 @@ browser_setup() {
 	set -- "$ARR" wizard --state-dir "$STATE_DIR" --bind "$bind" --port "$PORT" \
 		--torrent-port "$TORRENT_PORT" --upload-limit-kib "$UPLOAD_LIMIT_KIB" --ffprobe "$FFPROBE"
 	[ "$bind" != 127.0.0.1 ] || set -- "$@" --open
+	[ "$ERROR_REPORTS" != 1 ] || set -- "$@" --error-reports
 	# Arr runs as the user who ran sudo, so the page checks folders as that user too.
 	if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
 		chown "$SUDO_USER" "$STATE_DIR"

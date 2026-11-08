@@ -9,6 +9,7 @@
 use regex::Regex;
 use sentry::protocol::Event;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 /// Arr's Sentry project (EU region). A DSN only lets reports in; it can't read anything.
 const ARR_DSN: &str = "https://cf6596faade13d63657c233888c8464d@o4512395548884992.ingest.de.sentry.io/4512395555307600";
@@ -16,10 +17,13 @@ const ARR_DSN: &str = "https://cf6596faade13d63657c233888c8464d@o451239554888499
 const MAX_MESSAGE: usize = 2000;
 
 /// Where reports go: `ARR_SENTRY_DSN` when set (a self-hosted Sentry or GlitchTip; empty
-/// turns reporting off), else Arr's project.
-pub fn dsn() -> Option<String> {
-    let d = std::env::var("ARR_SENTRY_DSN").unwrap_or_else(|_| ARR_DSN.to_string());
-    Some(d.trim().to_string()).filter(|d| !d.is_empty())
+/// turns reporting off, as does one that isn't a DSN), else Arr's project.
+pub fn dsn() -> Option<sentry::types::Dsn> {
+    parse_dsn(&std::env::var("ARR_SENTRY_DSN").unwrap_or_else(|_| ARR_DSN.to_string()))
+}
+
+fn parse_dsn(d: &str) -> Option<sentry::types::Dsn> {
+    d.trim().parse().ok()
 }
 
 /// Whether this build can send reports at all (so setup only asks when it can).
@@ -28,7 +32,15 @@ pub fn available() -> bool {
 }
 
 /// Reporting while held; dropping it sends what's queued (for up to two seconds).
-pub struct Reporting(Option<sentry::ClientInitGuard>);
+pub struct Reporting(Option<Arc<sentry::Client>>);
+
+impl Drop for Reporting {
+    fn drop(&mut self) {
+        if let Some(c) = &self.0 {
+            c.close(Some(Duration::from_secs(2)));
+        }
+    }
+}
 
 impl Reporting {
     /// Whether reports are actually being sent.
@@ -40,33 +52,62 @@ impl Reporting {
 /// Starts reporting for `component` ("server", "setup", "installer", ...) when the user
 /// agreed and there's somewhere to report to. Panics are reported from then on too.
 pub fn start(enabled: bool, component: &str) -> Reporting {
-    if !enabled {
-        return Reporting(None);
+    match dsn() {
+        Some(dsn) if enabled => start_to(dsn, component),
+        _ => Reporting(None),
     }
-    let Some(dsn) = dsn() else {
-        return Reporting(None);
-    };
+}
+
+fn start_to(dsn: sentry::types::Dsn, component: &str) -> Reporting {
     let mut options = sentry::ClientOptions::default();
     options.release = sentry::release_name!();
     options.send_default_pii = false;
     options.server_name = None;
     options.attach_stacktrace = false;
+    options.dsn = Some(dsn);
     options.before_send = Some(Arc::new(|e| Some(scrub_event(e))));
-    let guard = sentry::init((dsn, options));
-    if !guard.is_enabled() {
+    // Bound to the main hub, not this thread's as `sentry::init` does: the setup page
+    // turns reporting on from one worker thread and fails on another.
+    let client = Arc::new(sentry::Client::from(sentry::apply_defaults(options)));
+    if !client.is_enabled() {
         return Reporting(None);
     }
-    sentry::configure_scope(|s| s.set_tag("component", component));
-    Reporting(Some(guard))
+    let hub = sentry::Hub::main();
+    hub.bind_client(Some(client.clone()));
+    hub.configure_scope(|s| s.set_tag("component", component));
+    Reporting(Some(client))
 }
 
 /// Reports an error that stopped something the user was doing. Does nothing unless
 /// reporting was started.
 pub fn error(component: &str, message: &str) {
-    sentry::with_scope(
+    let hub = sentry::Hub::main();
+    hub.with_scope(
         |s| s.set_tag("component", component),
-        || sentry::capture_message(&scrub(message), sentry::Level::Error),
+        || hub.capture_message(&scrub(message), sentry::Level::Error),
     );
+}
+
+/// Error detail shown to the user but left out of reports: another program's output, or
+/// an import error naming a title. Wrap it, and add the reportable part as context.
+#[derive(Debug)]
+pub struct Private(pub String);
+
+impl std::fmt::Display for Private {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Private {}
+
+/// An error chain as `{:#}` shows it, without its [`Private`] parts.
+pub fn reportable(e: &anyhow::Error) -> String {
+    e.chain()
+        .filter(|c| !c.is::<Private>())
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 /// For `arr report`: whether a config file says yes, read without its secrets (a broken
@@ -123,11 +164,19 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r(r#""[^"\n]*""#), "\"…\""),
         (r(r"“[^”\n]*”|‘[^’\n]*’"), "“…”"),
         (r(r"(^|[\s(:=\[,])'[^'\n]*'"), "$1'…'"),
-        // Paths: Windows (C:\…, \\server\…), home (~/…) and Unix (/…).
-        (r(r#"\b[A-Za-z]:[\\/][^\s"'<>|]*"#), "<path>"),
-        (r(r#"\\\\[^\s"'<>|]+"#), "<path>"),
-        (r(r#"~/[^\s"'<>]*"#), "<path>"),
-        (r(r#"(^|[\s(=\[,:])/[^\s"'<>]+"#), "$1<path>"),
+        // Paths: Windows (C:\…, \\server\…), home (~/…) and Unix (/…). Names in them can
+        // hold spaces and apostrophes, so a path runs to the next separator: ": ", "; ",
+        // ", ", a double quote, a line end or the end.
+        (
+            r(r#"\b[A-Za-z]:[\\/][^\n"]*?(: |; |, |"|\n|$)"#),
+            "<path>$1",
+        ),
+        (r(r#"\\\\[^\n"]+?(: |; |, |"|\n|$)"#), "<path>$1"),
+        (r(r#"~/[^\n"]*?(: |; |, |"|\n|$)"#), "<path>$1"),
+        (
+            r(r#"(^|[\s(=\[,:])/[^\n"]+?(: |; |, |"|\n|$)"#),
+            "$1<path>$2",
+        ),
         (r(r"\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b"), "<ip>"),
         (r(r"(?i)\b[0-9a-f]{0,4}(:[0-9a-f]{0,4}){2,7}\b"), "<ip>"),
         (
@@ -180,6 +229,94 @@ mod tests {
         }
         // The shape of the error stays readable.
         assert!(out.starts_with("import failed for"), "{out}");
+    }
+
+    #[test]
+    fn paths_go_whole_even_with_spaces() {
+        assert_eq!(
+            scrub(r"can't read C:\Users\Harry Potter\Media\config.toml: access denied"),
+            "can't read <path>: access denied"
+        );
+        assert_eq!(
+            scrub("can't create /srv/media/Movies/The Matrix (1999)/Harry's cut.mkv: no space"),
+            "can't create <path>: no space"
+        );
+        assert_eq!(scrub("in ~/My Movies"), "in <path>");
+        assert_eq!(
+            scrub(r"on \\nas\Media Share\TV; retrying"),
+            "on <path>; retrying"
+        );
+    }
+
+    #[test]
+    fn private_detail_stays_out_of_reports() {
+        // How the setup page's Plex import fails (wizard.rs), with bootstrap.rs's message.
+        let e = anyhow::Error::new(Private(
+            "The Matrix: tmdb connection failed; the run resumes at this item".into(),
+        ))
+        .context("the Plex import didn't finish");
+        assert!(
+            format!("{e:#}")
+                .ends_with(": The Matrix: tmdb connection failed; the run resumes at this item")
+        );
+        assert_eq!(reportable(&e), "the Plex import didn't finish");
+    }
+
+    /// The setup page turns reporting on from one worker thread and fails on another,
+    /// whose hub already exists.
+    #[test]
+    fn a_failure_on_another_thread_is_reported() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (got_tx, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut buf = vec![];
+                let mut chunk = [0; 4096];
+                // Headers, then as much body as they announce.
+                while let Ok(n @ 1..) = s.read(&mut chunk) {
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_lowercase();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+                let _ = got_tx.send(String::from_utf8_lossy(&buf).into_owned());
+            }
+        });
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _ = sentry::Hub::current(); // this thread's hub, made before reporting is on
+            wait.recv().unwrap();
+            error("setup", "failed on another thread");
+        });
+        let dsn = parse_dsn(&format!("http://key@{addr}/1")).unwrap();
+        let reporting = start_to(dsn, "setup");
+        go.send(()).unwrap();
+        worker.join().unwrap();
+        drop(reporting);
+        let body = got
+            .recv_timeout(Duration::from_secs(5))
+            .expect("nothing was sent");
+        assert!(body.contains("failed on another thread"), "{body}");
+    }
+
+    #[test]
+    fn a_bad_dsn_turns_reporting_off() {
+        assert!(parse_dsn(ARR_DSN).is_some());
+        assert!(parse_dsn("http://key@127.0.0.1:9/1").is_some());
+        for bad in ["", "  ", "not a dsn", "https://sentry.io/1"] {
+            assert!(parse_dsn(bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]

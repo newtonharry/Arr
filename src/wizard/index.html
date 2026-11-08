@@ -25,6 +25,11 @@
         <p id="signin-wait" class="muted" hidden>Waiting for you to sign in on the Plex tab… <a id="signin-link" href="#" target="_blank" rel="noopener noreferrer">Open it again</a></p>
       </div>
       <p id="signed-in" class="ok" hidden>Signed in to Plex.</p>
+      <!-- Here, not with the other options, so it can cover a failed Plex install too. -->
+      <div id="reporting-box" hidden>
+        <label class="check"><input type="checkbox" id="reporting"> Send error reports to help fix Arr</label>
+        <p class="hint">If something goes wrong during setup or later, Arr sends a short note about the error to its developer (through Sentry, stored in the EU). Names, folders, addresses and passwords are removed first, and nothing about your library or what you watch is sent. <a href="https://github.com/newtonharry/Arr/blob/main/docs/PRIVACY.md" target="_blank" rel="noopener noreferrer">What's sent</a>.</p>
+      </div>
     </section>
 
     <section id="step-server" class="card" hidden>
@@ -84,11 +89,6 @@
 
       <label class="check"><input type="checkbox" id="auto-update"> Install Arr updates automatically</label>
       <p class="hint">Recommended. Arr checks once a day for a new version and installs it, and goes back to the old one if the new one doesn't start.</p>
-
-      <div id="reporting-box" hidden>
-        <label class="check"><input type="checkbox" id="reporting"> Send error reports to help fix Arr</label>
-        <p class="hint">If something goes wrong, Arr sends a short note about the error to its developer (through Sentry, stored in the EU). Names, folders, addresses and passwords are removed first, and nothing about your library or what you watch is sent. <a href="https://github.com/newtonharry/Arr/blob/main/docs/PRIVACY.md" target="_blank" rel="noopener noreferrer">What's sent</a>.</p>
-      </div>
 
       <details>
         <summary>Optional: a TMDB key, to find movies you don't have yet</summary>

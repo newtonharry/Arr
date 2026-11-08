@@ -661,9 +661,13 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
     let extra = [
         format!("--plex-installer={installer}"),
         format!("--plex-port={}", mock.port()),
+        // The installer's --error-reports: the box starts ticked.
+        "--error-reports".into(),
     ];
     let (_child, link, port) = start_wizard(&tmp.path().join("state"), mock, &extra).await;
     let page = open_page(&link, port).await;
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(v["reporting"]["enabled"], true, "{v}");
     page.post("/api/plex/signin", json!({})).await;
     page.post("/api/plex/check", json!({})).await;
     let (_, v) = page.post("/api/plex/check", json!({})).await;

@@ -69,6 +69,8 @@ pub struct Options {
     pub plex_installer: Option<String>,
     /// Where Plex listens on this computer (32400).
     pub plex_port: u16,
+    /// The installer was told yes (`--error-reports`): the page starts with reports on.
+    pub error_reports: bool,
 }
 
 struct Wizard {
@@ -194,7 +196,10 @@ pub async fn run(opts: Options) -> Result<()> {
         http: upstream::http_client(PLEX_TIMEOUT, reqwest::redirect::Policy::none()),
         inner: Mutex::new(Inner::default()),
         finished: Notify::new(),
-        reporting: Mutex::new(None),
+        reporting: Mutex::new(
+            opts.error_reports
+                .then(|| crate::report::start(true, "setup")),
+        ),
         opts,
     });
     let host = if wiz.opts.bind.is_loopback() {
@@ -872,7 +877,10 @@ async fn install_plex(State(wiz): St) -> Response {
         w.inner.lock().unwrap().install = match result {
             Ok(()) => Install::Done,
             Err(message) => {
-                crate::report::error("plex-install", &message);
+                // Closing the password dialog is a choice, not a failure.
+                if message != NO_PASSWORD {
+                    crate::report::error("plex-install", &message);
+                }
                 Install::Failed { message }
             }
         };
@@ -883,6 +891,8 @@ async fn install_plex(State(wiz): St) -> Response {
 fn set_install_step(wiz: &Wizard, step: &str) {
     wiz.inner.lock().unwrap().install = Install::Running { step: step.into() };
 }
+
+const NO_PASSWORD: &str = "Plex wasn't installed, because the password wasn't entered. Click Install Plex again to retry.";
 
 async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -927,9 +937,7 @@ async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
     if !status.success() {
         // pkexec: 126 when the password dialog is closed, 127 when it isn't authorized.
         return Err(match status.code() {
-            Some(126 | 127) if cmd[0].ends_with("pkexec") => {
-                "Plex wasn't installed, because the password wasn't entered. Click Install Plex again to retry.".into()
-            }
+            Some(126 | 127) if cmd[0].ends_with("pkexec") => NO_PASSWORD.into(),
             _ => format!("Plex couldn't be installed: {}", tail(&errors)),
         });
     }
@@ -1300,9 +1308,10 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
                 downloading: c.downloading,
             },
             Err(e) => {
-                let message = format!("{e:#}");
-                crate::report::error("setup", &message);
-                Phase::Failed { message }
+                crate::report::error("setup", &crate::report::reportable(&e));
+                Phase::Failed {
+                    message: format!("{e:#}"),
+                }
             }
         };
         if matches!(inner.phase, Phase::Done { .. }) {
@@ -1400,7 +1409,11 @@ async fn arr(wiz: &Wizard, args: &[&str], config: &Path) -> Result<()> {
     if out.status.success() {
         return Ok(());
     }
-    bail!("arr {} failed: {}", args[0], tail(&out.stderr))
+    // Its output is shown on the page but not reported: it can name anything.
+    Err(
+        anyhow::Error::new(crate::report::Private(tail(&out.stderr)))
+            .context(format!("arr {} failed", args[0])),
+    )
 }
 
 fn tail(bytes: &[u8]) -> String {
@@ -1445,11 +1458,10 @@ async fn bootstrap(wiz: &Wizard, config: &Path, media: &str) -> Result<()> {
     }
     let status = child.wait().await?;
     let stdout = collect.await.unwrap_or_default();
+    // The import's own words (log lines, titles) are shown on the page but not reported.
+    let private = |m: String| anyhow::Error::new(crate::report::Private(m));
     if !status.success() {
-        bail!(
-            "the Plex import failed: {}",
-            tail(last.join("\n").as_bytes())
-        );
+        return Err(private(tail(last.join("\n").as_bytes())).context("the Plex import failed"));
     }
     let out: Value = serde_json::from_slice(&stdout).unwrap_or(Value::Null);
     if let Some(run) = out["runs"]
@@ -1458,12 +1470,10 @@ async fn bootstrap(wiz: &Wizard, config: &Path, media: &str) -> Result<()> {
         .flatten()
         .find(|r| r["status"] != "done")
     {
-        bail!(
-            "the Plex import didn't finish: {}",
-            run["last_error"]
-                .as_str()
-                .unwrap_or("run the installer again to continue it")
-        );
+        let why = run["last_error"]
+            .as_str()
+            .unwrap_or("run the installer again to continue it");
+        return Err(private(why.to_string()).context("the Plex import didn't finish"));
     }
     Ok(())
 }
