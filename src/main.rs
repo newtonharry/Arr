@@ -122,8 +122,9 @@ enum Command {
         /// Owner of the folders it creates, as UID:GID.
         #[arg(long)]
         owner: Option<String>,
-        #[arg(long, default_value = "/srv/media")]
-        media: PathBuf,
+        /// The media folder (default: /srv/media on Linux, your Media folder on Windows).
+        #[arg(long)]
+        media: Option<PathBuf>,
     },
     /// Run the HTTP API (and, with [execution] enabled, the background worker).
     Serve {
@@ -539,6 +540,7 @@ async fn main() -> Result<()> {
                 }
                 None => None,
             };
+            let media = media.unwrap_or_else(arr::plexinstall::default_media);
             arr::plexinstall::run(arr::plexinstall::Options { owner, media }).await
         }
         Command::Mcp {

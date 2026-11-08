@@ -147,6 +147,7 @@ async fn unplayable_media_fails_is_blocklisted_and_never_owned() {
     assert_eq!(e.grab_row(&id).failure.as_deref(), Some("invalid_media"));
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test]
 async fn symlinks_existing_destinations_and_free_space_block_without_writing() {
     let mut snap = parity_snapshot(Some(1));
@@ -678,6 +679,7 @@ async fn crash_recovery_restores_originals_and_rolls_back_uncommitted_imports() 
     assert!(again["journal"].as_array().unwrap().is_empty());
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test]
 async fn unreadable_sources_block_instead_of_failing_the_release() {
     use std::os::unix::fs::PermissionsExt;

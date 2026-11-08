@@ -1,9 +1,14 @@
 //! Owner-only file handling: private directories (0700), private files (0600), atomic
 //! replacement, and bounded reads.
+//!
+//! On Windows there are no mode bits: privacy comes from the folder's access list. The
+//! state folder lives in the user's profile, which only that user (and administrators) can
+//! open, and `install.ps1` also strips inherited access from it.
 
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -20,13 +25,16 @@ pub fn check_private_dir(path: &Path) -> Result<()> {
     if !meta.is_dir() {
         bail!("{} is not a directory", path.display());
     }
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        bail!(
-            "{} has mode {:o}; private directories must not be accessible to group/other (chmod 700)",
-            path.display(),
-            mode
-        );
+    #[cfg(unix)]
+    {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "{} has mode {:o}; private directories must not be accessible to group/other (chmod 700)",
+                path.display(),
+                mode
+            );
+        }
     }
     Ok(())
 }
@@ -36,9 +44,10 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .recursive(true)
+            let mut b = fs::DirBuilder::new();
+            #[cfg(unix)]
+            b.mode(0o700);
+            b.recursive(true)
                 .create(path)
                 .with_context(|| format!("cannot create {}", path.display()))?;
             // The umask may have narrowed the mode further; never widen it.
@@ -54,23 +63,27 @@ pub fn check_private_file(path: &Path) -> Result<()> {
     if !meta.is_file() {
         bail!("{} is not a regular file", path.display());
     }
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        bail!(
-            "{} has mode {:o}; private files must not be readable by group/other (chmod 600)",
-            path.display(),
-            mode
-        );
+    #[cfg(unix)]
+    {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "{} has mode {:o}; private files must not be readable by group/other (chmod 600)",
+                path.display(),
+                mode
+            );
+        }
     }
     Ok(())
 }
 
 /// Creates a new file (fails if it exists) with mode 0600, writes, and fsyncs it.
 pub fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    o.mode(0o600);
+    let mut f = o
         .open(path)
         .with_context(|| format!("cannot create {}", path.display()))?;
     f.write_all(bytes)
@@ -78,10 +91,69 @@ pub fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("cannot write {}", path.display()))
 }
 
+/// Makes a rename or new file in `path` durable. Windows can't open a folder this way, and
+/// NTFS journals renames, so there it does nothing.
 pub fn fsync_dir(path: &Path) -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
     File::open(path)
         .and_then(|d| d.sync_all())
         .with_context(|| format!("cannot fsync {}", path.display()))
+}
+
+/// A file's (device, inode) without following a final symlink. On Windows: the volume
+/// serial number and the NTFS file index, which identify a file the same way.
+pub fn file_id(path: &Path) -> std::io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::symlink_metadata(path)?;
+        Ok((m.dev(), m.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            GetFileInformationByHandle,
+        };
+        // Metadata only (no read access), folders too, and the link itself, not its target.
+        let f = OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid open handle and a zeroed out-parameter of the right type.
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((
+            info.dwVolumeSerialNumber as u64,
+            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        ))
+    }
+}
+
+/// Last-modified time in whole seconds since 1970, as `stat`'s `st_mtime`.
+pub fn mtime(m: &fs::Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        m.mtime()
+    }
+    #[cfg(not(unix))]
+    {
+        match m
+            .modified()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH))
+        {
+            Ok(Ok(d)) => d.as_secs() as i64,
+            Ok(Err(e)) => -(e.duration().as_secs_f64().ceil() as i64),
+            Err(_) => 0,
+        }
+    }
 }
 
 pub fn random_hex(bytes: usize) -> Result<String> {
@@ -145,6 +217,7 @@ pub fn read_secret_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn private_dir_and_file_modes_are_enforced() {
         let tmp = tempfile::tempdir().unwrap();
@@ -182,6 +255,22 @@ mod tests {
             !err.contains("s3cret"),
             "errors must not echo secret contents"
         );
+    }
+
+    #[test]
+    fn file_ids_tell_files_apart_and_follow_renames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::write(&a, b"1").unwrap();
+        fs::write(&b, b"2").unwrap();
+        let id = file_id(&a).unwrap();
+        assert_ne!(id, file_id(&b).unwrap());
+        assert_eq!(id.0, file_id(&b).unwrap().0, "same volume");
+        let c = tmp.path().join("c");
+        fs::rename(&a, &c).unwrap();
+        assert_eq!(file_id(&c).unwrap(), id);
+        assert!(file_id(&a).is_err());
+        assert!(file_id(tmp.path()).is_ok(), "folders have ids too");
     }
 
     #[test]

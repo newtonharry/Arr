@@ -1167,7 +1167,7 @@ pub fn summary(prepared: &Prepared, status: &str, dir: Option<PathBuf>) -> Value
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // fixtures use Unix absolute paths
 mod tests {
     use super::*;
     use crate::fsutil;

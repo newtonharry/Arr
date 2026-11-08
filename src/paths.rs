@@ -15,6 +15,31 @@ pub fn normalize_client(p: &str) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
+/// A relative path as `/`-separated text on every OS (Windows would use `\\`), which is
+/// how relative paths are stored and compared. None unless every part is a plain name.
+pub fn rel_string(rel: &Path) -> Option<String> {
+    let mut parts = vec![];
+    for c in rel.components() {
+        match c {
+            Component::Normal(p) => parts.push(p.to_string_lossy().into_owned()),
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// A local folder written as a download client path: `/`-separated and starting with `/`.
+/// Unix paths are unchanged; on Windows `C:\\Users\\x` becomes `/C:/Users/x`.
+pub fn client_form(local: &Path) -> String {
+    let s = local.to_string_lossy().replace('\\', "/");
+    let s = s.trim_end_matches('/');
+    if s.starts_with('/') {
+        s.to_string()
+    } else {
+        format!("/{s}")
+    }
+}
+
 /// Maps a client path below `client_root` to the same location below `local_root`.
 pub fn client_to_local(client_root: &str, local_root: &Path, client_path: &str) -> Option<PathBuf> {
     let root = normalize_client(client_root)?;
@@ -115,6 +140,7 @@ pub fn ensure_dirs(root: &Path, rel: &Path) -> Result<PathBuf, String> {
 }
 
 /// Free bytes available to this process on the filesystem holding `path`.
+#[cfg(unix)]
 pub fn free_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -124,6 +150,25 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     #[allow(clippy::unnecessary_cast)] // c_ulong/fsblkcnt_t widths differ across targets
     let free = (s.f_bavail as u64).saturating_mul(s.f_frsize as u64);
     (rc == 0).then_some(free)
+}
+
+/// Free bytes available to this process on the drive holding `path`.
+#[cfg(windows)]
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: a NUL-terminated wide path and a valid out-parameter; the others may be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free)
 }
 
 #[cfg(test)]
@@ -155,6 +200,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // makes symlinks
     #[test]
     fn symlinks_are_refused() {
         let tmp = tempfile::tempdir().unwrap();

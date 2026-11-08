@@ -239,9 +239,9 @@ async fn start(o: Opts) -> Emb {
         .unwrap_or_default();
     let extra = format!(
         "[execution]\nenabled = true\ndownload_cleanup = true\n\
-         [embedded]\ndownload_dir = \"{dl}\"\nlisten = \"127.0.0.1:0\"\ntrackers = false\ndht = false\nlocal_discovery = false\ninitial_peers = [\"{seed}\"]\nmax_active_downloads = {max}\n{limit}\
-         [migration]\nmode = \"{mode}\"\n\
-         [library]\nmovies = \"{movies}\"\ntv = \"{tv}\"\nsample_detection = false\nprobe_timeout_secs = 30\n\
+         [embedded]\ndownload_dir = '{dl}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ndht = false\nlocal_discovery = false\ninitial_peers = [\"{seed}\"]\nmax_active_downloads = {max}\n{limit}\
+         [migration]\nmode = '{mode}'\n\
+         [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = false\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 3600\n{stall}{tmdb}",
         dl = downloads.display(),
         seed = seeder.addr(),
@@ -476,7 +476,7 @@ async fn a_new_movie_arrives_over_bittorrent_imports_and_seeds_to_ratio_two_acro
         .to_string();
     let g = e.grab(&id);
     assert_eq!((g.category.as_str(), g.seed_ratio), ("radarr", Some(2.0)));
-    assert_eq!(g.save_path, e.downloads.display().to_string());
+    assert_eq!(g.save_path, arr::paths::client_form(&e.downloads));
 
     // Real bytes from the controlled peer, every piece checked, then the normal import.
     e.until(&id, "imported", |g| g.state == "imported").await;
@@ -864,11 +864,11 @@ async fn a_state_is_bound_to_its_first_download_backend() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("state");
     let lib = format!(
-        "[library]\nmovies = \"{}\"\n[migration]\nmode = \"legacy\"\n[execution]\nenabled = true\n",
+        "[library]\nmovies = '{}'\n[migration]\nmode = \"legacy\"\n[execution]\nenabled = true\n",
         tmp.path().join("movies").display()
     );
     let embedded = format!(
-        "{lib}[embedded]\ndownload_dir = \"{}\"\nlisten = \"127.0.0.1:0\"\n",
+        "{lib}[embedded]\ndownload_dir = '{}'\nlisten = \"127.0.0.1:0\"\n",
         tmp.path().join("dl").display()
     );
     let (addr, _mock) = start_mock().await;
@@ -881,7 +881,7 @@ async fn a_state_is_bound_to_its_first_download_backend() {
     drop(state);
     // The same state with qBittorrent configured instead is refused, never reinterpreted.
     let qbit = format!(
-        "{lib}[qbittorrent]\nbase_url = \"http://127.0.0.1:9/\"\nsave_path = \"/downloads\"\nlocal_path = \"{}\"\n",
+        "{lib}[qbittorrent]\nbase_url = \"http://127.0.0.1:9/\"\nsave_path = \"/downloads\"\nlocal_path = '{}'\n",
         tmp.path().join("qb").display()
     );
     write_state(&dir, &snapshot(), &qbit, Some(addr), false);
@@ -916,9 +916,9 @@ async fn the_server_process_killed_mid_download_resumes_and_imports() {
     fsutil::write_new_private_file(&dir.join("secrets/tmdb"), TMDB_V3_KEY.as_bytes()).unwrap();
     let extra = format!(
         "[execution]\nenabled = true\ndownload_cleanup = true\n\
-         [embedded]\ndownload_dir = \"{}\"\nlisten = \"127.0.0.1:0\"\ntrackers = false\ninitial_peers = [\"{}\"]\ndownload_limit_bytes_per_sec = 16384\n\
+         [embedded]\ndownload_dir = '{}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ninitial_peers = [\"{}\"]\ndownload_limit_bytes_per_sec = 16384\n\
          [migration]\nmode = \"coexistence\"\n\
-         [library]\nmovies = \"{}\"\nsample_detection = false\nprobe_timeout_secs = 30\n\
+         [library]\nmovies = '{}'\nsample_detection = false\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 1\n\
          [tmdb]\nenabled = true\nbase_url = \"http://{mock_addr}/tmdb\"\ncredential_file = \"secrets/tmdb\"\n",
         downloads.display(),
@@ -1068,7 +1068,7 @@ fn standalone(
     fsutil::write_new_private_file(&state.join("secrets/api_token"), TOKEN.as_bytes()).unwrap();
     std::fs::create_dir_all(root.join("downloads")).unwrap();
     let text = format!(
-        "[server]\napi_token_file = \"secrets/api_token\"\n[embedded]\ndownload_dir = \"{}\"\nlisten = \"127.0.0.1:0\"\ntrackers = false\n",
+        "[server]\napi_token_file = \"secrets/api_token\"\n[embedded]\ndownload_dir = '{}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\n",
         root.join("downloads").display()
     );
     fsutil::write_new_private_file(&state.join("config.toml"), text.as_bytes()).unwrap();
@@ -1646,7 +1646,7 @@ fn an_occupied_api_port_starts_no_engine() {
         .unwrap();
     let cfg_path = root.join("state/config.toml");
     let text = format!(
-        "[server]\nlisten = \"{}\"\napi_token_file = \"secrets/api_token\"\n[execution]\nenabled = true\n[embedded]\ndownload_dir = \"{}\"\nlisten = \"{engine_port}\"\ntrackers = false\n[library]\nmovies = \"{}\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9/\"\napi_key_file = \"secrets/api_token\"\n[migration]\nmode = \"coexistence\"\n",
+        "[server]\nlisten = '{}'\napi_token_file = \"secrets/api_token\"\n[execution]\nenabled = true\n[embedded]\ndownload_dir = '{}'\nlisten = '{engine_port}'\ntrackers = false\n[library]\nmovies = '{}'\n[prowlarr]\nbase_url = \"http://127.0.0.1:9/\"\napi_key_file = \"secrets/api_token\"\n[migration]\nmode = \"coexistence\"\n",
         api.local_addr().unwrap(),
         root.join("downloads").display(),
         root.join("movies").display()

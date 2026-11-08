@@ -440,7 +440,18 @@ fn d_probes_per_scan() -> u32 {
     20
 }
 
+/// Debian's ffprobe; on Windows, the first `ffprobe.exe` on the PATH.
 fn d_ffprobe() -> String {
+    if cfg!(windows) {
+        return std::env::var_os("PATH")
+            .and_then(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.join("ffprobe.exe"))
+                    .find(|f| f.is_absolute() && f.is_file())
+            })
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ffprobe.exe".into());
+    }
     "/usr/bin/ffprobe".into()
 }
 fn d_probe_timeout() -> u64 {
@@ -838,6 +849,24 @@ fn absolute_path(raw: &str, what: &str) -> Result<PathBuf> {
     Ok(p.to_path_buf())
 }
 
+/// A folder as another program (qBittorrent, Plex, perhaps in Docker) sees it: absolute in
+/// Unix or Windows form, whatever this computer runs, without '.' or '..'. Trailing
+/// separators are dropped ("/" stays "", for the caller to decide).
+fn remote_path(raw: &str, what: &str) -> Result<String> {
+    let s = raw.trim();
+    let b = s.as_bytes();
+    let unix = s.starts_with('/');
+    let windows = (b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && matches!(b[2], b'/' | b'\\'))
+        || s.starts_with("\\\\");
+    if !(unix || windows) || s.split(['/', '\\']).any(|c| c == "." || c == "..") {
+        bail!("{what} must be an absolute path without '.' or '..' components");
+    }
+    Ok(s.trim_end_matches(['/', '\\']).to_string())
+}
+
 fn category(raw: Option<String>, what: &str) -> Result<Option<String>> {
     match raw {
         None => Ok(None),
@@ -1141,10 +1170,14 @@ pub fn parse_config(
                     "qbittorrent.username_file and qbittorrent.password_file must be set together (or both omitted when qBittorrent bypasses authentication for this client)"
                 );
             }
-            let save_path = absolute_path(&q.save_path, "qbittorrent.save_path")?
-                .to_string_lossy()
-                .trim_end_matches('/')
-                .to_string();
+            let save_path = remote_path(&q.save_path, "qbittorrent.save_path")?;
+            // Download-client paths are compared in Unix form; qBittorrent on Windows isn't
+            // supported (on Windows, use the built-in downloader: [embedded]).
+            if !q.save_path.trim().starts_with('/') {
+                bail!(
+                    "qbittorrent.save_path must be the folder as qBittorrent sees it, in Unix form such as /downloads (qBittorrent running on Windows isn't supported; use [embedded])"
+                );
+            }
             Some(QbitConfig {
                 base_url: parse_base_url(&q.base_url, "qbittorrent.base_url")?,
                 username,
@@ -1175,11 +1208,9 @@ pub fn parse_config(
         None => None,
         Some(e) => {
             let download_dir = absolute_path(&e.download_dir, "embedded.download_dir")?;
-            let save_path = download_dir
-                .to_string_lossy()
-                .trim_end_matches('/')
-                .to_string();
-            if save_path.is_empty() || paths_overlap(&download_dir, &state_dir) {
+            let save_path = crate::paths::client_form(&download_dir);
+            if save_path.is_empty() || save_path == "/" || paths_overlap(&download_dir, &state_dir)
+            {
                 bail!(
                     "embedded.download_dir must be a dedicated directory, not / and neither inside nor around the state directory"
                 );
@@ -1389,10 +1420,7 @@ pub fn parse_config(
             let plex_path = |v: &Option<String>, what: &str| -> Result<Option<String>> {
                 v.as_deref()
                     .map(|p| {
-                        absolute_path(p, what).map(|p| {
-                            let s = p.to_string_lossy().trim_end_matches('/').to_string();
-                            if s.is_empty() { "/".to_string() } else { s }
-                        })
+                        remote_path(p, what).map(|s| if s.is_empty() { "/".to_string() } else { s })
                     })
                     .transpose()
             };
@@ -2033,7 +2061,6 @@ mode = "coexistence"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn setup(config: &str) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2055,6 +2082,7 @@ mod tests {
         (tmp, cfg)
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn embedded_section_is_explicit_exclusive_and_validated() {
         let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n";
@@ -2092,7 +2120,7 @@ mod tests {
             ),
             (
                 format!(
-                    "{base}[embedded]\ndownload_dir = \"{around_state}\"\nlisten = \"127.0.0.1:0\"\n"
+                    "{base}[embedded]\ndownload_dir = '{around_state}'\nlisten = \"127.0.0.1:0\"\n"
                 ),
                 "state directory",
             ),
@@ -2175,6 +2203,7 @@ mod tests {
         assert!(fc.execution.download_cleanup && !fc.execution.enabled);
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn execution_sections_are_validated() {
         let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n";
@@ -2440,6 +2469,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn deferred_secrets_list_missing_files_without_reading_values() {
         let text = "[server]\napi_token_file = \"secrets/api_token\"\n[plex]\nbase_url = \"http://127.0.0.1:32400\"\ntoken_file = \"secrets/plex_token\"\nmovies_path = \"/data/movies/\"\n";
@@ -2513,8 +2543,10 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_loopback_requires_explicit_opt_in_and_secret_modes_are_checked() {
+        use std::os::unix::fs::PermissionsExt;
         let (_t, cfg) = setup(
             "[server]\nlisten = \"0.0.0.0:8787\"\nallow_non_loopback = true\napi_token_file = \"secrets/api_token\"\n",
         );

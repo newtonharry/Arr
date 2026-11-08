@@ -162,7 +162,7 @@ async fn sigkill_recovers_partial_download_then_real_upload_accounting() {
     let api_addr = address();
     let engine_addr = address();
     let extra = format!(
-        "[execution]\nenabled=true\n[embedded]\ndownload_dir=\"{}\"\nlisten=\"{engine_addr}\"\ntrackers=false\ndht=false\nlocal_discovery=false\ninitial_peers=[\"{}\"]\ndownload_limit_bytes_per_sec=131072\npeer_limit=8\n[migration]\nmode=\"coexistence\"\n[library]\nmovies=\"{}\"\nsample_detection=false\n[automation]\npoll_seconds=1\nrss_interval_minutes=0\nmetadata_refresh_hours=720\nrescan_hours=720\n",
+        "[execution]\nenabled=true\n[embedded]\ndownload_dir='{}'\nlisten=\"{engine_addr}\"\ntrackers=false\ndht=false\nlocal_discovery=false\ninitial_peers=[\"{}\"]\ndownload_limit_bytes_per_sec=131072\npeer_limit=8\n[migration]\nmode=\"coexistence\"\n[library]\nmovies='{}'\nsample_detection=false\n[automation]\npoll_seconds=1\nrss_interval_minutes=0\nmetadata_refresh_hours=720\nrescan_hours=720\n",
         downloads.display(),
         seed.listen_addr().unwrap(),
         movies.display()

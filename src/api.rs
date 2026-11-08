@@ -4051,12 +4051,28 @@ async fn shutdown() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
+    #[cfg(unix)]
     let term = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut s) => {
                 s.recv().await;
             }
             Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    // Windows: Ctrl+C, closing the console window, logging off or shutting down.
+    #[cfg(windows)]
+    let term = async {
+        use tokio::signal::windows;
+        match (
+            windows::ctrl_close(),
+            windows::ctrl_logoff(),
+            windows::ctrl_shutdown(),
+        ) {
+            (Ok(mut a), Ok(mut b), Ok(mut c)) => {
+                tokio::select! { _ = a.recv() => {}, _ = b.recv() => {}, _ = c.recv() => {} }
+            }
+            _ => std::future::pending::<()>().await,
         }
     };
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }

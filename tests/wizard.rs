@@ -219,6 +219,20 @@ fn wrong_code(code: &str) -> String {
     format!("{}{last}", &code[..code.len() - 1])
 }
 
+/// Debian's ffprobe; on Windows, the first on the PATH.
+fn ffprobe() -> std::path::PathBuf {
+    if cfg!(unix) {
+        return "/usr/bin/ffprobe".into();
+    }
+    std::env::var_os("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("ffprobe.exe"))
+                .find(|f| f.is_file())
+        })
+        .unwrap_or_else(|| "ffprobe.exe".into())
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -272,7 +286,8 @@ async fn start_wizard(
         .args(["wizard", "--no-docker", "--port", &port.to_string()])
         .arg("--state-dir")
         .arg(state_dir)
-        .args(["--ffprobe", "/usr/bin/ffprobe"])
+        .arg("--ffprobe")
+        .arg(ffprobe())
         .arg(format!("--plex-tv-url=http://{mock}/"))
         .arg(format!("--plex-auth-url=http://{mock}/auth"))
         .args(extra)
@@ -450,13 +465,19 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         format!("base_url = \"http://127.0.0.1:{}/\"", mock.port()),
         "movie_section = 1".into(),
         "tv_section = 2".into(),
-        format!("movies = {:?}", movies.to_str().unwrap()),
-        format!("tv_path = {:?}", tv.to_str().unwrap()),
-        format!("download_dir = {:?}", downloads.to_str().unwrap()),
         "[execution]\nenabled = false".into(),
         "[tmdb]\nenabled = false".into(),
     ] {
         assert!(config.contains(&want), "missing {want:?} in:\n{config}");
+    }
+    // Paths are compared as values: TOML spells Windows paths differently.
+    let parsed: toml::Table = toml::from_str(&config).unwrap();
+    for (table, key, want) in [
+        ("library", "movies", &movies),
+        ("plex", "tv_path", &tv),
+        ("embedded", "download_dir", &downloads),
+    ] {
+        assert_eq!(parsed[table][key].as_str(), want.to_str(), "{table}.{key}");
     }
     assert!(downloads.is_dir());
     assert_eq!(
@@ -467,6 +488,7 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         std::fs::read_to_string(state_dir.join("setup-choices")).unwrap(),
         "auto_update=1\n"
     );
+    #[cfg(unix)]
     for f in [
         "config.toml",
         "secrets/plex_token",
@@ -516,7 +538,7 @@ async fn an_existing_config_is_never_replaced() {
             "wizard",
             "--no-docker",
             "--ffprobe",
-            "/usr/bin/ffprobe",
+            ffprobe().to_str().unwrap(),
             "--port",
         ])
         .arg(free_port().to_string())
@@ -576,6 +598,7 @@ async fn only_the_accounts_plex_on_this_computer_is_used() {
     assert_eq!(v["plex"]["name"], "Living Room");
 }
 
+#[cfg(unix)] // only the Unix-only install test uses it
 /// Opens the page with the link's code; returns a client holding the session cookie.
 async fn open_page(link: &str, port: u16) -> Page {
     let http = reqwest::Client::builder()

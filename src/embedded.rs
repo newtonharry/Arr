@@ -334,7 +334,10 @@ fn inspect(bytes: &[u8]) -> Result<Inspected, String> {
             return Err("the torrent contains a symlink entry".into());
         }
         let rel = f.filename.to_pathbuf();
-        if paths::safe_rel(&rel.to_string_lossy()).is_none() {
+        if paths::rel_string(&rel)
+            .and_then(|r| paths::safe_rel(&r))
+            .is_none()
+        {
             return Err(format!("unsafe file name {:?}", rel.to_string_lossy()));
         }
         files.push(rel);
@@ -375,18 +378,15 @@ fn real_directories(path: &Path) -> Result<(), UpstreamError> {
 
 /// Takes the exclusive engine lock of a state's session directory (non-blocking).
 fn lock_session(dir: &Path) -> Result<std::fs::File, UpstreamError> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let f = o
         .open(dir.join("engine.lock"))
         .map_err(|e| io_failure("opening the engine lock", &e))?;
-    // SAFETY: flock on a file descriptor this function owns; no memory is involved.
-    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if r != 0 {
+    // flock(LOCK_EX | LOCK_NB) on Unix, LockFileEx on Windows.
+    if f.try_lock().is_err() {
         return Err(unavailable(
             "another engine already runs on this state directory; one state directory has one embedded engine",
         ));
@@ -1344,7 +1344,8 @@ impl Embedded {
             if f.attrs.padding {
                 continue;
             }
-            let rel = f.relative_filename.to_string_lossy().to_string();
+            let rel = paths::rel_string(&f.relative_filename)
+                .unwrap_or_else(|| f.relative_filename.to_string_lossy().into_owned());
             let name = if row.multi_file {
                 format!("{}/{rel}", row.name)
             } else {
@@ -1476,11 +1477,13 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(unix)]
     fn layout(torrent: &[u8]) -> Layout {
         let t = librqbit::torrent_from_bytes(torrent).unwrap();
         Layout::of(&t.info.data.validate().unwrap())
     }
 
+    #[cfg(unix)] // makes symlinks
     #[test]
     fn the_piece_check_accepts_exact_data_and_rejects_any_difference() {
         // Files spanning several pieces and a piece boundary between files.
@@ -1637,7 +1640,7 @@ mod tests {
         std::fs::create_dir_all(&downloads).unwrap();
         let store = Store::open(&root.join("state.sqlite")).unwrap();
         let cfg = EmbeddedConfig {
-            save_path: downloads.to_string_lossy().into(),
+            save_path: crate::paths::client_form(&downloads),
             download_dir: downloads,
             session_dir: root.join("embedded"),
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -1682,13 +1685,16 @@ mod tests {
         let hash = t.info_hash.clone();
         // An admitted, active record of this torrent with its complete file in place, as the
         // engine itself left them: the engine finds every piece and the transfer completes.
-        let (h, out) = (hash.clone(), cfg.save_path.clone());
+        // The save path is client-style; the output folder is the real folder (they differ
+        // on Windows: /C:/x and C:\x).
+        let (h, save) = (hash.clone(), cfg.save_path.clone());
+        let out = cfg.download_dir.to_string_lossy().into_owned();
         store
             .blocking(|c| {
                 c.execute(
                     "INSERT INTO embedded_torrents (info_hash, name, category, tags, save_path, output_folder, multi_file, ratio_limit, seeding_time_limit, admitted_at, added_at, updated_at)
-                     VALUES (?1, ?2, 'um-movies', 'unified-media', ?3, ?3, 0, -2.0, -2, 'x', 'x', 'x')",
-                    params![h, name, out],
+                     VALUES (?1, ?2, 'um-movies', 'unified-media', ?3, ?4, 0, -2.0, -2, 'x', 'x', 'x')",
+                    params![h, name, save, out],
                 )?;
                 Ok(())
             })

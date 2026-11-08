@@ -755,7 +755,10 @@ async fn outage_and_partial_pagination() {
             .unwrap(),
     )
     .await;
-    assert_eq!((s, code(&v)), (502, "upstream_unavailable"), "{text}");
+    // Windows retries a refused connection for about two seconds, so it can time out first.
+    let refused = (s, code(&v)) == (502, "upstream_unavailable");
+    let timed_out = cfg!(windows) && (s, code(&v)) == (504, "upstream_timeout");
+    assert!(refused || timed_out, "{text}");
     assert!(
         !text.contains(&closed.port().to_string()),
         "URL leaked: {text}"

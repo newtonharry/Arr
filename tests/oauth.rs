@@ -153,6 +153,7 @@ impl Env {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(
             dir.path(),
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
@@ -187,7 +188,7 @@ impl Env {
         let text = format!(
             "[server]\napi_token_file = \"secrets/api_token\"\n\
              [mcp]\nenabled = true\ntoken_file = \"secrets/mcp_token\"\nallowed_hosts = [\"127.0.0.1\"]\n\
-             [mcp.oauth]\npublic_url = \"{}\"\ngoogle_client_id = \"{GOOGLE_ID}\"\n\
+             [mcp.oauth]\npublic_url = '{}'\ngoogle_client_id = '{GOOGLE_ID}'\n\
              google_client_secret_file = \"secrets/google_secret\"\nallowed_emails = {emails}\n\
              trusted_client_metadata = [\"http://{m}/oauth/\"]\n\
              google_authorization_endpoint = \"http://{m}/google/auth\"\n\

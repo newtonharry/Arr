@@ -789,7 +789,7 @@ async fn a_legacy_seeded_state_switched_to_coexistence_refuses_unadopted_items_a
     let cfg = e.dir.join("config.toml");
     let text = std::fs::read_to_string(&cfg)
         .unwrap()
-        .replace("mode = \"legacy\"", "mode = \"coexistence\"");
+        .replace("mode = 'legacy'", "mode = 'coexistence'");
     std::fs::remove_file(&cfg).unwrap();
     fsutil::write_new_private_file(&cfg, text.as_bytes()).unwrap();
     e.restart().await;

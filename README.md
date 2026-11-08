@@ -41,9 +41,26 @@ the page. To answer the questions in the terminal instead, add `--terminal`:
 `curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --terminal`.
 
 Arr runs on macOS and on Linux with glibc 2.35 or newer (Debian 12, Ubuntu 22.04, Raspberry
-Pi OS 12 and later), on x86_64 and ARM64. On Windows, run it inside WSL2. Plex can run
-natively or in Docker; when the script can see the Plex container, it maps Docker paths back
-to your disk.
+Pi OS 12 and later), on x86_64 and ARM64. Plex can run natively or in Docker; when the script
+can see the Plex container, it maps Docker paths back to your disk.
+
+### Windows
+
+On the PC that runs Plex, open PowerShell (Start menu, type "PowerShell") and paste:
+
+```powershell
+irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex
+```
+
+It needs no administrator rights. It installs FFmpeg with `winget` if it's missing (it asks
+first), opens the same setup page, and starts Arr in the background whenever you log in, as
+Plex itself does on Windows. Arr lives in `%LOCALAPPDATA%\Programs\Arr`, its config and data
+in `%LOCALAPPDATA%\Arr` (only your account can open it), and its log in
+`%LOCALAPPDATA%\Arr\arr.log`. Windows Firewall may ask whether `arr-background` may accept
+connections: allowing it lets other torrent peers reach you, which makes downloads faster.
+Options are environment variables, listed at the top of
+[`install.ps1`](install.ps1). Setting up access from ChatGPT on your phone (`--remote`) isn't
+in the Windows installer yet.
 
 ### Updates
 

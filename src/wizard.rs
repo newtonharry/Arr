@@ -48,8 +48,6 @@ const PLEX_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_PLEX_JSON: usize = 2 * 1024 * 1024;
 /// Between looks at plex.tv after linking a new Plex.
 const CLAIM_WAIT: Duration = Duration::from_secs(1);
-/// Where a Plex installed from the page keeps movies and shows (Movies, TV Shows).
-const MEDIA: &str = "/srv/media";
 
 pub struct Options {
     pub state_dir: PathBuf,
@@ -208,12 +206,16 @@ pub async fn run(opts: Options) -> Result<()> {
     println!("\nOpen this link in your web browser to set up Arr:\n");
     println!("    {link}\n");
     if wiz.opts.open {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
+        // Windows: `start` would treat the link's `&` as a command separator.
+        let (opener, args): (&str, &[&str]) = if cfg!(windows) {
+            ("rundll32", &["url.dll,FileProtocolHandler"])
+        } else if cfg!(target_os = "macos") {
+            ("open", &[])
         } else {
-            "xdg-open"
+            ("xdg-open", &[])
         };
         let _ = Command::new(opener)
+            .args(args)
             .arg(&link)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -405,7 +407,9 @@ fn snapshot(wiz: &Wizard) -> Value {
         "install": inner.install,
         "can_install": install_command(wiz).is_some(),
         "install_command": manual_install_command(wiz),
-        "media_folder": MEDIA,
+        "media_folder": crate::plexinstall::default_media(),
+        "media_movies": crate::plexinstall::default_media().join("Movies"),
+        "media_tv": crate::plexinstall::default_media().join("TV Shows"),
         "phase": inner.phase,
     })
 }
@@ -759,7 +763,14 @@ fn install_command(wiz: &Wizard) -> Option<Vec<String>> {
     if let Some(cmd) = &wiz.opts.plex_installer {
         return Some(vec!["sh".into(), "-c".into(), cmd.clone()]);
     }
-    crate::plexinstall::package_manager()?;
+    let pm = crate::plexinstall::package_manager()?;
+    if pm == "windows" {
+        // Plex's installer asks Windows for permission itself.
+        return Some(vec![
+            wiz.opts.arr.to_string_lossy().into_owned(),
+            "plex-install".into(),
+        ]);
+    }
     let desktop =
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
     if !desktop || !Path::new("/usr/bin/pkexec").is_file() {
@@ -769,7 +780,13 @@ fn install_command(wiz: &Wizard) -> Option<Vec<String>> {
         "/usr/bin/pkexec".to_string(),
         wiz.opts.arr.to_string_lossy().into_owned(),
     ];
-    cmd.extend(["plex-install".into(), "--media".into(), MEDIA.into()]);
+    cmd.extend([
+        "plex-install".into(),
+        "--media".into(),
+        crate::plexinstall::default_media()
+            .to_string_lossy()
+            .into_owned(),
+    ]);
     if let Some(owner) = owner() {
         cmd.extend(["--owner".into(), owner]);
     }
@@ -778,7 +795,9 @@ fn install_command(wiz: &Wizard) -> Option<Vec<String>> {
 
 /// The same, for pasting into a terminal where the page can't ask for the password itself.
 fn manual_install_command(wiz: &Wizard) -> Option<String> {
-    crate::plexinstall::package_manager()?;
+    if crate::plexinstall::package_manager()? == "windows" {
+        return None;
+    }
     let arr = wiz.opts.arr.to_string_lossy();
     let arr = if arr.contains([' ', '\'', '"']) {
         format!("'{}'", arr.replace('\'', "'\\''"))
@@ -853,17 +872,28 @@ async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
         let _ = stderr.read_to_end(&mut buf).await;
         buf
     });
+    // Steps until the installer exits. Not until its output closes: a program it starts
+    // (Plex, on Windows) may keep that open.
     let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(step) = line.strip_prefix("step: ") {
-            set_install_step(wiz, step);
+    let failed = |e: std::io::Error| format!("the Plex installer failed: {e}");
+    let status = loop {
+        tokio::select! {
+            line = lines.next_line() => match line {
+                Ok(Some(line)) => {
+                    if let Some(step) = line.strip_prefix("step: ") {
+                        set_install_step(wiz, step);
+                    }
+                }
+                _ => break child.wait().await.map_err(failed)?,
+            },
+            status = child.wait() => break status.map_err(failed)?,
         }
-    }
-    let status = child
-        .wait()
+    };
+    let errors = tokio::time::timeout(Duration::from_secs(2), errors)
         .await
-        .map_err(|e| format!("the Plex installer failed: {e}"))?;
-    let errors = errors.await.unwrap_or_default();
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
     if !status.success() {
         // pkexec: 126 when the password dialog is closed, 127 when it isn't authorized.
         return Err(match status.code() {
@@ -976,7 +1006,8 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
         }
         if !plex_can_read(Path::new(&folder)) {
             warnings.push(format!(
-                "Plex may not be able to see {folder}: it runs as its own user, and folders inside your home folder are usually private. {MEDIA} works."
+                "Plex may not be able to see {folder}: it runs as its own user, and folders inside your home folder are usually private. {} works.",
+                crate::plexinstall::default_media().display()
             ));
         }
         let Ok(mut url) = plex.base_url.join("library/sections") else {

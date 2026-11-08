@@ -28,7 +28,6 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -213,7 +212,7 @@ pub fn select(
             });
             continue;
         };
-        let rel = rel.to_string_lossy().to_string();
+        let rel = paths::rel_string(&rel).unwrap_or_else(|| rel.to_string_lossy().into_owned());
         let Some(ext) = ext_of(&rel) else { continue };
         if !VIDEO_EXTENSIONS.contains(&ext.as_str()) {
             if OTHER_VIDEO.contains(&ext.as_str()) {
@@ -1189,9 +1188,10 @@ fn stage(
             dest.strip_prefix(root).unwrap_or(&dest).display()
         )));
     }
-    let dest_meta = std::fs::metadata(&dest_dir)
+    let (dest_dev, _) = crate::fsutil::file_id(&dest_dir)
         .map_err(|e| FileError::Blocked(format!("cannot stat the destination: {}", e.kind())))?;
-    let mut method = if hardlinks && dest_meta.dev() == src_meta.dev() {
+    let same_fs = crate::fsutil::file_id(&p.source).is_ok_and(|(dev, _)| dev == dest_dev);
+    let mut method = if hardlinks && same_fs {
         "hardlink"
     } else {
         "copy"
@@ -1211,9 +1211,9 @@ fn stage(
             .map_err(|e| FileError::Internal(e.into()))?;
     let dest_rel = dest
         .strip_prefix(root)
-        .map_err(|_| FileError::Blocked("destination escaped the root".into()))?
-        .to_string_lossy()
-        .to_string();
+        .ok()
+        .and_then(paths::rel_string)
+        .ok_or_else(|| FileError::Blocked("destination escaped the root".into()))?;
     let journal = store.blocking(|c| {
         c.execute(
             "INSERT INTO import_journal (grab_id, source, root, dest, targets, size, method, state, replaced_file_id, replaced_path, quality, revision_version, revision_real, updated_at)
@@ -1268,8 +1268,8 @@ fn stage(
         store.blocking(|c| journal_set(c, journal, "rolled_back", Some(&e)))?;
         return Err(FileError::Blocked(format!("{}: {e}", p.rel)));
     }
-    let ino = std::fs::symlink_metadata(&staged)
-        .map(|m| m.ino())
+    let ino = crate::fsutil::file_id(&staged)
+        .map(|(_, ino)| ino)
         .map_err(|e| FileError::Internal(e.into()))?;
     store.blocking(|c| {
         c.execute(
@@ -1334,7 +1334,7 @@ fn publish(
                 std::fs::rename(&old, &b).map_err(|e| {
                     FileError::Blocked(format!("cannot move the replaced file aside: {}", e.kind()))
                 })?;
-                let ino = std::fs::symlink_metadata(&b).map(|m| m.ino()).unwrap_or(0);
+                let ino = crate::fsutil::file_id(&b).map(|(_, ino)| ino).unwrap_or(0);
                 store.blocking(|c| {
                     c.execute(
                         "UPDATE import_journal SET state = 'backed_up', backup = ?2, backup_ino = ?3, updated_at = ?4 WHERE id = ?1",
@@ -1379,10 +1379,12 @@ fn publish(
     let dest_rel = s
         .dest
         .strip_prefix(root)
-        .map_err(|_| FileError::Blocked("destination escaped the root".into()))?
-        .to_string_lossy()
-        .to_string();
-    let mtime = std::fs::symlink_metadata(&s.dest).map(|m| m.mtime()).ok();
+        .ok()
+        .and_then(paths::rel_string)
+        .ok_or_else(|| FileError::Blocked("destination escaped the root".into()))?;
+    let mtime = std::fs::symlink_metadata(&s.dest)
+        .map(|m| crate::fsutil::mtime(&m))
+        .ok();
     store.blocking(|c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now_s = rfc3339(now);
@@ -1464,7 +1466,8 @@ pub fn recover(c: &Connection) -> Result<Vec<String>> {
         std::fs::symlink_metadata(p)
             .ok()
             .filter(|m| m.file_type().is_file())
-            .map(|m| m.ino() as i64)
+            .and_then(|_| crate::fsutil::file_id(p).ok())
+            .map(|(_, ino)| ino as i64)
     };
     for (id, root, dest, state, staged, staged_ino, replaced, backup, backup_ino) in rows {
         let root = PathBuf::from(root);

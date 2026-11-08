@@ -28,3 +28,89 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      # Keep LF line endings: tests compare files byte for byte.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Install Rust and FFmpeg
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --component clippy
+          rustup default 1.94.1
+          choco install ffmpeg -y --no-progress
+          # Chocolatey's ffprobe is a launcher that starts the real one as a second process,
+          # which Arr's one-process sandbox refuses: put the real folder first on the PATH.
+          $ff = Get-ChildItem C:\ProgramData\chocolatey\lib\ffmpeg -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          $ff.DirectoryName | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-windows-${{ hashFiles('Cargo.lock') }}
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked --no-fail-fast
+      # install.ps1 the way users run it (irm | iex), in Windows PowerShell 5.1, against a
+      # release zip built here: download, checksum, install, PATH.
+      - name: Installer
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$pwd\install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
+          cargo build --release --locked
+          if ($LASTEXITCODE) { exit 1 }
+          $name = 'arr-x86_64-pc-windows-msvc'
+          New-Item -ItemType Directory -Force "dist\$name" | Out-Null
+          Copy-Item target\release\arr.exe, target\release\arr-background.exe "dist\$name"
+          Compress-Archive "dist\$name" "dist\$name.zip"
+          $hash = (Get-FileHash "dist\$name.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content "dist\$name.zip.sha256" "$hash  $name.zip"
+          Start-Process python -ArgumentList '-m', 'http.server', '8999', '--bind', '127.0.0.1', '--directory', 'dist'
+          Start-Sleep -Seconds 3
+          $env:ARR_DOWNLOAD_BASE = 'http://127.0.0.1:8999'
+          $env:ARR_BIN_DIR = "$env:RUNNER_TEMP\arr bin"
+          $env:ARR_NO_SETUP = '1'
+          $env:ARR_INSTALL_STRICT = '1'
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          & "$env:ARR_BIN_DIR\arr.exe" --version
+          if ($LASTEXITCODE) { exit 1 }
+          $p = Start-Process "$env:ARR_BIN_DIR\arr-background.exe" -ArgumentList '--hidden', 'cmd.exe', '/c', 'exit 7' -Wait -PassThru
+          if ($p.ExitCode -ne 7) { "arr-background --hidden exited with $($p.ExitCode)"; exit 1 }
+          $path = (Get-ItemProperty HKCU:\Environment).Path
+          if (($path -split ';') -notcontains $env:ARR_BIN_DIR) { "not on PATH: $path"; exit 1 }
+          # Running again replaces the files in place.
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          # And the uninstaller takes it all away again.
+          [System.Management.Automation.Language.Parser]::ParseFile("$pwd\uninstall.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
+          $env:ARR_YES = '1'; $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '1'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          if (Test-Path $env:ARR_BIN_DIR) { "still there: $env:ARR_BIN_DIR"; exit 1 }
+          $path = (Get-ItemProperty HKCU:\Environment).Path
+          if (($path -split ';') -contains $env:ARR_BIN_DIR) { "still on PATH: $path"; exit 1 }
+      # The real Plex install the setup page runs (this runner is an administrator, so
+      # Windows doesn't need to ask), then the uninstaller removes Plex again.
+      - name: Plex install and removal
+        shell: powershell
+        run: |
+          $out = & target\release\arr.exe plex-install 2>&1
+          $out
+          if ($LASTEXITCODE) { exit 1 }
+          if (-not ($out -match '^step: Installing Plex Media Server')) { 'no install step reported'; exit 1 }
+          $id = $null
+          for ($i = 0; $i -lt 60 -and -not $id; $i++) {
+            try { $id = Invoke-RestMethod http://127.0.0.1:32400/identity -Headers @{ Accept = 'application/json' } -TimeoutSec 3 } catch { Start-Sleep 2 }
+          }
+          if (-not $id) { 'Plex never answered on 32400'; exit 1 }
+          "Plex $($id.MediaContainer.version) is running, claimed: $($id.MediaContainer.claimed)"
+          foreach ($d in 'Movies', 'TV Shows') { if (-not (Test-Path "$env:USERPROFILE\Media\$d")) { "no $d folder"; exit 1 } }
+          $env:ARR_YES = '1'; $env:ARR_REMOVE = 'plex'; $env:ARR_DELETE_DATA = '1'; $env:ARR_INSTALL_STRICT = '1'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          $left = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like 'Plex Media Server*' }
+          if ($left) { 'Plex is still installed'; exit 1 }
+          if (-not (Test-Path "$env:USERPROFILE\Media\Movies")) { 'the media folder was removed'; exit 1 }

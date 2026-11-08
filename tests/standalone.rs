@@ -548,7 +548,7 @@ credential_file = "secrets/tmdb"
 enabled = {execution}
 download_cleanup = true
 [embedded]
-download_dir = "{dl}"
+download_dir = '{dl}'
 listen = "127.0.0.1:0"
 trackers = false
 dht = {dht}
@@ -556,8 +556,8 @@ local_discovery = false
 {peers}[migration]
 mode = "coexistence"
 [library]
-movies = "{movies}"
-tv = "{tv}"
+movies = '{movies}'
+tv = '{tv}'
 sample_detection = false
 probe_timeout_secs = 30
 [automation]
@@ -1784,9 +1784,12 @@ async fn managed_setup_api_hot_activation_guards_and_restart() {
     app.stop().await;
     // A tampered import is refused at startup (digest-verified like a snapshot import).
     let settings = dir.join("settings.json");
-    let mut perms = std::fs::metadata(&settings).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
-    std::fs::set_permissions(&settings, perms).unwrap();
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&settings).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        std::fs::set_permissions(&settings, perms).unwrap();
+    }
     let mut text = std::fs::read_to_string(&settings).unwrap();
     text = text.replacen("\"seed_ratio\": 1.0", "\"seed_ratio\": 0.0", 1);
     std::fs::write(&settings, text).unwrap();

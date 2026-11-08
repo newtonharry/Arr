@@ -25,7 +25,7 @@ fn setup(root: &Path, api: SocketAddr, engine: SocketAddr) -> config::RuntimeCon
     .unwrap();
     std::fs::create_dir(root.join("downloads")).unwrap();
     let text = format!(
-        "[server]\nlisten=\"{api}\"\napi_token_file=\"secrets/api_token\"\n[state]\ndir=\".\"\n[execution]\nenabled=false\n[embedded]\ndownload_dir=\"{}\"\nlisten=\"{engine}\"\ntrackers=false\ndht=false\nlocal_discovery=false\n",
+        "[server]\nlisten=\"{api}\"\napi_token_file=\"secrets/api_token\"\n[state]\ndir=\".\"\n[execution]\nenabled=false\n[embedded]\ndownload_dir='{}'\nlisten=\"{engine}\"\ntrackers=false\ndht=false\nlocal_discovery=false\n",
         root.join("downloads").display()
     );
     fsutil::write_new_private_file(&state.join("config.toml"), text.as_bytes()).unwrap();
@@ -72,6 +72,7 @@ fn disabled_execution_does_not_start_embedded_network_listener() {
     );
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_parent_symlink_is_refused_before_engine_writes() {
     let root = tempfile::tempdir().unwrap();
@@ -231,6 +232,7 @@ async fn tampered_persisted_output_folder_is_refused_before_restoration_writes()
     );
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_symlinked_download_root_is_refused_before_engine_start() {
     let root = tempfile::tempdir().unwrap();

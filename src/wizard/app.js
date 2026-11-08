@@ -126,8 +126,8 @@ function fillLibraries(plex) {
   $("step-options").hidden = none;
   $("apply").disabled = none;
   if (none) {
-    $("new-movies").value = `${state.media_folder}/Movies`;
-    $("new-tv").value = `${state.media_folder}/TV Shows`;
+    $("new-movies").value = state.media_movies;
+    $("new-tv").value = state.media_tv;
     return;
   }
   for (const kind of ["movies", "tv"]) {
@@ -173,8 +173,12 @@ function suggestDownloads() {
   if (dl.dataset.edited) return;
   const first = ["movies", "tv"].map((k) => $(`${k}-lib`).value && $(`${k}-folder`).value).find(Boolean);
   if (!first) return;
-  const parent = first.replace(/\/+$/, "").replace(/\/[^/]*$/, "") || "/";
-  dl.value = `${parent === "/" ? "" : parent}/arr-downloads`;
+  // Beside the library folder: /srv/media/Movies -> /srv/media/arr-downloads, and on
+  // Windows D:\Media\Movies -> D:\Media\arr-downloads.
+  const sep = /^([A-Za-z]:)?\\/.test(first) ? "\\" : "/";
+  const trimmed = first.replace(/[\\/]+$/, "");
+  const cut = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  dl.value = `${cut >= 0 ? trimmed.slice(0, cut) : trimmed}${sep}arr-downloads`;
 }
 
 async function checkFolder(inputId, hintId, create) {
