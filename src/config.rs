@@ -849,6 +849,24 @@ fn absolute_path(raw: &str, what: &str) -> Result<PathBuf> {
     Ok(p.to_path_buf())
 }
 
+/// A folder as another program (qBittorrent, Plex, perhaps in Docker) sees it: absolute in
+/// Unix or Windows form, whatever this computer runs, without '.' or '..'. Trailing
+/// separators are dropped ("/" stays "", for the caller to decide).
+fn remote_path(raw: &str, what: &str) -> Result<String> {
+    let s = raw.trim();
+    let b = s.as_bytes();
+    let unix = s.starts_with('/');
+    let windows = (b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && matches!(b[2], b'/' | b'\\'))
+        || s.starts_with("\\\\");
+    if !(unix || windows) || s.split(['/', '\\']).any(|c| c == "." || c == "..") {
+        bail!("{what} must be an absolute path without '.' or '..' components");
+    }
+    Ok(s.trim_end_matches(['/', '\\']).to_string())
+}
+
 fn category(raw: Option<String>, what: &str) -> Result<Option<String>> {
     match raw {
         None => Ok(None),
@@ -1152,10 +1170,7 @@ pub fn parse_config(
                     "qbittorrent.username_file and qbittorrent.password_file must be set together (or both omitted when qBittorrent bypasses authentication for this client)"
                 );
             }
-            let save_path = absolute_path(&q.save_path, "qbittorrent.save_path")?
-                .to_string_lossy()
-                .trim_end_matches('/')
-                .to_string();
+            let save_path = remote_path(&q.save_path, "qbittorrent.save_path")?;
             Some(QbitConfig {
                 base_url: parse_base_url(&q.base_url, "qbittorrent.base_url")?,
                 username,
@@ -1186,11 +1201,9 @@ pub fn parse_config(
         None => None,
         Some(e) => {
             let download_dir = absolute_path(&e.download_dir, "embedded.download_dir")?;
-            let save_path = download_dir
-                .to_string_lossy()
-                .trim_end_matches('/')
-                .to_string();
-            if save_path.is_empty() || paths_overlap(&download_dir, &state_dir) {
+            let save_path = crate::paths::client_form(&download_dir);
+            if save_path.is_empty() || save_path == "/" || paths_overlap(&download_dir, &state_dir)
+            {
                 bail!(
                     "embedded.download_dir must be a dedicated directory, not / and neither inside nor around the state directory"
                 );
@@ -1400,10 +1413,7 @@ pub fn parse_config(
             let plex_path = |v: &Option<String>, what: &str| -> Result<Option<String>> {
                 v.as_deref()
                     .map(|p| {
-                        absolute_path(p, what).map(|p| {
-                            let s = p.to_string_lossy().trim_end_matches('/').to_string();
-                            if s.is_empty() { "/".to_string() } else { s }
-                        })
+                        remote_path(p, what).map(|s| if s.is_empty() { "/".to_string() } else { s })
                     })
                     .transpose()
             };

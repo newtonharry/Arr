@@ -1636,7 +1636,7 @@ mod tests {
         std::fs::create_dir_all(&downloads).unwrap();
         let store = Store::open(&root.join("state.sqlite")).unwrap();
         let cfg = EmbeddedConfig {
-            save_path: downloads.to_string_lossy().into(),
+            save_path: crate::paths::client_form(&downloads),
             download_dir: downloads,
             session_dir: root.join("embedded"),
             listen: "127.0.0.1:0".parse().unwrap(),

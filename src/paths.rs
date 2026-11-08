@@ -15,6 +15,18 @@ pub fn normalize_client(p: &str) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
+/// A local folder written as a download client path: `/`-separated and starting with `/`.
+/// Unix paths are unchanged; on Windows `C:\\Users\\x` becomes `/C:/Users/x`.
+pub fn client_form(local: &Path) -> String {
+    let s = local.to_string_lossy().replace('\\', "/");
+    let s = s.trim_end_matches('/');
+    if s.starts_with('/') {
+        s.to_string()
+    } else {
+        format!("/{s}")
+    }
+}
+
 /// Maps a client path below `client_root` to the same location below `local_root`.
 pub fn client_to_local(client_root: &str, local_root: &Path, client_path: &str) -> Option<PathBuf> {
     let root = normalize_client(client_root)?;
