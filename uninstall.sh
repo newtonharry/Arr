@@ -72,16 +72,51 @@ run() {
 os=$(uname -s)
 SUDO=""
 [ "$(id -u)" = 0 ] || SUDO="sudo"
-# Deletes a folder, refusing anything that isn't clearly a data folder of the app.
+# Under sudo, HOME is usually root's: a per-user Arr is in the home of whoever ran sudo, and
+# its services run in that user's session.
+U_HOME=$HOME U_UID=$(id -u) AS_USER="" XDG_CFG=${XDG_CONFIG_HOME:-} XDG_DATA=${XDG_DATA_HOME:-}
+if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+	case "$SUDO_USER" in *[!A-Za-z0-9._-]*) die "unexpected SUDO_USER: $SUDO_USER" ;; esac
+	U_HOME=$( (getent passwd "$SUDO_USER" 2>/dev/null || true) | cut -d: -f6)
+	[ -n "$U_HOME" ] || U_HOME=$(eval echo "~$SUDO_USER")
+	U_UID=$(id -u "$SUDO_USER")
+	AS_USER="sudo -u $SUDO_USER env XDG_RUNTIME_DIR=/run/user/$U_UID"
+	XDG_CFG="" XDG_DATA=""
+fi
+# Folders that hold media: never deleted, nor anything that contains them.
+PROTECT=""
+has_media() { # has_media <dir>: any video file inside?
+	[ -n "$(find "$1" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m4v' -o -iname '*.avi' \
+		-o -iname '*.mov' -o -iname '*.wmv' -o -iname '*.ts' -o -iname '*.m2ts' -o -iname '*.mpg' \
+		-o -iname '*.mpeg' -o -iname '*.webm' -o -iname '*.iso' \) -print 2>/dev/null | head -n1)" ]
+}
+# Deletes an app's own data folder; refuses one that isn't clearly that alone.
 remove_dir() { # remove_dir <dir> <why>
-	case "${1%/}" in
-	"" | "$HOME" | /home | /Users | /var | /var/lib | /usr | /usr/local | /etc | /opt | /srv | /mnt | /media | \
-		/Applications | "$HOME/Library" | "$HOME/Library/Application Support" | "$HOME/.local" | "$HOME/.local/share")
+	d=${1%/}
+	case "$d" in
+	"" | / | "$U_HOME" | /home | /Users | /root | /var | /var/lib | /usr | /usr/local | /etc | /opt | /srv | /mnt | \
+		/media | /Applications | "$U_HOME/Library" | "$U_HOME/Library/Application Support" | "$U_HOME/.local" | \
+		"$U_HOME/.local/share")
 		say "  not deleting $1: that's not a folder of its own"
 		return 0
 		;;
 	esac
-	[ -e "$1" ] || return 0
+	[ -e "$d" ] || return 0
+	held=""
+	while IFS= read -r p; do
+		[ -n "$p" ] || continue
+		case "$p/" in "$d"/*) held=$p ;; esac
+	done <<EOF
+$PROTECT
+EOF
+	if [ -n "$held" ]; then
+		say "  not deleting $1: it holds $held, which Arr uses for media or downloads; delete it yourself if you're sure"
+		return 0
+	fi
+	if has_media "$d"; then
+		say "  not deleting $1: it has movie or TV files in it; delete it yourself if you're sure"
+		return 0
+	fi
 	if [ -w "$(dirname "$1")" ]; then run rm -rf -- "$1"; else run $SUDO rm -rf -- "$1"; fi
 	[ "$DRY_RUN" = 1 ] || say "  deleted $1 ($2)"
 }
@@ -95,8 +130,8 @@ remove_file() { # remove_file <file>
 # Arr: the service files say where the binary and config are; otherwise the defaults.
 ARR_FOUND=""
 SYSTEM_UNIT=/etc/systemd/system/arr.service
-USER_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/arr.service"
-PLIST="$HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
+USER_UNIT="${XDG_CFG:-$U_HOME/.config}/systemd/user/arr.service"
+PLIST="$U_HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
 unquote() { sed 's/%%/%/g; s/\$\$/$/g; s/\\"/"/g; s/\\\\/\\/g'; }
 from_unit() { # from_unit <unit file>: sets ARR_BIN and ARR_CONFIG from ExecStart
 	line=$(sed -n 's/^ExecStart=//p' "$1" | head -n1)
@@ -104,7 +139,9 @@ from_unit() { # from_unit <unit file>: sets ARR_BIN and ARR_CONFIG from ExecStar
 	ARR_CONFIG=$(printf '%s' "$line" | sed -n 's/.* --config "\(\([^"\\]\|\\.\)*\)".*/\1/p' | unquote)
 }
 from_plist() {
-	strings=$(sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p' "$1" |
+	# Every <string>, in order, however many share a line.
+	strings=$(awk '{ while (match($0, /<string>[^<]*<\/string>/)) {
+			print substr($0, RSTART + 8, RLENGTH - 17); $0 = substr($0, RSTART + RLENGTH) } }' "$1" |
 		sed 's/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&amp;/\&/g')
 	ARR_BIN=$(printf '%s\n' "$strings" | sed -n 2p)
 	ARR_CONFIG=$(printf '%s\n' "$strings" | sed -n 5p)
@@ -116,12 +153,12 @@ elif [ -f "$PLIST" ]; then from_plist "$PLIST"; ARR_FOUND="login item"; fi
 [ -z "$BIN_DIR" ] || ARR_BIN="$BIN_DIR/arr"
 [ -z "$STATE_DIR" ] || ARR_CONFIG="$STATE_DIR/config.toml"
 if [ -z "$ARR_BIN" ]; then
-	for b in "$(command -v arr 2>/dev/null || true)" /usr/local/bin/arr "$HOME/.local/bin/arr"; do
+	for b in "$(command -v arr 2>/dev/null || true)" /usr/local/bin/arr "$U_HOME/.local/bin/arr"; do
 		if [ -n "$b" ] && [ -x "$b" ] && "$b" --version 2>/dev/null | grep -q '^arr '; then ARR_BIN=$b; break; fi
 	done
 fi
 if [ -z "$ARR_CONFIG" ]; then
-	for d in /var/lib/arr "${XDG_DATA_HOME:-$HOME/.local/share}/arr" "$HOME/Library/Application Support/arr"; do
+	for d in /var/lib/arr "${XDG_DATA:-$U_HOME/.local/share}/arr" "$U_HOME/Library/Application Support/arr"; do
 		if [ -f "$d/config.toml" ] || [ -f "$d/state.sqlite" ]; then ARR_CONFIG="$d/config.toml"; break; fi
 	done
 fi
@@ -131,6 +168,12 @@ ARR_STATE=""
 DOWNLOADS=""
 [ -z "$ARR_CONFIG" ] || [ ! -r "$ARR_CONFIG" ] ||
 	DOWNLOADS=$(sed -n 's/^download_dir = "\(.*\)"$/\1/p' "$ARR_CONFIG" | head -n1)
+# Every folder the config names (libraries, downloads) is protected from deletion.
+if [ -n "$ARR_CONFIG" ] && [ -r "$ARR_CONFIG" ]; then
+	PROTECT=$(sed -n 's/^[A-Za-z_]* = "\(\/[^"]*\)"$/\1/p' "$ARR_CONFIG" | while IFS= read -r p; do
+		if [ -d "$p" ]; then printf '%s\n' "${p%/}"; fi
+	done)
+fi
 
 # Plex: a system package, a snap, Docker containers, or the macOS app.
 PLEX_KIND="" PLEX_DATA="" PLEX_CONTAINERS=""
@@ -141,7 +184,7 @@ elif have rpm && rpm -q plexmediaserver >/dev/null 2>&1; then
 elif have snap && snap list plexmediaserver >/dev/null 2>&1; then
 	PLEX_KIND=snap
 elif [ "$os" = Darwin ] && [ -d "/Applications/Plex Media Server.app" ]; then
-	PLEX_KIND=mac PLEX_DATA="$HOME/Library/Application Support/Plex Media Server"
+	PLEX_KIND=mac PLEX_DATA="$U_HOME/Library/Application Support/Plex Media Server"
 fi
 if have docker; then
 	PLEX_CONTAINERS=$(docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null |
@@ -223,15 +266,16 @@ if [ "$DO_ARR" = 1 ]; then
 	udir=$(dirname "$USER_UNIT")
 	if [ -f "$USER_UNIT" ]; then
 		for u in arr-update.timer arr-update.service arr-tunnel.service arr.service; do
-			run systemctl --user disable --now "$u" >/dev/null 2>&1 || true
+			run $AS_USER systemctl --user disable --now "$u" >/dev/null 2>&1 || true
 			remove_file "$udir/$u"
 		done
-		run systemctl --user daemon-reload || true
+		run $AS_USER systemctl --user daemon-reload || true
 	fi
 	for p in arr arr-tunnel arr-update; do
-		f="$HOME/Library/LaunchAgents/io.github.newtonharry.$p.plist"
+		f="$U_HOME/Library/LaunchAgents/io.github.newtonharry.$p.plist"
 		[ -f "$f" ] || continue
-		run launchctl unload "$f" 2>/dev/null || true
+		if [ -n "$AS_USER" ]; then run launchctl bootout "gui/$U_UID" "$f" 2>/dev/null || true
+		else run launchctl unload "$f" 2>/dev/null || true; fi
 		remove_file "$f"
 	done
 	if [ -n "$ARR_BIN" ]; then
@@ -276,8 +320,8 @@ if [ "$DO_PLEX" = 1 ]; then
 	esac
 	[ "$PLEX_WIPE" != 1 ] || [ -z "$PLEX_DATA" ] || remove_dir "$PLEX_DATA" "Plex's library database and settings"
 	if [ "$PLEX_WIPE" = 1 ] && [ "$PLEX_KIND" = mac ]; then
-		remove_dir "$HOME/Library/Caches/PlexMediaServer" "Plex's cache"
-		remove_file "$HOME/Library/Preferences/com.plexapp.plexmediaserver.plist"
+		remove_dir "$U_HOME/Library/Caches/PlexMediaServer" "Plex's cache"
+		remove_file "$U_HOME/Library/Preferences/com.plexapp.plexmediaserver.plist"
 	fi
 	for c in $PLEX_CONTAINERS; do
 		# Plex's data in a container lives in the folder mounted at /config.
