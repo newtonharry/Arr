@@ -87,6 +87,9 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/ownership"),
     ("get", "/api/v1/status/{media_id}"),
     ("get", "/api/v1/attention"),
+    ("get", "/api/v1/feed"),
+    ("get", "/api/v1/ideas"),
+    ("post", "/api/v1/quick-add"),
     ("get", "/api/v1/rss"),
     ("get", "/api/v1/setup"),
     ("post", "/api/v1/setup"),
@@ -794,6 +797,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/ownership", get(ownership))
         .route("/api/v1/status/{media_id}", get(media_status))
         .route("/api/v1/attention", get(attention))
+        .route("/api/v1/feed", get(feed))
+        .route("/api/v1/ideas", get(ideas))
+        .route("/api/v1/quick-add", post(quick_add))
         .route("/api/v1/rss", get(rss_status))
         .route("/api/v1/setup", get(setup_status).post(setup_apply))
         .route("/api/v1/setup/plex", get(setup_plex))
@@ -4032,10 +4038,11 @@ pub async fn serve(cfg: RuntimeConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The whole HTTP application: the API, plus the remote MCP endpoint at `/mcp` when
+/// The whole HTTP application: the API and the web app, plus the remote MCP endpoint at `/mcp` when
 /// `[mcp] enabled`. The closure ends MCP processing at shutdown.
 pub fn app(state: Arc<AppState>) -> anyhow::Result<(Router, Box<dyn FnOnce() + Send>)> {
     let api = router(state.clone());
+    let web = crate::webapp::router(&state, api.clone())?;
     match &state.cfg.mcp {
         Some(m) => {
             let (mcp, stop) = crate::mcp::remote(
@@ -4044,9 +4051,9 @@ pub fn app(state: Arc<AppState>) -> anyhow::Result<(Router, Box<dyn FnOnce() + S
                 state.cfg.api_token.expose(),
                 &state.cfg.state_dir,
             )?;
-            Ok((mcp.merge(api), Box::new(stop)))
+            Ok((mcp.merge(api).merge(web), Box::new(stop)))
         }
-        None => Ok((api, Box::new(|| {}))),
+        None => Ok((api.merge(web), Box::new(|| {}))),
     }
 }
 
@@ -4475,6 +4482,15 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
 async fn attention(State(st): St) -> ApiResult {
     st.loaded()?;
     let now = OffsetDateTime::now_utc();
+    let items = attention_list(&st, now, true).await?;
+    ok(json!({ "total": items.len(), "items": items, "observed_at": rfc3339(now) }))
+}
+
+async fn attention_list(
+    st: &AppState,
+    now: OffsetDateTime,
+    with_holds: bool,
+) -> Result<Vec<Value>, ApiError> {
     let since = rfc3339(now - Duration::from_secs(7 * 86_400));
     let grabs = st
         .store
@@ -4501,13 +4517,417 @@ async fn attention(State(st): St) -> ApiResult {
                     .is_some_and(|u| u >= horizon.as_str())
         })
         .collect();
-    let holds: Vec<Value> = st
-        .index()
-        .catalog
-        .series
+    let holds: Vec<Value> = if with_holds {
+        st.index()
+            .catalog
+            .series
+            .iter()
+            .filter_map(hold_item)
+            .collect()
+    } else {
+        vec![]
+    };
+    Ok(attention_items(&grabs, &requests, holds))
+}
+
+// ---------------------------------------------------------------- web app: feed, ideas, quick add
+
+/// A title and year for the app, from the catalog; a plain placeholder when it is unknown.
+fn feed_title(index: &CatalogIndex, id: MediaId) -> (String, Option<u16>) {
+    match id {
+        MediaId::Movie { tmdb } => index
+            .movie(tmdb)
+            .map(|m| (m.title.clone(), m.year))
+            .unwrap_or_else(|| (format!("Movie {tmdb}"), None)),
+        other => other
+            .series_key()
+            .and_then(|k| {
+                index
+                    .series(k)
+                    .map(|s| (s.title.clone(), s.year))
+                    .or_else(|| {
+                        let (SeriesKey::Tvdb(n) | SeriesKey::Tvmaze(n)) = k;
+                        Some((format!("Show {n}"), None))
+                    })
+            })
+            .unwrap_or_else(|| ("Unknown title".into(), None)),
+    }
+}
+
+/// "Season 2", "Seasons 1–3", "S4 E1 · Title", or none for a movie or a whole series.
+fn feed_detail(index: &CatalogIndex, targets: &[MediaId]) -> Option<String> {
+    let mut seasons = std::collections::BTreeSet::new();
+    for t in targets {
+        match *t {
+            MediaId::Season(_, s) | MediaId::Episode(_, s, _) => {
+                seasons.insert(s);
+            }
+            _ => {}
+        }
+    }
+    if let [MediaId::Episode(k, s, e)] = targets {
+        let name = index
+            .series(*k)
+            .and_then(|x| x.episodes.as_ref())
+            .and_then(|eps| eps.iter().find(|x| x.season == *s && x.number == *e))
+            .and_then(|x| x.title.clone())
+            .filter(|t| !t.trim().is_empty());
+        return Some(match name {
+            Some(n) => format!("S{s} E{e} \u{b7} {n}"),
+            None => format!("S{s} E{e}"),
+        });
+    }
+    let (first, last) = (*seasons.first()?, *seasons.last()?);
+    Some(if first == last {
+        format!("Season {first}")
+    } else if seasons.len() == usize::from(last - first) + 1 {
+        format!("Seasons {first}\u{2013}{last}")
+    } else {
+        let list: Vec<String> = seasons.iter().map(u16::to_string).collect();
+        format!("Seasons {}", list.join(", "))
+    })
+}
+
+/// Whether a download of `grab` is already looking after what `request` asks for.
+fn download_covers(request: MediaId, grab: MediaId) -> bool {
+    match (request, grab) {
+        (MediaId::Series(a), g) => g.series_key() == Some(a),
+        (MediaId::Season(a, s), MediaId::Season(b, t) | MediaId::Episode(b, t, _)) => {
+            a == b && s == t
+        }
+        (MediaId::Episode(a, s, e), MediaId::Season(b, t)) => a == b && s == t && e > 0,
+        (r, g) => r == g,
+    }
+}
+
+async fn feed(State(st): St) -> ApiResult {
+    st.loaded()?;
+    let now = OffsetDateTime::now_utc();
+    let index = st.index();
+    let since = rfc3339(now - Duration::from_secs(7 * 86_400));
+    let (active, imported, requests) = st
+        .store
+        .with(move |c| {
+            Ok((
+                downloads::select(c, "active = 1 ORDER BY created_at LIMIT 200", &[])?,
+                downloads::select(
+                    c,
+                    "state = 'imported' AND updated_at >= ?1 ORDER BY updated_at DESC LIMIT 20",
+                    &[&since],
+                )?,
+                worker::list_requests(c, true)?,
+            ))
+        })
+        .await
+        .map_err(internal("feed"))?;
+    let targets_of = |g: &downloads::Grab| -> Vec<MediaId> {
+        let t: Vec<MediaId> = g.targets.iter().map(|t| t.target).collect();
+        if t.is_empty() { vec![g.target] } else { t }
+    };
+    let entry = |id: MediaId, targets: &[MediaId]| {
+        let (title, year) = feed_title(&index, id);
+        (title, year, feed_detail(&index, targets))
+    };
+
+    let on_its_way: Vec<Value> = active
         .iter()
-        .filter_map(hold_item)
+        .filter_map(|g| {
+            let stage = match g.state.as_str() {
+                "queued" | "unconfirmed" => "found",
+                "downloading" => "downloading",
+                "completed" | "importing" => "checking",
+                _ => return None,
+            };
+            let targets = targets_of(g);
+            let (title, year, detail) = entry(targets[0], &targets);
+            Some(json!({
+                "grab_id": g.id, "media_id": targets[0], "title": title, "year": year, "detail": detail,
+                "stage": stage,
+                "progress": (stage == "downloading").then_some(g.progress).flatten().map(|p| p.clamp(0.0, 1.0)),
+                "paused": g.user_paused || g.client_state.as_deref() == Some("paused"),
+            }))
+        })
         .collect();
-    let items = attention_items(&grabs, &requests, holds);
-    ok(json!({ "total": items.len(), "items": items, "observed_at": rfc3339(now) }))
+
+    let arrived: Vec<Value> = imported
+        .iter()
+        .map(|g| {
+            let targets = targets_of(g);
+            let (title, year, detail) = entry(targets[0], &targets);
+            json!({ "media_id": targets[0], "title": title, "year": year, "detail": detail, "at": g.updated_at })
+        })
+        .collect();
+
+    let needs_you: Vec<Value> = attention_list(&st, now, false)
+        .await?
+        .into_iter()
+        .filter_map(|a| {
+            let kind = a["kind"].as_str()?;
+            let problem = match kind {
+                "download_failed" => "The download didn't work",
+                "import_blocked" => "Arr couldn't add the file to Plex",
+                "request_expired" => "Arr couldn't find a copy to download",
+                _ => return None,
+            };
+            let target: MediaId = a["target"].as_str()?.parse().ok()?;
+            let grab_id = a["grab_id"].as_str();
+            // A request is retried by adding the title again, which takes a movie or a series.
+            let media_id = match (grab_id, target) {
+                (None, t @ MediaId::Movie { .. }) => t,
+                (None, t) => MediaId::Series(t.series_key()?),
+                (Some(_), t) => t,
+            };
+            let (title, year, detail) = entry(target, &[target]);
+            Some(json!({
+                "key": format!("{kind}:{}", grab_id.map_or_else(|| target.to_string(), str::to_string)),
+                "media_id": media_id, "title": title, "year": year, "detail": detail,
+                "problem": problem, "grab_id": grab_id,
+                "at": a.get("at").or_else(|| a.get("since")).cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect();
+
+    let covered: Vec<MediaId> = active.iter().flat_map(&targets_of).collect();
+    let today = now.date().to_string();
+    let looking: Vec<Value> = requests
+        .iter()
+        .filter_map(|r| {
+            let target: MediaId = r["target"].as_str()?.parse().ok()?;
+            if covered.iter().any(|g| download_covers(target, *g)) {
+                return None;
+            }
+            let (title, year, detail) = entry(target, &[target]);
+            let until = match target {
+                MediaId::Movie { tmdb } => index
+                    .movie(tmdb)
+                    .and_then(|m| m.digital_release.as_deref())
+                    .and_then(|d| d.get(..10))
+                    .filter(|d| *d > today.as_str())
+                    .map(str::to_string),
+                _ => None,
+            };
+            Some(json!({
+                "media_id": target, "title": title, "year": year, "detail": detail,
+                "until": until, "next_try_at": r["next_attempt_at"],
+            }))
+        })
+        .collect();
+
+    let coming_up: Vec<Value> =
+        library::calendar(&index, now, now + Duration::from_secs(14 * 86_400), now)
+            .into_iter()
+            .filter(|e| e.monitored && e.status == "upcoming")
+            .take(20)
+            .map(|e| {
+                let (title, year) = feed_title(&index, e.series);
+                json!({
+                    "media_id": e.target, "title": title, "year": year,
+                    "detail": feed_detail(&index, &[e.target]), "at": e.air_date_utc,
+                })
+            })
+            .collect();
+
+    ok(json!({
+        "generated_at": rfc3339(now),
+        "movies_enabled": st.tmdb.is_some(),
+        "needs_you": needs_you,
+        "on_its_way": on_its_way,
+        "arrived": arrived,
+        "looking": looking,
+        "coming_up": coming_up,
+    }))
+}
+
+/// Popular shows with new episodes this week (TVmaze web schedule).
+async fn ideas(State(st): St) -> ApiResult {
+    let Some(tv) = &st.tvmaze else {
+        return ok(json!({ "status": "disabled", "items": [] }));
+    };
+    let Ok(shows) = tv.ideas().await else {
+        return ok(json!({ "status": "unavailable", "items": [] }));
+    };
+    let index = st.index();
+    let items: Vec<Value> = shows
+        .iter()
+        .map(|s| {
+            let key = s.tvdb.map_or(SeriesKey::Tvmaze(s.id), SeriesKey::Tvdb);
+            let in_library = [
+                SeriesKey::Tvdb(s.tvdb.unwrap_or(0)),
+                SeriesKey::Tvmaze(s.id),
+            ]
+            .into_iter()
+            .filter_map(|k| index.series(k))
+            .any(|x| x.monitored && managed(&x.provenance.source_app));
+            json!({
+                "media_id": MediaId::Series(key), "title": s.name, "year": s.year,
+                "network": s.network, "in_library": in_library, "summary": s.summary,
+            })
+        })
+        .collect();
+    ok(json!({ "status": "ok", "items": items }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuickAddBody {
+    media_id: String,
+}
+
+/// `POST /library` with the defaults, in-process; the reply's JSON.
+async fn add_value(
+    st: &Arc<AppState>,
+    media_id: String,
+    monitor: Option<MonitorMode>,
+    search: bool,
+) -> Result<Value, ApiError> {
+    let body = AddBody {
+        media_id,
+        monitored: None,
+        monitor,
+        quality_profile: None,
+        root_folder: None,
+        search,
+        metadata: None,
+        native_handoff_confirmed: false,
+        preserve_monitoring: false,
+    };
+    let resp = library_add(State(st.clone()), ApiJson(body)).await?;
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .map_err(|_| ApiError::internal("quick add", "unreadable reply"))?;
+    serde_json::from_slice(&bytes).map_err(|_| ApiError::internal("quick add", "unreadable reply"))
+}
+
+/// Day and month for a sentence ("12 Dec"), from `YYYY-MM-DD`.
+fn short_date(d: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = d
+        .get(5..7)
+        .and_then(|m| m.parse::<usize>().ok())
+        .and_then(|m| MONTHS.get(m.wrapping_sub(1)));
+    match (month, d.get(8..10).and_then(|x| x.parse::<u8>().ok())) {
+        (Some(m), Some(day)) => format!("{day} {m}"),
+        _ => d.to_string(),
+    }
+}
+
+/// What an add did, in the app's words, from the add reply (mirrors the MCP `automatic` summary).
+fn quick_outcome(v: &Value) -> (&'static str, Option<String>, String) {
+    let state = v["plan"]["state"].as_str().unwrap_or("");
+    let ex = &v["plan"]["execution"];
+    let queued = ex["mode"] == "executed" && ex["grabs"].as_array().is_some_and(|g| !g.is_empty());
+    if queued
+        || matches!(
+            state,
+            "download_queued" | "download_started" | "in_progress"
+        )
+    {
+        return (
+            "on_its_way",
+            None,
+            "Arr found a copy and is getting it now.".into(),
+        );
+    }
+    if matches!(state, "already_satisfied" | "imported") {
+        return ("in_plex", None, "It's already in Plex.".into());
+    }
+    let until = v["acquisition_blockers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|b| b["code"] == "not_released_yet")
+        .map(|b| {
+            b["until"]
+                .as_str()
+                .and_then(|u| u.get(..10))
+                .map(str::to_string)
+        });
+    if let Some(until) = until {
+        let message = match &until {
+            Some(d) => format!("Not out yet. Arr will get it after {}.", short_date(d)),
+            None => "Not out yet. Arr will get it once it's out.".into(),
+        };
+        return ("waiting", until, message);
+    }
+    (
+        "looking",
+        None,
+        "Arr is looking for a copy and will keep trying.".into(),
+    )
+}
+
+/// One tap to get a movie or a show: what a person means by "get me this".
+async fn quick_add(State(st): St, ApiJson(body): ApiJson<QuickAddBody>) -> ApiResult {
+    st.loaded()?;
+    let id = parse_media_id(&body.media_id)?;
+    match id {
+        MediaId::Movie { tmdb } => {
+            let v = match add_value(&st, id.to_string(), None, true).await {
+                Ok(v) => v,
+                Err(e)
+                    if e.status == StatusCode::CONFLICT
+                        && e.code == ErrorCode::MetadataUnavailable
+                        && st.tmdb.is_none() =>
+                {
+                    return ok(json!({
+                        "media_id": id, "title": format!("Movie {tmdb}"), "detail": null,
+                        "outcome": "movies_off", "until": null,
+                        "message": "Movie search isn't set up yet. The person who runs Arr can add a free TMDB key.",
+                    }));
+                }
+                Err(e) => return Err(e),
+            };
+            let (outcome, until, message) = quick_outcome(&v);
+            let title = feed_title(&st.index(), id).0;
+            ok(json!({
+                "media_id": id, "title": title, "detail": null,
+                "outcome": outcome, "until": until, "message": message,
+            }))
+        }
+        MediaId::Series(_) => {
+            let v = add_value(&st, id.to_string(), Some(MonitorMode::Future), false).await?;
+            let sid: MediaId = v["media_id"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(id);
+            let index = st.index();
+            let (title, _) = feed_title(&index, sid);
+            let now = OffsetDateTime::now_utc();
+            let latest = sid
+                .series_key()
+                .and_then(|k| index.series(k))
+                .and_then(|s| {
+                    s.episodes
+                        .iter()
+                        .flatten()
+                        .filter(|e| e.season > 0)
+                        .filter(|e| {
+                            e.air_date_utc.as_deref().is_some_and(|d| {
+                                OffsetDateTime::parse(d, &Rfc3339).is_ok_and(|t| t <= now)
+                            })
+                        })
+                        .map(|e| e.season)
+                        .max()
+                });
+            let (Some(season), Some(key)) = (latest, sid.series_key()) else {
+                return ok(json!({
+                    "media_id": sid, "title": title, "detail": null,
+                    "outcome": "following", "until": null,
+                    "message": "Arr will get new episodes as they air.",
+                }));
+            };
+            let v = add_value(&st, MediaId::Season(key, season).to_string(), None, true).await?;
+            let (outcome, until, message) = quick_outcome(&v);
+            ok(json!({
+                "media_id": sid, "title": title, "detail": format!("Season {season}"),
+                "outcome": outcome, "until": until, "message": message,
+            }))
+        }
+        _ => Err(ApiError::bad_request(
+            ErrorCode::InvalidRequest,
+            "media_id must be a movie or a series",
+        )),
+    }
 }

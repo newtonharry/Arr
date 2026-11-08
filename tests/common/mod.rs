@@ -362,6 +362,12 @@ pub struct MockState {
     pub tvmaze_extra: HashMap<String, Vec<Value>>,
     /// TMDB movie details overriding the built-in ones, per id.
     pub tmdb_movies: HashMap<String, Value>,
+    /// Entries of TVmaze's `schedule/web`, answered for every date.
+    pub schedule: Vec<Value>,
+    /// The `date` of each `schedule/web` request.
+    pub schedule_dates: Vec<String>,
+    /// `schedule/web` answers HTTP 500.
+    pub schedule_fail: bool,
     /// When set, each download fetch is recorded, then answered only once notified.
     pub download_gate: Option<Arc<tokio::sync::Notify>>,
 }
@@ -488,6 +494,7 @@ fn shows() -> Vec<Value> {
         tvmaze_show(9003, "WAR", "2026-01-05", Some(999001)),
         tvmaze_show(9004, "War", "2019-03-01", None),
         tvmaze_show(9005, "Parity Partial", "2025-01-10", Some(999005)),
+        tvmaze_show(9006, "Coming Soon Show", "2099-01-10", Some(999006)),
     ]
 }
 
@@ -539,6 +546,9 @@ async fn tvmaze_episodes(
         .get(&id)
         .cloned()
         .unwrap_or_default();
+    if id == "9006" {
+        return axum::Json(vec![json!({ "season": 1, "number": 1, "name": "Pilot", "type": "regular", "airstamp": "2099-01-10T02:00:00+00:00", "runtime": 30 })]).into_response();
+    }
     if id == "9005" {
         let mut eps = parity_partial_episodes();
         eps.extend(extra);
@@ -557,6 +567,19 @@ async fn tvmaze_episodes(
     }
     eps.extend(extra);
     axum::Json(eps).into_response()
+}
+
+async fn tvmaze_schedule(
+    State(m): State<Mock>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let mut m = m.lock().unwrap();
+    m.schedule_dates
+        .push(q.get("date").cloned().unwrap_or_default());
+    if m.schedule_fail {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    axum::Json(m.schedule.clone()).into_response()
 }
 
 async fn tvmaze_search(Query(q): Query<HashMap<String, String>>) -> Response {
@@ -759,6 +782,9 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         plex: vec![],
         tvmaze_extra: HashMap::new(),
         tmdb_movies: HashMap::new(),
+        schedule: vec![],
+        schedule_dates: vec![],
+        schedule_fail: false,
         download_gate: None,
     }));
     let app = Router::new()
@@ -767,6 +793,7 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         .route("/tvmaze/shows/{id}", get(tvmaze_show_by_id))
         .route("/tvmaze/shows/{id}/episodes", get(tvmaze_episodes))
         .route("/tvmaze/search/shows", get(tvmaze_search))
+        .route("/tvmaze/schedule/web", get(tvmaze_schedule))
         .route("/tmdb/3/search/movie", get(tmdb_search))
         .route("/tmdb/3/movie/{id}", get(tmdb_details))
         .route("/prowlarr/{id}/download", get(prowlarr_download))

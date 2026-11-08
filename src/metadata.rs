@@ -6,7 +6,8 @@ use crate::upstream::{self, TtlCache, UpstreamError};
 use reqwest::Url;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const METADATA_TTL: Duration = Duration::from_secs(3600);
@@ -78,11 +79,98 @@ struct SearchHit {
     show: TvmazeShow,
 }
 
+/// A popular show with a new episode this week (TVmaze web schedule).
+#[derive(Debug, Clone)]
+pub struct WebShow {
+    pub id: u32,
+    pub tvdb: Option<u32>,
+    pub name: String,
+    pub year: Option<u16>,
+    pub network: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ScheduleEntry {
+    #[serde(default, rename = "_embedded")]
+    embedded: Option<ScheduleEmbedded>,
+}
+
+#[derive(Deserialize)]
+struct ScheduleEmbedded {
+    show: Option<ScheduleShow>,
+}
+
+#[derive(Deserialize)]
+struct ScheduleShow {
+    #[serde(flatten)]
+    show: TvmazeShow,
+    #[serde(default)]
+    weight: Option<f64>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    network: Option<ScheduleNetwork>,
+    #[serde(default, rename = "webChannel")]
+    web_channel: Option<ScheduleNetwork>,
+}
+
+#[derive(Deserialize)]
+struct ScheduleNetwork {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Plain text of a TVmaze summary (HTML), at most 200 characters.
+fn plain_summary(html: &str) -> Option<String> {
+    let mut text = String::new();
+    let mut tag = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                tag.clear();
+            }
+            '>' if in_tag => {
+                in_tag = false;
+                let name = tag.trim_start_matches('/').to_ascii_lowercase();
+                if ["p", "br", "li", "div"].iter().any(|b| {
+                    name.strip_prefix(b)
+                        .is_some_and(|r| !r.starts_with(char::is_alphanumeric))
+                }) {
+                    text.push(' ');
+                }
+            }
+            c if in_tag => tag.push(c),
+            c => text.push(c),
+        }
+    }
+    let text = text
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        None
+    } else if text.chars().count() <= 200 {
+        Some(text)
+    } else {
+        let cut: String = text.chars().take(199).collect();
+        Some(format!("{}\u{2026}", cut.trim_end()))
+    }
+}
+
+const IDEAS_TTL: Duration = Duration::from_secs(6 * 3600);
+const IDEAS_MAX: usize = 24;
+
 pub struct Tvmaze {
     base: Url,
     http: reqwest::Client,
     shows: TtlCache<String, Option<TvmazeShow>>,
     episodes: TtlCache<u32, Vec<TvmazeEpisode>>,
+    ideas: Mutex<Option<(Instant, Vec<WebShow>)>>,
 }
 
 impl Tvmaze {
@@ -92,6 +180,7 @@ impl Tvmaze {
             http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
             shows: TtlCache::new(METADATA_TTL, 512),
             episodes: TtlCache::new(METADATA_TTL, 128),
+            ideas: Mutex::new(None),
         }
     }
 
@@ -149,6 +238,74 @@ impl Tvmaze {
         Err(UpstreamError::BadResponse {
             reason: "too many redirects".into(),
         })
+    }
+
+    /// Popular shows with an episode on the web schedule in the last seven days, most popular
+    /// first (cached for six hours; a failed refresh serves the cached answer).
+    pub async fn ideas(&self) -> Result<Vec<WebShow>, UpstreamError> {
+        let cached = self.ideas.lock().unwrap().clone();
+        if let Some((at, shows)) = &cached
+            && at.elapsed() < IDEAS_TTL
+        {
+            return Ok(shows.clone());
+        }
+        let today = time::OffsetDateTime::now_utc().date();
+        let fmt = time::macros::format_description!("[year]-[month]-[day]");
+        let mut ranked: Vec<(f64, WebShow)> = vec![];
+        let mut last_err = None;
+        let mut answered = false;
+        for back in 0..7 {
+            let day = today - time::Duration::days(back);
+            let date = day.format(&fmt).unwrap_or_default();
+            let entries: Vec<ScheduleEntry> = match self
+                .get(self.url("schedule/web", &[("date", &date)])?)
+                .await
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            answered = true;
+            for show in entries
+                .into_iter()
+                .filter_map(|e| e.embedded?.show)
+                .filter(|s| !s.show.name.trim().is_empty())
+            {
+                if ranked.iter().any(|(_, r)| r.id == show.show.id) {
+                    continue;
+                }
+                let network = show
+                    .network
+                    .or(show.web_channel)
+                    .and_then(|n| n.name)
+                    .filter(|n| !n.is_empty());
+                ranked.push((
+                    show.weight.unwrap_or(0.0),
+                    WebShow {
+                        id: show.show.id,
+                        tvdb: show.show.externals.thetvdb,
+                        name: show.show.name.trim().to_string(),
+                        year: show.show.year(),
+                        network,
+                        summary: show.summary.as_deref().and_then(plain_summary),
+                    },
+                ));
+            }
+        }
+        if !answered {
+            return match cached {
+                Some((_, shows)) => Ok(shows),
+                None => Err(last_err.unwrap_or(UpstreamError::BadResponse {
+                    reason: "no schedule".into(),
+                })),
+            };
+        }
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let shows: Vec<WebShow> = ranked.into_iter().map(|(_, s)| s).take(IDEAS_MAX).collect();
+        *self.ideas.lock().unwrap() = Some((Instant::now(), shows.clone()));
+        Ok(shows)
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<TvmazeShow>, UpstreamError> {
