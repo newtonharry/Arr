@@ -82,14 +82,16 @@ both keep your config. To stop automatic updates, run the installer with `--no-a
 Update logs go to `journalctl -u arr-update` (`--user` for a user install), or `update.log` in
 the state folder on macOS.
 
-### Adding a TMDB key later
+### A TMDB key, to find new movies
 
-Without a TMDB key Arr can't find movies you don't own yet (TV works without one). Skipped it
-during setup? Get a free key at <https://www.themoviedb.org/settings/api> (create an account,
-choose **Developer**, then copy the API key or the API read access token) and run the install
-command again. Seeing that Arr can't find new movies yet, it asks for the key, checks it with
-TMDB, saves it and restarts Arr. Your settings stay as they are. To skip the question, add the
-key to the command:
+Arr finds TV shows on its own, but to find movies you don't own yet it needs a free key from
+TMDB, the movie database. The setup page and the terminal install both walk you through
+getting one (about five minutes) and check it with TMDB before saving it; you can also skip
+it. [docs/TMDB.md](docs/TMDB.md) has the steps.
+
+Skipped it? Run the install command again: seeing that Arr can't find new movies yet, it walks
+you through it, checks the key, saves it and restarts Arr. Your settings stay as they are. To
+give the key straight away:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --tmdb-key YOUR_KEY
@@ -131,8 +133,10 @@ README and ask it to install Arr. It needs three things from you:
   folders.
 - **A Plex token**, only if the script can't read it from Plex's settings. In Plex Web, open
   any movie, choose ⋯ > Get Info > View XML, and copy the value after `X-Plex-Token=`.
-- **A TMDB key** (optional, free at <https://www.themoviedb.org/settings/api>). Without one,
-  Arr can't find movies you don't already own. TV works without it.
+- **A TMDB key** (optional, free). Without one, Arr can't find movies you don't already own;
+  TV works without it. It needs your TMDB login, so you create it yourself:
+  [docs/TMDB.md](docs/TMDB.md) has the five-minute steps to follow, or to hand to you. The
+  installer checks the key and stops with an `error:` line if TMDB refuses it.
 
 The agent then runs:
 
@@ -267,9 +271,16 @@ The default search source is The Pirate Bay's public API. You can add any Torzna
 - [docs/EMBEDDED-DOWNLOADER.md](docs/EMBEDDED-DOWNLOADER.md): the BitTorrent engine, seeding
   and limits.
 - [docs/MIGRATION.md](docs/MIGRATION.md): importing Sonarr/Radarr/Prowlarr settings.
+- [docs/TMDB.md](docs/TMDB.md): getting a free TMDB key, so Arr can find new movies.
 - [docs/PRIVACY.md](docs/PRIVACY.md): what Arr sends (nothing, unless you allow error
   reports) and what's removed first.
 - [docs/READINESS.md](docs/READINESS.md): what the tests cover and the known limits.
 - [docs/EXECUTION-SANDBOX.md](docs/EXECUTION-SANDBOX.md): testing downloads safely in a
   sandbox.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the pieces fit together.
+
+## Credits
+
+Movie details come from [TMDB](https://www.themoviedb.org) and TV details from
+[TVmaze](https://www.tvmaze.com). Arr uses TMDB and the TMDB APIs but is not endorsed,
+certified or otherwise approved by TMDB.

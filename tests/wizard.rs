@@ -18,6 +18,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_arr");
 const ACCOUNT_TOKEN: &str = "account-token-0123456789";
 const SERVER_TOKEN: &str = "server-token-0123456789";
 const MACHINE: &str = "machine-0123456789";
+const TMDB_KEY: &str = "tmdb-key-0123456789";
 
 #[derive(Default)]
 struct World {
@@ -64,6 +65,17 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = Router::new()
+        // TMDB, for checking keys: only TMDB_KEY works.
+        .route(
+            "/3/movie/603",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                if q.get("api_key").map(String::as_str) == Some(TMDB_KEY) {
+                    (StatusCode::OK, r#"{"id":603,"title":"The Matrix"}"#)
+                } else {
+                    (StatusCode::UNAUTHORIZED, r#"{"status_code":7}"#)
+                }
+            }),
+        )
         .route(
             "/api/v2/pins",
             post(|State(m): State<Mock>, h: HeaderMap| async move {
@@ -290,6 +302,7 @@ async fn start_wizard(
         .arg(ffprobe())
         .arg(format!("--plex-tv-url=http://{mock}/"))
         .arg(format!("--plex-auth-url=http://{mock}/auth"))
+        .arg(format!("--tmdb-url=http://{mock}/"))
         .args(extra)
         // Error reports never leave a test: nothing listens on port 9.
         .env("ARR_SENTRY_DSN", "http://key@127.0.0.1:9/1")
@@ -455,6 +468,27 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     assert!(!state_dir.join("config.toml").exists());
 
+    // A TMDB key is checked as it's pasted, and again on Finish: a refused one saves nothing.
+    let (s, v) = page
+        .post("/api/tmdb/check", json!({ "key": "not-the-key" }))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("TMDB didn't accept"),
+        "{v}"
+    );
+    let (s, v) = page
+        .post("/api/tmdb/check", json!({ "key": TMDB_KEY }))
+        .await;
+    assert_eq!((s, &v["ok"]), (StatusCode::OK, &json!(true)), "{v}");
+    let mut wrong = choices("1:0");
+    wrong["tmdb"] = json!("not-the-key");
+    let (s, v) = page.post("/api/apply", wrong).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(!state_dir.join("config.toml").exists());
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(v["phase"]["state"], "editing", "{v}");
+
     let (s, v) = page.post("/api/apply", choices("1:0")).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let mut last = Value::Null;
@@ -467,6 +501,8 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert_eq!(last["state"], "done", "{last}");
+    // No key: the page says how to add one later.
+    assert_eq!(last["movies"], false, "{last}");
     let (s, _) = page.post("/api/apply", choices("1:0")).await;
     assert_eq!(s, StatusCode::CONFLICT);
     let (s, _) = page.post("/api/finish", json!({})).await;

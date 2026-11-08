@@ -377,6 +377,12 @@ async fn catalog_lookup_discovery_and_capabilities() {
         .find(|p| p["name"] == "tmdb")
         .unwrap();
     assert_eq!(tmdb["status"], "not_configured");
+    // The assistant is told how the user gets a key, so it can walk them through it.
+    let message = tmdb["message"].as_str().unwrap();
+    assert!(
+        message.contains("docs/TMDB.md") && message.contains("--tmdb-key"),
+        "{message}"
+    );
 
     let (_, v, _) = body(app.get("/api/v1/capabilities").send().await.unwrap()).await;
     let state = |n: &str| {

@@ -61,6 +61,37 @@ function Install-Arr {
 		return $a -match '^[Yy]'
 	}
 
+	# Whether TMDB accepts a key, asked through arr with the key on stdin; $script:TmdbWhy says
+	# why not. (Windows PowerShell turns a native program's stderr into errors, hence Continue.)
+	function Test-TmdbKey($key) {
+		$ErrorActionPreference = 'Continue'
+		$out = $key | & $Arr tmdb-key --check 2>&1 | ForEach-Object { "$_" }
+		$script:TmdbWhy = (($out -join ' ').Trim() -replace '^Error: ', '')
+		return $LASTEXITCODE -eq 0
+	}
+	# Walks whoever is at the keyboard through getting a TMDB key (docs/TMDB.md; the setup page
+	# and Arr's answers to an assistant give the same steps). Returns it, or '' if skipped.
+	function Read-TmdbKey {
+		if (-not (Interactive)) { return '' }
+		Say 'Arr finds TV shows on its own. To find movies you don''t have yet, it needs a free key'
+		Say 'from TMDB, the movie database. It takes about five minutes:'
+		Say '  1. Create a free account: https://www.themoviedb.org/signup'
+		Say '  2. Request a key on https://www.themoviedb.org/settings/api and accept TMDB''s terms.'
+		Say '     If it asks about your app, it''s personal use: name Arr, URL'
+		Say '     https://github.com/newtonharry/Arr, summary "Personal media server".'
+		Say '  3. Copy the API Read Access Token (the long one) or the API Key.'
+		Say '  Help: https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md'
+		if (Confirm 'Open TMDB in your browser now?' 'y') { Open-Page 'https://www.themoviedb.org/signup' }
+		for ($i = 0; $i -lt 3; $i++) {
+			$key = "$(Read-Host 'Paste the TMDB key (Enter to skip)')".Trim()
+			if (-not $key) { break }
+			if (Test-TmdbKey $key) { Say 'That key works.'; return $key }
+			Say $script:TmdbWhy
+		}
+		Say 'No TMDB key for now: TV works, and running this again later asks for one.'
+		return ''
+	}
+
 	if (-not [Environment]::Is64BitOperatingSystem) { throw 'Arr needs 64-bit Windows.' }
 	if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
 		Say 'This PC has an ARM processor; Arr runs through Windows 11''s x64 emulation.'
@@ -125,11 +156,11 @@ function Install-Arr {
 		$tmdbKey = $env:ARR_TMDB_KEY
 		$tmdbOn = (Get-Content $Config -Raw) -match '(?ms)^\[tmdb\][^\[]*?^enabled *= *true'
 		if (-not $tmdbKey -and -not $tmdbOn -and (Interactive)) {
-			Say 'Optional: a free TMDB key lets Arr find movies you don''t own yet'
-			Say '(https://www.themoviedb.org/settings/api). TV search works without one.'
-			$tmdbKey = Read-Host 'TMDB API key or read token (Enter to skip)'
+			Step 'Arr can''t find new movies yet'
+			$tmdbKey = Read-TmdbKey
 		}
 		if ($tmdbKey) {
+			# Arr is already set up (and stopped for the update), so a refused key warns, never stops.
 			Step 'Adding your TMDB key'
 			$tmdbKey.Trim() | & $Arr tmdb-key --config $Config
 			if ($LASTEXITCODE -eq 0) { Say 'Arr can now find movies you don''t own yet.' }

@@ -43,6 +43,7 @@ function render(s) {
     $("done-downloading").textContent = s.phase.downloading
       ? "Ask for a movie or show and Arr will download it into Plex."
       : "Downloading is off for now. Run the installer again or edit Arr's config to turn it on.";
+    $("done-movies").hidden = !!s.phase.movies;
     return;
   }
   if (phase === "failed") showError(s.phase.message);
@@ -299,6 +300,36 @@ $("create-libs").addEventListener("click", async (ev) => {
   $("libs-warning").hidden = warnings.length === 0;
   if (state && state.plex && !formFilled) fillLibraries(state.plex);
 });
+
+// The TMDB key is checked with TMDB as it's pasted, so a wrong one shows up straight away.
+const tmdbHint = $("tmdb-hint");
+const tmdbHintDefault = tmdbHint.innerHTML;
+let tmdbTimer = null;
+$("tmdb").addEventListener("input", () => {
+  clearTimeout(tmdbTimer);
+  const key = $("tmdb").value.trim();
+  tmdbHint.classList.remove("bad", "good");
+  if (!key) { tmdbHint.innerHTML = tmdbHintDefault; return; }
+  tmdbHint.textContent = "Checking the key with TMDB…";
+  tmdbTimer = setTimeout(async () => {
+    let ok = true, message = "This key works: Arr can find new movies.";
+    try { await call("POST", "/api/tmdb/check", { key }); } catch (e) { ok = false; message = e.message; }
+    if ($("tmdb").value.trim() !== key) return; // changed while TMDB answered
+    tmdbHint.textContent = message;
+    tmdbHint.classList.add(ok ? "good" : "bad");
+  }, 500);
+});
+
+// Copy buttons for the TMDB form's answers, where the browser allows it (localhost, HTTPS).
+if (navigator.clipboard && window.isSecureContext) {
+  for (const b of document.querySelectorAll("button.copy")) {
+    b.hidden = false;
+    b.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; } catch (_) { /* leave it */ }
+      setTimeout(() => { b.textContent = "Copy"; }, 1500);
+    });
+  }
+}
 
 $("form").addEventListener("submit", async (ev) => {
   ev.preventDefault();

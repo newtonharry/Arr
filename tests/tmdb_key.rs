@@ -111,3 +111,25 @@ async fn a_key_added_after_setup_is_checked_saved_and_turned_on() {
         Some(true)
     );
 }
+
+#[tokio::test(flavor = "multi_thread")] // the mock answers while this thread waits on arr
+async fn check_only_asks_tmdb_and_saves_nothing() {
+    let tmdb = start_tmdb().await;
+    let check = |key: &str| {
+        let mut child = Command::new(BIN)
+            .args(["tmdb-key", "--check"])
+            .arg(format!("--tmdb-url=http://{tmdb}/"))
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        write!(child.stdin.take().unwrap(), "{key}").unwrap();
+        child.wait_with_output().unwrap()
+    };
+    assert!(check("good-key").status.success());
+    let out = check("wrong-key");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("TMDB didn't accept that key"));
+    let out = check("");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("doesn't look like a TMDB key"));
+}

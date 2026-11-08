@@ -160,6 +160,85 @@ ask_secret() { # ask_secret "Question" -> answer, not shown as it's typed
 	printf '\n' >/dev/tty
 	printf '%s' "$a"
 }
+
+# Opens a page in the browser of whoever is at this computer: not over SSH or with --yes,
+# and under sudo as the user who ran it, never as root.
+open_page() {
+	interactive && [ -z "${SSH_CONNECTION:-}" ] || return 0
+	url=$1
+	if [ "$os" = Darwin ]; then
+		if [ "$(id -u)" = 0 ]; then
+			[ -n "${SUDO_USER:-}" ] || return 0
+			set -- sudo -u "$SUDO_USER" open "$url"
+		else
+			set -- open "$url"
+		fi
+	else
+		have xdg-open || return 0
+		if [ "$(id -u)" = 0 ]; then
+			[ -n "${SUDO_USER:-}" ] || return 0
+			# The desktop session the setup page found, if it ran; otherwise find it now. Either
+			# way the browser gets the user's runtime folder and session bus, not just a display.
+			[ -n "${DESKTOP_ENV:-}" ] || desktop_env
+			if [ -z "${DESKTOP_ENV:-}" ]; then
+				[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+				rt="/run/user/$(id -u "$SUDO_USER")"
+				DESKTOP_ENV="XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus${DISPLAY:+ DISPLAY=$DISPLAY}${WAYLAND_DISPLAY:+ WAYLAND_DISPLAY=$WAYLAND_DISPLAY}"
+			fi
+			# shellcheck disable=SC2086 # NAME=value words without spaces
+			set -- sudo -u "$SUDO_USER" env $DESKTOP_ENV xdg-open "$url"
+		else
+			[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+			set -- xdg-open "$url"
+		fi
+	fi
+	say "  (opening $url)"
+	"$@" >/dev/null 2>&1 </dev/null &
+}
+
+# A TMDB key lets Arr find movies you don't own yet (docs/TMDB.md). The setup page and Arr's
+# answers to an assistant give the same steps.
+tmdb_steps() {
+	say "Arr finds TV shows on its own. To find movies you don't have yet, it needs a free key"
+	say "from TMDB, the movie database. It takes about five minutes, on a computer:"
+	say "  1. Create a free account: https://www.themoviedb.org/signup"
+	say "  2. Request a key on https://www.themoviedb.org/settings/api and accept TMDB's terms."
+	say "     If it asks about your app, it's personal use: name Arr, URL"
+	say "     https://github.com/newtonharry/Arr, summary \"Personal media server\"."
+	say "  3. Copy the API Read Access Token (the long one) or the API Key."
+	say "  Help: https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md"
+}
+# tmdb_key_ok KEY: whether TMDB accepts it (asked through arr; the key goes on stdin). If not,
+# TMDB_WHY says why.
+tmdb_key_ok() {
+	TMDB_WHY=$(printf '%s' "$1" | "$ARR" tmdb-key --check 2>&1 >/dev/null) && return 0
+	TMDB_WHY=${TMDB_WHY#Error: }
+	return 1
+}
+# ask_tmdb_key: walks whoever is at the terminal through getting a key, then checks it.
+# Sets TMDB_KEY, empty if they skip it.
+ask_tmdb_key() {
+	TMDB_KEY=""
+	interactive || return 0
+	say ""
+	tmdb_steps
+	if [ -z "${SSH_CONNECTION:-}" ] && confirm "Open TMDB in your browser now?" y; then
+		open_page https://www.themoviedb.org/signup
+	fi
+	tries=0
+	while [ "$tries" -lt 3 ]; do
+		key=$(ask "Paste the TMDB key (Enter to skip)" "")
+		[ -n "$key" ] || break
+		if tmdb_key_ok "$key"; then
+			TMDB_KEY=$key
+			say "That key works."
+			return 0
+		fi
+		say "$TMDB_WHY"
+		tries=$((tries + 1))
+	done
+	say "No TMDB key for now: TV works, and running this again later asks for one."
+}
 confirm() { # confirm "Question" y|n
 	a=$(ask "$1 (y/n)" "$2")
 	case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac
@@ -391,10 +470,11 @@ for d in "$MOVIES" "$TV" "$DOWNLOADS"; do
 		die "${SUDO_USER:-$(id -un)} can't write to $d; fix its permissions or run as the user your media belongs to"
 done
 
-if [ -z "$TMDB_KEY" ]; then
-	say "Optional: a free TMDB key lets Arr find movies you don't own yet"
-	say "(https://www.themoviedb.org/settings/api). TV search works without one."
-	TMDB_KEY=$(ask "TMDB API key or read token (Enter to skip)" "")
+if [ -n "$TMDB_KEY" ]; then
+	# Nothing is written yet, so a key TMDB refuses stops here with the reason.
+	tmdb_key_ok "$TMDB_KEY" || die "$TMDB_WHY (the key from --tmdb-key or ARR_TMDB_KEY; see docs/TMDB.md)"
+else
+	ask_tmdb_key
 fi
 
 if [ "$DOWNLOADING" = 1 ] && ! confirm "Let Arr download and import what you ask for?" y; then
@@ -571,11 +651,11 @@ if [ -f "$CONFIG" ]; then
 	# A TMDB key can be added on any later run: --tmdb-key, ARR_TMDB_KEY, or asked here.
 	if [ -z "$TMDB_KEY" ] && interactive &&
 		! awk '/^\[/{s=($1=="[tmdb]")} s&&/^enabled *= *true/{f=1} END{exit !f}' "$CONFIG"; then
-		say "Optional: a free TMDB key lets Arr find movies you don't own yet"
-		say "(https://www.themoviedb.org/settings/api). TV search works without one."
-		TMDB_KEY=$(ask "TMDB API key or read token (Enter to skip)" "")
+		step "Arr can't find new movies yet"
+		ask_tmdb_key
 	fi
 	if [ -n "$TMDB_KEY" ]; then
+		# Arr is already set up and running, so a refused key warns rather than stopping.
 		step "Adding your TMDB key"
 		if printf '%s' "$TMDB_KEY" | "$ARR" tmdb-key --config "$CONFIG"; then
 			say "Arr can now find movies you don't own yet."
@@ -595,40 +675,6 @@ fi
 
 # ChatGPT (on the web, your phone or any device) needs a public HTTPS address and a sign-in.
 # A free ngrok domain provides the address; Google sign-in limits Arr to the accounts you list.
-# Opens a page in the browser of whoever is at this computer: not over SSH or with --yes,
-# and under sudo as the user who ran it, never as root.
-open_page() {
-	interactive && [ -z "${SSH_CONNECTION:-}" ] || return 0
-	url=$1
-	if [ "$os" = Darwin ]; then
-		if [ "$(id -u)" = 0 ]; then
-			[ -n "${SUDO_USER:-}" ] || return 0
-			set -- sudo -u "$SUDO_USER" open "$url"
-		else
-			set -- open "$url"
-		fi
-	else
-		have xdg-open || return 0
-		if [ "$(id -u)" = 0 ]; then
-			[ -n "${SUDO_USER:-}" ] || return 0
-			# The desktop session the setup page found, if it ran; otherwise find it now. Either
-			# way the browser gets the user's runtime folder and session bus, not just a display.
-			[ -n "${DESKTOP_ENV:-}" ] || desktop_env
-			if [ -z "${DESKTOP_ENV:-}" ]; then
-				[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
-				rt="/run/user/$(id -u "$SUDO_USER")"
-				DESKTOP_ENV="XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus${DISPLAY:+ DISPLAY=$DISPLAY}${WAYLAND_DISPLAY:+ WAYLAND_DISPLAY=$WAYLAND_DISPLAY}"
-			fi
-			# shellcheck disable=SC2086 # NAME=value words without spaces
-			set -- sudo -u "$SUDO_USER" env $DESKTOP_ENV xdg-open "$url"
-		else
-			[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
-			set -- xdg-open "$url"
-		fi
-	fi
-	say "  (opening $url)"
-	"$@" >/dev/null 2>&1 </dev/null &
-}
 
 remote_setup() {
 	step "Setting up access from ChatGPT on your phone and other devices"

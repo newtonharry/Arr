@@ -71,6 +71,8 @@ pub struct Options {
     pub plex_port: u16,
     /// The installer was told yes (`--error-reports`): the page starts with reports on.
     pub error_reports: bool,
+    /// Where TMDB's API is, for checking keys (overridden in tests).
+    pub tmdb_url: Url,
 }
 
 struct Wizard {
@@ -156,6 +158,8 @@ enum Phase {
     },
     Done {
         downloading: bool,
+        /// A TMDB key was added, so Arr can find new movies.
+        movies: bool,
     },
     Failed {
         message: String,
@@ -255,6 +259,7 @@ fn router(wiz: Arc<Wizard>) -> Router {
         .route("/api/plex/install", post(install_plex))
         .route("/api/plex/libraries", post(create_libraries))
         .route("/api/reporting", post(set_reporting))
+        .route("/api/tmdb/check", post(check_tmdb))
         .route("/api/folder", post(folder))
         .route("/api/apply", post(apply))
         .route("/api/finish", post(finish))
@@ -773,6 +778,19 @@ async fn sections(base_url: Url, token: Secret) -> Result<Vec<Section>, upstream
 #[derive(Deserialize)]
 struct ReportingChoice {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct TmdbKey {
+    key: String,
+}
+
+/// Checks a TMDB key as it's pasted, so the page can say straight away whether it works.
+async fn check_tmdb(State(wiz): St, Json(k): Json<TmdbKey>) -> Response {
+    match crate::tmdbkey::verify(&wiz.opts.tmdb_url, &k.key).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => problem(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
 }
 
 /// The "Send error reports" box: reporting starts the moment it's ticked, so a failure
@@ -1294,8 +1312,14 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
         return problem(StatusCode::BAD_REQUEST, &format!("download folder: {m}"));
     }
     let tmdb = c.tmdb.trim().to_string();
-    if tmdb.len() > 1024 || tmdb.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
-        return problem(StatusCode::BAD_REQUEST, "that TMDB key doesn't look right");
+    if !tmdb.is_empty() {
+        // Checked again here, not only as it's typed: a key saved has worked once. The
+        // working phase keeps a second click out while TMDB answers.
+        set_phase(&wiz, "Checking your TMDB key", "");
+        if let Err(e) = crate::tmdbkey::verify(&wiz.opts.tmdb_url, &tmdb).await {
+            wiz.inner.lock().unwrap().phase = Phase::Editing;
+            return problem(StatusCode::BAD_REQUEST, &format!("{e:#}"));
+        }
     }
     set_phase(&wiz, "Saving your settings", "");
     let w = wiz.clone();
@@ -1305,6 +1329,7 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
         inner.phase = match result {
             Ok(()) => Phase::Done {
                 downloading: c.downloading,
+                movies: !tmdb.is_empty(),
             },
             Err(e) => {
                 crate::report::error("setup", &crate::report::reportable(&e));

@@ -17,6 +17,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once at startup; its size doesn't matter
 enum Command {
     /// Create a private state directory, API token and config template (never overwrites).
     /// The template favours native indexers and the embedded downloader; pass
@@ -117,6 +118,9 @@ enum Command {
         /// Start with error reports ticked (the installer's --error-reports).
         #[arg(long)]
         error_reports: bool,
+        /// Tests: where TMDB's API is, for checking keys.
+        #[arg(long, hide = true, default_value = arr::tmdbkey::API_URL)]
+        tmdb_url: reqwest::Url,
     },
     /// Install Plex Media Server from Plex's package source, and make a media folder Plex and
     /// you can both use (Movies, TV Shows). Needs administrator rights; the setup page runs it
@@ -146,10 +150,17 @@ enum Command {
         message: String,
     },
     /// Add or replace the TMDB key (read from stdin) of an existing install, so Arr can find
-    /// movies you don't own yet. Checks it with TMDB first; restart Arr afterwards.
+    /// movies you don't own yet. Checks it with TMDB first; restart Arr afterwards. With
+    /// --check instead of --config, only checks it. Getting a key: docs/TMDB.md.
     TmdbKey {
+        #[arg(long, required_unless_present = "check", conflicts_with = "check")]
+        config: Option<PathBuf>,
+        /// Only check the key with TMDB; save nothing.
         #[arg(long)]
-        config: PathBuf,
+        check: bool,
+        /// Tests: where TMDB's API is (with --check).
+        #[arg(long, hide = true, default_value = arr::tmdbkey::API_URL)]
+        tmdb_url: reqwest::Url,
     },
     /// Serve MCP tools on stdin/stdout as a client of a running API (stdout carries only MCP).
     Mcp {
@@ -541,7 +552,11 @@ async fn main() -> Result<()> {
             arr::report::error(&component, &message);
             Ok(())
         }
-        Command::TmdbKey { config } => {
+        Command::TmdbKey {
+            config,
+            check: _,
+            tmdb_url,
+        } => {
             // From stdin, so the key stays out of the process list.
             let mut key = String::new();
             std::io::Read::read_to_string(
@@ -549,7 +564,10 @@ async fn main() -> Result<()> {
                 &mut key,
             )
             .context("couldn't read the key")?;
-            arr::tmdbkey::set(&config, &key).await
+            match config {
+                Some(config) => arr::tmdbkey::set(&config, &key).await,
+                None => arr::tmdbkey::verify(&tmdb_url, &key).await,
+            }
         }
         Command::Wizard {
             state_dir,
@@ -565,6 +583,7 @@ async fn main() -> Result<()> {
             plex_installer,
             plex_port,
             error_reports,
+            tmdb_url,
         } => {
             wizard::run(wizard::Options {
                 state_dir,
@@ -581,6 +600,7 @@ async fn main() -> Result<()> {
                 plex_installer,
                 plex_port,
                 error_reports,
+                tmdb_url,
             })
             .await
         }
