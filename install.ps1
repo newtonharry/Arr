@@ -12,7 +12,8 @@
 #   ARR_TMDB_KEY         a TMDB key, so Arr can find new movies
 #   ARR_UPLOAD_LIMIT_KIB upload limit for downloads in KiB/s (0 = no limit)
 #   ARR_TORRENT_PORT     the port downloads use (default 50413)
-#   ARR_PORT             Arr's port on this computer (default 8787; first setup only)
+#   ARR_PORT             Arr's port on this computer (default 8787; first setup only, and
+#                        with ARR_YES a re-run with a different port is refused)
 #   ARR_STATE_DIR        Arr's folder: config, secrets, database (default: where Arr is
 #                        installed, else %LOCALAPPDATA%\Arr)
 #   ARR_BIN_DIR          where arr.exe goes (default: where it is, else %LOCALAPPDATA%\Programs\Arr)
@@ -34,6 +35,12 @@
 function Install-Arr {
 	$ErrorActionPreference = 'Stop'
 	$ProgressPreference = 'SilentlyContinue' # the progress bar makes downloads very slow
+	# What this run changed, for the error handler at the bottom to undo (an earlier run in this
+	# window may have left these set): Arr stopped, programs swapped, settings saved aside.
+	$script:ArrStopped = $false # set by Stop-Arr: if this run fails, Arr is started again
+	$script:Swapped = @()
+	$script:Snapshot = $null
+	$script:Healthy = $false # once Arr runs well again, nothing is undone
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 	$Repo = 'newtonharry/Arr'
@@ -46,7 +53,7 @@ function Install-Arr {
 	}
 	$BinDir, $StateDir = Get-ArrDirs
 	# A given option is checked before anything changes, so it either applies or stops here.
-	foreach ($o in @(@('ARR_PORT', 1, 65535), @('ARR_TORRENT_PORT', 1, 65535), @('ARR_UPLOAD_LIMIT_KIB', 0, 4194304),
+	foreach ($o in @(@('ARR_PORT', 1, 65535), @('ARR_TORRENT_PORT', 1, 65535), @('ARR_UPLOAD_LIMIT_KIB', 0, 4194303),
 			@('ARR_ERROR_REPORTS', 0, 1), @('ARR_AUTO_UPDATE', 0, 1))) {
 		$v = [Environment]::GetEnvironmentVariable($o[0])
 		if ($v -and -not ($v -match '^\d{1,7}$' -and [int]$v -ge $o[1] -and [int]$v -le $o[2])) {
@@ -59,7 +66,6 @@ function Install-Arr {
 	$UploadLimit = if ($env:ARR_UPLOAD_LIMIT_KIB) { [int]$env:ARR_UPLOAD_LIMIT_KIB } else { 0 }
 	$AutoUpdate = $env:ARR_AUTO_UPDATE
 	$Yes = $env:ARR_YES -eq '1'
-	$script:ArrStopped = $false # set by Stop-Arr: if this run fails, Arr is started again
 	$Config = Join-Path $StateDir 'config.toml'
 	$Arr = Join-Path $BinDir 'arr.exe'
 	$Background = Join-Path $BinDir 'arr-background.exe'
@@ -131,6 +137,17 @@ function Install-Arr {
 		throw 'Windows setup needs the setup page in a browser; run this without ARR_YES'
 	}
 	if ($StateDir -ne (Join-Path $env:LOCALAPPDATA 'Arr') -and -not $env:ARR_STATE_DIR) { Say "Found Arr installed in $StateDir" }
+	Assert-OwnTask
+	# A re-run keeps Arr's port from its config.
+	if (Test-Path $Config) {
+		$m = Select-String -Path $Config -Pattern '^listen = "[^"]*:(\d+)"$' | Select-Object -First 1
+		if ($m) { $Port = [int]$m.Matches[0].Groups[1].Value }
+		if ($env:ARR_PORT -and [int]$env:ARR_PORT -ne $Port) {
+			if ($Yes) { throw "ARR_PORT is $env:ARR_PORT, but Arr uses port $Port from its config (change listen in $Config); nothing was changed" }
+			# Options left set in this window from an earlier run shouldn't stop this one.
+			Write-Warning "ARR_PORT is ignored: Arr keeps port $Port from its config"
+		}
+	}
 
 	# ------------------------------------------------------------ install the program
 
@@ -153,16 +170,17 @@ function Install-Arr {
 		New-Item -ItemType Directory -Force $BinDir | Out-Null
 		# Arr keeps running meanwhile (Windows can rename a running program); a re-run keeps the
 		# old programs as .previous, to go back to if the new ones don't start.
-		$swapped = @()
+		# Until Arr runs well again, a failure puts them back (Undo-Run).
+		$script:SwapDir = $BinDir
 		try {
 			foreach ($exe in 'arr.exe', 'arr-background.exe') {
 				$dst = Join-Path $BinDir $exe
 				$had = Test-Path $dst
 				Replace-File "$new\$exe" $dst -Keep
-				if ($had) { $swapped += $exe }
+				if ($had) { $script:Swapped += $exe }
 			}
 		} catch {
-			Restore-Previous $BinDir $swapped
+			Undo-Run
 			throw "couldn't put the new version in place ($($_.Exception.Message)); the old one is still there"
 		}
 	} finally {
@@ -206,17 +224,12 @@ function Install-Arr {
 
 	if (Test-Path $Config) {
 		Step "Keeping your config in $StateDir"
-		# A config the new version can't use stops here, with Arr still running as it was.
+		# A config the new version can't use stops here, with Arr still running as it was (and
+		# the previous programs put back).
 		$check = Run-Arr check --config $Config
 		if ($LASTEXITCODE -ne 0) {
 			$check | ForEach-Object { Say $_ }
 			throw "Arr can't use $Config (see above), so Arr keeps running as it was. Fix the file, or move it aside and run this again to set up again."
-		}
-		$m = Select-String -Path $Config -Pattern '^listen = "[^"]*:(\d+)"$' | Select-Object -First 1
-		if ($m) { $Port = [int]$m.Matches[0].Groups[1].Value }
-		# Options left set in this window from an earlier run shouldn't stop this one.
-		if ($env:ARR_PORT -and [int]$env:ARR_PORT -ne $Port) {
-			Write-Warning "ARR_PORT is ignored: Arr keeps port $Port from its config"
 		}
 		if (Select-String -Path $Config -Pattern '^\[plex\]' -Quiet) {
 			$null = Run-Arr plex-signin --config $Config --check
@@ -244,6 +257,8 @@ function Install-Arr {
 		}
 		# Given options change only those settings; each is checked, and a refused one stops
 		# here, before Arr is restarted. The TMDB key goes first: it's the one likely refused.
+		# If this run fails before Arr runs well again, the config and secrets go back as they are now.
+		Save-Settings $StateDir
 		if ($tmdbKey) { $tmdbKey.Trim() | Set-Arr tmdb-key }
 		if ($env:ARR_UPLOAD_LIMIT_KIB) { Set-Arr upload-limit-kib $UploadLimit }
 		if ($env:ARR_TORRENT_PORT) { Set-Arr torrent-port $TorrentPort }
@@ -306,14 +321,18 @@ function Install-Arr {
 	$api = "http://127.0.0.1:$Port"
 	$log = Join-Path $StateDir 'arr.log'
 	if (-not (Wait-Healthy $api '' 30)) {
-		if (-not $swapped) { throw "Arr didn't start; see $log" }
+		if (-not $script:Swapped -and -not $script:Snapshot) { throw "Arr didn't start; see $log" }
+		$what = if ($script:Swapped) { 'the new version of Arr didn''t start, so the previous version and settings are back' }
+		else { 'Arr didn''t start with the new settings, so the previous ones are back' }
 		Stop-Arr $Background
-		Restore-Previous $BinDir $swapped
+		Undo-Run
 		Start-ScheduledTask -TaskName 'Arr'
 		$script:ArrStopped = $false
 		$back = if (Wait-Healthy $api '' 30) { 'and it is running' } else { 'but it didn''t start either' }
-		throw "the new version of Arr didn't start, so the previous version is back, $back; see $log"
+		throw "$what, $back; see $log"
 	}
+	$script:Healthy = $true
+	if ($script:Snapshot) { Remove-Item -Recurse -Force $script:Snapshot -ErrorAction SilentlyContinue; $script:Snapshot = $null }
 
 	# A configured tunnel runs as its own log-on task next to Arr, without a window.
 	$PublicUrl = $null
@@ -636,6 +655,50 @@ function Remove-Aside($path) {
 	Remove-Item $old -Force -ErrorAction SilentlyContinue
 }
 
+# Refuses to go on when the "Arr" task runs as someone else: this run would take it over.
+function Assert-OwnTask {
+	$who = (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue).Principal.UserId
+	if (-not $who) { return }
+	$me = [Security.Principal.WindowsIdentity]::GetCurrent()
+	$sid = if ($who -match '^S-1-') { $who } else {
+		try { (New-Object Security.Principal.NTAccount $who).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $null }
+	}
+	$mine = if ($sid) { $sid -eq $me.User.Value } else { ($who -split '\\')[-1] -eq ($me.Name -split '\\')[-1] }
+	if (-not $mine) { throw "Arr is installed for $who; run this as that user" }
+}
+
+# Copies config.toml and secrets\ into Arr's private folder, for Undo-Run to put back.
+function Save-Settings($stateDir) {
+	$snap = Join-Path $stateDir 'rerun-backup'
+	if (Test-Path $snap) { Remove-Item -Recurse -Force $snap }
+	New-Item -ItemType Directory $snap | Out-Null
+	Copy-Item (Join-Path $stateDir 'config.toml') $snap
+	$secrets = Join-Path $stateDir 'secrets'
+	if (Test-Path $secrets) { Copy-Item $secrets $snap -Recurse }
+	$script:Snapshot = $snap
+}
+
+# Puts back what this run changed before Arr ran well again: the programs it replaced and the
+# settings Save-Settings saved, copied over the files in place so they keep their permissions.
+# Doing it twice is harmless.
+function Undo-Run {
+	if ($script:Swapped) { Restore-Previous $script:SwapDir $script:Swapped; $script:Swapped = @() }
+	$snap = $script:Snapshot
+	if (-not $snap) { return }
+	$stateDir = Split-Path $snap
+	Copy-Item (Join-Path $snap 'config.toml') (Join-Path $stateDir 'config.toml') -Force
+	$secrets = Join-Path $stateDir 'secrets'
+	$saved = Join-Path $snap 'secrets'
+	if (Test-Path $saved) {
+		Get-ChildItem $secrets -File | Where-Object { -not (Test-Path (Join-Path $saved $_.Name)) } | Remove-Item -Force
+		Copy-Item (Join-Path $saved '*') $secrets -Recurse -Force
+	} elseif (Test-Path $secrets) {
+		Remove-Item -Recurse -Force $secrets
+	}
+	Remove-Item -Recurse -Force $snap
+	$script:Snapshot = $null
+}
+
 # Puts back the programs Replace-File -Keep kept, for each name in $names.
 function Restore-Previous($binDir, $names) {
 	foreach ($e in $names) {
@@ -646,17 +709,15 @@ function Restore-Previous($binDir, $names) {
 	}
 }
 
-# Arr's folders: from ARR_BIN_DIR and ARR_STATE_DIR, else those of the install that the "Arr"
-# log-on task runs (it may not be in the default folders), else the defaults.
+# Arr's folders: those of the install that the "Arr" log-on task runs (it may not be in the
+# default folders), else the defaults; ARR_BIN_DIR and ARR_STATE_DIR each override only their own.
 function Get-ArrDirs {
 	$bin = Join-Path $env:LOCALAPPDATA 'Programs\Arr'
 	$state = Join-Path $env:LOCALAPPDATA 'Arr'
-	if (-not $env:ARR_STATE_DIR) {
-		$a = (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue).Actions | Select-Object -First 1
-		if ($a -and $a.Arguments -match '--config "([^"]+)"') {
-			$state = Split-Path $Matches[1]
-			$bin = Split-Path $a.Execute
-		}
+	$a = (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue).Actions | Select-Object -First 1
+	if ($a -and $a.Arguments -match '--config "([^"]+)"') {
+		$state = Split-Path $Matches[1]
+		$bin = Split-Path $a.Execute
 	}
 	if ($env:ARR_BIN_DIR) { $bin = $env:ARR_BIN_DIR }
 	if ($env:ARR_STATE_DIR) { $state = $env:ARR_STATE_DIR }
@@ -826,6 +887,12 @@ try {
 } catch {
 	$failure = $_
 	Write-Host "error: $($failure.Exception.Message)" -ForegroundColor Red
+	# Arr isn't running well on what this run changed: put the previous programs and settings
+	# back first, so Arr starts on them again (or, still running, keeps them next time).
+	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) {
+		Write-Host 'Putting back the previous version and settings.'
+		try { Undo-Run } catch { Write-Host "couldn't put them all back: $($_.Exception.Message)" -ForegroundColor Red }
+	}
 	# Arr was stopped to restart it on the new version, and that didn't happen: start it again.
 	if ($script:ArrStopped -and (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)) {
 		Write-Host 'Starting Arr again.'
