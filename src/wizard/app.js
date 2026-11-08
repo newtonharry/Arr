@@ -117,6 +117,7 @@ function fillLibraries(plex) {
   formFilled = true;
   const none = plex.movies.length === 0 && plex.tv.length === 0;
   $("new-libraries").hidden = !none;
+  $("libraries-intro").hidden = none;
   for (const el of document.querySelectorAll(".library")) el.hidden = none;
   $("step-options").hidden = none;
   $("apply").disabled = none;
