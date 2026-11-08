@@ -21,16 +21,21 @@ pub async fn set(config_path: &Path, key: &str) -> Result<()> {
             "that TMDB key doesn't look right: paste the API key or the API read access token from https://www.themoviedb.org/settings/api"
         );
     }
+    // Absolute, so a bare `config.toml` has a folder to write beside.
+    let config_path = &std::path::absolute(config_path)?;
     let old_config = std::fs::read_to_string(config_path)
         .with_context(|| format!("can't read {}", config_path.display()))?;
     let dir = config_path.parent().context("the config has no folder")?;
     let secret = dir.join(CREDENTIAL_FILE);
     let old_secret = std::fs::read(&secret).ok();
-    fsutil::ensure_private_dir(&dir.join("secrets"))?;
-    fsutil::atomic_replace_private(&secret, key.as_bytes())?;
-    fsutil::atomic_replace_private(config_path, enable_tmdb(&old_config).as_bytes())?;
 
-    let checked = check(config_path).await;
+    let checked = async {
+        fsutil::ensure_private_dir(&dir.join("secrets"))?;
+        fsutil::atomic_replace_private(&secret, key.as_bytes())?;
+        fsutil::atomic_replace_private(config_path, enable_tmdb(&old_config).as_bytes())?;
+        check(config_path).await
+    }
+    .await;
     if checked.is_err() {
         let _ = fsutil::atomic_replace_private(config_path, old_config.as_bytes());
         let _ = match &old_secret {

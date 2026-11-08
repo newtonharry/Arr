@@ -29,7 +29,12 @@ async fn start_tmdb() -> std::net::SocketAddr {
 }
 
 fn tmdb_key(config: &Path, key: &str) -> std::process::Output {
+    tmdb_key_in(Path::new("."), config, key)
+}
+
+fn tmdb_key_in(cwd: &Path, config: &Path, key: &str) -> std::process::Output {
     let mut child = Command::new(BIN)
+        .current_dir(cwd)
         .args(["tmdb-key", "--config"])
         .arg(config)
         .stdin(Stdio::piped())
@@ -71,7 +76,8 @@ async fn a_key_added_after_setup_is_checked_saved_and_turned_on() {
     assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
     assert!(!secret.exists());
 
-    let out = tmdb_key(&config, "good-key");
+    // Run from the state folder with a bare file name, as someone might by hand.
+    let out = tmdb_key_in(&state, Path::new("config.toml"), "good-key");
     assert!(
         out.status.success(),
         "{}",
