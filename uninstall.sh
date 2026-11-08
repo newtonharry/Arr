@@ -362,6 +362,7 @@ if [ "$DO_PLEX" = 1 ]; then
 			if [ -f "$f" ] && grep -qi 'plex\.tv' "$f"; then remove_file "$f"; fi
 		done
 		remove_file /usr/share/keyrings/plexmediaserver.v2.gpg
+		remove_file /usr/share/keyrings/plexmediaserver.v2.asc
 		;;
 	rpm)
 		if have dnf; then run $SUDO dnf remove -y plexmediaserver; else run $SUDO yum remove -y plexmediaserver; fi

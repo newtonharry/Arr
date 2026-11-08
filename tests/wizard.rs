@@ -27,6 +27,13 @@ struct World {
     tv_path: String,
     /// The machine the Plex beside the wizard says it is.
     identity: String,
+    /// No Plex answers on this computer until it's "installed".
+    not_installed: bool,
+    /// A new Plex isn't linked to any account (and plex.tv doesn't list it).
+    unclaimed: bool,
+    claims: u32,
+    /// Libraries added through the API: (type, location, language).
+    created: Vec<(String, String, String)>,
     /// The token each request carried, by path.
     tokens: Vec<(String, String)>,
     client_ids: Vec<String>,
@@ -97,12 +104,13 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
                 let port = addr.port();
+                let listed = !m.lock().unwrap().unclaimed;
                 axum::Json(json!([
                     { "name": "Phone", "provides": "client,player", "owned": true,
                       "clientIdentifier": "phone", "accessToken": "x", "connections": [] },
                     { "name": "Friend's Plex", "provides": "server", "owned": false,
                       "clientIdentifier": "friend", "accessToken": "friend-token", "connections": [] },
-                    { "name": "Living Room", "provides": "server", "owned": true,
+                    { "name": "Living Room", "provides": if listed { "server" } else { "none" }, "owned": true,
                       "clientIdentifier": MACHINE, "accessToken": SERVER_TOKEN,
                       "connections": [
                         { "protocol": "http", "address": "127.0.0.1", "port": port,
@@ -115,8 +123,39 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
         .route(
             "/identity",
             get(|State(m): State<Mock>| async move {
-                let id = m.lock().unwrap().identity.clone();
-                axum::Json(json!({ "MediaContainer": { "machineIdentifier": id } }))
+                let w = m.lock().unwrap();
+                if w.not_installed {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                axum::Json(json!({ "MediaContainer": { "machineIdentifier": w.identity, "claimed": !w.unclaimed } }))
+                    .into_response()
+            }),
+        )
+        .route(
+            "/api/claim/token.json",
+            get(|State(m): State<Mock>, h: HeaderMap| async move {
+                record(&m, "resources", &h);
+                axum::Json(json!({ "token": "claim-0123" }))
+            }),
+        )
+        .route(
+            "/myplex/claim",
+            post(|State(m): State<Mock>, Query(q): Query<HashMap<String, String>>| async move {
+                let mut w = m.lock().unwrap();
+                if q.get("token").map(String::as_str) != Some("claim-0123") {
+                    return StatusCode::BAD_REQUEST;
+                }
+                w.unclaimed = false;
+                w.claims += 1;
+                StatusCode::OK
+            }),
+        )
+        .route(
+            "/test/install",
+            post(|State(m): State<Mock>| async move {
+                let mut w = m.lock().unwrap();
+                w.not_installed = false;
+                w.unclaimed = true;
             }),
         )
         .route(
@@ -127,12 +166,35 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
                     return StatusCode::UNAUTHORIZED.into_response();
                 }
                 let w = m.lock().unwrap();
-                axum::Json(json!({ "MediaContainer": { "Directory": [
-                    { "key": "1", "title": "Movies", "type": "movie", "Location": [{ "path": w.movies_path }] },
-                    { "key": "2", "title": "TV Shows", "type": "show", "Location": [{ "path": w.tv_path }] },
-                    { "key": "3", "title": "Music", "type": "artist", "Location": [{ "path": "/music" }] },
-                ] } }))
-                .into_response()
+                // A Plex installed from the page starts with no libraries.
+                let dirs: Vec<Value> = if w.claims > 0 {
+                    w.created.iter().enumerate().map(|(i, (kind, path, _))| json!({
+                        "key": (10 + i).to_string(), "title": if kind == "movie" { "Movies" } else { "TV Shows" },
+                        "type": kind, "Location": [{ "path": path }] })).collect()
+                } else {
+                    vec![
+                        json!({ "key": "1", "title": "Movies", "type": "movie", "Location": [{ "path": w.movies_path }] }),
+                        json!({ "key": "2", "title": "TV Shows", "type": "show", "Location": [{ "path": w.tv_path }] }),
+                        json!({ "key": "3", "title": "Music", "type": "artist", "Location": [{ "path": "/music" }] }),
+                    ]
+                };
+                axum::Json(json!({ "MediaContainer": { "Directory": dirs } })).into_response()
+            })
+            .post(|State(m): State<Mock>, h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                record(&m, "sections", &h);
+                if h.get("x-plex-token").and_then(|v| v.to_str().ok()) != Some(SERVER_TOKEN) {
+                    return StatusCode::UNAUTHORIZED;
+                }
+                let want = |k: &str| q.get(k).cloned().unwrap_or_default();
+                let agent_ok = matches!(
+                    (want("type").as_str(), want("agent").as_str(), want("scanner").as_str()),
+                    ("movie", "tv.plex.agents.movie", "Plex Movie") | ("show", "tv.plex.agents.series", "Plex TV Series")
+                );
+                if !agent_ok {
+                    return StatusCode::BAD_REQUEST;
+                }
+                m.lock().unwrap().created.push((want("type"), want("location"), want("language")));
+                StatusCode::CREATED
             }),
         )
         .route(
@@ -200,7 +262,11 @@ impl Page {
 }
 
 /// Starts `arr wizard` against the mock; returns it, the link it printed, and its port.
-async fn start_wizard(state_dir: &Path, mock: SocketAddr) -> (tokio::process::Child, String, u16) {
+async fn start_wizard(
+    state_dir: &Path,
+    mock: SocketAddr,
+    extra: &[String],
+) -> (tokio::process::Child, String, u16) {
     let port = free_port();
     let mut child = tokio::process::Command::new(BIN)
         .args(["wizard", "--no-docker", "--port", &port.to_string()])
@@ -209,6 +275,7 @@ async fn start_wizard(state_dir: &Path, mock: SocketAddr) -> (tokio::process::Ch
         .args(["--ffprobe", "/usr/bin/ffprobe"])
         .arg(format!("--plex-tv-url=http://{mock}/"))
         .arg(format!("--plex-auth-url=http://{mock}/auth"))
+        .args(extra)
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -238,7 +305,7 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     std::fs::create_dir_all(&tv).unwrap();
     let state_dir = tmp.path().join("state");
     let (mock, world) = start_mock(&movies, &tv).await;
-    let (mut child, link, port) = start_wizard(&state_dir, mock).await;
+    let (mut child, link, port) = start_wizard(&state_dir, mock, &[]).await;
     let base = format!("http://127.0.0.1:{port}");
     let code = link.split("code=").nth(1).unwrap();
 
@@ -473,7 +540,7 @@ async fn only_the_accounts_plex_on_this_computer_is_used() {
     // The Plex here belongs to someone else (or isn't signed in yet).
     world.lock().unwrap().identity = "someone-else".into();
     world.lock().unwrap().resources_calls = 1; // no plex.tv hiccup in this test
-    let (_child, link, port) = start_wizard(&tmp.path().join("state"), mock).await;
+    let (_child, link, port) = start_wizard(&tmp.path().join("state"), mock, &[]).await;
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -507,4 +574,116 @@ async fn only_the_accounts_plex_on_this_computer_is_used() {
     let (_, v) = page.post("/api/plex/check", json!({})).await;
     assert_eq!(v["missing"], Value::Null);
     assert_eq!(v["plex"]["name"], "Living Room");
+}
+
+/// Opens the page with the link's code; returns a client holding the session cookie.
+async fn open_page(link: &str, port: u16) -> Page {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let r = http
+        .get(link.replace("localhost", "127.0.0.1"))
+        .send()
+        .await
+        .unwrap();
+    let cookie = r.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    Page {
+        base: format!("http://127.0.0.1:{port}"),
+        cookie,
+        http,
+    }
+}
+
+#[cfg(unix)] // the stand-in installer is a shell command
+#[tokio::test]
+async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mock, world) = start_mock(tmp.path(), tmp.path()).await;
+    {
+        let mut w = world.lock().unwrap();
+        w.not_installed = true;
+        w.resources_calls = 1; // no plex.tv hiccup in this test
+    }
+    // Stands in for `pkexec arr plex-install`: reports a step, then Plex is "installed".
+    let installer = format!(
+        "echo 'step: Installing Plex Media Server'; curl -fsS -X POST http://{mock}/test/install"
+    );
+    let extra = [
+        format!("--plex-installer={installer}"),
+        format!("--plex-port={}", mock.port()),
+    ];
+    let (_child, link, port) = start_wizard(&tmp.path().join("state"), mock, &extra).await;
+    let page = open_page(&link, port).await;
+    page.post("/api/plex/signin", json!({})).await;
+    page.post("/api/plex/check", json!({})).await;
+    let (_, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(v["missing"], "not_installed", "{v}");
+    assert_eq!(v["can_install"], true);
+    assert_eq!(v["install"]["state"], "idle");
+
+    let (s, v) = page.post("/api/plex/install", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mut install = Value::Null;
+    for _ in 0..60 {
+        let (_, v) = page.get("/api/state").await;
+        install = v["install"].clone();
+        if install["state"] != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(install["state"], "done", "{install}");
+
+    // The next look finds a new, unlinked Plex, links it to the account and connects.
+    let (s, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(world.lock().unwrap().claims, 1);
+    assert_eq!(v["plex"]["name"], "Living Room", "{v}");
+    assert_eq!(v["plex"]["movies"], json!([]));
+
+    // It has no libraries, so the page makes them. Here they're in a private folder (like a
+    // home folder), which Plex's own user can't open.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let movies = tmp.path().join("media/Movies");
+    let tv = tmp.path().join("media/TV Shows");
+    let (s, v) = page
+        .post(
+            "/api/plex/libraries",
+            json!({ "movies": movies, "tv": tv, "language": "en-AU" }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(movies.is_dir() && tv.is_dir());
+    assert_eq!(v["plex"]["movies"][0]["local_path"], json!(movies));
+    assert_eq!(v["plex"]["tv"][0]["title"], "TV Shows");
+    let created = world.lock().unwrap().created.clone();
+    assert_eq!(
+        created,
+        vec![
+            (
+                "movie".into(),
+                movies.to_str().unwrap().into(),
+                "en-AU".into()
+            ),
+            ("show".into(), tv.to_str().unwrap().into(), "en-AU".into()),
+        ]
+    );
+    // The temp folder is private, so the page warns that Plex may not see it.
+    assert!(
+        v["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("Plex may not be able to see"),
+        "{v}"
+    );
 }

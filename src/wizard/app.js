@@ -4,6 +4,8 @@ const $ = (id) => document.getElementById(id);
 let state = null;
 let polling = null;
 let formFilled = false;
+let listening = false;
+let linking = false;
 
 async function call(method, path, body) {
   const opts = { method, headers: { "x-arr-setup": "1" } };
@@ -53,8 +55,9 @@ function render(s) {
   renderServer(s);
 
   const ready = !!s.plex;
+  const noLibraries = ready && s.plex.movies.length === 0 && s.plex.tv.length === 0;
   $("step-libraries").hidden = !ready;
-  $("step-options").hidden = !ready;
+  $("step-options").hidden = !ready || noLibraries;
   if (ready && !formFilled) fillLibraries(s.plex);
 }
 
@@ -79,6 +82,22 @@ const MISSING = {
 function renderServer(s) {
   $("connected").hidden = !s.plex;
   if (s.plex) $("connected").textContent = `Found ${s.plex.name} on this computer.`;
+  const install = s.install.state;
+  // No Plex here (or it's being installed): offer to install it.
+  const installing = !s.plex && s.signed_in && (s.missing === "not_installed" || install !== "idle");
+  $("install").hidden = !installing;
+  if (installing) {
+    $("missing").hidden = true;
+    const busy = install === "running" || install === "done" || linking;
+    $("install-progress").hidden = !busy;
+    $("install-step").textContent = linking ? "Linking Plex to your account…"
+      : install === "done" ? "Plex is installed." : (s.install.step || "");
+    $("install-ask").hidden = busy || !s.can_install;
+    $("install-manual").hidden = busy || s.can_install;
+    $("install-cmd").textContent = s.install_command || "";
+    if (install === "failed" && !busy) showError(s.install.message);
+    return;
+  }
   // Signed in but not connected: always offer to look again, even when the last look
   // failed before it could say why (plex.tv unreachable, say).
   $("missing").hidden = !s.signed_in || !!s.plex;
@@ -97,8 +116,15 @@ function renderServer(s) {
 function fillLibraries(plex) {
   formFilled = true;
   const none = plex.movies.length === 0 && plex.tv.length === 0;
-  $("no-libraries").hidden = !none;
+  $("new-libraries").hidden = !none;
+  for (const el of document.querySelectorAll(".library")) el.hidden = none;
+  $("step-options").hidden = none;
   $("apply").disabled = none;
+  if (none) {
+    $("new-movies").value = `${state.media_folder}/Movies`;
+    $("new-tv").value = `${state.media_folder}/TV Shows`;
+    return;
+  }
   for (const kind of ["movies", "tv"]) {
     const sel = $(`${kind}-lib`);
     sel.replaceChildren();
@@ -113,11 +139,14 @@ function fillLibraries(plex) {
     skip.value = "";
     skip.textContent = kind === "movies" ? "Don't add movies" : "Don't add TV shows";
     sel.append(skip);
-    sel.addEventListener("change", () => libraryChanged(kind));
-    $(`${kind}-folder`).addEventListener("change", () => checkFolder(`${kind}-folder`, `${kind}-hint`, false));
+    if (!listening) {
+      sel.addEventListener("change", () => libraryChanged(kind));
+      $(`${kind}-folder`).addEventListener("change", () => checkFolder(`${kind}-folder`, `${kind}-hint`, false));
+    }
     libraryChanged(kind);
   }
-  $("downloads").addEventListener("change", () => checkFolder("downloads", "downloads-hint", true));
+  if (!listening) $("downloads").addEventListener("change", () => checkFolder("downloads", "downloads-hint", true));
+  listening = true;
 }
 
 function libraryChanged(kind) {
@@ -217,6 +246,35 @@ $("signin-btn").addEventListener("click", async () => {
 
 $("look-again").addEventListener("click", (ev) =>
   act(ev.target, () => call("POST", "/api/plex/check")));
+$("install-look").addEventListener("click", (ev) =>
+  act(ev.target, () => call("POST", "/api/plex/check")));
+
+// Install Plex, then link it to the account (the check does that), showing each step.
+$("install-btn").addEventListener("click", async (ev) => {
+  await act(ev.target, () => call("POST", "/api/plex/install"));
+  if (!state || state.install.state !== "running") return;
+  clearInterval(polling);
+  polling = setInterval(async () => {
+    let s;
+    try { s = await call("GET", "/api/state"); } catch (_) { return; }
+    if (s.install.state === "running") { render(s); return; }
+    clearInterval(polling); polling = null;
+    if (s.install.state !== "done") { render(s); return; }
+    linking = true;
+    render(s);
+    try { render(await call("POST", "/api/plex/check")); }
+    catch (e) { showError(e.message); }
+    finally { linking = false; render(state); }
+  }, 1000);
+});
+
+$("create-libs").addEventListener("click", async (ev) => {
+  const body = { movies: $("new-movies").value, tv: $("new-tv").value, language: navigator.language || "" };
+  formFilled = false;
+  await act(ev.target, () => call("POST", "/api/plex/libraries", body));
+  if (state && state.warnings && state.warnings.length) $("new-libs-hint").textContent = state.warnings.join(" ");
+  if (state && state.plex && !formFilled) fillLibraries(state.plex);
+});
 
 $("form").addEventListener("submit", async (ev) => {
   ev.preventDefault();

@@ -46,6 +46,10 @@ const LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const LINGER: Duration = Duration::from_secs(60);
 const PLEX_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_PLEX_JSON: usize = 2 * 1024 * 1024;
+/// Between looks at plex.tv after linking a new Plex.
+const CLAIM_WAIT: Duration = Duration::from_secs(1);
+/// Where a Plex installed from the page keeps movies and shows (Movies, TV Shows).
+const MEDIA: &str = "/srv/media";
 
 pub struct Options {
     pub state_dir: PathBuf,
@@ -63,6 +67,10 @@ pub struct Options {
     pub docker: bool,
     /// Open the link in this computer's browser too.
     pub open: bool,
+    /// Tests: a shell command run instead of installing Plex as administrator.
+    pub plex_installer: Option<String>,
+    /// Where Plex listens on this computer (32400).
+    pub plex_port: u16,
 }
 
 struct Wizard {
@@ -82,7 +90,25 @@ struct Inner {
     plex: Option<Connected>,
     /// Set when the last look found no Plex on this computer that Arr can use.
     missing: Option<Missing>,
+    install: Install,
+    /// The port of an unclaimed Plex found on this computer.
+    unclaimed_port: Option<u16>,
     phase: Phase,
+}
+
+/// Installing Plex from the page (`arr plex-install` as administrator).
+#[derive(Clone, Default, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum Install {
+    #[default]
+    Idle,
+    Running {
+        step: String,
+    },
+    Done,
+    Failed {
+        message: String,
+    },
 }
 
 /// Why the Plex on this computer can't be used.
@@ -95,6 +121,8 @@ enum Missing {
     NotLinked,
     /// It's the account's server, but its libraries couldn't be read (still starting?).
     Unreadable,
+    /// A new Plex that isn't linked to any account yet; the page links it.
+    Unclaimed,
 }
 
 /// A Plex server the signed-in account owns.
@@ -214,6 +242,8 @@ fn router(wiz: Arc<Wizard>) -> Router {
         .route("/api/state", get(state))
         .route("/api/plex/signin", post(signin))
         .route("/api/plex/check", post(check_signin))
+        .route("/api/plex/install", post(install_plex))
+        .route("/api/plex/libraries", post(create_libraries))
         .route("/api/folder", post(folder))
         .route("/api/apply", post(apply))
         .route("/api/finish", post(finish))
@@ -372,6 +402,10 @@ fn snapshot(wiz: &Wizard) -> Value {
         "waiting_for_signin": inner.pin.is_some() && inner.account.is_none(),
         "plex": plex,
         "missing": inner.missing,
+        "install": inner.install,
+        "can_install": install_command(wiz).is_some(),
+        "install_command": manual_install_command(wiz),
+        "media_folder": MEDIA,
         "phase": inner.phase,
     })
 }
@@ -490,10 +524,74 @@ async fn check_signin(State(wiz): St) -> Response {
             Ok(s) => s,
             Err(e) => return plex_down(e),
         };
-        let missing = find_local(&wiz, &servers).await.err();
+        let mut missing = find_local(&wiz, &servers).await.err();
+        if let Some(Missing::Unclaimed) = missing {
+            // A new Plex: link it to this account, then wait for plex.tv to list it.
+            if let Err(msg) = claim(&wiz).await {
+                return problem(StatusCode::BAD_GATEWAY, &msg);
+            }
+            for _ in 0..15 {
+                tokio::time::sleep(CLAIM_WAIT).await;
+                let Ok(now) = self::servers(&wiz).await else {
+                    continue;
+                };
+                missing = find_local(&wiz, &now).await.err();
+                if !matches!(missing, Some(Missing::Unclaimed | Missing::NotLinked)) {
+                    break;
+                }
+            }
+        }
         wiz.inner.lock().unwrap().missing = missing;
     }
     Json(snapshot(&wiz)).into_response()
+}
+
+#[derive(Deserialize)]
+struct ClaimToken {
+    token: String,
+}
+
+/// Links the unclaimed Plex on this computer to the signed-in account.
+async fn claim(wiz: &Wizard) -> Result<(), String> {
+    let account = wiz.inner.lock().unwrap().account.clone();
+    let Some(account) = account else {
+        return Err("sign in to Plex first".into());
+    };
+    let url = wiz
+        .opts
+        .plex_tv
+        .join("api/claim/token.json")
+        .map_err(|_| "bad plex.tv address".to_string())?;
+    let token: ClaimToken = match upstream::send(
+        plex_tv(wiz, wiz.http.get(url)).header("X-Plex-Token", account.expose()),
+    )
+    .await
+    {
+        Ok(r) => upstream::read_json(r, 64 * 1024)
+            .await
+            .map_err(|e| format!("couldn't link Plex to your account: {}", e.describe()))?,
+        Err(e) => return Err(format!("couldn't reach plex.tv: {}", e.describe())),
+    };
+    let port = wiz
+        .inner
+        .lock()
+        .unwrap()
+        .unclaimed_port
+        .unwrap_or(wiz.opts.plex_port);
+    let url = format!(
+        "http://127.0.0.1:{port}/myplex/claim?token={}",
+        urlencode(&token.token)
+    );
+    let r = upstream::send(plex_tv(wiz, wiz.http.post(url)))
+        .await
+        .map_err(|e| format!("couldn't link Plex to your account: {}", e.describe()))?;
+    if !r.status().is_success() {
+        return Err(format!(
+            "Plex didn't accept the link to your account ({})",
+            r.status()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -570,6 +668,9 @@ struct Identity {
 struct IdentityContainer {
     #[serde(rename = "machineIdentifier", default)]
     machine_identifier: String,
+    /// False on a new Plex that no account owns yet.
+    #[serde(default)]
+    claimed: Option<bool>,
 }
 
 /// Connects to the Plex running on this computer, if it's one of the account's servers.
@@ -579,7 +680,7 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
         .iter()
         .flat_map(|s| s.ports.iter().copied())
         .collect();
-    ports.push(32400);
+    ports.push(wiz.opts.plex_port);
     ports.sort_unstable();
     ports.dedup();
     let mut answered = false;
@@ -599,6 +700,10 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
             continue;
         };
         answered = true;
+        if id.container.claimed == Some(false) {
+            wiz.inner.lock().unwrap().unclaimed_port = Some(port);
+            return Err(Missing::Unclaimed);
+        }
         let Some(server) = servers
             .iter()
             .find(|s| s.id == id.container.machine_identifier)
@@ -644,6 +749,280 @@ async fn sections(base_url: Url, token: Secret) -> Result<Vec<Section>, upstream
     })
     .sections()
     .await
+}
+
+// ------------------------------------------------------------------ installing Plex
+
+/// How this page installs Plex as administrator: the system's password dialog running
+/// `arr plex-install`. None where that isn't possible (no apt/dnf, no dialog, no desktop).
+fn install_command(wiz: &Wizard) -> Option<Vec<String>> {
+    if let Some(cmd) = &wiz.opts.plex_installer {
+        return Some(vec!["sh".into(), "-c".into(), cmd.clone()]);
+    }
+    crate::plexinstall::package_manager()?;
+    let desktop =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if !desktop || !Path::new("/usr/bin/pkexec").is_file() {
+        return None;
+    }
+    let mut cmd = vec![
+        "/usr/bin/pkexec".to_string(),
+        wiz.opts.arr.to_string_lossy().into_owned(),
+    ];
+    cmd.extend(["plex-install".into(), "--media".into(), MEDIA.into()]);
+    if let Some(owner) = owner() {
+        cmd.extend(["--owner".into(), owner]);
+    }
+    Some(cmd)
+}
+
+/// The same, for pasting into a terminal where the page can't ask for the password itself.
+fn manual_install_command(wiz: &Wizard) -> Option<String> {
+    crate::plexinstall::package_manager()?;
+    let arr = wiz.opts.arr.to_string_lossy();
+    let arr = if arr.contains([' ', '\'', '"']) {
+        format!("'{}'", arr.replace('\'', "'\\''"))
+    } else {
+        arr.into_owned()
+    };
+    Some(match owner() {
+        Some(o) => format!("sudo {arr} plex-install --owner {o}"),
+        None => format!("sudo {arr} plex-install"),
+    })
+}
+
+/// UID:GID of the user running the page, who gets the new media folders.
+fn owner() -> Option<String> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid and getgid can't fail.
+        Some(format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+            libc::getgid()
+        }))
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+async fn install_plex(State(wiz): St) -> Response {
+    let Some(cmd) = install_command(&wiz) else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Arr can't ask for your password here; run the command shown on the page in a terminal",
+        );
+    };
+    {
+        let mut inner = wiz.inner.lock().unwrap();
+        if matches!(inner.install, Install::Running { .. }) {
+            return problem(StatusCode::CONFLICT, "Plex is already being installed");
+        }
+        inner.install = Install::Running {
+            step: "Waiting for your password".into(),
+        };
+    }
+    let w = wiz.clone();
+    tokio::spawn(async move {
+        let result = run_install(&w, cmd).await;
+        w.inner.lock().unwrap().install = match result {
+            Ok(()) => Install::Done,
+            Err(message) => Install::Failed { message },
+        };
+    });
+    Json(snapshot(&wiz)).into_response()
+}
+
+fn set_install_step(wiz: &Wizard, step: &str) {
+    wiz.inner.lock().unwrap().install = Install::Running { step: step.into() };
+}
+
+async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let mut child = Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("couldn't start the Plex installer: {e}"))?;
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err("couldn't start the Plex installer".into());
+    };
+    let errors = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    let mut lines = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(step) = line.strip_prefix("step: ") {
+            set_install_step(wiz, step);
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("the Plex installer failed: {e}"))?;
+    let errors = errors.await.unwrap_or_default();
+    if !status.success() {
+        // pkexec: 126 when the password dialog is closed, 127 when it isn't authorized.
+        return Err(match status.code() {
+            Some(126 | 127) if cmd[0].ends_with("pkexec") => {
+                "Plex wasn't installed, because the password wasn't entered. Click Install Plex again to retry.".into()
+            }
+            _ => format!("Plex couldn't be installed: {}", tail(&errors)),
+        });
+    }
+    set_install_step(wiz, "Waiting for Plex to start");
+    let identity = Url::parse(&format!("http://127.0.0.1:{}/identity", wiz.opts.plex_port))
+        .map_err(|e| e.to_string())?;
+    for _ in 0..90 {
+        if let Ok(r) = upstream::send(wiz.http.get(identity.clone())).await
+            && r.status().is_success()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(
+        "Plex was installed but hasn't started yet. Restart the computer, then click Look again."
+            .into(),
+    )
+}
+
+#[derive(Deserialize)]
+struct NewLibraries {
+    movies: Option<String>,
+    tv: Option<String>,
+    #[serde(default)]
+    language: String,
+}
+
+/// Creates Movies and TV Shows libraries in a Plex that has none, in the folders given.
+async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Response {
+    let plex = wiz.inner.lock().unwrap().plex.clone();
+    let Some(mut plex) = plex else {
+        return problem(StatusCode::BAD_REQUEST, "connect to Plex first");
+    };
+    if !plex.mounts.is_empty() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Plex runs in Docker here: add the libraries in Plex itself, then reload this page",
+        );
+    }
+    let ok_lang = n.language.len() <= 8
+        && n.language
+            .split('-')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()));
+    let language = if ok_lang && !n.language.is_empty() {
+        n.language.as_str()
+    } else {
+        "en-US"
+    };
+    let mut warnings = vec![];
+    let wanted = [
+        (
+            n.movies,
+            "movie",
+            "Movies",
+            "tv.plex.agents.movie",
+            "Plex Movie",
+        ),
+        (
+            n.tv,
+            "show",
+            "TV Shows",
+            "tv.plex.agents.series",
+            "Plex TV Series",
+        ),
+    ];
+    if wanted
+        .iter()
+        .all(|w| w.0.as_deref().is_none_or(|f| f.trim().is_empty()))
+    {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "choose a folder for movies or TV shows",
+        );
+    }
+    for (folder, kind, name, agent, scanner) in wanted {
+        let Some(folder) = folder
+            .map(|f| f.trim().trim_end_matches('/').to_string())
+            .filter(|f| !f.is_empty())
+        else {
+            continue;
+        };
+        if plex.sections.iter().any(|s| s.kind == kind) {
+            continue;
+        }
+        if let Err(m) = check_folder(&folder, true).and_then(|()| {
+            std::fs::create_dir_all(&folder).map_err(|e| format!("can't create it: {}", e.kind()))
+        }) {
+            return problem(StatusCode::BAD_REQUEST, &format!("{folder}: {m}"));
+        }
+        if !plex_can_read(Path::new(&folder)) {
+            warnings.push(format!(
+                "Plex may not be able to see {folder}: it runs as its own user, and folders inside your home folder are usually private. {MEDIA} works."
+            ));
+        }
+        let Ok(mut url) = plex.base_url.join("library/sections") else {
+            return problem(StatusCode::INTERNAL_SERVER_ERROR, "bad Plex address");
+        };
+        url.query_pairs_mut()
+            .append_pair("name", name)
+            .append_pair("type", kind)
+            .append_pair("agent", agent)
+            .append_pair("scanner", scanner)
+            .append_pair("language", language)
+            .append_pair("location", &folder);
+        let sent = upstream::send(
+            wiz.http
+                .post(url)
+                .header("Accept", "application/json")
+                .header("X-Plex-Token", plex.token.expose()),
+        )
+        .await;
+        match sent {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                return problem(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Plex didn't create the {name} library ({})", r.status()),
+                );
+            }
+            Err(e) => return plex_down(e),
+        }
+    }
+    match sections(plex.base_url.clone(), plex.token.clone()).await {
+        Ok(s) => plex.sections = s,
+        Err(e) => return plex_down(e),
+    }
+    wiz.inner.lock().unwrap().plex = Some(plex);
+    let mut v = snapshot(&wiz);
+    v["warnings"] = json!(warnings);
+    Json(v).into_response()
+}
+
+/// Whether a user other than the owner can open `dir` (Plex runs as its own user on Linux).
+fn plex_can_read(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| {
+            std::fs::metadata(p)
+                .map(|m| m.permissions().mode())
+                .unwrap_or(0)
+        };
+        if mode(dir) & 0o005 != 0o005 {
+            return false;
+        }
+        dir.ancestors().skip(1).all(|a| mode(a) & 0o001 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        true
+    }
 }
 
 /// The mounts of a running Plex container, as (container path, host path), longest

@@ -34,6 +34,22 @@
         <p id="missing-text"></p>
         <button type="button" id="look-again">Look again</button>
       </div>
+      <div id="install" hidden>
+        <p>Plex isn't on this computer yet. Plex is the free app that plays your movies and shows on your TV, phone and browser, and Arr can install it for you.</p>
+        <div id="install-ask">
+          <button type="button" id="install-btn" class="primary">Install Plex for me</button>
+          <p class="hint">Your computer will ask for your password, as it does when you install any app.</p>
+        </div>
+        <div id="install-manual" hidden>
+          <p>To install it, open a terminal, paste this line and press Enter, then come back and click <strong>Look again</strong>:</p>
+          <pre><code id="install-cmd"></code></pre>
+          <button type="button" id="install-look">Look again</button>
+        </div>
+        <div id="install-progress" hidden>
+          <div class="spinner" aria-hidden="true"></div>
+          <p id="install-step" class="muted" aria-live="polite"></p>
+        </div>
+      </div>
     </section>
 
     <section id="step-libraries" class="card" hidden>
@@ -49,7 +65,13 @@
         <label class="folder">Folder on this computer <input id="tv-folder" autocomplete="off"></label>
         <p class="hint" id="tv-hint"></p>
       </div>
-      <p id="no-libraries" class="muted" hidden>Plex has no movie or TV library yet. Add one in Plex (Settings › Libraries › Add Library), then reload this page.</p>
+      <div id="new-libraries" hidden>
+        <p>Plex has no movie or TV library yet. Arr will create them in these folders:</p>
+        <label>Movies <input id="new-movies" autocomplete="off"></label>
+        <label>TV shows <input id="new-tv" autocomplete="off"></label>
+        <button type="button" id="create-libs" class="primary">Create my libraries</button>
+        <p class="hint" id="new-libs-hint"></p>
+      </div>
     </section>
 
     <section id="step-options" class="card" hidden>
