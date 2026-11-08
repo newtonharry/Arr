@@ -53,10 +53,38 @@ curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "arr doesn't an
 echo "tunnel log:"; tail -n 3 "$state/tunnel.log"
 before=$(cat "$state/config.toml")
 
+# After every rerun Arr runs and answers, and its config is still the runner's.
+still_running() {
+	launchctl list io.github.newtonharry.arr >/dev/null || fail "arr isn't loaded after $1"
+	curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "arr doesn't answer after $1"
+	[ "$(stat -f %Su "$state/config.toml")" = "$(id -un)" ] || fail "config.toml isn't $(id -un)'s after $1"
+}
+still_running "the install"
+
 echo "== a rerun keeps remote access"
 sh install.sh "$@" >rerun.out 2>&1 || true
 grep -q 'already has remote access; keeping it' rerun.out || { cat rerun.out; fail "rerun didn't keep remote access"; }
 [ "$(cat "$state/config.toml")" = "$before" ] || fail "a rerun changed the config"
+[ -x "$HOME/.local/bin/arr.previous" ] || fail "the rerun didn't keep the previous binary"
+still_running "a rerun"
+
+echo "== a rerun with a first-setup-only option is refused, and changes nothing"
+if sh install.sh --yes --no-auto-update --movies /elsewhere >refused.out 2>&1; then
+	cat refused.out; fail "--movies on an existing install was accepted"
+fi
+cat refused.out
+grep -q -- '--movies only applies to the first setup' refused.out || fail "the refusal doesn't say why"
+[ "$(cat "$state/config.toml")" = "$before" ] || fail "a refused rerun changed the config"
+still_running "a refused rerun"
+
+echo "== a rerun applies a setting it's given"
+sh install.sh --yes --no-auto-update --upload-limit-kib 100 >limit.out 2>&1 || true
+grep -q '^upload_limit_bytes_per_sec = 102400$' "$state/config.toml" || { cat limit.out; fail "--upload-limit-kib wasn't applied"; }
+still_running "a rerun with --upload-limit-kib"
+
+echo "== running as root on a Mac is refused"
+if sudo sh install.sh --yes >root.out 2>&1; then cat root.out; fail "install.sh ran as root on a Mac"; fi
+grep -q 'without sudo' root.out || { cat root.out; fail "the refusal doesn't say to run it without sudo"; }
 
 echo "== uninstall Arr and Plex, keeping media"
 sh uninstall.sh --yes --all --delete-data

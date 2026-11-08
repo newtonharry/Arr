@@ -28,6 +28,10 @@ TV_SECTION="${ARR_TV_SECTION:-}"
 PORT="${ARR_PORT:-8787}"
 TORRENT_PORT="${ARR_TORRENT_PORT:-50413}"
 UPLOAD_LIMIT_KIB="${ARR_UPLOAD_LIMIT_KIB:-0}"
+# Which of these were given, so a run on an existing install changes only those.
+PORT_SET=0; [ -z "${ARR_PORT:-}" ] || PORT_SET=1
+TORRENT_PORT_SET=0; [ -z "${ARR_TORRENT_PORT:-}" ] || TORRENT_PORT_SET=1
+UPLOAD_SET=0; [ -z "${ARR_UPLOAD_LIMIT_KIB:-}" ] || UPLOAD_SET=1
 YES="${ARR_YES:-0}"
 REMOTE="${ARR_REMOTE:-0}"
 NGROK_TOKEN="${ARR_NGROK_TOKEN:-}"
@@ -48,25 +52,27 @@ Install Arr and set it up next to your Plex server.
 
 Usage: install.sh [options]
 
+Running this again updates Arr and keeps your setup. Settings you leave out stay as they
+are; a setting you give is applied, or refused before anything changes.
+
   --yes                  answer every question with its default (no prompts)
-  --terminal             answer setup questions here instead of on a web page
+  --terminal             answer setup questions here instead of on a web page (first setup only)
   --install-only         install the binary and stop (no setup)
   --version vX.Y.Z       install a specific release (default: latest)
   --bin-dir DIR          where to put the arr binary
   --state-dir DIR        where Arr keeps its config and data
   --plex-url URL         Plex server address (default: http://127.0.0.1:32400)
   --plex-token TOKEN     Plex token (default: read from Plex's Preferences.xml if possible)
-  --movies DIR           movie library folder as this machine sees it
-  --tv DIR               TV library folder as this machine sees it
-  --movie-section N      Plex movie library number (default: the first one)
-  --tv-section N         Plex TV library number (default: the first one)
-  --downloads DIR        where torrents download before import
+  --movies DIR           movie library folder as this machine sees it (first setup only)
+  --tv DIR               TV library folder as this machine sees it (first setup only)
+  --movie-section N      Plex movie library number (default: the first one; first setup only)
+  --tv-section N         Plex TV library number (default: the first one; first setup only)
+  --downloads DIR        where torrents download before import (first setup only)
   --tmdb-key KEY         TMDB API key or read token, to find movies you don't own yet
-                         (adds it to an existing install too)
-  --port N               API port (default: 8787)
+  --port N               API port (default: 8787; first setup only)
   --torrent-port N       BitTorrent port (default: 50413)
   --upload-limit-kib N   upload limit in KiB/s for all torrents (default: 0 = none)
-  --search-only          set Arr up without letting it download anything yet
+  --search-only          don't let Arr download anything (turns downloading off)
   --no-service           don't install a background service
   --auto-update          install new releases automatically (a daily check); asked if not given
   --no-auto-update       don't, and turn automatic updates off if they were on
@@ -75,7 +81,7 @@ Usage: install.sh [options]
   --no-error-reports     don't
 
 Use Arr from ChatGPT on your phone or any device (docs/REMOTE.md). Run again with these to
-add it to an existing install:
+add it to an existing install; once it's set up, change it in config.toml instead:
 
   --remote                     set up a public HTTPS address (ngrok) and Google sign-in
   --ngrok-token TOKEN          your ngrok authtoken (dashboard.ngrok.com)
@@ -107,9 +113,9 @@ while [ $# -gt 0 ]; do
 	--tv-section) TV_SECTION="$2"; shift ;;
 	--downloads) DOWNLOADS="$2"; shift ;;
 	--tmdb-key) TMDB_KEY="$2"; shift ;;
-	--port) PORT="$2"; shift ;;
-	--torrent-port) TORRENT_PORT="$2"; shift ;;
-	--upload-limit-kib) UPLOAD_LIMIT_KIB="$2"; shift ;;
+	--port) PORT="$2"; PORT_SET=1; shift ;;
+	--torrent-port) TORRENT_PORT="$2"; TORRENT_PORT_SET=1; shift ;;
+	--upload-limit-kib) UPLOAD_LIMIT_KIB="$2"; UPLOAD_SET=1; shift ;;
 	--auto-update) AUTO_UPDATE=1 ;;
 	--no-auto-update) AUTO_UPDATE=0 ;;
 	--error-reports) ERROR_REPORTS=1 ;;
@@ -132,6 +138,7 @@ say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
 die() {
 	printf 'error: %s\n' "$*" >&2
+	undo_bin
 	# Told to Arr's developer only if this install's config says so (docs/PRIVACY.md).
 	if [ -n "${ARR:-}" ] && [ -x "${ARR:-}" ] && [ -f "${CONFIG:-}" ]; then
 		"$ARR" report --config "$CONFIG" --component installer --message "$*" >/dev/null 2>&1 </dev/null || true
@@ -251,7 +258,84 @@ sha256() {
 }
 fetch() { curl -fsSL --retry 3 "$@"; }
 
-have curl || die "curl is required"
+# On a re-run the arr this run replaced stays as arr.previous until the new one answers. A
+# run that stops before then puts it back (restarting Arr if this run had restarted it), so a
+# failed re-run leaves the install as it found it.
+UNDO_BIN=0 RESTART=""
+undo_bin() {
+	[ "${UNDO_BIN:-0}" = 1 ] || return 0
+	UNDO_BIN=0
+	mv -f "$BIN_DIR/arr.previous" "$BIN_DIR/arr" || return 0
+	printf 'Put the previous version of Arr back in %s.\n' "$BIN_DIR" >&2
+	[ -z "$RESTART" ] || $RESTART >/dev/null 2>&1 || true
+}
+# An option this run can't apply to an existing install: with nobody to ask, stop; at a
+# terminal, say so and carry on without it.
+reject() {
+	if interactive; then say "warning: $1; carrying on without it." >&2; else die "$1"; fi
+}
+# conf SECTION KEY: a value from config.toml, strings unquoted (wherever the key sits in it).
+conf() {
+	awk -v sec="[$1]" -v key="$2" '
+		/^[ \t]*\[/ { h = $0; sub(/#.*/, "", h); gsub(/[ \t]/, "", h); cur = h; next }
+		cur == sec {
+			line = $0; sub(/^[ \t]+/, "", line)
+			eq = index(line, "="); if (eq == 0) next
+			k = substr(line, 1, eq - 1); sub(/[ \t]+$/, "", k)
+			if (k != key) next
+			v = substr(line, eq + 1); sub(/^[ \t]+/, "", v)
+			q = substr(v, 1, 1); out = ""
+			if (q == "\"") {
+				for (i = 2; i <= length(v); i++) {
+					c = substr(v, i, 1)
+					if (c == "\\") { i++; c = substr(v, i, 1) } else if (c == "\"") break
+					out = out c
+				}
+			} else if (q == "\047") { r = substr(v, 2); out = substr(r, 1, index(r, "\047") - 1) }
+			else { out = v; sub(/[ \t]*(#.*)?$/, "", out) }
+			print out; exit
+		}' "$CONFIG" 2>/dev/null || true
+}
+conf_port() { p=$(conf server listen); p=${p##*:}; printf '%s' "${p:-8787}"; }
+# Runs a command as the user Arr runs as (under sudo, not as root).
+as_run() {
+	if [ "$(id -u)" = 0 ] && [ "$RUN_AS" != root ]; then sudo -u "$RUN_AS" "$@"; else "$@"; fi
+}
+# "https://Name.ngrok-free.app/" -> name.ngrok-free.app
+norm_domain() { printf '%s' "$1" | sed 's#^https\{0,1\}://##; s#/.*$##' | tr 'A-Z' 'a-z'; }
+# "A@b.c, d@e.f" -> "a@b.c", "d@e.f" (a TOML list's insides)
+toml_emails() {
+	out=""
+	for e in $(printf '%s' "$1" | tr ',' ' '); do
+		out="$out${out:+, }$(toml "$(printf '%s' "$e" | tr 'A-Z' 'a-z')")"
+	done
+	printf '%s' "$out"
+}
+# Are the remote access values given the ones already set up? (Then there's nothing to change.)
+remote_same() {
+	[ -z "$NGROK_TOKEN" ] || [ "$NGROK_TOKEN" = "$(sed -n 's/^  authtoken: //p' "$STATE_DIR/ngrok.yml" 2>/dev/null)" ] || return 1
+	[ -z "$NGROK_DOMAIN" ] || [ "https://$(norm_domain "$NGROK_DOMAIN")" = "$(conf mcp.oauth public_url)" ] || return 1
+	[ -z "$GOOGLE_ID" ] || [ "$GOOGLE_ID" = "$(conf mcp.oauth google_client_id)" ] || return 1
+	[ -z "$GOOGLE_SECRET" ] || [ "$GOOGLE_SECRET" = "$(cat "$STATE_DIR/secrets/google_client_secret" 2>/dev/null)" ] || return 1
+	[ -z "$ALLOW_EMAILS" ] || [ "[$(toml_emails "$ALLOW_EMAILS")]" = "$(conf mcp.oauth allowed_emails)" ]
+}
+# The ngrok agent, next to arr. Sets NGROK.
+install_ngrok() {
+	say "Installing the ngrok agent"
+	case "$os-$arch" in
+	Linux-x86_64) n=linux-amd64.tgz ;;
+	Linux-aarch64) n=linux-arm64.tgz ;;
+	Darwin-x86_64) n=darwin-amd64.zip ;;
+	*) n=darwin-arm64.zip ;;
+	esac
+	fetch -o "$tmp/ngrok-$n" "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-$n" || die "ngrok download failed"
+	case "$n" in
+	*.zip) (cd "$tmp" && unzip -oq "ngrok-$n") ;;
+	*) tar -xzf "$tmp/ngrok-$n" -C "$tmp" ;;
+	esac
+	install -m 755 "$tmp/ngrok" "$BIN_DIR/ngrok"
+	NGROK="$BIN_DIR/ngrok"
+}
 have tar || die "tar is required"
 
 # ---------------------------------------------------------------- install the binary
@@ -268,6 +352,109 @@ Linux) target="$arch-unknown-linux-gnu" ;;
 Darwin) target="$arch-apple-darwin" ;;
 *) die "Arr runs on Linux and macOS. On Windows, run this inside WSL2." ;;
 esac
+# On a Mac, Arr is a login item of yours, and root's files in your folders would lock you out.
+[ "$os" != Darwin ] || [ "$(id -u)" != 0 ] || die "on a Mac, run this without sudo: Arr runs as you"
+
+# ---------------------------------------------------------------- an existing install
+
+# Running this again must update the Arr that's already here, not set up a second one next to
+# it: its service says where its binary and config are, and which user it runs as.
+EXPLICIT_DIRS="$STATE_DIR$BIN_DIR"
+FOUND="" FOUND_BIN="" FOUND_CONFIG="" FOUND_USER=""
+# Under sudo, HOME may be root's: a per-user Arr is in the home of whoever ran sudo.
+U_HOME=$HOME
+if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+	case "$SUDO_USER" in *[!A-Za-z0-9._-]*) die "unexpected SUDO_USER: $SUDO_USER" ;; esac
+	U_HOME=$( (getent passwd "$SUDO_USER" 2>/dev/null || true) | cut -d: -f6)
+	[ -n "$U_HOME" ] || U_HOME=$(eval echo "~$SUDO_USER")
+fi
+# The same parsing as uninstall.sh: install.sh writes these files, quoted its way.
+unquote() { sed 's/%%/%/g; s/\$\$/$/g; s/\\"/"/g; s/\\\\/\\/g'; }
+from_unit() {
+	line=$(sed -n 's/^ExecStart=//p' "$1" | head -n1)
+	FOUND_BIN=$(printf '%s' "$line" | sed -n 's/^"\(\([^"\\]\|\\.\)*\)".*/\1/p' | unquote)
+	FOUND_CONFIG=$(printf '%s' "$line" | sed -n 's/.* --config "\(\([^"\\]\|\\.\)*\)".*/\1/p' | unquote)
+	FOUND_USER=$(sed -n 's/^User=//p' "$1" | head -n1)
+}
+from_plist() {
+	strings=$(awk '{ while (match($0, /<string>[^<]*<\/string>/)) {
+			print substr($0, RSTART + 8, RLENGTH - 17); $0 = substr($0, RSTART + RLENGTH) } }' "$1" |
+		sed 's/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&amp;/\&/g')
+	FOUND_BIN=$(printf '%s\n' "$strings" | sed -n 2p)
+	FOUND_CONFIG=$(printf '%s\n' "$strings" | sed -n 5p)
+}
+if [ -z "$EXPLICIT_DIRS" ]; then
+	sys_unit=/etc/systemd/system/arr.service
+	user_unit="$U_HOME/.config/systemd/user/arr.service"
+	plist="$U_HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
+	if [ "$os" = Darwin ]; then
+		[ ! -f "$plist" ] || { from_plist "$plist"; FOUND=launchd; }
+	elif [ "$(id -u)" = 0 ]; then
+		if [ -f "$sys_unit" ]; then
+			from_unit "$sys_unit"; FOUND=system
+		elif [ "$U_HOME" != "$HOME" ] && [ -f "$user_unit" ]; then
+			from_unit "$user_unit"
+			die "Arr is already installed for $SUDO_USER (config $FOUND_CONFIG); run this again without sudo"
+		fi
+	elif [ -f "$user_unit" ]; then
+		from_unit "$user_unit"; FOUND=user
+	elif [ -f "$sys_unit" ]; then
+		from_unit "$sys_unit"
+		die "Arr is already installed system-wide (config $FOUND_CONFIG); run this again with sudo"
+	fi
+	[ -z "$FOUND_BIN" ] || BIN_DIR=$(dirname "$FOUND_BIN")
+	[ -z "$FOUND_CONFIG" ] || STATE_DIR=$(dirname "$FOUND_CONFIG")
+fi
+if [ -z "$BIN_DIR" ]; then
+	if [ "$(id -u)" = 0 ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="$HOME/.local/bin"; fi
+fi
+if [ -z "$STATE_DIR" ]; then
+	if [ "$os" = Darwin ]; then STATE_DIR="$HOME/Library/Application Support/arr"
+	elif [ "$(id -u)" = 0 ]; then STATE_DIR=/var/lib/arr
+	else STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/arr"; fi
+fi
+CONFIG="$STATE_DIR/config.toml"
+
+# Under sudo Arr runs as the user who ran sudo. On a re-run it keeps running as whoever it
+# runs as already (its service's User=, or who owns its folder), never as someone new.
+RUN_AS=""
+if [ "$(id -u)" = 0 ]; then
+	RUN_AS=${SUDO_USER:-root}
+	if [ -f "$CONFIG" ]; then
+		if [ "$FOUND" = system ]; then was=${FOUND_USER:-root}
+		else was=$(stat -c %U "$STATE_DIR" 2>/dev/null || true); [ "$was" != root ] || was=""; fi
+		if [ -n "$was" ] && [ "$was" != "$RUN_AS" ]; then
+			[ "$RUN_AS" = root ] || [ "$was" = root ] ||
+				die "Arr runs as $was here, not $RUN_AS; run this again from $was's account, with sudo"
+			RUN_AS=$was
+		fi
+	fi
+fi
+
+# ---------------------------------------------------------------- options on a re-run
+
+# Settings left out stay as they are. A setting given is applied further down (arr set), or
+# refused here, before anything changes.
+case "$UPLOAD_LIMIT_KIB" in "" | *[!0-9]*) die "--upload-limit-kib needs a whole number of KiB/s (0 = no limit)" ;; esac
+case "$TORRENT_PORT" in "" | *[!0-9]* | 0) die "--torrent-port needs a port number" ;; esac
+case "$PORT" in "" | *[!0-9]* | 0) die "--port needs a port number" ;; esac
+if [ "$SETUP" = 1 ] && [ -f "$CONFIG" ]; then
+	first_only() { # first_only OPTION VALUE SECTION KEY
+		[ -z "$2" ] || [ "$2" = "$(conf "$3" "$4")" ] ||
+			reject "$1 only applies to the first setup; to change it, edit $4 under [$3] in $CONFIG, then run this again"
+	}
+	[ "$PORT_SET" = 0 ] || [ "$PORT" = "$(conf_port)" ] ||
+		reject "--port only applies to the first setup; to change it, edit listen under [server] in $CONFIG, then run this again"
+	first_only --movies "$MOVIES" library movies
+	first_only --tv "$TV" library tv
+	first_only --downloads "$DOWNLOADS" embedded download_dir
+	first_only --movie-section "$MOVIE_SECTION" plex movie_section
+	first_only --tv-section "$TV_SECTION" plex tv_section
+	[ "$TERMINAL" = 0 ] || reject "--terminal only applies to the first setup, and Arr is set up already"
+	if grep -q '^\[mcp\.oauth\]' "$CONFIG" && ! remote_same; then
+		reject "remote access is set up already; to change it, edit [mcp.oauth] in $CONFIG as docs/REMOTE.md explains, then run this again"
+	fi
+fi
 
 if [ -z "$DOWNLOAD_BASE" ]; then
 	if [ "$VERSION" = latest ]; then
@@ -275,9 +462,6 @@ if [ -z "$DOWNLOAD_BASE" ]; then
 	else
 		DOWNLOAD_BASE="https://github.com/$REPO/releases/download/$VERSION"
 	fi
-fi
-if [ -z "$BIN_DIR" ]; then
-	if [ "$(id -u)" = 0 ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="$HOME/.local/bin"; fi
 fi
 
 step "Downloading Arr ($VERSION, $target)"
@@ -288,15 +472,33 @@ fetch -o "$tmp/$asset" "$DOWNLOAD_BASE/$asset" || die "download failed: $DOWNLOA
 fetch -o "$tmp/$asset.sha256" "$DOWNLOAD_BASE/$asset.sha256" || die "checksum download failed"
 [ "$(sha256 "$tmp/$asset")" = "$(cut -d' ' -f1 "$tmp/$asset.sha256")" ] || die "checksum mismatch for $asset"
 tar -xzf "$tmp/$asset" -C "$tmp"
+# A binary that doesn't run here never replaces one that does.
+"$tmp/arr-$target/arr" --version >/dev/null 2>&1 ||
+	die "the downloaded Arr doesn't run on this machine ($target); nothing was changed"
 mkdir -p "$BIN_DIR"
 # The real folder, without symlinks: services and the updater run exactly the path checked.
 BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
-install -m 755 "$tmp/arr-$target/arr" "$BIN_DIR/arr"
 ARR="$BIN_DIR/arr"
+# On a re-run the old binary stays as arr.previous. The new one goes in with one rename, so
+# nothing ever runs a half-written arr.
+prev=0
+if [ -f "$CONFIG" ] && [ -x "$ARR" ]; then cp -p "$ARR" "$ARR.previous"; prev=1; fi
+cp "$tmp/arr-$target/arr" "$ARR.new"
+chmod 755 "$ARR.new"
+mv -f "$ARR.new" "$ARR"
+UNDO_BIN=$prev
 say "Installed $("$ARR" --version) to $ARR"
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "Add $BIN_DIR to your PATH to run 'arr' directly." ;; esac
 
-[ "$SETUP" = 1 ] || exit 0
+if [ "$SETUP" != 1 ]; then
+	UNDO_BIN=0
+	case "$FOUND" in
+	system) say "Restart Arr to use the new version: sudo systemctl restart arr" ;;
+	user) say "Restart Arr to use the new version: systemctl --user restart arr" ;;
+	launchd) say "Restart Arr to use the new version: launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr" ;;
+	esac
+	exit 0
+fi
 
 # ---------------------------------------------------------------- ffprobe
 
@@ -340,23 +542,13 @@ fi
 FFPROBE=$(command -v ffprobe)
 say "Found $FFPROBE"
 
-# ---------------------------------------------------------------- state directory
+# ---------------------------------------------------------------- setup
 
-if [ -z "$STATE_DIR" ]; then
-	if [ "$os" = Darwin ]; then STATE_DIR="$HOME/Library/Application Support/arr"
-	elif [ "$(id -u)" = 0 ]; then STATE_DIR=/var/lib/arr
-	else STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/arr"; fi
-fi
-CONFIG="$STATE_DIR/config.toml"
-
-# The service runs as the user who ran sudo, so check access as that user.
-writable() {
-	if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then sudo -u "$SUDO_USER" test -w "$1"
-	else [ -w "$1" ]; fi
-}
+# The service runs as RUN_AS, so check access as that user.
+writable() { as_run test -w "$1"; }
 
 # Finds Plex and your libraries, then writes and checks a new config. Skipped when a config
-# already exists: running the installer again only updates the binary and restarts Arr.
+# already exists: running the installer again applies only the options given.
 configure() {
 # ---------------------------------------------------------------- Plex
 
@@ -463,11 +655,11 @@ if [ -z "$DOWNLOADS" ]; then
 fi
 if [ ! -d "$DOWNLOADS" ]; then
 	mkdir -p "$DOWNLOADS" || die "can't create $DOWNLOADS"
-	[ "$(id -u)" != 0 ] || [ -z "${SUDO_USER:-}" ] || chown "$SUDO_USER" "$DOWNLOADS"
+	[ "$(id -u)" != 0 ] || [ "$RUN_AS" = root ] || chown "$RUN_AS" "$DOWNLOADS"
 fi
 for d in "$MOVIES" "$TV" "$DOWNLOADS"; do
 	[ -z "$d" ] || writable "$d" ||
-		die "${SUDO_USER:-$(id -un)} can't write to $d; fix its permissions or run as the user your media belongs to"
+		die "${RUN_AS:-$(id -un)} can't write to $d; fix its permissions or run as the user your media belongs to"
 done
 
 if [ -n "$TMDB_KEY" ]; then
@@ -611,7 +803,8 @@ desktop_env() {
 browser_setup() {
 	step "Setting up Arr in your web browser"
 	# Over SSH (or on a machine without a screen) the page has to open on another computer,
-	# so it listens on this machine's network address. The link carries a secret code.
+	# so it listens on this machine's network address; arr wizard refuses a public one and
+	# explains how to reach the page over SSH instead. The link carries a secret code.
 	bind=127.0.0.1
 	DESKTOP_ENV=""
 	desktop_env
@@ -628,48 +821,119 @@ browser_setup() {
 		--torrent-port "$TORRENT_PORT" --upload-limit-kib "$UPLOAD_LIMIT_KIB" --ffprobe "$FFPROBE"
 	[ "$bind" != 127.0.0.1 ] || set -- "$@" --open
 	[ "$ERROR_REPORTS" != 1 ] || set -- "$@" --error-reports
-	# Arr runs as the user who ran sudo, so the page checks folders as that user too.
-	if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
-		chown "$SUDO_USER" "$STATE_DIR"
+	# Arr runs as RUN_AS, so the page checks folders as that user too, and its files are theirs.
+	if [ "$(id -u)" = 0 ] && [ "$RUN_AS" != root ]; then
+		chown -R "$RUN_AS" "$STATE_DIR"
 		# shellcheck disable=SC2086 # NAME=value words without spaces
-		set -- sudo -u "$SUDO_USER" env $DESKTOP_ENV "$@"
+		set -- sudo -u "$RUN_AS" env $DESKTOP_ENV "$@"
 	fi
-	"$@" </dev/null || die "setup wasn't finished; run this script again to start over"
-	# The page asked about automatic updates; the answer is used once, below.
+	# The page writes config.toml only once setup has succeeded, so a run that stops here
+	# leaves nothing half-done.
+	"$@" </dev/null || die "setup wasn't finished, so nothing was saved; run this again to start over"
+	setup_choices
+}
+
+# The setup page's answer about automatic updates, used once (an option given wins).
+setup_choices() {
 	if [ -z "$AUTO_UPDATE" ] && [ -f "$STATE_DIR/setup-choices" ]; then
 		AUTO_UPDATE=$(sed -n 's/^auto_update=\([01]\)$/\1/p' "$STATE_DIR/setup-choices")
 	fi
 	rm -f "$STATE_DIR/setup-choices"
-	grep -A1 '^\[execution\]' "$CONFIG" | grep -q 'enabled = true' || DOWNLOADING=0
+}
+
+# set_conf NAME [VALUE]: one setting through arr set, which checks it first and changes
+# nothing if it's refused.
+set_conf() {
+	if out=$(as_run "$ARR" set --config "$CONFIG" "$@" 2>&1); then say "$out"; else reject "${out#Error: }"; fi
+}
+# set_secret NAME VALUE: the value goes to arr on stdin, never on a command line.
+set_secret() {
+	(umask 077 && printf '%s' "$2" >"$tmp/value")
+	set_conf "$1" <"$tmp/value"
+	rm -f "$tmp/value"
+}
+
+# Plex can stop accepting Arr's sign-in, for example after "sign out of all devices".
+plex_signin() {
+	rc=0
+	out=$(as_run "$ARR" plex-signin --config "$CONFIG" --check 2>&1) || rc=$?
+	case "$rc" in
+	0) return 0 ;;
+	1) ;;
+	*) say "warning: ${out#Error: }; carrying on without checking Arr's Plex sign-in." >&2; return 0 ;;
+	esac
+	if ! interactive; then
+		say "warning: Plex no longer accepts Arr's sign-in (for example after 'sign out of all devices')." >&2
+		say "  Arr can't see your Plex libraries until you run this again in a terminal, or with --plex-token." >&2
+		return 0
+	fi
+	step "Plex no longer accepts Arr's sign-in"
+	say "That happens after 'sign out of all devices' in Plex, for example. Sign in again:"
+	# The link opens as soon as arr prints it; arr's exit status comes last, on its own line.
+	if { rc=0; as_run "$ARR" plex-signin --config "$CONFIG" </dev/null || rc=$?; echo "arr-exit $rc"; } | {
+		rc=1
+		while IFS= read -r line; do
+			case "$line" in
+			"arr-exit "*) rc=${line#arr-exit } ;;
+			*": http"*) say "$line"; open_page "${line##* }" ;;
+			*) say "$line" ;;
+			esac
+		done
+		exit "$rc"
+	}; then
+		say "Arr is signed in to Plex again."
+	else
+		say "warning: the Plex sign-in didn't finish; Arr carries on without Plex. Run this again to retry." >&2
+	fi
 }
 
 if [ -f "$CONFIG" ]; then
 	step "Keeping your config in $STATE_DIR"
-	PORT=$(sed -n 's/^listen = "[^"]*:\([0-9][0-9]*\)"$/\1/p' "$CONFIG" | head -n1)
-	PORT=${PORT:-8787}
-	grep -A1 '^\[execution\]' "$CONFIG" | grep -q 'enabled = true' || DOWNLOADING=0
+	# Arr's files stay its service user's and private, whatever happened to them since.
+	[ "$(id -u)" != 0 ] || [ "$RUN_AS" = root ] || chown -R "$RUN_AS" "$STATE_DIR"
+	chmod 700 "$STATE_DIR"
+	chmod 600 "$CONFIG"
+	if [ -d "$STATE_DIR/secrets" ]; then
+		chmod 700 "$STATE_DIR/secrets"
+		for f in "$STATE_DIR"/secrets/*; do [ ! -f "$f" ] || chmod 600 "$f"; done
+	fi
+	# Nothing restarts until the config passes with this version: until then the running Arr
+	# keeps going as it was.
+	if ! as_run "$ARR" check --config "$CONFIG" >"$tmp/check.json" 2>"$tmp/check.err"; then
+		cat "$tmp/check.err" >&2
+		why=$(sed -n '1s/^Error: //p' "$tmp/check.err")
+		die "Arr's config has a problem${why:+: $why}. Arr keeps running as it was. Fix that in $CONFIG, or move the file aside and run this again to set Arr up from the start"
+	fi
+	PORT=$(conf_port)
+	setup_choices
+	if [ -n "$PLEX_TOKEN" ]; then
+		set_secret plex-token "$PLEX_TOKEN"
+	elif grep -q '^\[plex\]' "$CONFIG"; then
+		plex_signin
+	fi
+	[ "$PLEX_URL_SET" = 0 ] || [ "$PLEX_URL" = "$(conf plex base_url)" ] || set_conf plex-url "$PLEX_URL"
 	# A TMDB key can be added on any later run: --tmdb-key, ARR_TMDB_KEY, or asked here.
-	if [ -z "$TMDB_KEY" ] && interactive &&
-		! awk '/^\[/{s=($1=="[tmdb]")} s&&/^enabled *= *true/{f=1} END{exit !f}' "$CONFIG"; then
+	if [ -z "$TMDB_KEY" ] && interactive && [ "$(conf tmdb enabled)" != true ]; then
 		step "Arr can't find new movies yet"
 		ask_tmdb_key
 	fi
-	if [ -n "$TMDB_KEY" ]; then
-		# Arr is already set up and running, so a refused key warns rather than stopping.
-		step "Adding your TMDB key"
-		if printf '%s' "$TMDB_KEY" | "$ARR" tmdb-key --config "$CONFIG"; then
-			say "Arr can now find movies you don't own yet."
-		else
-			say "warning: the TMDB key wasn't added; Arr carries on without it. Run this again to retry." >&2
-		fi
-	fi
-elif [ "$TERMINAL" != 1 ] && interactive && [ "$DOWNLOADING" = 1 ] && [ "$PLEX_URL_SET" = 0 ] &&
-	[ -z "$PLEX_TOKEN$MOVIES$TV$MOVIE_SECTION$TV_SECTION$DOWNLOADS$TMDB_KEY" ]; then
-	# Setup options on the command line (or --search-only) mean the terminal setup.
-	browser_setup
+	[ -z "$TMDB_KEY" ] || set_secret tmdb-key "$TMDB_KEY"
+	[ "$DOWNLOADING" = 1 ] || set_conf downloading off
+	[ "$UPLOAD_SET" = 0 ] || set_conf upload-limit-kib "$UPLOAD_LIMIT_KIB"
+	[ "$TORRENT_PORT_SET" = 0 ] || set_conf torrent-port "$TORRENT_PORT"
+	case "$ERROR_REPORTS" in 1) set_conf error-reports on ;; 0) set_conf error-reports off ;; esac
 else
-	configure
+	[ ! -f "$CONFIG.failed" ] || say "Setting Arr up from the start ($CONFIG.failed holds the last attempt, which failed)."
+	if [ "$TERMINAL" != 1 ] && interactive && [ "$DOWNLOADING" = 1 ] && [ "$PLEX_URL_SET" = 0 ] &&
+		[ -z "$PLEX_TOKEN$MOVIES$TV$MOVIE_SECTION$TV_SECTION$DOWNLOADS$TMDB_KEY" ]; then
+		# Setup options on the command line (or --search-only) mean the terminal setup.
+		browser_setup
+	else
+		configure
+	fi
 fi
+DOWNLOADING=0
+[ "$(conf execution enabled)" != true ] || DOWNLOADING=1
 
 # ---------------------------------------------------------------- phone and ChatGPT access
 
@@ -698,7 +962,7 @@ remote_setup() {
 		open_page https://dashboard.ngrok.com/domains
 		NGROK_DOMAIN=$(ask "  ngrok domain, like quiet-river-1234.ngrok-free.app" "")
 	fi
-	NGROK_DOMAIN=$(printf '%s' "$NGROK_DOMAIN" | sed 's#^https\{0,1\}://##; s#/.*$##' | tr 'A-Z' 'a-z')
+	NGROK_DOMAIN=$(norm_domain "$NGROK_DOMAIN")
 	[ -n "$NGROK_TOKEN" ] && [ -n "$NGROK_DOMAIN" ] ||
 		die "remote access needs --ngrok-token and --ngrok-domain (see docs/REMOTE.md)"
 	case "$NGROK_TOKEN" in *[!A-Za-z0-9_-]*) die "that doesn't look like an ngrok authtoken" ;; esac
@@ -723,29 +987,13 @@ remote_setup() {
 	[ -n "$ALLOW_EMAILS" ] || ALLOW_EMAILS=$(ask "  Google accounts allowed to use Arr (comma-separated)" "")
 	[ -n "$GOOGLE_ID" ] && [ -n "$GOOGLE_SECRET" ] && [ -n "$ALLOW_EMAILS" ] ||
 		die "remote access needs --google-client-id, --google-client-secret and --allow-email (see docs/REMOTE.md)"
-	emails=""
 	for e in $(printf '%s' "$ALLOW_EMAILS" | tr ',' ' '); do
 		case "$e" in *[!A-Za-z0-9._%+@-]* | *@*@* | @* | *@) die "not an email address: $e" ;; *@*.*) ;; *) die "not an email address: $e" ;; esac
-		emails="$emails${emails:+, }$(toml "$(printf '%s' "$e" | tr 'A-Z' 'a-z')")"
 	done
+	emails=$(toml_emails "$ALLOW_EMAILS")
 
 	NGROK=$(command -v ngrok || true)
-	if [ -z "$NGROK" ]; then
-		say "Installing the ngrok agent"
-		case "$os-$arch" in
-		Linux-x86_64) n=linux-amd64.tgz ;;
-		Linux-aarch64) n=linux-arm64.tgz ;;
-		Darwin-x86_64) n=darwin-amd64.zip ;;
-		*) n=darwin-arm64.zip ;;
-		esac
-		fetch -o "$tmp/ngrok-$n" "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-$n" || die "ngrok download failed"
-		case "$n" in
-		*.zip) (cd "$tmp" && unzip -oq "ngrok-$n") ;;
-		*) tar -xzf "$tmp/ngrok-$n" -C "$tmp" ;;
-		esac
-		install -m 755 "$tmp/ngrok" "$BIN_DIR/ngrok"
-		NGROK="$BIN_DIR/ngrok"
-	fi
+	[ -n "$NGROK" ] || install_ngrok
 	umask 077
 	# The authtoken stays in a private config file, never on a command line. web_addr: false
 	# turns off ngrok's local inspection API, which would otherwise let any local user read the
@@ -797,13 +1045,15 @@ if [ "$REMOTE" != 1 ] && ! grep -q '^\[mcp\.oauth\]' "$CONFIG" && interactive; t
 fi
 if [ "$REMOTE" = 1 ]; then remote_setup; fi
 
-# A configured tunnel runs as its own service next to Arr.
+# A configured tunnel runs as its own service next to Arr, and needs the ngrok agent.
 PUBLIC_URL=""
 logs_tunnel="the arr-tunnel service's log"
 NGROK=${NGROK:-}
 if [ -f "$STATE_DIR/ngrok.yml" ] && grep -q '^\[mcp\.oauth\]' "$CONFIG"; then
 	PUBLIC_URL=$(sed -n 's/^public_url = "\(.*\)"$/\1/p' "$CONFIG" | head -n1)
-	NGROK=${NGROK:-$(command -v ngrok || printf '%s' "$BIN_DIR/ngrok")}
+	[ -n "$NGROK" ] || NGROK=$(command -v ngrok || true)
+	[ -n "$NGROK" ] || [ ! -x "$BIN_DIR/ngrok" ] || NGROK="$BIN_DIR/ngrok"
+	[ -n "$NGROK" ] || install_ngrok
 fi
 
 # ---------------------------------------------------------------- run it
@@ -815,6 +1065,10 @@ started=0
 sd_exe() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')"; }
 sd() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g; s/\$/$$/g')"; }
 xml() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
+# Runs one service manager command; if it fails, says which and where Arr's log is.
+svc() {
+	"$@" >"$tmp/svc.out" 2>&1 || { cat "$tmp/svc.out" >&2; die "'$*' failed; see: $logs"; }
+}
 if [ "$SERVICE" = 1 ] && [ "$os" = Linux ] && have systemctl && [ -d /run/systemd/system ]; then
 	unit="[Unit]
 Description=Arr media manager
@@ -838,42 +1092,57 @@ Restart=always
 RestartSec=10
 "
 	if [ "$(id -u)" = 0 ]; then
-		run_as=${SUDO_USER:-root}
-		if [ "$run_as" != root ]; then
-			chown -R "$run_as" "$STATE_DIR"
-			unit="$unit
-User=$run_as"
-			tunnel="$tunnel
-User=$run_as"
-		fi
-		printf '%s\n[Install]\nWantedBy=multi-user.target\n' "$unit" >/etc/systemd/system/arr.service
-		[ -z "$PUBLIC_URL" ] || printf '%s\n[Install]\nWantedBy=multi-user.target\n' "$tunnel" >/etc/systemd/system/arr-tunnel.service
-		systemctl daemon-reload && systemctl enable arr >/dev/null 2>&1 && systemctl restart arr && started=1
-		[ -z "$PUBLIC_URL" ] || { systemctl enable arr-tunnel >/dev/null 2>&1 && systemctl restart arr-tunnel; }
+		sdir=/etc/systemd/system sctl=systemctl wanted=multi-user.target
 		logs="journalctl -u arr -f"
 		logs_tunnel="journalctl -u arr-tunnel"
+		if [ "$RUN_AS" != root ]; then
+			chown -R "$RUN_AS" "$STATE_DIR"
+			unit="$unit
+User=$RUN_AS"
+			tunnel="$tunnel
+User=$RUN_AS"
+		fi
 	else
-		mkdir -p "$HOME/.config/systemd/user"
-		printf '%s\n[Install]\nWantedBy=default.target\n' "$unit" >"$HOME/.config/systemd/user/arr.service"
-		[ -z "$PUBLIC_URL" ] || printf '%s\n[Install]\nWantedBy=default.target\n' "$tunnel" >"$HOME/.config/systemd/user/arr-tunnel.service"
-		systemctl --user daemon-reload && systemctl --user enable arr >/dev/null 2>&1 &&
-			systemctl --user restart arr && started=1
-		[ -z "$PUBLIC_URL" ] || { systemctl --user enable arr-tunnel >/dev/null 2>&1 && systemctl --user restart arr-tunnel; }
+		sdir="$HOME/.config/systemd/user" sctl="systemctl --user" wanted=default.target
 		logs="journalctl --user -u arr -f"
 		logs_tunnel="journalctl --user -u arr-tunnel"
+	fi
+	mkdir -p "$sdir"
+	printf '%s\n[Install]\nWantedBy=%s\n' "$unit" "$wanted" >"$sdir/arr.service"
+	if [ -n "$PUBLIC_URL" ]; then
+		printf '%s\n[Install]\nWantedBy=%s\n' "$tunnel" "$wanted" >"$sdir/arr-tunnel.service"
+	elif [ -f "$sdir/arr-tunnel.service" ]; then
+		# Remote access is gone from the config, so its tunnel goes too.
+		$sctl disable --now arr-tunnel >/dev/null 2>&1 || true
+		rm -f "$sdir/arr-tunnel.service"
+	fi
+	# shellcheck disable=SC2086 # $sctl is "systemctl" or "systemctl --user"
+	{
+		svc $sctl daemon-reload
+		svc $sctl enable arr
+		RESTART="$sctl restart arr"
+		svc $sctl restart arr
+		if [ -n "$PUBLIC_URL" ]; then
+			svc $sctl enable arr-tunnel
+			svc $sctl restart arr-tunnel
+		fi
+	}
+	started=1
+	if [ "$(id -u)" != 0 ]; then
 		# Keeps the user services running after you log out and starts them at boot. Over SSH
 		# this often needs an administrator; say so instead of failing quietly.
 		have loginctl && loginctl --no-ask-password enable-linger "$(id -un)" >/dev/null 2>&1 || true
 		if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q '=yes'; then
 			say "Warning: Arr stops when you log out and won't start after a reboot. Fix it with:"
 			say "  sudo loginctl enable-linger $(id -un)"
-			say "or install system-wide by running this script with sudo."
 		fi
 	fi
 elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
 	plist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
+	logs="tail -f \"$STATE_DIR/arr.log\""
+	logs_tunnel="$STATE_DIR/tunnel.log"
 	mkdir -p "$(dirname "$plist")"
-	cat >"$plist" <<EOF
+	cat >"$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -885,14 +1154,14 @@ elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
   <key>KeepAlive</key><true/>
   <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/arr.log")</string>
 </dict></plist>
-EOF
+PLIST
 	launchctl unload "$plist" 2>/dev/null || true
-	launchctl load "$plist" && started=1
-	logs="tail -f \"$STATE_DIR/arr.log\""
-	logs_tunnel="$STATE_DIR/tunnel.log"
+	RESTART="launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr"
+	svc launchctl load "$plist"
+	started=1
+	tplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-tunnel.plist"
 	if [ -n "$PUBLIC_URL" ]; then
-		tplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-tunnel.plist"
-		cat >"$tplist" <<EOF
+		cat >"$tplist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -906,18 +1175,43 @@ EOF
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$(xml "$STATE_DIR/tunnel.log")</string>
 </dict></plist>
-EOF
+PLIST
 		launchctl unload "$tplist" 2>/dev/null || true
-		launchctl load "$tplist"
+		svc launchctl load "$tplist"
+	elif [ -f "$tplist" ]; then
+		# Remote access is gone from the config, so its tunnel goes too.
+		launchctl unload "$tplist" 2>/dev/null || true
+		rm -f "$tplist"
 	fi
 fi
 if [ "$started" != 1 ]; then
+	UNDO_BIN=0
 	say "No background service was installed. Start Arr with:"
 	say "  $run_cmd"
 	[ -z "$PUBLIC_URL" ] ||
 		say "  \"$NGROK\" http 127.0.0.1:$PORT --url=$PUBLIC_URL --config \"$STATE_DIR/ngrok.yml\""
 	exit 0
 fi
+
+# A new version that doesn't answer is swapped back for the one that did.
+API="http://127.0.0.1:$PORT"
+healthy() {
+	i=0
+	until fetch --max-time 3 -o /dev/null "$API/api/v1/health" 2>/dev/null; do
+		i=$((i + 1))
+		[ $i -lt 30 ] || return 1
+		sleep 1
+	done
+}
+if ! healthy; then
+	if [ "$UNDO_BIN" = 1 ]; then
+		undo_bin
+		if healthy; then die "the new version of Arr didn't start, so the previous one is running again; see: $logs"; fi
+		die "the new version of Arr didn't start, and the previous one didn't either; see: $logs"
+	fi
+	die "Arr didn't start; see: $logs"
+fi
+UNDO_BIN=0
 
 # ---------------------------------------------------------------- automatic updates
 
@@ -926,6 +1220,11 @@ fi
 # (checked by SHA-256), and it rolls back if the new version doesn't start.
 if [ "$os" = Darwin ]; then kind=launchd; elif [ "$(id -u)" = 0 ]; then kind=system; else kind=user; fi
 UPDATER="$BIN_DIR/arr-update"
+case "$kind" in
+system) udir=/etc/systemd/system sctl="systemctl" ;;
+*) udir="$HOME/.config/systemd/user" sctl="systemctl --user" ;;
+esac
+uplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-update.plist"
 if [ -z "$AUTO_UPDATE" ]; then
 	if [ -f "$UPDATER" ]; then
 		AUTO_UPDATE=1
@@ -1075,7 +1374,6 @@ EOF
 	install -m 755 "$tmp/arr-update" "$UPDATER"
 	case "$kind" in
 	system | user)
-		if [ "$kind" = system ]; then udir=/etc/systemd/system; sctl="systemctl"; else udir="$HOME/.config/systemd/user"; sctl="systemctl --user"; fi
 		printf '[Unit]\nDescription=Update Arr to the latest release\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/bin/sh %s\n' \
 			"$(sd "$UPDATER")" >"$udir/arr-update.service"
 		printf '[Unit]\nDescription=Check for Arr updates once a day\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=6h\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' \
@@ -1084,7 +1382,6 @@ EOF
 			die "couldn't start the update timer"
 		;;
 	launchd)
-		uplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-update.plist"
 		cat >"$uplist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1101,23 +1398,22 @@ EOF
 		;;
 	esac
 	say "Arr checks for a new release once a day and installs it. Turn this off with --no-auto-update."
-elif [ -f "$UPDATER" ]; then
+elif [ -f "$UPDATER" ] || [ -f "$udir/arr-update.timer" ] || [ -f "$uplist" ]; then
+	# Whatever is left of them: the daily job without its updater would only fail.
 	step "Turning off automatic updates"
 	case "$kind" in
-	system) systemctl disable --now arr-update.timer >/dev/null 2>&1 || true ;;
-	user) systemctl --user disable --now arr-update.timer >/dev/null 2>&1 || true ;;
-	launchd) launchctl unload "$HOME/Library/LaunchAgents/io.github.newtonharry.arr-update.plist" 2>/dev/null || true ;;
+	system | user)
+		$sctl disable --now arr-update.timer >/dev/null 2>&1 || true
+		rm -f "$udir/arr-update.timer" "$udir/arr-update.service"
+		$sctl daemon-reload || true
+		;;
+	launchd)
+		launchctl unload "$uplist" 2>/dev/null || true
+		rm -f "$uplist"
+		;;
 	esac
 	rm -f "$UPDATER"
 fi
-
-API="http://127.0.0.1:$PORT"
-i=0
-until fetch -o /dev/null "$API/api/v1/health" 2>/dev/null; do
-	i=$((i + 1))
-	[ $i -lt 30 ] || die "Arr didn't start; see: $logs"
-	sleep 1
-done
 
 # A config without Plex has nothing to import.
 if grep -q '^\[plex\]' "$CONFIG"; then
@@ -1149,7 +1445,7 @@ Arr is running at $API
   API token:   $STATE_DIR/secrets/api_token
   Config:      $CONFIG
   Logs:        $logs
-  Downloading: $([ "$DOWNLOADING" = 1 ] && echo on || echo "off (set [execution] enabled = true to turn it on)")
+  Downloading: $([ "$DOWNLOADING" = 1 ] && echo on || echo "off (turn it on: \"$ARR\" set --config \"$CONFIG\" downloading on)")
 
 To use Arr from Claude Desktop, Claude Code or another MCP client on this machine, add:
 

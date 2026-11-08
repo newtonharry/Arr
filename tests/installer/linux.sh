@@ -55,11 +55,35 @@ sudo journalctl -u arr-tunnel --no-pager | grep -q 'ERR_NGROK\|authentication fa
 	fail "ngrok didn't run (no error from ngrok's servers in its log)"
 echo "tunnel log:"; sudo journalctl -u arr-tunnel --no-pager | tail -n 3
 
+# After every rerun Arr runs and answers, as the user who ran sudo, who still owns its config.
+still_running() {
+	systemctl is-active arr >/dev/null || fail "arr isn't running after $1"
+	curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "arr doesn't answer after $1"
+	[ "$(sudo stat -c %U "$state/config.toml")" = "$(id -un)" ] || fail "config.toml isn't $(id -un)'s after $1"
+}
+still_running "the install"
+
 echo "== a rerun keeps remote access"
 # shellcheck disable=SC2086
 sudo -E sh install.sh $remote >rerun.out 2>&1 || true
 grep -q 'already has remote access; keeping it' rerun.out || { cat rerun.out; fail "rerun didn't keep remote access"; }
 [ "$(sudo cat "$state/config.toml")" = "$config" ] || fail "a rerun changed the config"
+sudo test -x /usr/local/bin/arr.previous || fail "the rerun didn't keep the previous binary"
+still_running "a rerun"
+
+echo "== a rerun with a first-setup-only option is refused, and changes nothing"
+if sudo -E sh install.sh --yes --no-auto-update --movies /elsewhere >refused.out 2>&1; then
+	cat refused.out; fail "--movies on an existing install was accepted"
+fi
+cat refused.out
+grep -q -- '--movies only applies to the first setup' refused.out || fail "the refusal doesn't say why"
+[ "$(sudo cat "$state/config.toml")" = "$config" ] || fail "a refused rerun changed the config"
+still_running "a refused rerun"
+
+echo "== a rerun applies a setting it's given"
+sudo -E sh install.sh --yes --no-auto-update --upload-limit-kib 100 >limit.out 2>&1 || true
+sudo grep -q '^upload_limit_bytes_per_sec = 102400$' "$state/config.toml" || { cat limit.out; fail "--upload-limit-kib wasn't applied"; }
+still_running "a rerun with --upload-limit-kib"
 
 echo "== uninstall Arr and its data"
 sudo sh uninstall.sh --yes --arr --delete-data
