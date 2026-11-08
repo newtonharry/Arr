@@ -36,8 +36,10 @@ enum Check {
     /// The config loads.
     Load,
     Tmdb,
-    /// Plex lists its libraries; the message is for a refused token.
-    Plex(String),
+    /// Plex lists its libraries with the new token.
+    PlexToken,
+    /// Plex answers at the new address (it may refuse the saved token).
+    PlexUrl,
 }
 
 /// Changes `name` to `value` in the install configured by `config_path` and returns the line
@@ -51,42 +53,93 @@ pub async fn run(config_path: &Path, name: &str, value: Option<&str>) -> Result<
     let table: toml::Table = toml::from_str(&old)
         .with_context(|| format!("{} isn't a valid config", config_path.display()))?;
     let plan = plan(&table, dir, name, value)?;
+    // The line editor can't handle every way TOML can say a key (dotted or quoted keys,
+    // values over several lines), so the result must say exactly what was meant.
+    let edited = match &plan.edit {
+        Some((section, keys)) => {
+            let text = edit(&old, section, keys);
+            if let Some(key) = mismatch(&text, section, keys) {
+                bail!(
+                    "couldn't change {name} automatically; edit {key} under [{section}] in {} by hand",
+                    config_path.display()
+                );
+            }
+            Some(text)
+        }
+        None => None,
+    };
     let old_file = match &plan.file {
-        Some((path, _)) => match std::fs::read(path) {
-            Ok(b) => Some(b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).with_context(|| format!("can't read {}", path.display())),
-        },
+        Some((path, _)) => {
+            // Under sudo a folder made here would belong to root.
+            let parent = path.parent().context("the file has no folder")?;
+            if !parent.is_dir() {
+                bail!("the secrets folder {} is missing", parent.display());
+            }
+            match std::fs::read(path) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e).with_context(|| format!("can't read {}", path.display())),
+            }
+        }
         None => None,
     };
 
     let applied = async {
         if let Some((path, bytes)) = &plan.file {
-            let parent = path.parent().context("the file has no folder")?;
-            if !parent.exists() {
-                fsutil::ensure_private_dir(parent)?;
-            }
             fsutil::atomic_replace_private(path, bytes)?;
         }
-        if let Some((section, keys)) = &plan.edit {
-            fsutil::atomic_replace_private(config_path, edit(&old, section, keys).as_bytes())?;
+        if let Some(text) = &edited {
+            fsutil::atomic_replace_private(config_path, text.as_bytes())?;
         }
         let cfg = config::load(config_path).context("Arr wouldn't start with that change")?;
-        check(&plan.check, &cfg).await
+        check(&plan.check, &cfg, config_path).await
     }
     .await;
-    if applied.is_err() {
-        if plan.edit.is_some() {
-            let _ = fsutil::atomic_replace_private(config_path, old.as_bytes());
-        }
-        if let Some((path, _)) = &plan.file {
-            let _ = match &old_file {
-                Some(b) => fsutil::atomic_replace_private(path, b),
-                None => std::fs::remove_file(path).map_err(Into::into),
-            };
+    match applied {
+        Ok(None) => Ok(plan.done),
+        Ok(Some(note)) => Ok(format!("{} {note}", plan.done)),
+        Err(e) => {
+            let mut e = format!("{e:#}");
+            if edited.is_some()
+                && let Err(r) = fsutil::atomic_replace_private(config_path, old.as_bytes())
+            {
+                e += &format!(", and couldn't put back {}: {r:#}", config_path.display());
+            }
+            if let Some((path, _)) = &plan.file {
+                let restored = match &old_file {
+                    Some(b) => fsutil::atomic_replace_private(path, b),
+                    None => std::fs::remove_file(path).map_err(Into::into),
+                };
+                if let Err(r) = restored {
+                    e += &format!(", and couldn't put back {}: {r:#}", path.display());
+                }
+            }
+            Err(anyhow::anyhow!(e))
         }
     }
-    applied.map(|()| plan.done)
+}
+
+/// The first of `keys` that `text` doesn't set to the intended value under `[section]` (or
+/// still has, for a key to remove). Text that isn't TOML any more fails on the first key.
+fn mismatch<'k>(text: &str, section: &str, keys: &[(&'k str, Option<String>)]) -> Option<&'k str> {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return keys.first().map(|(k, _)| *k);
+    };
+    let got = table.get(section).and_then(toml::Value::as_table);
+    keys.iter()
+        .find(|(k, want)| {
+            let want = want.as_ref().map(|v| {
+                toml::from_str::<toml::Table>(&format!("v = {v}"))
+                    .ok()
+                    .and_then(|mut t| t.remove("v"))
+            });
+            let have = got.and_then(|t| t.get(*k));
+            match want {
+                None => have.is_some(),
+                Some(want) => want.is_none() || have != want.as_ref(),
+            }
+        })
+        .map(|(k, _)| *k)
 }
 
 fn plan(table: &toml::Table, dir: &Path, name: &str, value: Option<&str>) -> Result<Plan> {
@@ -147,7 +200,7 @@ fn plan(table: &toml::Table, dir: &Path, name: &str, value: Option<&str>) -> Res
                         .context("this install isn't connected to Plex ([plex] token_file)")?,
                     value.as_bytes().to_vec(),
                 )),
-                check: Check::Plex("Plex didn't accept that token".into()),
+                check: Check::PlexToken,
                 done: format!("Saved the Plex token. {restart}"),
             }
         }
@@ -155,7 +208,7 @@ fn plan(table: &toml::Table, dir: &Path, name: &str, value: Option<&str>) -> Res
             section("plex").context("this install isn't connected to Plex (no [plex] section)")?;
             let url = config::parse_base_url(value, "plex-url")?;
             Plan {
-                check: Check::Plex(format!("Plex at {url} didn't accept Arr's saved token")),
+                check: Check::PlexUrl,
                 ..simple(
                     "plex",
                     "base_url",
@@ -166,12 +219,19 @@ fn plan(table: &toml::Table, dir: &Path, name: &str, value: Option<&str>) -> Res
         }
         "downloading" => {
             let on = switch(value)?;
-            simple(
-                "execution",
-                "enabled",
-                on.to_string(),
-                format!("Turned downloading {value}. {restart}"),
-            )
+            // `download_submission` is the old name of `enabled`; both would be a duplicate.
+            Plan {
+                edit: Some((
+                    "execution",
+                    vec![
+                        ("enabled", Some(on.to_string())),
+                        ("download_submission", None),
+                    ],
+                )),
+                file: None,
+                check: Check::Load,
+                done: format!("Turned downloading {value}. {restart}"),
+            }
         }
         "error-reports" => {
             let on = switch(value)?;
@@ -267,26 +327,37 @@ fn switch(value: &str) -> Result<bool> {
     }
 }
 
-async fn check(check: &Check, cfg: &config::RuntimeConfig) -> Result<()> {
+/// Tries the change for real. `Some` is a note to add to the success line.
+async fn check(
+    check: &Check,
+    cfg: &config::RuntimeConfig,
+    config_path: &Path,
+) -> Result<Option<String>> {
+    let plex = || cfg.plex.clone().context("the config has no [plex] section");
     match check {
-        Check::Load => Ok(()),
+        Check::Load => Ok(None),
         Check::Tmdb => {
             let tmdb = cfg
                 .tmdb
                 .as_ref()
                 .and_then(Tmdb::new)
                 .context("the config didn't turn TMDB on")?;
-            tmdbkey::ask(&tmdb).await
+            tmdbkey::ask(&tmdb).await.map(|()| None)
         }
-        Check::Plex(refused) => {
-            let plex = cfg
-                .plex
-                .clone()
-                .context("the config has no [plex] section")?;
+        Check::PlexToken | Check::PlexUrl => {
+            let plex = plex()?;
             let url = plex.base_url.clone();
             match Plex::new(plex).sections().await {
-                Ok(_) => Ok(()),
-                Err(UpstreamError::Auth { .. }) => bail!("{refused}"),
+                Ok(_) => Ok(None),
+                Err(UpstreamError::Auth { .. }) if matches!(check, Check::PlexToken) => {
+                    bail!("Plex didn't accept that token")
+                }
+                // Plex is there; the sign-in is a separate fix (the installer applies the
+                // address first, then a new token or sign-in).
+                Err(UpstreamError::Auth { .. }) => Ok(Some(format!(
+                    "Plex refused the saved sign-in there; run `arr plex-signin --config {}` or set a new token.",
+                    config_path.display()
+                ))),
                 Err(e) => bail!("couldn't reach Plex at {url} ({})", e.describe()),
             }
         }

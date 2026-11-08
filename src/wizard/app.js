@@ -39,7 +39,7 @@ function render(s) {
     return;
   }
   if (phase === "done") {
-    $("done-movies").hidden = !!s.phase.movies;
+    $("done-movies").hidden = !s.phase.no_tmdb;
     return;
   }
   // The form is back, and Finish starts again where it stopped (the import resumes).

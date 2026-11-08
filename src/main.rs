@@ -65,9 +65,9 @@ enum Command {
     Bootstrap {
         #[arg(long)]
         config: PathBuf,
-        /// movies, tv or all.
-        #[arg(long, default_value = "all")]
-        media: String,
+        /// movies, tv or all (default: the ones [plex] has a library section for).
+        #[arg(long)]
+        media: Option<String>,
         #[arg(long)]
         restart: bool,
         #[arg(long)]
@@ -97,8 +97,8 @@ enum Command {
         port: u16,
         #[arg(long, default_value_t = 50413)]
         torrent_port: u16,
-        /// Upload limit in KiB/s for all torrents (0 = none).
-        #[arg(long, default_value_t = 0)]
+        /// Upload limit in KiB/s for all torrents (0 = none; at most 4194303, as `arr set`).
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=u64::from(u32::MAX / 1024)))]
         upload_limit_kib: u64,
         #[arg(long)]
         ffprobe: PathBuf,
@@ -200,9 +200,10 @@ enum Command {
         /// Only check the key with TMDB; save nothing.
         #[arg(long)]
         check: bool,
-        /// Tests: where TMDB's API is (with --check).
-        #[arg(long, hide = true, requires = "check", default_value = arr::tmdbkey::API_URL)]
-        tmdb_url: reqwest::Url,
+        /// Tests: where TMDB's API is (with --check). `requires = "check"` can't work: a
+        /// flag's default counts as present.
+        #[arg(long, hide = true, conflicts_with = "config")]
+        tmdb_url: Option<reqwest::Url>,
     },
     /// Serve MCP tools on stdin/stdout as a client of a running API (stdout carries only MCP).
     Mcp {
@@ -452,16 +453,20 @@ fn read_secret(what: &str) -> Result<String> {
     Ok(s.trim().to_string())
 }
 
+// Returning (not `process::exit`) lets the runtime drop, so kill_on_drop children stop.
 #[tokio::main]
-async fn main() {
-    // One line, so installers can show it as it is.
-    if let Err(e) = run().await {
-        eprintln!("Error: {e:#}");
-        std::process::exit(1);
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(code) => code,
+        Err(e) => {
+            // One line, so installers can show it as it is.
+            eprintln!("Error: {}", arr::fsutil::one_line(&format!("{e:#}")));
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     // Logs go to stderr; the MCP adapter stays quiet unless asked.
     let default_filter = match cli.command {
@@ -480,7 +485,7 @@ async fn run() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    match cli.command {
+    let result = match cli.command {
         Command::Init {
             state_dir,
             listen,
@@ -523,14 +528,29 @@ async fn run() -> Result<()> {
         } => {
             let cfg = config::load(&config)?;
             let state = api::AppState::new(cfg)?;
-            let kinds: Vec<arr::settings::MediaKind> = match media.as_str() {
-                "all" => vec![
-                    arr::settings::MediaKind::Movie,
-                    arr::settings::MediaKind::Series,
-                ],
-                "movies" => vec![arr::settings::MediaKind::Movie],
-                "tv" => vec![arr::settings::MediaKind::Series],
-                other => anyhow::bail!("--media must be movies, tv or all (got {other:?})"),
+            use arr::settings::MediaKind::{Movie, Series};
+            let kinds: Vec<arr::settings::MediaKind> = match media.as_deref() {
+                Some("all") => vec![Movie, Series],
+                Some("movies") => vec![Movie],
+                Some("tv") => vec![Series],
+                Some(other) => anyhow::bail!("--media must be movies, tv or all (got {other:?})"),
+                // The libraries this install has; an asked-for one that isn't there fails.
+                None => {
+                    let plex = state.cfg.plex.as_ref();
+                    let kinds: Vec<_> = [
+                        (Movie, plex.and_then(|p| p.movie_section)),
+                        (Series, plex.and_then(|p| p.tv_section)),
+                    ]
+                    .into_iter()
+                    .filter_map(|(m, s)| s.map(|_| m))
+                    .collect();
+                    if kinds.is_empty() {
+                        anyhow::bail!(
+                            "no Plex library is configured ([plex] movie_section or tv_section)"
+                        );
+                    }
+                    kinds
+                }
             };
             let mut out = vec![];
             for m in kinds {
@@ -670,6 +690,10 @@ async fn run() -> Result<()> {
             check: _,
             tmdb_url,
         } => {
+            let tmdb_url = match tmdb_url {
+                Some(u) => u,
+                None => arr::tmdbkey::API_URL.parse()?,
+            };
             let key = read_secret("TMDB key")?;
             match config {
                 Some(config) => {
@@ -733,15 +757,19 @@ async fn run() -> Result<()> {
             check,
             plex_tv_url,
             plex_auth_url,
-        } => std::process::exit(
-            arr::plexsignin::main(arr::plexsignin::Options {
+        } => {
+            // 0 accepted, 1 refused (or sign-in failed), 2 unreachable.
+            let code = arr::plexsignin::main(arr::plexsignin::Options {
                 config,
                 check,
                 plex_tv: plex_tv_url,
                 plex_auth: plex_auth_url,
             })
-            .await,
-        ),
+            .await;
+            return Ok(std::process::ExitCode::from(
+                u8::try_from(code).unwrap_or(1),
+            ));
+        }
         Command::Mcp {
             api_url,
             token_file,
@@ -761,5 +789,6 @@ async fn run() -> Result<()> {
             seconds,
             ffmpeg,
         } => fixture(out, name, files, seconds, ffmpeg),
-    }
+    };
+    result.map(|()| std::process::ExitCode::SUCCESS)
 }

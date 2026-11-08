@@ -255,7 +255,7 @@ pub async fn main(opts: Options) -> i32 {
     match run.await {
         Ok(()) => 0,
         Err((code, e)) => {
-            eprintln!("Error: {e:#}");
+            eprintln!("Error: {}", crate::fsutil::one_line(&format!("{e:#}")));
             code
         }
     }

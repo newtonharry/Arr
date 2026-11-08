@@ -133,3 +133,19 @@ async fn check_only_asks_tmdb_and_saves_nothing() {
     let out = check("");
     assert!(String::from_utf8_lossy(&out.stderr).contains("doesn't look like a TMDB key"));
 }
+
+#[test]
+fn a_test_tmdb_address_only_goes_with_check() {
+    // Saving always checks with the real TMDB, so --tmdb-url with --config is a usage error.
+    let out = Command::new(BIN)
+        .args(["tmdb-key", "--tmdb-url", "http://x/", "--config", "c"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

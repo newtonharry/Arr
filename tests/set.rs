@@ -20,19 +20,38 @@ async fn serve(app: Router) -> SocketAddr {
     addr
 }
 
-/// A Plex that accepts tokens starting with `accept`.
+/// A Plex that accepts tokens starting with `accept`, with empty libraries.
 async fn start_plex(accept: &'static str) -> SocketAddr {
-    serve(Router::new().route(
-        "/library/sections",
-        get(move |h: HeaderMap| async move {
-            let token = h.get("x-plex-token").and_then(|v| v.to_str().ok());
-            if token.is_some_and(|t| t.starts_with(accept)) {
-                (StatusCode::OK, r#"{"MediaContainer":{"Directory":[]}}"#)
-            } else {
-                (StatusCode::UNAUTHORIZED, "")
-            }
-        }),
-    ))
+    let ok = move |h: &HeaderMap| {
+        let token = h.get("x-plex-token").and_then(|v| v.to_str().ok());
+        token.is_some_and(|t| t.starts_with(accept))
+    };
+    serve(
+        Router::new()
+            .route(
+                "/library/sections",
+                get(move |h: HeaderMap| async move {
+                    if ok(&h) {
+                        (StatusCode::OK, r#"{"MediaContainer":{"Directory":[]}}"#)
+                    } else {
+                        (StatusCode::UNAUTHORIZED, "")
+                    }
+                }),
+            )
+            .route(
+                "/library/sections/{id}/all",
+                get(move |h: HeaderMap| async move {
+                    if ok(&h) {
+                        (
+                            StatusCode::OK,
+                            r#"{"MediaContainer":{"size":0,"totalSize":0,"offset":0,"Metadata":[]}}"#,
+                        )
+                    } else {
+                        (StatusCode::UNAUTHORIZED, "")
+                    }
+                }),
+            ),
+    )
     .await
 }
 
@@ -181,12 +200,7 @@ async fn plex_token_and_address_are_tried_before_they_are_kept() {
         "on stdin",
     );
 
-    // A server that refuses the saved token, and one that isn't there, change nothing.
-    let other = format!("http://{other_plex}");
-    refused(
-        &set(&config, &["plex-url", &other], None),
-        "didn't accept Arr's saved token",
-    );
+    // A server that isn't there, or isn't Plex, changes nothing.
     refused(
         &set(&config, &["plex-url", "http://127.0.0.1:1"], None),
         "couldn't reach Plex",
@@ -196,6 +210,21 @@ async fn plex_token_and_address_are_tried_before_they_are_kept() {
         "http or https",
     );
     assert_eq!(std::fs::read(&config).unwrap(), before);
+
+    // A Plex that refuses the saved token is still Plex: the address is kept, with a note
+    // (the installer then signs in again or sets a new token).
+    let other = format!("http://{other_plex}/");
+    says(
+        &set(&config, &["plex-url", &other], None),
+        &format!(
+            "Changed the Plex address to {other}. Restart Arr to use it. Plex refused the saved sign-in there; run `arr plex-signin --config {}` or set a new token.",
+            config.display()
+        ),
+    );
+    assert_eq!(
+        table(&config)["plex"]["base_url"].as_str(),
+        Some(other.as_str())
+    );
 
     let url = format!("http://localhost:{}", plex.port());
     says(
@@ -345,4 +374,119 @@ async fn bootstrap_reports_and_fails_when_a_run_fails() {
         last.starts_with("Error: ") && last.contains("movies: no Plex section"),
         "{err}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_the_line_editor_cant_make_are_refused() {
+    let tmdb = start_tmdb().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let plex = start_plex("good").await;
+    let config = full_install(tmp.path(), tmdb, plex);
+    let text = std::fs::read_to_string(&config).unwrap();
+
+    // `download_submission` is the old name of `enabled`: it goes, or both would be there.
+    let legacy = text.replacen(
+        "\nenabled = false\ndownload_cleanup",
+        "\ndownload_submission = false\ndownload_cleanup",
+        1,
+    );
+    assert_ne!(legacy, text);
+    write_private(&config, legacy.as_bytes());
+    says(
+        &set(&config, &["downloading", "on"], None),
+        "Turned downloading on. Restart Arr to use it.",
+    );
+    let execution = table(&config)["execution"].as_table().unwrap().clone();
+    assert_eq!(execution["enabled"].as_bool(), Some(true));
+    assert!(!execution.contains_key("download_submission"));
+
+    // A dotted key: the edit would say it twice, so nothing changes.
+    let dotted = format!("reporting.enabled = false\n{text}");
+    write_private(&config, dotted.as_bytes());
+    refused(
+        &set(&config, &["error-reports", "on"], None),
+        "couldn't change error-reports automatically; edit enabled under [reporting]",
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), dotted);
+
+    // Under sudo a new secrets folder would belong to root.
+    let secrets = config.with_file_name("secrets");
+    std::fs::rename(&secrets, tmp.path().join("moved")).unwrap();
+    refused(
+        &set(&config, &["tmdb-key"], Some("good-key")),
+        "the secrets folder",
+    );
+    assert!(!secrets.exists());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), dotted);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_reads_the_libraries_the_config_has() {
+    let (tmdb, plex) = (start_tmdb().await, start_plex("good").await);
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("movies")).unwrap();
+    let config = full_install(tmp.path(), tmdb, plex);
+    let movies_only = |section: u32| {
+        let text = std::fs::read_to_string(&config).unwrap();
+        // Not the template's commented-out example.
+        let text = match text.find("\nmovie_section = ").map(|i| i + 1) {
+            Some(i) => {
+                let end = i + text[i..].find('\n').unwrap();
+                format!("{}movie_section = {section}{}", &text[..i], &text[end..])
+            }
+            None => text.replacen(
+                "\ntoken_file = \"secrets/plex_token\"\n",
+                &format!("\ntoken_file = \"secrets/plex_token\"\nmovie_section = {section}\nmovies_path = \"/data/movies\"\n"),
+                1,
+            ),
+        };
+        write_private(&config, text.as_bytes());
+    };
+    movies_only(1);
+    let setup = Command::new(BIN)
+        .args(["setup", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let bootstrap = |args: &[&str]| {
+        let out = Command::new(BIN)
+            .arg("bootstrap")
+            .args(args)
+            .arg("--config")
+            .arg(&config)
+            .output()
+            .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+        (out, report)
+    };
+    // No --media: just the movie library, the only one there is.
+    let (out, report) = bootstrap(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(report["runs"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(report["runs"][0]["media"], "movie", "{report}");
+    assert_eq!(report["runs"][0]["section"], 1, "{report}");
+    // Asking for TV, which isn't set up, still fails.
+    let (out, _) = bootstrap(&["--media", "tv"]);
+    assert_eq!(out.status.code(), Some(1));
+
+    // Setup retried with another library: its run starts over, not the old one's.
+    movies_only(3);
+    let (out, report) = bootstrap(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(report["runs"][0]["section"], 3, "{report}");
+    assert_eq!(report["runs"][0]["status"], "done", "{report}");
 }

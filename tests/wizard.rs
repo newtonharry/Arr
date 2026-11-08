@@ -23,6 +23,10 @@ const TMDB_KEY: &str = "tmdb-key-0123456789";
 #[derive(Default)]
 struct World {
     pin_polls: u32,
+    /// Sign-ins started: the first gets PIN 42, the next 43, and so on.
+    pins_made: u64,
+    /// plex.tv answers for PIN 42 late, signing in another account.
+    slow_first_pin: bool,
     resources_calls: u32,
     movies_path: String,
     tv_path: String,
@@ -84,7 +88,12 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
             "/api/v2/pins",
             post(|State(m): State<Mock>, h: HeaderMap| async move {
                 record(&m, "pins", &h);
-                axum::Json(json!({ "id": 42, "code": "pin-code", "authToken": null }))
+                let id = {
+                    let mut w = m.lock().unwrap();
+                    w.pins_made += 1;
+                    41 + w.pins_made
+                };
+                axum::Json(json!({ "id": id, "code": "pin-code", "authToken": null }))
             }),
         )
         .route(
@@ -95,8 +104,16 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
                  AxPath(id): AxPath<u64>,
                  Query(q): Query<HashMap<String, String>>| async move {
                     record(&m, "pin", &h);
-                    if id != 42 || q.get("code").map(String::as_str) != Some("pin-code") {
+                    let made = m.lock().unwrap().pins_made;
+                    if !(42..42 + made).contains(&id)
+                        || q.get("code").map(String::as_str) != Some("pin-code")
+                    {
                         return StatusCode::NOT_FOUND.into_response();
+                    }
+                    if id == 42 && m.lock().unwrap().slow_first_pin {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        return axum::Json(json!({ "id": 42, "code": "pin-code", "authToken": "old-account" }))
+                            .into_response();
                     }
                     let mut w = m.lock().unwrap();
                     w.pin_polls += 1;
@@ -264,6 +281,7 @@ fn free_port() -> u16 {
         .port()
 }
 
+#[derive(Clone)]
 struct Page {
     base: String,
     cookie: String,
@@ -542,7 +560,7 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     assert_eq!(last["state"], "done", "{last}");
     assert!(!state_dir.join("config.toml.new").exists());
     // No key: the page says how to add one later.
-    assert_eq!(last["movies"], false, "{last}");
+    assert_eq!(last["no_tmdb"], true, "{last}");
     let (s, _) = page.post("/api/apply", choices("1:0")).await;
     assert_eq!(s, StatusCode::CONFLICT);
     let (s, _) = page.post("/api/finish", json!({})).await;
@@ -646,7 +664,7 @@ async fn an_existing_config_is_never_replaced() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("already exists") && err.contains("--delete-data"),
+        err.contains("already exists") && err.contains("choose to delete Arr's data"),
         "{err}"
     );
     assert_eq!(
@@ -712,7 +730,6 @@ async fn only_the_accounts_plex_on_this_computer_is_used() {
     assert_eq!(v["plex"]["movies"][1]["title"], "Films", "{v}");
 }
 
-#[cfg(unix)] // only the Unix-only install test uses it
 /// Opens the page with the link's code; returns a client holding the session cookie.
 async fn open_page(link: &str, port: u16) -> Page {
     let http = reqwest::Client::builder()
@@ -841,4 +858,39 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
             .contains("Plex may not be able to see"),
         "{v}"
     );
+}
+
+#[tokio::test]
+async fn a_late_answer_for_an_earlier_signin_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mock, world) = start_mock(tmp.path(), tmp.path()).await;
+    world.lock().unwrap().slow_first_pin = true;
+    let (_child, link, port) = start_wizard(&tmp.path().join("state"), mock, &[]).await;
+    let page = open_page(&link, port).await;
+    page.post("/api/plex/signin", json!({})).await;
+    // plex.tv is slow to say PIN 42 signed in; meanwhile the user signs in again.
+    let slow = {
+        let page = page.clone();
+        tokio::spawn(async move { page.post("/api/plex/check", json!({})).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (s, v) = page.post("/api/plex/signin", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    slow.await.unwrap();
+    // The old account isn't signed in: the page waits for the new sign-in.
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(v["signed_in"], false, "{v}");
+    assert_eq!(v["waiting_for_signin"], true, "{v}");
+}
+
+#[test]
+fn an_upload_limit_the_config_cant_hold_is_refused() {
+    // 4194303 KiB/s is the most bytes per second a u32 holds, as with `arr set`.
+    let out = std::process::Command::new(BIN)
+        .args(["wizard", "--state-dir", "s", "--ffprobe", "f"])
+        .args(["--upload-limit-kib", "4194304"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("4194304"));
 }

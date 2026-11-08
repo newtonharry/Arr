@@ -39,6 +39,15 @@ pub fn check_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `text` on one line (line breaks become spaces), so installers can show an error as it is.
+pub fn one_line(text: &str) -> String {
+    text.split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Creates `path` (and missing parents) with mode 0700 if absent, then checks it.
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
@@ -238,6 +247,14 @@ pub fn read_secret_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_are_flattened_to_one_line() {
+        assert_eq!(
+            one_line("bad config: TOML parse error\r\n  |\n1 | a =\n  |    ^\n"),
+            "bad config: TOML parse error | 1 | a = |    ^"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

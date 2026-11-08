@@ -151,8 +151,8 @@ enum Phase {
         detail: String,
     },
     Done {
-        /// A TMDB key was added, so Arr can find new movies.
-        movies: bool,
+        /// A movie library was set up without a TMDB key, so Arr can't find new movies.
+        no_tmdb: bool,
     },
     Failed {
         message: String,
@@ -167,7 +167,7 @@ pub async fn run(mut opts: Options) -> Result<()> {
     if config.exists() {
         // Not "remove it": Arr's catalog still points at the old folders.
         bail!(
-            "{} already exists; Arr is set up (to start over, run the uninstaller with --delete-data first)",
+            "{} already exists; Arr is set up (to start over, run the uninstaller and choose to delete Arr's data first)",
             config.display()
         );
     }
@@ -505,6 +505,9 @@ fn plex_down(e: upstream::UpstreamError) -> Response {
 /// Polls the sign-in once; once signed in, looks for this computer's Plex, or reads its
 /// libraries again (ones added in Plex meanwhile show up).
 async fn check_signin(State(wiz): St) -> Response {
+    // Held from reading the PIN to the last state change, so a new sign-in (which waits for
+    // it) always comes after, and a late reply for the old PIN can't sign the old account in.
+    let _lookup = wiz.lookup.lock().await;
     let (pin, signed_in) = {
         let inner = wiz.inner.lock().unwrap();
         (inner.pin.clone(), inner.account.is_some())
@@ -513,11 +516,20 @@ async fn check_signin(State(wiz): St) -> Response {
         let Some((id, code)) = pin else {
             return Json(snapshot(&wiz)).into_response();
         };
-        match wiz.tv.check_pin(id, &code).await {
-            Ok(PinState::SignedIn(t)) => wiz.inner.lock().unwrap().account = Some(t),
-            Ok(PinState::Waiting) => return Json(snapshot(&wiz)).into_response(),
+        let reply = wiz.tv.check_pin(id, &code).await;
+        let mut inner = wiz.inner.lock().unwrap();
+        if inner.pin.as_ref() != Some(&(id, code)) {
+            drop(inner);
+            return Json(snapshot(&wiz)).into_response();
+        }
+        match reply {
+            Ok(PinState::SignedIn(t)) => inner.account = Some(t),
+            Ok(PinState::Waiting) => {
+                drop(inner);
+                return Json(snapshot(&wiz)).into_response();
+            }
             Ok(PinState::Expired) => {
-                wiz.inner.lock().unwrap().pin = None;
+                inner.pin = None;
                 return problem(
                     StatusCode::GONE,
                     "the Plex sign-in expired; click Sign in again",
@@ -526,7 +538,6 @@ async fn check_signin(State(wiz): St) -> Response {
             Err(e) => return plex_down(e),
         }
     }
-    let _lookup = wiz.lookup.lock().await;
     let plex = wiz.inner.lock().unwrap().plex.clone();
     if let Some(plex) = plex {
         return match sections(plex.base_url.clone(), plex.token.clone()).await {
@@ -1209,10 +1220,10 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
         };
         plex
     };
-    let refuse = |msg: &str| {
-        wiz.inner.lock().unwrap().phase = Phase::Editing;
-        problem(StatusCode::BAD_REQUEST, msg)
-    };
+    // Until setup is handed to its own task, any way out of here (a refusal, or the page
+    // going away mid-check, which drops this handler) goes back to editing.
+    let mut editing = BackToEditing(Some(&wiz));
+    let refuse = |msg: &str| problem(StatusCode::BAD_REQUEST, msg);
     let pick = |choice: &Option<LibraryChoice>, kind: &str| -> Result<Option<Library>, String> {
         let Some(ch) = choice else { return Ok(None) };
         let (key, idx) = ch
@@ -1256,14 +1267,14 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
         }
     }
     set_phase(&wiz, "Saving your settings", "");
+    editing.0 = None;
+    let no_tmdb = movies.is_some() && tmdb.is_empty();
     let w = wiz.clone();
     tokio::spawn(async move {
         let result = finish_setup(&w, &plex, movies, tv, &c, &tmdb).await;
         let mut inner = w.inner.lock().unwrap();
         inner.phase = match result {
-            Ok(()) => Phase::Done {
-                movies: !tmdb.is_empty(),
-            },
+            Ok(()) => Phase::Done { no_tmdb },
             Err(e) => {
                 crate::report::error("setup", &crate::report::reportable(&e));
                 Phase::Failed {
@@ -1280,6 +1291,17 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
         }
     });
     Json(snapshot(&wiz)).into_response()
+}
+
+/// Puts the phase back to editing when dropped, unless emptied first.
+struct BackToEditing<'a>(Option<&'a Wizard>);
+
+impl Drop for BackToEditing<'_> {
+    fn drop(&mut self) {
+        if let Some(w) = self.0 {
+            w.inner.lock().unwrap().phase = Phase::Editing;
+        }
+    }
 }
 
 fn set_phase(wiz: &Wizard, step: &str, detail: &str) {
