@@ -46,4 +46,5 @@ pub mod torrent;
 pub mod torznab;
 pub mod tpb;
 pub mod upstream;
+pub mod wizard;
 pub mod worker;

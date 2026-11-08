@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up Arr</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Set up Arr</h1>
+    <p class="lead">Arr finds and downloads movies and TV shows for your Plex server. This takes a few minutes, and nothing is downloaded yet.</p>
+  </header>
+
+  <div id="error" class="banner error" hidden></div>
+
+  <form id="form" novalidate>
+    <section id="step-plex" class="card">
+      <h2><span class="num">1</span> Sign in to Plex</h2>
+      <div id="signin">
+        <p>Arr uses your Plex account to find your server and libraries. Your password is entered on plex.tv, never here.</p>
+        <button type="button" id="signin-btn" class="primary">Sign in with Plex</button>
+        <p id="signin-wait" class="muted" hidden>Waiting for you to sign in on the Plex tab… <a id="signin-link" href="#" target="_blank" rel="noopener noreferrer">Open it again</a></p>
+      </div>
+      <p id="signed-in" class="ok" hidden>Signed in to Plex.</p>
+    </section>
+
+    <section id="step-server" class="card" hidden>
+      <h2><span class="num">2</span> Plex on this computer</h2>
+      <p id="connected" class="ok" hidden></p>
+      <div id="missing" hidden>
+        <p id="missing-text"></p>
+        <button type="button" id="look-again">Look again</button>
+      </div>
+    </section>
+
+    <section id="step-libraries" class="card" hidden>
+      <h2><span class="num">3</span> Libraries</h2>
+      <p>Arr adds new movies and shows to these Plex libraries, in the folders below.</p>
+      <div class="library" data-kind="movies">
+        <label>Movies <select id="movies-lib"></select></label>
+        <label class="folder">Folder on this computer <input id="movies-folder" autocomplete="off"></label>
+        <p class="hint" id="movies-hint"></p>
+      </div>
+      <div class="library" data-kind="tv">
+        <label>TV shows <select id="tv-lib"></select></label>
+        <label class="folder">Folder on this computer <input id="tv-folder" autocomplete="off"></label>
+        <p class="hint" id="tv-hint"></p>
+      </div>
+      <p id="no-libraries" class="muted" hidden>Plex has no movie or TV library yet. Add one in Plex (Settings › Libraries › Add Library), then reload this page.</p>
+    </section>
+
+    <section id="step-options" class="card" hidden>
+      <h2><span class="num">4</span> Downloads</h2>
+      <label>Download folder <input id="downloads" autocomplete="off"></label>
+      <p class="hint" id="downloads-hint">Downloads finish here, then move into your library. Keep it on the same drive as your library to save space.</p>
+
+      <label class="check"><input type="checkbox" id="downloading" checked> Let Arr download what you ask for</label>
+      <p class="hint">Turn this off to try Arr out first: it will search and plan, but not download.</p>
+
+      <label class="check"><input type="checkbox" id="auto-update"> Install Arr updates automatically</label>
+      <p class="hint">Recommended. Arr checks once a day for a new version and installs it, and goes back to the old one if the new one doesn't start.</p>
+
+      <details>
+        <summary>Optional: a TMDB key, to find movies you don't have yet</summary>
+        <p class="muted">TV shows work without it. Get a free key at <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener noreferrer">themoviedb.org/settings/api</a> (choose “Developer”, any app name is fine), then paste the API key or the read access token.</p>
+        <label>TMDB key <input id="tmdb" type="password" autocomplete="off"></label>
+      </details>
+
+      <button type="submit" id="apply" class="primary big">Finish setup</button>
+    </section>
+  </form>
+
+  <section id="working" class="card" hidden>
+    <h2 id="working-step">Saving your settings</h2>
+    <div class="spinner" aria-hidden="true"></div>
+    <p id="working-detail" class="muted"></p>
+  </section>
+
+  <section id="done" class="card" hidden>
+    <h2>Arr is set up</h2>
+    <p>Arr knows what's already in your Plex libraries. The installer is finishing up in the terminal, starting Arr in the background.</p>
+    <p id="done-downloading"></p>
+    <p>You can close this tab.</p>
+  </section>
+</main>
+</body>
+</html>

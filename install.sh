@@ -17,6 +17,7 @@ DOWNLOAD_BASE="${ARR_DOWNLOAD_BASE:-}"
 BIN_DIR="${ARR_BIN_DIR:-}"
 STATE_DIR="${ARR_STATE_DIR:-}"
 PLEX_URL="${ARR_PLEX_URL:-http://127.0.0.1:32400}"
+PLEX_URL_SET=0; [ -z "${ARR_PLEX_URL:-}" ] || PLEX_URL_SET=1
 PLEX_TOKEN="${ARR_PLEX_TOKEN:-}"
 TMDB_KEY="${ARR_TMDB_KEY:-}"
 MOVIES="${ARR_MOVIES:-}"
@@ -36,6 +37,7 @@ GOOGLE_SECRET="${ARR_GOOGLE_CLIENT_SECRET:-}"
 ALLOW_EMAILS="${ARR_ALLOW_EMAILS:-}"
 AUTO_UPDATE="${ARR_AUTO_UPDATE:-}"
 SETUP=1
+TERMINAL=0
 SERVICE=1
 DOWNLOADING=1
 
@@ -46,6 +48,7 @@ Install Arr and set it up next to your Plex server.
 Usage: install.sh [options]
 
   --yes                  answer every question with its default (no prompts)
+  --terminal             answer setup questions here instead of on a web page
   --install-only         install the binary and stop (no setup)
   --version vX.Y.Z       install a specific release (default: latest)
   --bin-dir DIR          where to put the arr binary
@@ -85,12 +88,13 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--yes | -y) YES=1 ;;
 	--install-only) SETUP=0 ;;
+	--terminal) TERMINAL=1 ;;
 	--no-service) SERVICE=0 ;;
 	--search-only) DOWNLOADING=0 ;;
 	--version) VERSION="$2"; shift ;;
 	--bin-dir) BIN_DIR="$2"; shift ;;
 	--state-dir) STATE_DIR="$2"; shift ;;
-	--plex-url) PLEX_URL="$2"; shift ;;
+	--plex-url) PLEX_URL="$2"; PLEX_URL_SET=1; shift ;;
 	--plex-token) PLEX_TOKEN="$2"; shift ;;
 	--movies) MOVIES="$2"; shift ;;
 	--tv) TV="$2"; shift ;;
@@ -445,11 +449,78 @@ failed() { mv "$CONFIG" "$CONFIG.failed"; die "$1 (the config is saved as $CONFI
 say "Config checked"
 }
 
+# The address this machine uses on its network.
+lan_ip() {
+	if have ip; then
+		ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1
+	elif have ipconfig; then
+		ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true
+	fi
+}
+
+# sudo usually drops the desktop's variables. Finds the sudo user's desktop session again,
+# so the setup page can open in their own browser.
+desktop_env() {
+	[ "$os" = Linux ] && [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && have loginctl || return 0
+	[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+	sid=$(loginctl show-user "$SUDO_USER" -p Display --value 2>/dev/null) || return 0
+	[ -n "$sid" ] || return 0
+	rt="/run/user/$(id -u "$SUDO_USER")"
+	case "$(loginctl show-session "$sid" -p Type --value 2>/dev/null)" in
+	wayland) WAYLAND_DISPLAY=$(ls "$rt" 2>/dev/null | grep -m1 '^wayland-[0-9]*$') || return 0 ;;
+	x11) DISPLAY=$(loginctl show-session "$sid" -p Display --value 2>/dev/null) || return 0 ;;
+	esac
+	[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+	DESKTOP_ENV="XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus"
+	[ -z "${DISPLAY:-}" ] || DESKTOP_ENV="$DESKTOP_ENV DISPLAY=$DISPLAY"
+	[ -z "${WAYLAND_DISPLAY:-}" ] || DESKTOP_ENV="$DESKTOP_ENV WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+}
+
+# Setup on a web page: sign in to Plex, pick libraries and folders, import what Plex has.
+# `arr wizard` writes the same config configure() does, then exits.
+browser_setup() {
+	step "Setting up Arr in your web browser"
+	# Over SSH (or on a machine without a screen) the page has to open on another computer,
+	# so it listens on this machine's network address. The link carries a secret code.
+	bind=127.0.0.1
+	DESKTOP_ENV=""
+	desktop_env
+	if [ -n "${SSH_CONNECTION:-}" ]; then
+		bind=$(printf '%s' "$SSH_CONNECTION" | awk '{print $3}')
+	elif [ "$os" = Linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+		bind=$(lan_ip)
+	fi
+	case "$bind" in "" | *%*) bind=$(lan_ip) ;; esac
+	[ -n "$bind" ] || bind=127.0.0.1
+	umask 077
+	mkdir -p "$STATE_DIR"
+	set -- "$ARR" wizard --state-dir "$STATE_DIR" --bind "$bind" --port "$PORT" \
+		--torrent-port "$TORRENT_PORT" --upload-limit-kib "$UPLOAD_LIMIT_KIB" --ffprobe "$FFPROBE"
+	[ "$bind" != 127.0.0.1 ] || set -- "$@" --open
+	# Arr runs as the user who ran sudo, so the page checks folders as that user too.
+	if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
+		chown "$SUDO_USER" "$STATE_DIR"
+		# shellcheck disable=SC2086 # NAME=value words without spaces
+		set -- sudo -u "$SUDO_USER" env $DESKTOP_ENV "$@"
+	fi
+	"$@" </dev/null || die "setup wasn't finished; run this script again to start over"
+	# The page asked about automatic updates; the answer is used once, below.
+	if [ -z "$AUTO_UPDATE" ] && [ -f "$STATE_DIR/setup-choices" ]; then
+		AUTO_UPDATE=$(sed -n 's/^auto_update=\([01]\)$/\1/p' "$STATE_DIR/setup-choices")
+	fi
+	rm -f "$STATE_DIR/setup-choices"
+	grep -A1 '^\[execution\]' "$CONFIG" | grep -q 'enabled = true' || DOWNLOADING=0
+}
+
 if [ -f "$CONFIG" ]; then
 	step "Keeping your config in $STATE_DIR"
 	PORT=$(sed -n 's/^listen = "[^"]*:\([0-9][0-9]*\)"$/\1/p' "$CONFIG" | head -n1)
 	PORT=${PORT:-8787}
 	grep -A1 '^\[execution\]' "$CONFIG" | grep -q 'enabled = true' || DOWNLOADING=0
+elif [ "$TERMINAL" != 1 ] && interactive && [ "$DOWNLOADING" = 1 ] && [ "$PLEX_URL_SET" = 0 ] &&
+	[ -z "$PLEX_TOKEN$MOVIES$TV$MOVIE_SECTION$TV_SECTION$DOWNLOADS$TMDB_KEY" ]; then
+	# Setup options on the command line (or --search-only) mean the terminal setup.
+	browser_setup
 else
 	configure
 fi
