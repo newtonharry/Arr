@@ -1473,6 +1473,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(unix)]
     fn layout(torrent: &[u8]) -> Layout {
         let t = librqbit::torrent_from_bytes(torrent).unwrap();
         Layout::of(&t.info.data.validate().unwrap())

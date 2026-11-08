@@ -48,6 +48,8 @@ jobs:
           name=arr-${{ matrix.target }}
           mkdir -p dist/$name
           cp target/${{ matrix.target }}/release/arr${{ matrix.exe }} README.md dist/$name/
+          # Windows: the window-less launcher the installer's tasks run.
+          [ -z "${{ matrix.exe }}" ] || cp target/${{ matrix.target }}/release/arr-background.exe dist/$name/
           if [ -n "${{ matrix.exe }}" ]; then
             ext=zip
             (cd dist && 7z a -bd $name.zip $name >/dev/null)

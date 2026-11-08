@@ -981,11 +981,10 @@ fn apply(
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // makes symlinks
 mod tests {
     use super::*;
 
-    #[cfg(unix)] // makes symlinks
     #[test]
     fn local_files_are_mapped_and_validated() {
         let tmp = tempfile::tempdir().unwrap();
