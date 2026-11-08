@@ -15,11 +15,10 @@ function Uninstall-Arr {
 	$ErrorActionPreference = 'Stop'
 	$BinDir = Join-Path $env:LOCALAPPDATA 'Programs\Arr'
 	$StateDir = Join-Path $env:LOCALAPPDATA 'Arr'
-	# Arr may be installed elsewhere: its log-on task says where.
-	if (-not $env:ARR_STATE_DIR) {
-		$a = (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue).Actions | Select-Object -First 1
-		if ($a -and $a.Arguments -match '--config "([^"]+)"') { $StateDir = Split-Path $Matches[1]; $BinDir = Split-Path $a.Execute }
-	}
+	# Arr may be installed elsewhere: its log-on task says where. ARR_BIN_DIR and ARR_STATE_DIR
+	# each override only their own folder.
+	$a = (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue).Actions | Select-Object -First 1
+	if ($a -and $a.Arguments -match '--config "([^"]+)"') { $StateDir = Split-Path $Matches[1]; $BinDir = Split-Path $a.Execute }
 	if ($env:ARR_BIN_DIR) { $BinDir = $env:ARR_BIN_DIR }
 	if ($env:ARR_STATE_DIR) { $StateDir = $env:ARR_STATE_DIR }
 	$Target = $env:ARR_REMOVE
