@@ -85,11 +85,16 @@ if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; th
 fi
 # Folders that hold media: never deleted, nor anything that contains them.
 PROTECT=""
-has_media() { # has_media <dir>: any video file inside?
+# Any video file, or any file over 500 MB (a download in progress has no video name yet)?
+# A database is the only big file an app's own folder should have.
+has_media() { # has_media <dir>
 	[ -n "$(find "$1" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m4v' -o -iname '*.avi' \
 		-o -iname '*.mov' -o -iname '*.wmv' -o -iname '*.ts' -o -iname '*.m2ts' -o -iname '*.mpg' \
-		-o -iname '*.mpeg' -o -iname '*.webm' -o -iname '*.iso' \) -print 2>/dev/null | head -n1)" ]
+		-o -iname '*.mpeg' -o -iname '*.webm' -o -iname '*.iso' \
+		-o \( -size +500M ! -name '*.sqlite*' ! -name '*.db' ! -name '*.db-*' \) \) -print 2>/dev/null | head -n1)" ]
 }
+# Plex keeps everything of its own in this folder, under its data or /config folder.
+PLEX_OWN="Library/Application Support/Plex Media Server"
 # Deletes an app's own data folder; refuses one that isn't clearly that alone.
 remove_dir() { # remove_dir <dir> <why>
 	d=${1%/}
@@ -114,7 +119,7 @@ EOF
 		return 0
 	fi
 	if has_media "$d"; then
-		say "  not deleting $1: it has movie or TV files in it; delete it yourself if you're sure"
+		say "  not deleting $1: it has movie or TV files (or other large files) in it; delete it yourself if you're sure"
 		return 0
 	fi
 	if [ -w "$(dirname "$1")" ]; then run rm -rf -- "$1"; else run $SUDO rm -rf -- "$1"; fi
@@ -146,6 +151,36 @@ from_plist() {
 	ARR_BIN=$(printf '%s\n' "$strings" | sed -n 2p)
 	ARR_CONFIG=$(printf '%s\n' "$strings" | sed -n 5p)
 }
+# Absolute paths assigned to keys matching $2 in TOML file $1, in any TOML spelling:
+# key="..." or key = '...', with spaces or comments around, \\ and \" unescaped.
+toml_paths() { # toml_paths <file> <key regex>
+	awk -v keys="^($2)\$" '
+	{
+		line = $0
+		sub(/^[ \t]+/, "", line)
+		eq = index(line, "=")
+		if (eq == 0) next
+		key = substr(line, 1, eq - 1)
+		sub(/[ \t]+$/, "", key)
+		if (key !~ keys) next
+		val = substr(line, eq + 1)
+		sub(/^[ \t]+/, "", val)
+		q = substr(val, 1, 1)
+		out = ""
+		if (q == "\"") {
+			for (i = 2; i <= length(val); i++) {
+				c = substr(val, i, 1)
+				if (c == "\\") { i++; c = substr(val, i, 1) }
+				else if (c == "\"") break
+				out = out c
+			}
+		} else if (q == "\047") {
+			rest = substr(val, 2)
+			out = substr(rest, 1, index(rest, "\047") - 1)
+		}
+		if (substr(out, 1, 1) == "/") print out
+	}' "$1" 2>/dev/null
+}
 ARR_BIN="" ARR_CONFIG=""
 if [ -f "$SYSTEM_UNIT" ]; then from_unit "$SYSTEM_UNIT"; ARR_FOUND="system service"
 elif [ -f "$USER_UNIT" ]; then from_unit "$USER_UNIT"; ARR_FOUND="user service"
@@ -167,10 +202,10 @@ ARR_STATE=""
 [ -n "$ARR_FOUND" ] || { [ -z "$ARR_BIN$ARR_STATE" ] || ARR_FOUND="files"; }
 DOWNLOADS=""
 [ -z "$ARR_CONFIG" ] || [ ! -r "$ARR_CONFIG" ] ||
-	DOWNLOADS=$(sed -n 's/^download_dir = "\(.*\)"$/\1/p' "$ARR_CONFIG" | head -n1)
+	DOWNLOADS=$(toml_paths "$ARR_CONFIG" download_dir | head -n1)
 # Every folder the config names (libraries, downloads) is protected from deletion.
 if [ -n "$ARR_CONFIG" ] && [ -r "$ARR_CONFIG" ]; then
-	PROTECT=$(sed -n 's/^[A-Za-z_]* = "\(\/[^"]*\)"$/\1/p' "$ARR_CONFIG" | while IFS= read -r p; do
+	PROTECT=$(toml_paths "$ARR_CONFIG" '[A-Za-z0-9_-]*' | while IFS= read -r p; do
 		if [ -d "$p" ]; then printf '%s\n' "${p%/}"; fi
 	done)
 fi
@@ -318,7 +353,12 @@ if [ "$DO_PLEX" = 1 ]; then
 		remove_dir "/Applications/Plex Media Server.app" "the Plex app"
 		;;
 	esac
-	[ "$PLEX_WIPE" != 1 ] || [ -z "$PLEX_DATA" ] || remove_dir "$PLEX_DATA" "Plex's library database and settings"
+	if [ "$PLEX_WIPE" = 1 ] && [ -n "$PLEX_DATA" ]; then
+		case "$PLEX_KIND" in
+		mac) remove_dir "$PLEX_DATA" "Plex's library database and settings" ;;
+		*) remove_dir "$PLEX_DATA/$PLEX_OWN" "Plex's library database and settings" ;;
+		esac
+	fi
 	if [ "$PLEX_WIPE" = 1 ] && [ "$PLEX_KIND" = mac ]; then
 		remove_dir "$U_HOME/Library/Caches/PlexMediaServer" "Plex's cache"
 		remove_file "$U_HOME/Library/Preferences/com.plexapp.plexmediaserver.plist"
@@ -330,8 +370,10 @@ if [ "$DO_PLEX" = 1 ]; then
 		run docker rm -f "$c" >/dev/null
 		say "  removed the Docker container \"$c\""
 		[ -z "$project" ] || say "  it came from Docker Compose project \"$project\": remove it from that compose file too, or 'docker compose up' brings it back"
-		if [ "$PLEX_WIPE" = 1 ] && [ -n "$cfg" ]; then
-			remove_dir "$cfg" "Plex's library database and settings"
+		if [ "$PLEX_WIPE" = 1 ] && [ -n "$cfg" ] && [ -d "$cfg/$PLEX_OWN" ]; then
+			remove_dir "$cfg/$PLEX_OWN" "Plex's library database and settings"
+		elif [ "$PLEX_WIPE" = 1 ] && [ -n "$cfg" ]; then
+			say "  kept $cfg: it doesn't look like Plex's own data folder; delete it yourself if you're sure"
 		elif [ -n "$cfg" ]; then
 			say "  kept its data in $cfg"
 		fi
