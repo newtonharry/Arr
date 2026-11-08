@@ -50,9 +50,10 @@ On Windows, open PowerShell (Start menu, type "PowerShell") and paste:
 $env:ARR_REMOTE = '1'; irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex
 ```
 
-(A first install on Windows also offers this at the end, so you can just answer yes there.)
-On Windows the installer walks you through steps 1 and 2 as it goes: it opens each ngrok and
-Google page in your browser, tells you what to copy, and the secrets you paste stay hidden.
+A first install offers this at the end on every platform, so you can just answer yes there.
+The installer walks you through steps 1 and 2 as it goes: it opens each ngrok and Google page
+in your browser (when you're at the computer, not over SSH), tells you what to copy, and the
+secrets you paste stay hidden.
 
 It asks for the five values from steps 1 and 2: the ngrok authtoken and domain, the Google
 client ID and secret, and the Google accounts allowed in. Then it:

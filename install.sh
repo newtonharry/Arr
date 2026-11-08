@@ -137,6 +137,15 @@ ask() { # ask "Question" default -> answer
 	fi
 	printf '%s' "$2"
 }
+ask_secret() { # ask_secret "Question" -> answer, not shown as it's typed
+	interactive || return 0
+	printf '%s: ' "$1" >/dev/tty
+	stty -echo </dev/tty 2>/dev/null || true
+	read -r a </dev/tty || a=""
+	stty echo </dev/tty 2>/dev/null || true
+	printf '\n' >/dev/tty
+	printf '%s' "$a"
+}
 confirm() { # confirm "Question" y|n
 	a=$(ask "$1 (y/n)" "$2")
 	case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac
@@ -210,15 +219,31 @@ if ! have ffprobe; then
 	elif have pacman; then cmd="$sudo pacman -S --noconfirm ffmpeg"
 	elif have apk; then cmd="$sudo apk add ffmpeg"
 	elif have brew; then cmd="brew install ffmpeg"
+	elif [ -x /opt/homebrew/bin/brew ]; then cmd="/opt/homebrew/bin/brew install ffmpeg"
+	elif [ -x /usr/local/bin/brew ]; then cmd="/usr/local/bin/brew install ffmpeg"
 	else cmd=""; fi
+	# A Mac without Homebrew (the usual way to add tools to a Mac): Homebrew's own installer
+	# first, which asks for your password, then FFmpeg with it.
+	if [ -z "$cmd" ] && [ "$os" = Darwin ] && [ "$(id -u)" != 0 ] && interactive &&
+		confirm "ffprobe is missing, and so is Homebrew, the usual way to add tools to a Mac. Install Homebrew (it asks for your password), then FFmpeg?" y; then
+		fetch -o "$tmp/brew-install.sh" https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh ||
+			die "couldn't download Homebrew's installer; see https://brew.sh"
+		/bin/bash "$tmp/brew-install.sh" </dev/tty || die "Homebrew wasn't installed; see https://brew.sh, then run this again"
+		for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$b" ] && cmd="$b install ffmpeg" && break; done
+		[ -n "$cmd" ] || die "Homebrew installed, but brew wasn't found; open a new terminal and run this again"
+		YES_FFMPEG=1
+	fi
 	[ -n "$cmd" ] || die "install FFmpeg (it provides ffprobe), then run this again"
-	if confirm "ffprobe is missing. Install it now with '$cmd'?" y; then
+	if [ "${YES_FFMPEG:-0}" = 1 ] || confirm "ffprobe is missing. Install it now with '$cmd'?" y; then
 		# shellcheck disable=SC2086
 		$cmd </dev/null || die "could not install FFmpeg (run '$cmd' yourself, then run this again)"
 	else
 		die "install FFmpeg (it provides ffprobe), then run this again"
 	fi
 fi
+# Homebrew's folders may not be on this shell's PATH yet (a fresh Homebrew, or a shell that
+# never loaded its setup).
+[ "$os" != Darwin ] || PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 FFPROBE=$(command -v ffprobe)
 say "Found $FFPROBE"
 
@@ -316,7 +341,9 @@ local_path() {
 		mapped=$(docker inspect -f '{{range .Mounts}}{{.Destination}}	{{.Source}}{{println}}{{end}}' "$plex_container" 2>/dev/null |
 			awk -F '	' 'NF == 2 { print length($1) "	" $0 }' | sort -rn |
 			while IFS='	' read -r _ dst src; do
-				case "$1" in "$dst" | "$dst"/*) printf '%s%s' "$src" "${1#"$dst"}"; break ;; esac
+				# "(pattern)": macOS's /bin/sh (bash 3.2) takes a bare "pattern)" inside $(...)
+				# for the end of the substitution and fails to parse this script.
+				case "$1" in ("$dst" | "$dst"/*) printf '%s%s' "$src" "${1#"$dst"}"; break ;; esac
 			done)
 		[ -n "$mapped" ] && { printf '%s' "$mapped"; return 0; }
 	fi
@@ -529,16 +556,63 @@ fi
 
 # ChatGPT (on the web, your phone or any device) needs a public HTTPS address and a sign-in.
 # A free ngrok domain provides the address; Google sign-in limits Arr to the accounts you list.
+# Opens a page in the browser of whoever is at this computer: not over SSH or with --yes,
+# and under sudo as the user who ran it, never as root.
+open_page() {
+	interactive && [ -z "${SSH_CONNECTION:-}" ] || return 0
+	url=$1
+	if [ "$os" = Darwin ]; then
+		if [ "$(id -u)" = 0 ]; then
+			[ -n "${SUDO_USER:-}" ] || return 0
+			set -- sudo -u "$SUDO_USER" open "$url"
+		else
+			set -- open "$url"
+		fi
+	else
+		have xdg-open || return 0
+		if [ "$(id -u)" = 0 ]; then
+			[ -n "${SUDO_USER:-}" ] || return 0
+			# The desktop session the setup page found, if it ran; otherwise find it now. Either
+			# way the browser gets the user's runtime folder and session bus, not just a display.
+			[ -n "${DESKTOP_ENV:-}" ] || desktop_env
+			if [ -z "${DESKTOP_ENV:-}" ]; then
+				[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+				rt="/run/user/$(id -u "$SUDO_USER")"
+				DESKTOP_ENV="XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus${DISPLAY:+ DISPLAY=$DISPLAY}${WAYLAND_DISPLAY:+ WAYLAND_DISPLAY=$WAYLAND_DISPLAY}"
+			fi
+			# shellcheck disable=SC2086 # NAME=value words without spaces
+			set -- sudo -u "$SUDO_USER" env $DESKTOP_ENV xdg-open "$url"
+		else
+			[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+			set -- xdg-open "$url"
+		fi
+	fi
+	say "  (opening $url)"
+	"$@" >/dev/null 2>&1 </dev/null &
+}
+
 remote_setup() {
 	step "Setting up access from ChatGPT on your phone and other devices"
 	if grep -q '^\[mcp\.oauth\]' "$CONFIG"; then
 		say "Your config already has remote access; keeping it."
 		return 0
 	fi
-	say "You need a free ngrok account and a Google OAuth client. The walkthrough:"
+	say "You need a free ngrok account and a Google OAuth client. The full guide:"
 	say "  https://github.com/$REPO/blob/main/docs/REMOTE.md"
-	[ -n "$NGROK_TOKEN" ] || NGROK_TOKEN=$(ask "ngrok authtoken (dashboard.ngrok.com > Your Authtoken)" "")
-	[ -n "$NGROK_DOMAIN" ] || NGROK_DOMAIN=$(ask "ngrok domain (dashboard.ngrok.com > Domains)" "")
+	if [ -z "$NGROK_TOKEN" ] || [ -z "$NGROK_DOMAIN" ]; then
+		say ""
+		say "Step 1 of 2: ngrok gives Arr a public HTTPS address (free, no router changes)."
+		say "  Sign up or log in, then copy \"Your Authtoken\", and on the Domains page copy your free"
+		say "  domain (create one if the list is empty)."
+	fi
+	if [ -z "$NGROK_TOKEN" ]; then
+		open_page https://dashboard.ngrok.com/get-started/your-authtoken
+		NGROK_TOKEN=$(ask_secret "  ngrok authtoken")
+	fi
+	if [ -z "$NGROK_DOMAIN" ]; then
+		open_page https://dashboard.ngrok.com/domains
+		NGROK_DOMAIN=$(ask "  ngrok domain, like quiet-river-1234.ngrok-free.app" "")
+	fi
 	NGROK_DOMAIN=$(printf '%s' "$NGROK_DOMAIN" | sed 's#^https\{0,1\}://##; s#/.*$##' | tr 'A-Z' 'a-z')
 	[ -n "$NGROK_TOKEN" ] && [ -n "$NGROK_DOMAIN" ] ||
 		die "remote access needs --ngrok-token and --ngrok-domain (see docs/REMOTE.md)"
@@ -549,12 +623,19 @@ remote_setup() {
 	*) die "that doesn't look like a domain: $NGROK_DOMAIN" ;;
 	esac
 	if [ -z "$GOOGLE_ID" ] || [ -z "$GOOGLE_SECRET" ]; then
-		say "Create a Google OAuth client (type: Web application) with this authorized redirect URI:"
-		say "  https://$NGROK_DOMAIN/auth/callback"
+		say ""
+		say "Step 2 of 2: Google sign-in decides who may use Arr. In Google Cloud:"
+		say "  - create a project (any name, for example arr);"
+		say "  - Google Auth Platform > Get started: app name Arr, audience External, your email;"
+		say "  - Audience: keep it in Testing and add each Google account that may use Arr as a test user;"
+		say "  - Clients > Create client: type \"Web application\", with this authorized redirect URI:"
+		say "      https://$NGROK_DOMAIN/auth/callback"
+		say "  - copy the client ID and client secret."
+		open_page https://console.cloud.google.com/auth/clients
 	fi
-	[ -n "$GOOGLE_ID" ] || GOOGLE_ID=$(ask "Google OAuth client ID" "")
-	[ -n "$GOOGLE_SECRET" ] || GOOGLE_SECRET=$(ask "Google OAuth client secret" "")
-	[ -n "$ALLOW_EMAILS" ] || ALLOW_EMAILS=$(ask "Google accounts allowed to use Arr (comma-separated)" "")
+	[ -n "$GOOGLE_ID" ] || GOOGLE_ID=$(ask "  Google OAuth client ID" "")
+	[ -n "$GOOGLE_SECRET" ] || GOOGLE_SECRET=$(ask_secret "  Google OAuth client secret")
+	[ -n "$ALLOW_EMAILS" ] || ALLOW_EMAILS=$(ask "  Google accounts allowed to use Arr (comma-separated)" "")
 	[ -n "$GOOGLE_ID" ] && [ -n "$GOOGLE_SECRET" ] && [ -n "$ALLOW_EMAILS" ] ||
 		die "remote access needs --google-client-id, --google-client-secret and --allow-email (see docs/REMOTE.md)"
 	emails=""
@@ -622,10 +703,18 @@ EOF
 	fi
 	say "Remote access configured for https://$NGROK_DOMAIN"
 }
+# Offered once, like on Windows, when nobody asked for it either way.
+if [ "$REMOTE" != 1 ] && ! grep -q '^\[mcp\.oauth\]' "$CONFIG" && interactive; then
+	say ""
+	say "Arr can also work from ChatGPT on your phone and other devices. That needs a free ngrok"
+	say "account and a Google sign-in app; this guide walks you through both (about 15 minutes)."
+	if confirm "Set that up now?" n; then REMOTE=1; fi
+fi
 if [ "$REMOTE" = 1 ]; then remote_setup; fi
 
 # A configured tunnel runs as its own service next to Arr.
 PUBLIC_URL=""
+logs_tunnel="the arr-tunnel service's log"
 NGROK=${NGROK:-}
 if [ -f "$STATE_DIR/ngrok.yml" ] && grep -q '^\[mcp\.oauth\]' "$CONFIG"; then
 	PUBLIC_URL=$(sed -n 's/^public_url = "\(.*\)"$/\1/p' "$CONFIG" | head -n1)
@@ -677,6 +766,7 @@ User=$run_as"
 		systemctl daemon-reload && systemctl enable arr >/dev/null 2>&1 && systemctl restart arr && started=1
 		[ -z "$PUBLIC_URL" ] || { systemctl enable arr-tunnel >/dev/null 2>&1 && systemctl restart arr-tunnel; }
 		logs="journalctl -u arr -f"
+		logs_tunnel="journalctl -u arr-tunnel"
 	else
 		mkdir -p "$HOME/.config/systemd/user"
 		printf '%s\n[Install]\nWantedBy=default.target\n' "$unit" >"$HOME/.config/systemd/user/arr.service"
@@ -685,6 +775,7 @@ User=$run_as"
 			systemctl --user restart arr && started=1
 		[ -z "$PUBLIC_URL" ] || { systemctl --user enable arr-tunnel >/dev/null 2>&1 && systemctl --user restart arr-tunnel; }
 		logs="journalctl --user -u arr -f"
+		logs_tunnel="journalctl --user -u arr-tunnel"
 		# Keeps the user services running after you log out and starts them at boot. Over SSH
 		# this often needs an administrator; say so instead of failing quietly.
 		have loginctl && loginctl --no-ask-password enable-linger "$(id -un)" >/dev/null 2>&1 || true
@@ -713,6 +804,7 @@ EOF
 	launchctl unload "$plist" 2>/dev/null || true
 	launchctl load "$plist" && started=1
 	logs="tail -f \"$STATE_DIR/arr.log\""
+	logs_tunnel="$STATE_DIR/tunnel.log"
 	if [ -n "$PUBLIC_URL" ]; then
 		tplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-tunnel.plist"
 		cat >"$tplist" <<EOF
@@ -940,26 +1032,29 @@ until fetch -o /dev/null "$API/api/v1/health" 2>/dev/null; do
 	sleep 1
 done
 
-step "Learning what you already own from Plex"
-printf 'Authorization: Bearer %s\n' "$(cat "$STATE_DIR/secrets/api_token")" >"$tmp/api.header"
-# Import only the kinds this config has a library for (a movie-only setup has no TV run).
-media=all
-grep -q '^movies = ' "$CONFIG" || media=tv
-grep -q '^tv = ' "$CONFIG" || media=movies
-i=0
-while :; do
-	fetch -X POST -H @"$tmp/api.header" -H "Content-Type: application/json" -d "{\"media\":\"$media\"}" \
-		-o "$tmp/boot.json" "$API/api/v1/setup/plex/bootstrap" || die "Plex import failed; see: $logs"
-	grep -q '"done": *true' "$tmp/boot.json" && break
-	i=$((i + 1))
-	[ $i -lt 500 ] || die "Plex import didn't finish; run this script again to continue it"
-done
-# "done" also covers a library whose import failed: report it instead of claiming success.
-if grep -q '"status": *"failed"' "$tmp/boot.json"; then
-	err=$(sed -n 's/.*"last_error": *"\([^"]*\)".*/\1/p' "$tmp/boot.json" | head -n1)
-	die "the Plex import failed${err:+: $err}; run this script again to retry"
+# A config without Plex has nothing to import.
+if grep -q '^\[plex\]' "$CONFIG"; then
+	step "Learning what you already own from Plex"
+	printf 'Authorization: Bearer %s\n' "$(cat "$STATE_DIR/secrets/api_token")" >"$tmp/api.header"
+	# Import only the kinds this config has a library for (a movie-only setup has no TV run).
+	media=all
+	grep -q '^movies = ' "$CONFIG" || media=tv
+	grep -q '^tv = ' "$CONFIG" || media=movies
+	i=0
+	while :; do
+		fetch -X POST -H @"$tmp/api.header" -H "Content-Type: application/json" -d "{\"media\":\"$media\"}" \
+			-o "$tmp/boot.json" "$API/api/v1/setup/plex/bootstrap" || die "Plex import failed; see: $logs"
+		grep -q '"done": *true' "$tmp/boot.json" && break
+		i=$((i + 1))
+		[ $i -lt 500 ] || die "Plex import didn't finish; run this script again to continue it"
+	done
+	# "done" also covers a library whose import failed: report it instead of claiming success.
+	if grep -q '"status": *"failed"' "$tmp/boot.json"; then
+		err=$(sed -n 's/.*"last_error": *"\([^"]*\)".*/\1/p' "$tmp/boot.json" | head -n1)
+		die "the Plex import failed${err:+: $err}; run this script again to retry"
+	fi
+	say "Done. Titles you already have are marked owned, and nothing was downloaded."
 fi
-say "Done. Titles you already have are marked owned, and nothing was downloaded."
 
 cat <<EOF
 
@@ -993,9 +1088,10 @@ fi
 
 step "Checking $PUBLIC_URL"
 i=0
+tries=$((${ARR_REMOTE_CHECK_SECONDS:-60} / 2)) # the variable is for tests
 until fetch "$PUBLIC_URL/.well-known/oauth-protected-resource/mcp" 2>/dev/null | grep -q "\"$PUBLIC_URL/mcp\""; do
 	i=$((i + 1))
-	[ $i -lt 30 ] || die "$PUBLIC_URL doesn't reach Arr yet; check the tunnel's log (journalctl -u arr-tunnel, or $STATE_DIR/tunnel.log on macOS)"
+	[ $i -lt "$tries" ] || die "$PUBLIC_URL doesn't reach Arr yet; the tunnel's log says why (an ERR_NGROK_... code names the problem, often a wrong authtoken or a domain from another account): $logs_tunnel"
 	sleep 2
 done
 cat <<EOF

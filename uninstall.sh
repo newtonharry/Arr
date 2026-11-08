@@ -236,7 +236,7 @@ elif [ -n "$ARR_CONFIG" ] && [ -r "$ARR_CONFIG" ]; then
 fi
 
 # Plex: a system package, a snap, Docker containers, or the macOS app.
-PLEX_KIND="" PLEX_DATA="" PLEX_CONTAINERS=""
+PLEX_KIND="" PLEX_DATA="" PLEX_CONTAINERS="" PLEX_APP=""
 if have dpkg-query && dpkg-query -W -f='${Status}' plexmediaserver 2>/dev/null | grep -q 'ok installed'; then
 	PLEX_KIND=deb PLEX_DATA=/var/lib/plexmediaserver
 elif have rpm && rpm -q plexmediaserver >/dev/null 2>&1; then
@@ -245,6 +245,11 @@ elif have snap && snap list plexmediaserver >/dev/null 2>&1; then
 	PLEX_KIND=snap
 elif [ "$os" = Darwin ] && [ -d "/Applications/Plex Media Server.app" ]; then
 	PLEX_KIND=mac PLEX_DATA="$U_HOME/Library/Application Support/Plex Media Server"
+	PLEX_APP="/Applications/Plex Media Server.app"
+elif [ "$os" = Darwin ] && [ -d "$U_HOME/Applications/Plex Media Server.app" ]; then
+	# Where Arr's "Install Plex for me" puts it when /Applications isn't yours to write.
+	PLEX_KIND=mac PLEX_DATA="$U_HOME/Library/Application Support/Plex Media Server"
+	PLEX_APP="$U_HOME/Applications/Plex Media Server.app"
 fi
 if have docker; then
 	PLEX_CONTAINERS=$(docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null |
@@ -260,7 +265,7 @@ fi
 case "$PLEX_KIND" in
 deb | rpm) say "  Plex Media Server: system package, data in $PLEX_DATA" ;;
 snap) say "  Plex Media Server: snap package" ;;
-mac) say "  Plex Media Server: /Applications/Plex Media Server.app, data in $PLEX_DATA" ;;
+mac) say "  Plex Media Server: $PLEX_APP, data in $PLEX_DATA" ;;
 esac
 for c in $PLEX_CONTAINERS; do say "  Plex Media Server: Docker container \"$c\""; done
 [ -n "$PLEX_KIND$PLEX_CONTAINERS" ] || say "  Plex Media Server: not installed"
@@ -375,8 +380,23 @@ if [ "$DO_PLEX" = 1 ]; then
 		else run $SUDO snap remove plexmediaserver; fi
 		;;
 	mac)
-		run osascript -e 'quit app "Plex Media Server"' 2>/dev/null || true
-		remove_dir "/Applications/Plex Media Server.app" "the Plex app"
+		# A plain stop: telling the app to quit would make macOS ask for permission first.
+		run pkill -x "Plex Media Server" 2>/dev/null || true
+		# The login agent Arr's "Install Plex for me" adds to start Plex at log-in.
+		agent="$U_HOME/Library/LaunchAgents/io.github.newtonharry.plex.plist"
+		if [ -f "$agent" ]; then
+			if [ -n "$AS_USER" ]; then run launchctl bootout "gui/$U_UID" "$agent" 2>/dev/null || true
+			else run launchctl unload "$agent" 2>/dev/null || true; fi
+			remove_file "$agent"
+		fi
+		# The app bundle ships small sample videos of its own, so the media guard for data
+		# folders doesn't apply; it's removed only when it really is Plex's app.
+		if grep -q 'com.plexapp.plexmediaserver' "$PLEX_APP/Contents/Info.plist" 2>/dev/null; then
+			if [ -w "$(dirname "$PLEX_APP")" ]; then run rm -rf -- "$PLEX_APP"; else run $SUDO rm -rf -- "$PLEX_APP"; fi
+			[ "$DRY_RUN" = 1 ] || say "  deleted $PLEX_APP (the Plex app)"
+		else
+			say "  not deleting $PLEX_APP: it doesn't look like Plex's app"
+		fi
 		;;
 	esac
 	if [ "$PLEX_WIPE" = 1 ] && [ -n "$PLEX_DATA" ]; then

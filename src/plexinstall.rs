@@ -1,7 +1,8 @@
 //! `arr plex-install`: installs Plex Media Server from Plex's official package source and
 //! makes a media folder that Plex and you can both use. On Linux the setup page runs it as
 //! administrator through the system's password dialog (`pkexec`); on Windows it runs as you
-//! and Plex's own installer asks Windows for permission. It does only this, and prints
+//! and Plex's own installer asks Windows for permission; on macOS it runs as you and puts
+//! the Plex app in Applications. It does only this, and prints
 //! `step: ...` lines for the page to show.
 
 use anyhow::{Context, Result, bail};
@@ -14,7 +15,7 @@ const APT_KEY: &str = "/usr/share/keyrings/plexmediaserver.v2.asc";
 const APT_LIST: &str = "/etc/apt/sources.list.d/plex.list";
 const DNF_REPO: &str = "/etc/yum.repos.d/plex.repo";
 /// Plex's machine-readable list of public builds (URL and SHA-1 per platform).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const DOWNLOADS_JSON: &str = "https://plex.tv/api/downloads/5.json";
 
 pub struct Options {
@@ -29,11 +30,14 @@ fn step(s: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// The package manager this installer knows how to use here, if any ("windows": Plex's
-/// own installer).
+/// The package manager this installer knows how to use here, if any ("windows" and
+/// "macos": Plex's own download).
 pub fn package_manager() -> Option<&'static str> {
     if cfg!(windows) {
         return Some("windows");
+    }
+    if cfg!(target_os = "macos") {
+        return Some("macos");
     }
     if !cfg!(target_os = "linux") {
         return None;
@@ -46,17 +50,23 @@ pub fn package_manager() -> Option<&'static str> {
 }
 
 /// Where a Plex installed by Arr keeps movies and shows: /srv/media on Linux (Plex runs as
-/// its own user there), your own Media folder on Windows (Plex runs as you).
+/// its own user there), your own Media folder on Windows and macOS (Plex runs as you).
 pub fn default_media() -> PathBuf {
     if cfg!(windows) {
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
         return home.unwrap_or_else(|| PathBuf::from("C:\\")).join("Media");
     }
+    if cfg!(target_os = "macos")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join("Media");
+    }
     PathBuf::from("/srv/media")
 }
 
 pub async fn run(opts: Options) -> Result<()> {
-    #[cfg(unix)]
+    // Only Linux installs system packages; Windows and macOS install Plex as you.
+    #[cfg(target_os = "linux")]
     if unsafe { libc::geteuid() } != 0 {
         bail!("arr plex-install installs system software: run it as administrator (sudo)");
     }
@@ -72,9 +82,12 @@ pub async fn run(opts: Options) -> Result<()> {
             "this computer has neither apt nor dnf; install Plex from https://www.plex.tv/media-server-downloads/"
         );
     };
-    #[cfg(windows)]
-    if pm == "windows" {
+    #[cfg(any(windows, target_os = "macos"))]
+    if pm == "windows" || pm == "macos" {
+        #[cfg(windows)]
         install_windows().await?;
+        #[cfg(target_os = "macos")]
+        install_macos().await?;
         step("Making your media folder");
         for d in [
             opts.media.clone(),
@@ -255,6 +268,131 @@ async fn install_windows() -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+/// Downloads Plex's Mac app from Plex's list, checks it, puts it in Applications (or your
+/// own Applications folder when that one isn't yours to write), starts it, and starts it
+/// again whenever you log in.
+#[cfg(target_os = "macos")]
+async fn install_macos() -> Result<()> {
+    use sha1::{Digest, Sha1};
+    use std::process::{Command, Stdio};
+    step("Downloading Plex Media Server");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()?;
+    let list: serde_json::Value = http
+        .get(DOWNLOADS_JSON)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .context("couldn't reach plex.tv for Plex")?
+        .json()
+        .await
+        .context("plex.tv's download list didn't read correctly")?;
+    let releases = list["computer"]["MacOS"]["releases"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let native = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let zips: Vec<&serde_json::Value> = releases
+        .iter()
+        .filter(|r| r["url"].as_str().is_some_and(|u| u.ends_with(".zip")))
+        .collect();
+    let release = zips
+        .iter()
+        .find(|r| r["build"].as_str().is_some_and(|b| b.contains(native)))
+        .or_else(|| zips.first())
+        .context("plex.tv's download list has no Mac build")?;
+    let (Some(url), Some(sum)) = (release["url"].as_str(), release["checksum"].as_str()) else {
+        bail!("plex.tv's download list has no Mac download address");
+    };
+    if !url.starts_with("https://downloads.plex.tv/") {
+        bail!("plex.tv pointed somewhere unexpected for Plex: {url}");
+    }
+    let bytes = http
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .context("couldn't download Plex")?
+        .bytes()
+        .await
+        .context("couldn't download Plex")?;
+    if hex::encode(Sha1::digest(&bytes)) != sum.to_ascii_lowercase() {
+        bail!("Plex didn't download correctly (its checksum doesn't match); try again");
+    }
+    let zip = std::env::temp_dir().join(format!(
+        "PlexMediaServer-{}.zip",
+        crate::fsutil::random_hex(4)?
+    ));
+    std::fs::write(&zip, &bytes).with_context(|| format!("cannot write {}", zip.display()))?;
+    step("Installing Plex Media Server");
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME isn't set")?);
+    let mut apps = PathBuf::from("/Applications");
+    let probe = apps.join(format!(".arr-{}", crate::fsutil::random_hex(4)?));
+    if std::fs::create_dir(&probe).is_ok() {
+        let _ = std::fs::remove_dir(&probe);
+    } else {
+        apps = home.join("Applications");
+        std::fs::create_dir_all(&apps)?;
+    }
+    // ditto keeps the app's signature and attributes intact.
+    let status = Command::new("/usr/bin/ditto")
+        .arg("-x")
+        .arg("-k")
+        .arg(&zip)
+        .arg(&apps)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status();
+    let _ = std::fs::remove_file(&zip);
+    if !status.context("couldn't unpack Plex")?.success() {
+        bail!("couldn't unpack Plex into {}", apps.display());
+    }
+    let app = apps.join("Plex Media Server.app");
+    if !app.is_dir() {
+        bail!("Plex unpacked, but {} isn't there", app.display());
+    }
+    step("Starting Plex");
+    // Started now, and again at every log-in by a login agent of its own.
+    let agent = home.join("Library/LaunchAgents/io.github.newtonharry.plex.plist");
+    std::fs::create_dir_all(agent.parent().expect("has a parent"))?;
+    let xml = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    std::fs::write(
+        &agent,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>io.github.newtonharry.plex</string>\n  <key>ProgramArguments</key><array><string>/usr/bin/open</string><string>-a</string><string>{}</string></array>\n  <key>RunAtLoad</key><true/>\n</dict></plist>\n",
+            xml(&app.to_string_lossy())
+        ),
+    )
+    .with_context(|| format!("cannot write {}", agent.display()))?;
+    let _ = Command::new("/usr/bin/open")
+        .arg("-a")
+        .arg(&app)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    for _ in 0..60 {
+        let up = http.get("http://127.0.0.1:32400/identity").send().await;
+        if up.is_ok_and(|r| r.status().is_success()) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    bail!(
+        "Plex is installed but didn't start; open Plex Media Server from Applications, then click Look again"
+    )
 }
 
 fn write_public(path: &Path, bytes: &[u8]) -> Result<()> {
