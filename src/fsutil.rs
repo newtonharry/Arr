@@ -171,11 +171,33 @@ pub fn atomic_replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .to_string_lossy();
     let tmp: PathBuf = dir.join(format!(".{name}.tmp-{}", random_hex(6)?));
     write_new_private_file(&tmp, bytes)?;
+    // Run as root (`sudo arr set`, an installer), keep the file its owner's, so the service
+    // can still read it.
+    #[cfg(unix)]
+    // SAFETY: geteuid has no preconditions and can't fail.
+    if unsafe { libc::geteuid() } == 0
+        && let Err(e) =
+            owner(path, dir).and_then(|(u, g)| std::os::unix::fs::chown(&tmp, Some(u), Some(g)))
+    {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("cannot set the owner of {}", path.display()));
+    }
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("cannot replace {}", path.display()));
     }
     fsync_dir(dir)
+}
+
+/// Who owns `path` (uid, gid), or the folder `dir` it will go in when it's new.
+#[cfg(unix)]
+fn owner(path: &Path, dir: &Path) -> std::io::Result<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = match fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::metadata(dir)?,
+        m => m?,
+    };
+    Ok((m.uid(), m.gid()))
 }
 
 /// Reads a whole file, refusing anything larger than `max` bytes.
@@ -271,6 +293,25 @@ mod tests {
         assert_eq!(file_id(&c).unwrap(), id);
         assert!(file_id(&a).is_err());
         assert!(file_id(tmp.path()).is_ok(), "folders have ids too");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_keeps_its_owner_and_a_new_one_gets_the_folders() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let ids = |p: &Path| {
+            let m = fs::metadata(p).unwrap();
+            (m.uid(), m.gid())
+        };
+        let new = tmp.path().join("new");
+        assert_eq!(owner(&new, tmp.path()).unwrap(), ids(tmp.path()));
+        // A file the folder's owner didn't make: root's /etc/hostname stands in.
+        let theirs = Path::new("/etc/hostname");
+        if theirs.exists() {
+            assert_eq!(owner(theirs, tmp.path()).unwrap(), ids(theirs));
+        }
+        assert!(owner(&tmp.path().join("no/such"), &tmp.path().join("no")).is_err());
     }
 
     #[test]

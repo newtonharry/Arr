@@ -9,7 +9,7 @@ use time::format_description::well_known::Rfc3339;
 #[command(
     name = "arr",
     version,
-    about = "Unified movie/TV API server (shadow by default; execution when enabled)"
+    about = "Finds, downloads and imports movies and TV for Plex."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -26,20 +26,22 @@ enum Command {
         #[arg(long)]
         state_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8787")]
-        listen: String,
+        listen: std::net::SocketAddr,
         #[arg(long)]
         prowlarr_url: Option<String>,
     },
     /// Create (or replace) managed settings for a standalone deployment, with an empty
-    /// catalog, from an optional setup document (TOML; defaults otherwise). Validates the
-    /// config without needing its secret files yet. Never enables execution.
+    /// catalog, from an optional setup document (TOML; otherwise the current setup's, or
+    /// defaults). Validates the config without needing its secret files yet. Never enables
+    /// execution.
     Setup {
         #[arg(long)]
         config: PathBuf,
-        /// Setup document (see config/setup.example.toml). Default: built-in defaults.
+        /// Setup document (see config/setup.example.toml). Default: the one the current
+        /// setup used, or built-in defaults.
         #[arg(long)]
         settings: Option<PathBuf>,
-        /// Validate and summarise without writing anything.
+        /// Validate and summarise without changing the settings.
         #[arg(long)]
         dry_run: bool,
     },
@@ -74,7 +76,8 @@ enum Command {
         #[arg(long)]
         batch: Option<u32>,
     },
-    /// Validate config, secret file modes, state DB and the active import (no network).
+    /// Check the config, secret file modes, state database and active import (no network;
+    /// creates or updates the state database).
     Check {
         #[arg(long)]
         config: PathBuf,
@@ -125,6 +128,7 @@ enum Command {
     /// Install Plex Media Server from Plex's package source, and make a media folder Plex and
     /// you can both use (Movies, TV Shows). Needs administrator rights; the setup page runs it
     /// through the system's password dialog.
+    #[command(hide = true)]
     PlexInstall {
         /// Owner of the folders it creates, as UID:GID.
         #[arg(long)]
@@ -140,6 +144,7 @@ enum Command {
     },
     /// Send one error report, if this install's config allows it ([reporting] enabled; see
     /// docs/PRIVACY.md). The installers and updaters use it; it never fails.
+    #[command(hide = true)]
     Report {
         #[arg(long)]
         config: PathBuf,
@@ -149,9 +154,31 @@ enum Command {
         #[arg(long)]
         message: String,
     },
-    /// Add or replace the TMDB key (read from stdin) of an existing install, so Arr can find
-    /// movies you don't own yet. Checks it with TMDB first; restart Arr afterwards. With
-    /// --check instead of --config, only checks it. Getting a key: docs/TMDB.md.
+    /// Change one setting of an existing install; restart Arr afterwards.
+    ///
+    /// Arr checks the change first (keys and Plex's address are tried for real) and
+    /// changes nothing if it doesn't work.
+    ///
+    /// Settings:
+    ///   tmdb-key, plex-token      a key or token, read from stdin
+    ///   plex-url URL              Plex's address, like http://127.0.0.1:32400
+    ///   downloading on|off
+    ///   upload-limit-kib N        KiB/s for all torrents; 0 for no limit
+    ///   torrent-port N            1 to 65535
+    ///   error-reports on|off
+    ///   api-token, mcp-token      make a new random token
+    #[command(verbatim_doc_comment)]
+    Set {
+        /// The install's config.toml.
+        #[arg(long)]
+        config: PathBuf,
+        /// The setting to change.
+        name: String,
+        /// Its new value.
+        value: Option<String>,
+    },
+    /// The TMDB key (read from stdin): `arr set tmdb-key`, or with --check, only checks it.
+    #[command(hide = true)]
     TmdbKey {
         #[arg(long, required_unless_present = "check", conflicts_with = "check")]
         config: Option<PathBuf>,
@@ -159,7 +186,7 @@ enum Command {
         #[arg(long)]
         check: bool,
         /// Tests: where TMDB's API is (with --check).
-        #[arg(long, hide = true, default_value = arr::tmdbkey::API_URL)]
+        #[arg(long, hide = true, requires = "check", default_value = arr::tmdbkey::API_URL)]
         tmdb_url: reqwest::Url,
     },
     /// Serve MCP tools on stdin/stdout as a client of a running API (stdout carries only MCP).
@@ -176,6 +203,7 @@ enum Command {
     },
     /// Generate an authored test release: real playable video files (ffmpeg testsrc) under
     /// OUT/<name>/ plus OUT/<name>.torrent with correct piece hashes. Never fetches anything.
+    #[command(hide = true)]
     Fixture {
         #[arg(long)]
         out: PathBuf,
@@ -240,9 +268,19 @@ fn fixture(
     Ok(())
 }
 
-fn init(state_dir: PathBuf, listen: String, prowlarr_url: Option<String>) -> Result<()> {
+fn init(
+    state_dir: PathBuf,
+    listen: std::net::SocketAddr,
+    prowlarr_url: Option<String>,
+) -> Result<()> {
     if let Some(u) = &prowlarr_url {
         config::parse_base_url(u, "--prowlarr-url")?;
+    }
+    // The template keeps server.allow_non_loopback off.
+    if !listen.ip().is_loopback() {
+        anyhow::bail!(
+            "--listen must be a loopback address like 127.0.0.1:8787 (set server.allow_non_loopback in the config to expose the API)"
+        );
     }
     fsutil::ensure_private_dir(&state_dir)?;
     let secrets = state_dir.join("secrets");
@@ -257,7 +295,7 @@ fn init(state_dir: PathBuf, listen: String, prowlarr_url: Option<String>) -> Res
     if !cfg.exists() {
         fsutil::write_new_private_file(
             &cfg,
-            config::template(&listen, prowlarr_url.as_deref()).as_bytes(),
+            config::template(&listen.to_string(), prowlarr_url.as_deref()).as_bytes(),
         )?;
         created.push(cfg.display().to_string());
     }
@@ -302,23 +340,28 @@ async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: boo
         &config_path.display().to_string(),
         config::Secrets::Defer,
     )?;
-    let doc = match &settings {
-        Some(p) => setup::read_doc(p)?,
-        None => setup::SetupDoc::default(),
-    };
-    let now = time::OffsetDateTime::now_utc();
-    let prepared = setup::prepare(&doc, &cfg, now).map_err(|errs| {
-        anyhow::anyhow!("the setup document is invalid:\n- {}", errs.join("\n- "))
-    })?;
     let state_dir = cfg.state_dir.clone();
     let active = import::load_active(&state_dir)?;
-    let origin = active.as_ref().map(|l| {
-        if l.manifest.files.contains_key(setup::SOURCE_FILE) {
+    let managed = active
+        .as_ref()
+        .filter(|l| l.manifest.files.contains_key(setup::SOURCE_FILE));
+    let origin = active.as_ref().map(|_| {
+        if managed.is_some() {
             "managed_setup"
         } else {
             "native_snapshot"
         }
     });
+    let doc = match (&settings, managed) {
+        (Some(p), _) => setup::read_doc(p)?,
+        // Running setup again (say, after adding an indexer) keeps custom profiles and goals.
+        (None, Some(l)) => setup::stored_doc(&state_dir, &l.manifest.import_id)?,
+        (None, None) => setup::SetupDoc::default(),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let prepared = setup::prepare(&doc, &cfg, now).map_err(|errs| {
+        anyhow::anyhow!("the setup document is invalid:\n- {}", errs.join("\n- "))
+    })?;
     let (index, grabs) = {
         let db = state_dir.join("state.sqlite");
         if db.exists() {
@@ -379,14 +422,38 @@ async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: boo
     Ok(())
 }
 
+/// Reads a secret from stdin, so it stays out of the process list. At a terminal, asks for it.
+fn read_secret(what: &str) -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Read};
+    let stdin = std::io::stdin();
+    let mut s = String::new();
+    if stdin.is_terminal() {
+        eprintln!("Paste the {what}, then press Enter");
+        stdin.lock().take(4096).read_line(&mut s)
+    } else {
+        stdin.lock().take(4096).read_to_string(&mut s)
+    }
+    .with_context(|| format!("couldn't read the {what}"))?;
+    Ok(s.trim().to_string())
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    // One line, so installers can show it as it is.
+    if let Err(e) = run().await {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     // Logs go to stderr; the MCP adapter stays quiet unless asked.
     let default_filter = match cli.command {
         Command::Mcp { .. }
         | Command::Wizard { .. }
         | Command::Report { .. }
+        | Command::Set { .. }
         | Command::TmdbKey { .. } => "warn",
         _ => "info,arr=info",
     };
@@ -482,6 +549,21 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({ "runs": out }))?
             );
+            let failed: Vec<String> = out
+                .iter()
+                .filter(|r| r.status != "done")
+                .map(|r| {
+                    let what = match r.media {
+                        arr::settings::MediaKind::Movie => "movies",
+                        arr::settings::MediaKind::Series => "TV",
+                    };
+                    let why = r.last_error.as_deref().unwrap_or("it didn't finish");
+                    format!("{what}: {why}")
+                })
+                .collect();
+            if !failed.is_empty() {
+                anyhow::bail!("reading Plex's library failed ({})", failed.join("; "));
+            }
             Ok(())
         }
         Command::Check { config } => {
@@ -552,22 +634,37 @@ async fn main() -> Result<()> {
             arr::report::error(&component, &message);
             Ok(())
         }
+        Command::Set {
+            config,
+            name,
+            value,
+        } => {
+            let value = match arr::set::secret(&name)? {
+                Some(what) if value.is_some() => {
+                    anyhow::bail!("give the {what} on stdin, not on the command line")
+                }
+                Some(what) => Some(read_secret(what)?),
+                None => value,
+            };
+            println!("{}", arr::set::run(&config, &name, value.as_deref()).await?);
+            Ok(())
+        }
         Command::TmdbKey {
             config,
             check: _,
             tmdb_url,
         } => {
-            // From stdin, so the key stays out of the process list.
-            let mut key = String::new();
-            std::io::Read::read_to_string(
-                &mut std::io::Read::take(std::io::stdin(), 4096),
-                &mut key,
-            )
-            .context("couldn't read the key")?;
+            let key = read_secret("TMDB key")?;
             match config {
-                Some(config) => arr::tmdbkey::set(&config, &key).await,
-                None => arr::tmdbkey::verify(&tmdb_url, &key).await,
+                Some(config) => {
+                    println!("{}", arr::set::run(&config, "tmdb-key", Some(&key)).await?)
+                }
+                None => {
+                    arr::tmdbkey::verify(&tmdb_url, &key).await?;
+                    println!("TMDB accepted that key.");
+                }
             }
+            Ok(())
         }
         Command::Wizard {
             state_dir,

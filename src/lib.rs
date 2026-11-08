@@ -39,6 +39,7 @@ pub mod report;
 pub mod rss;
 pub mod scan;
 pub mod search;
+pub mod set;
 pub mod settings;
 pub mod setup;
 pub mod store;

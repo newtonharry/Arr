@@ -344,11 +344,9 @@ fn d_tmdb_url() -> String {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionSection {
-    #[serde(default)]
+    /// `download_submission` is its earlier name.
+    #[serde(default, alias = "download_submission")]
     enabled: bool,
-    /// Earlier name of `enabled`; still accepted.
-    #[serde(default)]
-    download_submission: bool,
     /// Follow the imported `removeCompletedDownloads`/`removeFailedDownloads` policy (true) or
     /// always keep downloads in the client (false).
     #[serde(default = "d_true")]
@@ -359,7 +357,6 @@ impl Default for ExecutionSection {
     fn default() -> Self {
         ExecutionSection {
             enabled: false,
-            download_submission: false,
             download_cleanup: true,
         }
     }
@@ -974,6 +971,11 @@ impl RuntimeConfig {
     }
 }
 
+/// `s` as a TOML string, quoted and escaped.
+pub fn quote(s: &str) -> String {
+    toml::Value::String(s.into()).to_string()
+}
+
 /// Validates an operator-supplied upstream base URL: http(s), host, no credentials,
 /// no query/fragment. Returned with a trailing slash so `join` keeps any path prefix.
 pub fn parse_base_url(raw: &str, what: &str) -> Result<Url> {
@@ -1533,7 +1535,7 @@ pub fn parse_config(
         }
         _ => None,
     };
-    let execution_enabled = fc.execution.enabled || fc.execution.download_submission;
+    let execution_enabled = fc.execution.enabled;
     if execution_enabled {
         if qbittorrent.is_none() && embedded.is_none() {
             bail!(
@@ -1873,13 +1875,14 @@ fn indexer_config(
 /// The standalone template: native indexers and the embedded engine first, everything that
 /// writes off by default, credentials only as files.
 pub fn standalone_template(listen: &str) -> String {
+    let listen = quote(listen);
     format!(
         r#"# arr runtime configuration: standalone (native indexers, embedded downloader).
 # Relative paths resolve against this file's directory. Credentials live only in files under
 # secrets/ (chmod 600); never inline. Policy (profiles, seed goals, cleanup) is created with
 # `arr setup` (or POST /api/v1/setup). See docs/STANDALONE.md.
 [server]
-listen = "{listen}"
+listen = {listen}
 allow_non_loopback = false
 api_token_file = "secrets/api_token"
 max_body_bytes = 65536
@@ -1965,19 +1968,18 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
 /// it is the standalone layout (native indexers, embedded engine); with one, the legacy
 /// Prowlarr-backed layout.
 pub fn template(listen: &str, prowlarr_url: Option<&str>) -> String {
-    if prowlarr_url.is_none() {
+    let Some(url) = prowlarr_url else {
         return standalone_template(listen);
-    }
-    let prowlarr = match prowlarr_url {
-        Some(url) => format!(
-            "[prowlarr]\nbase_url = \"{url}\"\n# Owner-only file containing the Prowlarr API key (chmod 600).\napi_key_file = \"secrets/prowlarr_api_key\"\n"
-        ),
-        None => "# [prowlarr]\n# base_url = \"http://127.0.0.1:9696\"\n# api_key_file = \"secrets/prowlarr_api_key\"\n".to_string(),
     };
+    let listen = quote(listen);
+    let prowlarr = format!(
+        "[prowlarr]\nbase_url = {}\n# Owner-only file containing the Prowlarr API key (chmod 600).\napi_key_file = \"secrets/prowlarr_api_key\"\n",
+        quote(url)
+    );
     format!(
         r#"# arr runtime configuration. Relative paths resolve against this file's directory.
 [server]
-listen = "{listen}"
+listen = {listen}
 allow_non_loopback = false
 api_token_file = "secrets/api_token"
 max_body_bytes = 65536
@@ -2093,6 +2095,30 @@ mod tests {
         let cfg = dir.join("config.toml");
         fsutil::write_new_private_file(&cfg, config.as_bytes()).unwrap();
         (tmp, cfg)
+    }
+
+    #[cfg(unix)] // fixtures use Unix absolute paths
+    #[test]
+    fn download_submission_is_the_old_name_of_enabled() {
+        let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n[embedded]\ndownload_dir = \"/srv/um-dl\"\nlisten = \"127.0.0.1:0\"\n[library]\nmovies = \"/srv/movies\"\n[migration]\nmode = \"coexistence\"\n";
+        let (_t, cfg) = setup(&format!("{base}[execution]\ndownload_submission = true\n"));
+        assert!(load(&cfg).unwrap().execution_enabled);
+        let (_t, cfg) = setup(&format!(
+            "{base}[execution]\nenabled = false\ndownload_submission = true\n"
+        ));
+        let err = format!("{:#}", load(&cfg).unwrap_err());
+        assert!(err.contains("duplicate field"), "{err}");
+    }
+
+    #[test]
+    fn templates_quote_what_they_are_given() {
+        let t = template("127.0.0.1:8787", Some("http://x/\"\nevil = \"1"));
+        let parsed: toml::Table = toml::from_str(&t).unwrap();
+        assert_eq!(
+            parsed["prowlarr"]["base_url"].as_str(),
+            Some("http://x/\"\nevil = \"1")
+        );
+        assert!(standalone_template("127.0.0.1:8787").contains("listen = \"127.0.0.1:8787\""));
     }
 
     #[cfg(unix)] // fixtures use Unix absolute paths
