@@ -269,8 +269,8 @@ undo_bin() {
 		s=$SNAP; SNAP=""; failed=0
 		# Settings first, so the Arr restarted below reads them as they were.
 		if [ -d "$s/secrets" ]; then
-			rm -rf "$STATE_DIR/secrets.undo"
-			cp -Rp "$s/secrets" "$STATE_DIR/secrets.undo" && rm -rf "$STATE_DIR/secrets" &&
+			rm -rf "$STATE_DIR/secrets.undo" &&
+				cp -Rp "$s/secrets" "$STATE_DIR/secrets.undo" && rm -rf "$STATE_DIR/secrets" &&
 				mv "$STATE_DIR/secrets.undo" "$STATE_DIR/secrets" || failed=1
 		fi
 		cp -p "$s/config.toml" "$CONFIG" || failed=1
@@ -519,7 +519,7 @@ tmp=$(mktemp -d)
 # Arr answers, UNDO_BIN and SNAP are cleared and this only removes the temp folder; the
 # script's exit status stays its own. A folder holding settings that couldn't be put back
 # stays. dash skips EXIT on a signal, so Ctrl-C or a dropped SSH session exits through it.
-trap 'rc=$?; set +e; undo_bin; [ -n "$KEEP" ] || rm -rf "$tmp"; exit "$rc"' EXIT
+trap 'rc=$?; trap "" INT TERM HUP; set +e; undo_bin; [ -n "$KEEP" ] || rm -rf "$tmp"; exit "$rc"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP

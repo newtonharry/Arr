@@ -894,6 +894,8 @@ try {
 
 try {
 	Install-Arr
+	# Install-Arr returning at all (ARR_NO_SETUP included) means this run finished well.
+	$script:Healthy = $true
 } catch {
 	$failure = $_
 	Write-Host "error: $($failure.Exception.Message)" -ForegroundColor Red
