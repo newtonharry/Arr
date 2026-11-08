@@ -70,18 +70,28 @@ const MISSING = {
     "Open Plex", `http://${location.hostname}:32400/web`,
     " on this computer and sign in with the same account, then look again.",
   ],
+  unreadable: [
+    "Arr found Plex on this computer but couldn't read its libraries. If Plex is still starting, wait a minute, then look again.",
+    "", "", "",
+  ],
 };
 
 function renderServer(s) {
   $("connected").hidden = !s.plex;
   if (s.plex) $("connected").textContent = `Found ${s.plex.name} on this computer.`;
-  const why = !s.plex && s.signed_in && MISSING[s.missing];
-  $("missing").hidden = !why;
-  if (!why) return;
-  const [before, label, href, after] = why;
-  const a = document.createElement("a");
-  a.href = href; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = label;
-  $("missing-text").replaceChildren(before, a, after);
+  // Signed in but not connected: always offer to look again, even when the last look
+  // failed before it could say why (plex.tv unreachable, say).
+  $("missing").hidden = !s.signed_in || !!s.plex;
+  if (s.plex || !s.signed_in) return;
+  const [before, label, href, after] = MISSING[s.missing] ||
+    ["Arr couldn't check your Plex account just now. Check this computer's internet connection, then look again.", "", "", ""];
+  const parts = [before];
+  if (label) {
+    const a = document.createElement("a");
+    a.href = href; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = label;
+    parts.push(a, after);
+  }
+  $("missing-text").replaceChildren(...parts);
 }
 
 function fillLibraries(plex) {

@@ -93,6 +93,8 @@ enum Missing {
     NotInstalled,
     /// Plex answers, but it isn't one of the signed-in account's servers.
     NotLinked,
+    /// It's the account's server, but its libraries couldn't be read (still starting?).
+    Unreadable,
 }
 
 /// A Plex server the signed-in account owns.
@@ -581,6 +583,7 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
     ports.sort_unstable();
     ports.dedup();
     let mut answered = false;
+    let mut unreadable = false;
     for port in ports {
         let Ok(base) = Url::parse(&format!("http://127.0.0.1:{port}/")) else {
             continue;
@@ -603,6 +606,7 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
             continue;
         };
         let Ok(sections) = sections(base.clone(), server.token.clone()).await else {
+            unreadable = true;
             continue;
         };
         let mounts = if wiz.opts.docker {
@@ -619,7 +623,9 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
         });
         return Ok(());
     }
-    Err(if answered {
+    Err(if unreadable {
+        Missing::Unreadable
+    } else if answered {
         Missing::NotLinked
     } else {
         Missing::NotInstalled
