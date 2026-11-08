@@ -33,6 +33,10 @@ struct World {
     /// A new Plex isn't linked to any account (and plex.tv doesn't list it).
     unclaimed: bool,
     claims: u32,
+    /// A movie library added in Plex after the page connected.
+    added_library: Option<String>,
+    /// Plex fails to list a library's items, so the import fails.
+    import_fails: bool,
     /// Libraries added through the API: (type, location, language).
     created: Vec<(String, String, String)>,
     /// The token each request carried, by path.
@@ -190,6 +194,10 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
                         json!({ "key": "3", "title": "Music", "type": "artist", "Location": [{ "path": "/music" }] }),
                     ]
                 };
+                let mut dirs = dirs;
+                if let Some(path) = &w.added_library {
+                    dirs.push(json!({ "key": "4", "title": "Films", "type": "movie", "Location": [{ "path": path }] }));
+                }
                 axum::Json(json!({ "MediaContainer": { "Directory": dirs } })).into_response()
             })
             .post(|State(m): State<Mock>, h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
@@ -212,6 +220,9 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
         .route(
             "/library/sections/{id}/all",
             get(|State(m): State<Mock>, h: HeaderMap| async move {
+                if m.lock().unwrap().import_fails {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 record(&m, "all", &h);
                 if h.get("x-plex-token").and_then(|v| v.to_str().ok()) != Some(SERVER_TOKEN) {
                     return StatusCode::UNAUTHORIZED.into_response();
@@ -459,7 +470,6 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
             "tv": { "id": "2:0", "folder": tv },
             "downloads": downloads,
             "tmdb": "",
-            "downloading": false,
             "auto_update": true,
             "reporting": true,
         })
@@ -489,18 +499,48 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     let (_, v) = page.get("/api/state").await;
     assert_eq!(v["phase"]["state"], "editing", "{v}");
 
+    let finished = || async {
+        let mut last = Value::Null;
+        for _ in 0..120 {
+            let (_, v) = page.get("/api/state").await;
+            last = v["phase"].clone();
+            if last["state"] != "working" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        last
+    };
+
+    // Finish clicked in two tabs at once: only one starts setup. Here the import fails, so
+    // no config.toml appears (the installers would take it as set up).
+    world.lock().unwrap().import_fails = true;
+    let (a, b) = tokio::join!(
+        page.post("/api/apply", choices("1:0")),
+        page.post("/api/apply", choices("1:0"))
+    );
+    let mut codes = [a.0, b.0];
+    codes.sort();
+    assert_eq!(codes, [StatusCode::OK, StatusCode::CONFLICT], "{a:?} {b:?}");
+    let last = finished().await;
+    assert_eq!(last["state"], "failed", "{last}");
+    assert!(
+        last["message"]
+            .as_str()
+            .unwrap()
+            .contains("the Plex import failed"),
+        "{last}"
+    );
+    assert!(!state_dir.join("config.toml").exists());
+    assert!(state_dir.join("config.toml.failed").exists());
+
+    // Finish again tries again.
+    world.lock().unwrap().import_fails = false;
     let (s, v) = page.post("/api/apply", choices("1:0")).await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    let mut last = Value::Null;
-    for _ in 0..120 {
-        let (_, v) = page.get("/api/state").await;
-        last = v["phase"].clone();
-        if last["state"] != "working" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let last = finished().await;
     assert_eq!(last["state"], "done", "{last}");
+    assert!(!state_dir.join("config.toml.new").exists());
     // No key: the page says how to add one later.
     assert_eq!(last["movies"], false, "{last}");
     let (s, _) = page.post("/api/apply", choices("1:0")).await;
@@ -520,7 +560,7 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         format!("base_url = \"http://127.0.0.1:{}/\"", mock.port()),
         "movie_section = 1".into(),
         "tv_section = 2".into(),
-        "[execution]\nenabled = false".into(),
+        "[execution]\nenabled = true".into(),
         "[tmdb]\nenabled = false".into(),
         "[reporting]\nenabled = true".into(),
     ] {
@@ -604,7 +644,11 @@ async fn an_existing_config_is_never_replaced() {
         .await
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("already exists"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("already exists") && err.contains("--delete-data"),
+        "{err}"
+    );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
         "# mine\n"
@@ -647,11 +691,25 @@ async fn only_the_accounts_plex_on_this_computer_is_used() {
     assert_eq!(v["signed_in"], true);
     assert_eq!(v["plex"], Value::Null);
     assert_eq!(v["missing"], "not_linked");
+    // Signing in again (with another account, say) starts over.
+    let (s, v) = page.post("/api/plex/signin", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, v) = page.get("/api/state").await;
+    assert_eq!(v["signed_in"], false, "{v}");
+    assert_eq!(v["missing"], Value::Null, "{v}");
+    let (_, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(v["missing"], "not_linked", "{v}");
     // Once that Plex is signed in to this account, looking again connects.
     world.lock().unwrap().identity = MACHINE.into();
     let (_, v) = page.post("/api/plex/check", json!({})).await;
     assert_eq!(v["missing"], Value::Null);
     assert_eq!(v["plex"]["name"], "Living Room");
+    assert_eq!(v["plex"]["movies"].as_array().unwrap().len(), 1);
+    // A library added in Plex shows up on the next look.
+    world.lock().unwrap().added_library = Some("/films".into());
+    let (s, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["plex"]["movies"][1]["title"], "Films", "{v}");
 }
 
 #[cfg(unix)] // only the Unix-only install test uses it
@@ -724,11 +782,16 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
     }
     assert_eq!(install["state"], "done", "{install}");
 
-    // The next look finds a new, unlinked Plex, links it to the account and connects.
-    let (s, v) = page.post("/api/plex/check", json!({})).await;
-    assert_eq!(s, StatusCode::OK, "{v}");
+    // The next look finds a new, unlinked Plex, links it to the account and connects. Two
+    // looks at once (two tabs) link it only once.
+    let ((s, v), (s2, v2)) = tokio::join!(
+        page.post("/api/plex/check", json!({})),
+        page.post("/api/plex/check", json!({}))
+    );
+    assert_eq!((s, s2), (StatusCode::OK, StatusCode::OK), "{v} {v2}");
     assert_eq!(world.lock().unwrap().claims, 1);
     assert_eq!(v["plex"]["name"], "Living Room", "{v}");
+    assert_eq!(v2["plex"]["name"], "Living Room", "{v2}");
     assert_eq!(v["plex"]["movies"], json!([]));
 
     // It has no libraries, so the page makes them. Here they're in a private folder (like a

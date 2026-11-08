@@ -137,6 +137,21 @@ enum Command {
         #[arg(long)]
         media: Option<PathBuf>,
     },
+    /// Sign in to Plex again after Plex stopped accepting Arr's sign-in: prints a plex.tv
+    /// link, then replaces only the saved Plex token (the config isn't changed). With
+    /// --check, only says whether Plex still accepts it (exit 1 if not, 2 if unreachable).
+    PlexSignin {
+        /// Arr's config.toml.
+        #[arg(long)]
+        config: PathBuf,
+        /// Only check the saved sign-in; change nothing.
+        #[arg(long)]
+        check: bool,
+        #[arg(long, hide = true, default_value = "https://plex.tv/")]
+        plex_tv_url: reqwest::Url,
+        #[arg(long, hide = true, default_value = "https://app.plex.tv/auth")]
+        plex_auth_url: reqwest::Url,
+    },
     /// Run the HTTP API (and, with [execution] enabled, the background worker).
     Serve {
         #[arg(long)]
@@ -454,7 +469,8 @@ async fn run() -> Result<()> {
         | Command::Wizard { .. }
         | Command::Report { .. }
         | Command::Set { .. }
-        | Command::TmdbKey { .. } => "warn",
+        | Command::TmdbKey { .. }
+        | Command::PlexSignin { .. } => "warn",
         _ => "info,arr=info",
     };
     tracing_subscriber::fmt()
@@ -712,6 +728,20 @@ async fn run() -> Result<()> {
             let media = media.unwrap_or_else(arr::plexinstall::default_media);
             arr::plexinstall::run(arr::plexinstall::Options { owner, media }).await
         }
+        Command::PlexSignin {
+            config,
+            check,
+            plex_tv_url,
+            plex_auth_url,
+        } => std::process::exit(
+            arr::plexsignin::main(arr::plexsignin::Options {
+                config,
+                check,
+                plex_tv: plex_tv_url,
+                plex_auth: plex_auth_url,
+            })
+            .await,
+        ),
         Command::Mcp {
             api_url,
             token_file,
