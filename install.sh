@@ -62,6 +62,7 @@ Usage: install.sh [options]
   --tv-section N         Plex TV library number (default: the first one)
   --downloads DIR        where torrents download before import
   --tmdb-key KEY         TMDB API key or read token, to find movies you don't own yet
+                         (adds it to an existing install too)
   --port N               API port (default: 8787)
   --torrent-port N       BitTorrent port (default: 50413)
   --upload-limit-kib N   upload limit in KiB/s for all torrents (default: 0 = none)
@@ -567,6 +568,21 @@ if [ -f "$CONFIG" ]; then
 	PORT=$(sed -n 's/^listen = "[^"]*:\([0-9][0-9]*\)"$/\1/p' "$CONFIG" | head -n1)
 	PORT=${PORT:-8787}
 	grep -A1 '^\[execution\]' "$CONFIG" | grep -q 'enabled = true' || DOWNLOADING=0
+	# A TMDB key can be added on any later run: --tmdb-key, ARR_TMDB_KEY, or asked here.
+	if [ -z "$TMDB_KEY" ] && interactive &&
+		! awk '/^\[/{s=($1=="[tmdb]")} s&&/^enabled *= *true/{f=1} END{exit !f}' "$CONFIG"; then
+		say "Optional: a free TMDB key lets Arr find movies you don't own yet"
+		say "(https://www.themoviedb.org/settings/api). TV search works without one."
+		TMDB_KEY=$(ask "TMDB API key or read token (Enter to skip)" "")
+	fi
+	if [ -n "$TMDB_KEY" ]; then
+		step "Adding your TMDB key"
+		if printf '%s' "$TMDB_KEY" | "$ARR" tmdb-key --config "$CONFIG"; then
+			say "Arr can now find movies you don't own yet."
+		else
+			say "warning: the TMDB key wasn't added; Arr carries on without it. Run this again to retry." >&2
+		fi
+	fi
 elif [ "$TERMINAL" != 1 ] && interactive && [ "$DOWNLOADING" = 1 ] && [ "$PLEX_URL_SET" = 0 ] &&
 	[ -z "$PLEX_TOKEN$MOVIES$TV$MOVIE_SECTION$TV_SECTION$DOWNLOADS$TMDB_KEY" ]; then
 	# Setup options on the command line (or --search-only) mean the terminal setup.

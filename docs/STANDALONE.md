@@ -49,6 +49,8 @@ arr init --state-dir "$STATE"  # API token + standalone config template (never o
    install -m 600 /dev/null "$STATE/secrets/plex_token"     && "$EDITOR" "$STATE/secrets/plex_token"
    install -m 600 /dev/null "$STATE/secrets/tmdb_credential" && "$EDITOR" "$STATE/secrets/tmdb_credential"
    ```
+   For TMDB, `arr tmdb-key --config "$STATE/config.toml"` does both steps: it reads the key from
+   stdin, checks it with TMDB, saves it and turns on `[tmdb]` (restart Arr afterwards).
 3. **Managed settings** (profiles, size limits, per-indexer policy with explicit seed goals,
    download/cleanup policy, root folders) and an empty catalog:
    ```bash

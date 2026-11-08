@@ -332,7 +332,9 @@ mod tests {
                         }
                     }
                 }
-                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
+                );
                 let _ = got_tx.send(String::from_utf8_lossy(&buf).into_owned());
             }
         });

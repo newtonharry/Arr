@@ -44,6 +44,7 @@ pub mod setup;
 pub mod store;
 pub mod target;
 pub mod title;
+pub mod tmdbkey;
 pub mod torrent;
 pub mod torznab;
 pub mod tpb;

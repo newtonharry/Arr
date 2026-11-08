@@ -145,6 +145,12 @@ enum Command {
         #[arg(long)]
         message: String,
     },
+    /// Add or replace the TMDB key (read from stdin) of an existing install, so Arr can find
+    /// movies you don't own yet. Checks it with TMDB first; restart Arr afterwards.
+    TmdbKey {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Serve MCP tools on stdin/stdout as a client of a running API (stdout carries only MCP).
     Mcp {
         /// Base URL of `arr serve` (http or https; no credentials, query or fragment).
@@ -367,7 +373,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     // Logs go to stderr; the MCP adapter stays quiet unless asked.
     let default_filter = match cli.command {
-        Command::Mcp { .. } | Command::Wizard { .. } | Command::Report { .. } => "warn",
+        Command::Mcp { .. }
+        | Command::Wizard { .. }
+        | Command::Report { .. }
+        | Command::TmdbKey { .. } => "warn",
         _ => "info,arr=info",
     };
     tracing_subscriber::fmt()
@@ -531,6 +540,16 @@ async fn main() -> Result<()> {
             let _reporting = arr::report::start(arr::report::enabled_in(&config), &component);
             arr::report::error(&component, &message);
             Ok(())
+        }
+        Command::TmdbKey { config } => {
+            // From stdin, so the key stays out of the process list.
+            let mut key = String::new();
+            std::io::Read::read_to_string(
+                &mut std::io::Read::take(std::io::stdin(), 4096),
+                &mut key,
+            )
+            .context("couldn't read the key")?;
+            arr::tmdbkey::set(&config, &key).await
         }
         Command::Wizard {
             state_dir,
