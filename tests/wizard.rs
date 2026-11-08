@@ -224,6 +224,8 @@ async fn start_wizard(state_dir: &Path, mock: SocketAddr) -> (tokio::process::Ch
     })
     .await
     .unwrap();
+    // Keep reading: if the pipe closed, the wizard's next line would fail to print.
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
     (child, link, port)
 }
 
