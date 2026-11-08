@@ -68,8 +68,12 @@ client ID and secret, and the Google accounts allowed in. Then it:
   runs at log-on without a window and restarts ngrok if it stops;
 - confirms that `https://YOUR-NGROK-DOMAIN` reaches Arr.
 
-Running the installer again keeps your remote access as it is (to change it, remove the
-`[mcp.oauth]` section and the `allowed_hosts` line from `config.toml` first). The uninstaller removes the tunnel with Arr.
+Running the installer again keeps your remote access as it is. Once it's set up, the installer
+won't change it: `install.sh` refuses `--ngrok-token`, `--ngrok-domain`, `--google-client-id`,
+`--google-client-secret` and `--allow-email` values that differ from your setup (at a terminal
+it warns and carries on without them), and `install.ps1` warns and ignores the `ARR_NGROK_*`,
+`ARR_GOOGLE_*` and `ARR_ALLOW_EMAILS` values. Change it by hand instead; see
+[Changing it later](#changing-it-later). The uninstaller removes the tunnel with Arr.
 
 ## 4. Add Arr to ChatGPT
 
@@ -93,6 +97,34 @@ menus from time to time; if you can't find **Developer mode**, search ChatGPT's 
 Each allowed person signs in once from their own ChatGPT account. To remove someone, delete
 their address from `allowed_emails` in `config.toml` and restart Arr; their access stops
 immediately.
+
+## Changing it later
+
+Remote access lives in three places in Arr's state folder: `config.toml` (`allowed_hosts`
+under `[mcp]`; `public_url`, `google_client_id` and `allowed_emails` under `[mcp.oauth]`),
+`ngrok.yml` (the ngrok authtoken) and `secrets/google_client_secret`. Change only what changed,
+then restart Arr or the tunnel as each item says. [Restarting Arr](../README.md#restarting-arr)
+lists the commands; running the install command again restarts Arr and the tunnel too.
+
+- **New ngrok authtoken:** replace the value after `authtoken:` in `ngrok.yml`, then restart
+  the tunnel: `sudo systemctl restart arr-tunnel` (Linux, installed with `sudo`),
+  `systemctl --user restart arr-tunnel` (installed without), or
+  `launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr-tunnel` (macOS). On Windows,
+  run the install command again.
+- **New Google client secret:** replace the contents of `secrets/google_client_secret` with
+  it (only the secret; keep the file private), then restart Arr. A new client also has a new
+  ID: put it in `google_client_id`.
+- **Who's allowed in:** edit `allowed_emails`, then restart Arr.
+- **A different ngrok domain:** the new domain must be in your ngrok account. Set `public_url`
+  to `https://NEW-DOMAIN`, replace the old domain in `allowed_hosts`, and change the redirect
+  URI in your Google client to `https://NEW-DOMAIN/auth/callback`. Then run the install command
+  again: the tunnel takes its address from `public_url`, and the installer sets the tunnel up
+  with the new one. Update the connector's URL in ChatGPT too.
+- **Turning remote access off:** delete the `[mcp.oauth]` section, then run the install command
+  again. It removes the tunnel.
+
+`arr check --config <state folder>/config.toml` says whether the config is still valid before
+you restart.
 
 ## Let an AI agent set it up
 

@@ -47,6 +47,9 @@ you're typing on. The link includes a secret code, so nobody else on your networ
 the page. To answer the questions in the terminal instead, add `--terminal`:
 `curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --terminal`.
 
+Arr saves its setup only when setup has fully worked. If it stops halfway, nothing is kept:
+run the install command again to start over.
+
 Arr runs on macOS and on Linux with glibc 2.35 or newer (Debian 12, Ubuntu 22.04, Raspberry
 Pi OS 12 and later), on x86_64 and ARM64. Plex can run natively or in Docker; when the script
 can see the Plex container, it maps Docker paths back to your disk.
@@ -82,6 +85,85 @@ both keep your config. To stop automatic updates, run the installer with `--no-a
 Update logs go to `journalctl -u arr-update` (`--user` for a user install), or `update.log` in
 the state folder on macOS.
 
+### Something's wrong, or you want to change a setting
+
+Run the install command again. It updates Arr, checks and repairs it, and keeps your setup.
+Settings you leave out stay as they are; a setting you give is applied, or refused before
+anything changes. On a re-run the installer:
+
+- finds the Arr that's already installed. If you ran it with `sudo` and Arr was installed
+  without, or the other way round, it stops and tells you which. On a Mac, never use `sudo`;
+- checks Arr's config with the new version (`arr check`) before restarting anything. If the
+  config has a problem, it says what and stops; Arr keeps running as it was;
+- checks that Plex still accepts Arr's sign-in. Plex stops accepting it after "sign out of all
+  devices" or a password change; at a terminal, the installer walks you through signing in
+  again;
+- keeps the previous version of Arr, and puts it back if the new one doesn't start;
+- removes the tunnel if remote access is no longer in the config, and on Linux and macOS makes
+  Arr's folder and secrets private again.
+
+These options change an existing install: `--tmdb-key`, `--plex-token`, `--plex-url`,
+`--search-only` (turns downloading off), `--upload-limit-kib`, `--torrent-port`,
+`--error-reports` or `--no-error-reports`, and `--auto-update` or `--no-auto-update`. On
+Windows, set `ARR_TMDB_KEY`, `ARR_UPLOAD_LIMIT_KIB`, `ARR_TORRENT_PORT`, `ARR_ERROR_REPORTS` or
+`ARR_AUTO_UPDATE` before the install line.
+
+`--port`, `--movies`, `--tv`, `--downloads`, `--movie-section`, `--tv-section` and `--terminal`
+apply only to the first setup, as do the remote access values once remote access is set up. A
+re-run with a different value stops with an `error:` line (at a terminal it warns and carries
+on without it; on Windows it warns and ignores it).
+
+#### Changing one setting by hand: `arr set`
+
+`arr set` changes one setting. It checks the change first (keys, tokens and Plex's address are
+tried for real) and changes nothing if that fails. Run it as the user Arr runs as; the
+installer printed the config's path as `Config:`.
+
+```sh
+arr set --config ~/.local/share/arr/config.toml downloading on
+arr set --config ~/.local/share/arr/config.toml upload-limit-kib 2048
+printf %s YOUR_KEY | arr set --config ~/.local/share/arr/config.toml tmdb-key
+```
+
+| Setting | Value |
+| --- | --- |
+| `tmdb-key`, `plex-token` | read from stdin; at a terminal, paste it when asked |
+| `plex-url` | Plex's address, like `http://127.0.0.1:32400` |
+| `downloading` | `on` or `off` |
+| `upload-limit-kib` | KiB/s for all torrents; `0` for no limit |
+| `torrent-port` | 1 to 65535 |
+| `error-reports` | `on` or `off` |
+| `api-token`, `mcp-token` | no value: makes a new random token (update anything that uses it) |
+
+Plex stopped accepting Arr's sign-in? `arr plex-signin --config <config>` prints a plex.tv
+link; sign in, and it replaces only Arr's saved Plex token. `--check` only says whether Plex
+still accepts it.
+
+#### Restarting Arr
+
+`arr set`, `arr plex-signin` and `arr setup` take effect when Arr restarts. Running the install
+command again restarts it too, or:
+
+- Linux, installed with `sudo`: `sudo systemctl restart arr`
+- Linux, installed without: `systemctl --user restart arr`
+- macOS: `launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr`
+- Windows, in PowerShell: `Stop-ScheduledTask Arr; Start-ScheduledTask Arr`
+
+#### Changing library folders, Plex libraries or Arr's port
+
+These can't be changed in place. Arr's catalog remembers where every file is, and the port is
+in your MCP client settings, the updater and the tunnel. To change them, remove Arr with its
+data and set it up again:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.sh | sh -s -- --arr --delete-data
+```
+
+On Windows, run `$env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '1'` in PowerShell before
+the [`uninstall.ps1`](uninstall.ps1) line. This deletes Arr's config, secrets and database, never
+your movie and TV files. Then run the install command again; setup reads your Plex library
+again, so Arr still knows what you own.
+
 ### A TMDB key, to find new movies
 
 Arr finds TV shows on its own, but to find movies you don't own yet it needs a free key from
@@ -98,7 +180,8 @@ curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | s
 ```
 
 On Windows, run `$env:ARR_TMDB_KEY = 'YOUR_KEY'` in PowerShell before the install line. A key
-TMDB doesn't accept changes nothing.
+TMDB doesn't accept changes nothing. Without the installer, use
+`arr set --config <config> tmdb-key` and [restart Arr](#restarting-arr).
 
 ### Error reports
 
@@ -106,8 +189,9 @@ Setup also asks whether Arr may send error reports when something fails (off unl
 it). Before a report leaves your computer, Arr removes paths, names, titles, addresses, host
 names and anything that looks like a password or token. Nothing about your library is sent.
 Reports go to Arr's Sentry project in the EU. [docs/PRIVACY.md](docs/PRIVACY.md) lists exactly
-what's sent and how to turn it off later. In a terminal install, `--error-reports` or
-`--no-error-reports` answers the question.
+what's sent. In a terminal install, `--error-reports` or `--no-error-reports` answers the
+question. To change your answer later, run `arr set --config <config> error-reports off` (or
+`on`), then [restart Arr](#restarting-arr).
 
 ### Uninstall
 
@@ -147,13 +231,17 @@ curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | s
 
 `--yes` accepts every default and never waits for input. A failed run ends with one `error:`
 line that names the problem, usually with the flag that fixes it. Fix it and run the script
-again.
+again. On an install that's already set up, a re-run keeps everything you leave out and applies
+or refuses each option you give, before changing anything; folders, Plex sections and `--port`
+apply only to the first setup (see
+[Something's wrong, or you want to change a setting](#somethings-wrong-or-you-want-to-change-a-setting)).
 
 With `--yes`, automatic updates stay off unless the agent also passes `--auto-update`. An agent
 should ask you first: updates change the software on your machine without further prompts.
 
 Useful flags: `--movies DIR`, `--tv DIR`, `--downloads DIR`, `--plex-url URL`, `--port N`,
-`--upload-limit-kib N`, `--search-only` (set up without downloading), `--install-only`.
+`--upload-limit-kib N`, `--search-only` (don't download; `arr set ... downloading on` turns it
+on later), `--install-only`.
 `install.sh --help` lists them all.
 
 To confirm the install worked, the agent can run `arr check --config <state dir>/config.toml`;
@@ -230,8 +318,8 @@ Arr adds movies, whole seasons and single episodes. It checks each download agai
 asked for, refuses broken or mismatched files, picks up new episodes of seasons you added
 through RSS, and stops seeding once a torrent reaches its seed goal (ratio 1.0 or 72 hours by
 default). To change the goals or quality profiles, edit a copy of
-[config/setup.example.toml](config/setup.example.toml) and run
-`arr setup --config <config> --settings <file>`.
+[config/setup.example.toml](config/setup.example.toml), run
+`arr setup --config <config> --settings <file>`, then [restart Arr](#restarting-arr).
 
 It refuses things it can't do safely yet: quality upgrades of files you own, renaming,
 custom formats, usenet, anime and daily-show numbering, and specials (season 0). It never
@@ -242,12 +330,17 @@ ignore titles you add to Arr. If both monitor the same title, both may download 
 won't replace their file, so you lose bandwidth, not media.
 
 The default search source is The Pirate Bay's public API. You can add any Torznab indexer
-(Jackett, Prowlarr) in `config.toml`. Only download what you have the right to.
+(Jackett, Prowlarr) as an `[[indexer]]` in `config.toml`
+([config/standalone.example.toml](config/standalone.example.toml) has one). Arr uses it once
+you run `arr setup --config <config>`, then [restart Arr](#restarting-arr). Without
+`--settings`, `arr setup` keeps your current profiles and seed goals; if you gave it a settings
+file that lists `[[indexers]]`, add the new one there too. Only download what you have the
+right to.
 
 ## Other ways to run it
 
-- **Your own config.** `arr init`, then edit the template; every option is in
-  [config/standalone.example.toml](config/standalone.example.toml), and
+- **Your own config.** `arr init`, then edit the template;
+  [config/standalone.example.toml](config/standalone.example.toml) shows the common options, and
   [docs/STANDALONE.md](docs/STANDALONE.md) explains each step.
 - **Docker.** The [Dockerfile](Dockerfile) builds an image; mount your state directory at
   `/state` and your media folders read-write.

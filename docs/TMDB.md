@@ -35,15 +35,18 @@ Arr checks every key with TMDB before saving it, so a mistyped key is caught str
   ```
 
   On Windows, run `$env:ARR_TMDB_KEY = 'YOUR_KEY'` in PowerShell, then the install line.
-- **By hand:** `printf %s YOUR_KEY | arr tmdb-key --config <state folder>/config.toml`, then
-  restart Arr. It checks the key, saves it and turns movie search on.
+- **By hand:** `arr set --config <state folder>/config.toml tmdb-key`, then paste the key when
+  it asks (or pipe it in: `printf %s YOUR_KEY | arr set --config ... tmdb-key`). It checks the
+  key, saves it and turns movie search on. Then
+  [restart Arr](../README.md#restarting-arr).
 
 ## For AI agents installing Arr
 
 Ask the user for the key (it needs their TMDB login, so they create it themselves, following
-the steps above), then pass it with `--tmdb-key` (or `ARR_TMDB_KEY`). A fresh install stops
-with an `error:` line if TMDB doesn't accept the key; a re-run of an existing install warns and
-carries on without it. `arr tmdb-key --check` (key on stdin) checks a key without saving it.
+the steps above), then pass it with `--tmdb-key` (or `ARR_TMDB_KEY`). If TMDB doesn't accept
+the key, the installer stops with an `error:` line, and a re-run of an existing install stops
+before changing anything (at a terminal, `install.sh` warns and carries on without the key).
+`arr tmdb-key --check` (key on stdin) checks a key without saving it.
 
 When movie search isn't set up, Arr's answers to your assistant say so and point here, so the
 assistant can walk the user through these steps.
