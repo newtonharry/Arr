@@ -2,10 +2,12 @@
 
 Website: <https://newtonharry.github.io/Arr/>
 
-Arr replaces Sonarr, Radarr, Prowlarr and qBittorrent with one program for your Plex server.
-You ask for a movie or a season. Arr searches, downloads it with its built-in BitTorrent
-engine, checks the file with ffprobe, moves it into your Plex library and tells Plex to
-refresh.
+Arr turns a computer at home into a complete movie and TV setup, in one program. You ask for
+a movie or a season. Arr searches, downloads it with its built-in BitTorrent engine, checks the
+file with ffprobe, files it into your Plex library and tells Plex to refresh, so it's ready on
+your TV. It replaces the usual Sonarr, Radarr, Prowlarr and qBittorrent stack. New to Plex? The
+setup page checks for it and points you to it (installing it for you is coming next); already
+run Plex? Arr fits into your existing libraries.
 
 Arr has no web interface. You talk to it through an AI assistant over MCP ("add season 2 of
 Severance") or through its JSON API.
