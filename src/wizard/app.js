@@ -54,6 +54,8 @@ function render(s) {
   $("step-server").hidden = !s.signed_in;
   renderServer(s);
 
+  $("reporting-box").hidden = !s.reporting.available;
+  $("reporting").checked = s.reporting.enabled;
   const ready = !!s.plex;
   const noLibraries = ready && s.plex.movies.length === 0 && s.plex.tv.length === 0;
   $("step-libraries").hidden = !ready;
@@ -253,6 +255,10 @@ $("signin-btn").addEventListener("click", async () => {
   }
 });
 
+// Reports start as soon as the box is ticked, so a problem later in setup is covered too.
+$("reporting").addEventListener("change", (ev) =>
+  act(null, () => call("POST", "/api/reporting", { enabled: ev.target.checked })));
+
 $("look-again").addEventListener("click", (ev) =>
   act(ev.target, () => call("POST", "/api/plex/check")));
 $("install-look").addEventListener("click", (ev) =>
@@ -307,6 +313,7 @@ $("form").addEventListener("submit", async (ev) => {
     tmdb: $("tmdb").value.trim(),
     downloading: $("downloading").checked,
     auto_update: $("auto-update").checked,
+    reporting: $("reporting").checked,
   };
   await act($("apply"), () => call("POST", "/api/apply", body));
   if (state && state.phase.state === "working") startProgressPolling();

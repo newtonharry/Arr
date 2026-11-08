@@ -36,6 +36,7 @@ GOOGLE_ID="${ARR_GOOGLE_CLIENT_ID:-}"
 GOOGLE_SECRET="${ARR_GOOGLE_CLIENT_SECRET:-}"
 ALLOW_EMAILS="${ARR_ALLOW_EMAILS:-}"
 AUTO_UPDATE="${ARR_AUTO_UPDATE:-}"
+ERROR_REPORTS="${ARR_ERROR_REPORTS:-}"
 SETUP=1
 TERMINAL=0
 SERVICE=1
@@ -68,6 +69,9 @@ Usage: install.sh [options]
   --no-service           don't install a background service
   --auto-update          install new releases automatically (a daily check); asked if not given
   --no-auto-update       don't, and turn automatic updates off if they were on
+  --error-reports        send error reports, scrubbed of personal data (docs/PRIVACY.md);
+                         asked in the terminal setup if not given (the web setup has a box)
+  --no-error-reports     don't
 
 Use Arr from ChatGPT on your phone or any device (docs/REMOTE.md). Run again with these to
 add it to an existing install:
@@ -107,6 +111,8 @@ while [ $# -gt 0 ]; do
 	--upload-limit-kib) UPLOAD_LIMIT_KIB="$2"; shift ;;
 	--auto-update) AUTO_UPDATE=1 ;;
 	--no-auto-update) AUTO_UPDATE=0 ;;
+	--error-reports) ERROR_REPORTS=1 ;;
+	--no-error-reports) ERROR_REPORTS=0 ;;
 	--remote) REMOTE=1 ;;
 	--ngrok-token) NGROK_TOKEN="$2"; REMOTE=1; shift ;;
 	--ngrok-domain) NGROK_DOMAIN="$2"; REMOTE=1; shift ;;
@@ -123,7 +129,14 @@ done
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+die() {
+	printf 'error: %s\n' "$*" >&2
+	# Told to Arr's developer only if this install's config says so (docs/PRIVACY.md).
+	if [ -n "${ARR:-}" ] && [ -x "${ARR:-}" ] && [ -f "${CONFIG:-}" ]; then
+		"$ARR" report --config "$CONFIG" --component installer --message "$*" >/dev/null 2>&1 </dev/null || true
+	fi
+	exit 1
+}
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Prompts read from the terminal, so they work under `curl ... | sh`. Without one, or with
@@ -389,6 +402,13 @@ fi
 
 # ---------------------------------------------------------------- write the config
 
+if [ -z "$ERROR_REPORTS" ]; then
+	ERROR_REPORTS=0
+	if confirm "Send error reports to help fix Arr? Names, folders, addresses and passwords are removed first, and nothing about your library is sent (docs/PRIVACY.md)" n; then
+		ERROR_REPORTS=1
+	fi
+fi
+
 step "Writing $CONFIG"
 umask 077
 # init creates the folders and the API token; a previous failed run may have done so already.
@@ -466,6 +486,8 @@ EOF
 enabled = true
 token_file = "secrets/mcp_token"
 EOF
+	[ "$ERROR_REPORTS" != 1 ] ||
+		printf '\n# Error reports with names, paths, addresses and tokens removed; see docs/PRIVACY.md.\n[reporting]\nenabled = true\n'
 } >"$CONFIG"
 chmod 600 "$CONFIG"
 
@@ -524,6 +546,7 @@ browser_setup() {
 	set -- "$ARR" wizard --state-dir "$STATE_DIR" --bind "$bind" --port "$PORT" \
 		--torrent-port "$TORRENT_PORT" --upload-limit-kib "$UPLOAD_LIMIT_KIB" --ffprobe "$FFPROBE"
 	[ "$bind" != 127.0.0.1 ] || set -- "$@" --open
+	[ "$ERROR_REPORTS" != 1 ] || set -- "$@" --error-reports
 	# Arr runs as the user who ran sudo, so the page checks folders as that user too.
 	if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
 		chown "$SUDO_USER" "$STATE_DIR"
@@ -888,9 +911,9 @@ if [ "$AUTO_UPDATE" = 1 ]; then
 	step "Turning on automatic updates"
 	{
 		printf '#!/bin/sh\n# Arr updater, written by install.sh. A daily job runs it; you can run it by hand too.\n'
-		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\n' \
+		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\nCONFIG=%s\n' \
 			"$(sq "$REPO")" "$(sq "$ARR")" "$(sq "$target")" "$(sq "$kind")" "$(sq "$PORT")" \
-			"$(sq "$lock_kind")" "$(sq "$lock_tool")"
+			"$(sq "$lock_kind")" "$(sq "$lock_tool")" "$(sq "$CONFIG")"
 		cat <<'EOF'
 set -eu
 log() { printf 'arr-update: %s\n' "$*"; }
@@ -982,6 +1005,8 @@ log "$latest didn't start; going back to $current"
 mv -f "$ARR.previous" "$ARR"
 restart
 healthy "$current" || log "$current didn't start either; check Arr's logs"
+# Told to Arr's developer only if the config says so (docs/PRIVACY.md).
+"$ARR" report --config "$CONFIG" --component updater --message "$latest didn't start, so Arr went back to $current" >/dev/null 2>&1 || true
 exit 1
 EOF
 	} >"$tmp/arr-update"

@@ -82,6 +82,15 @@ both keep your config. To stop automatic updates, run the installer with `--no-a
 Update logs go to `journalctl -u arr-update` (`--user` for a user install), or `update.log` in
 the state folder on macOS.
 
+### Error reports
+
+Setup also asks whether Arr may send error reports when something fails (off unless you tick
+it). Before a report leaves your computer, Arr removes paths, names, titles, addresses, host
+names and anything that looks like a password or token. Nothing about your library is sent.
+Reports go to Arr's Sentry project in the EU. [docs/PRIVACY.md](docs/PRIVACY.md) lists exactly
+what's sent and how to turn it off later. In a terminal install, `--error-reports` or
+`--no-error-reports` answers the question.
+
 ### Uninstall
 
 To remove Arr, Plex Media Server, or both:
@@ -242,6 +251,8 @@ The default search source is The Pirate Bay's public API. You can add any Torzna
 - [docs/EMBEDDED-DOWNLOADER.md](docs/EMBEDDED-DOWNLOADER.md): the BitTorrent engine, seeding
   and limits.
 - [docs/MIGRATION.md](docs/MIGRATION.md): importing Sonarr/Radarr/Prowlarr settings.
+- [docs/PRIVACY.md](docs/PRIVACY.md): what Arr sends (nothing, unless you allow error
+  reports) and what's removed first.
 - [docs/READINESS.md](docs/READINESS.md): what the tests cover and the known limits.
 - [docs/EXECUTION-SANDBOX.md](docs/EXECUTION-SANDBOX.md): testing downloads safely in a
   sandbox.

@@ -8,6 +8,7 @@
 #
 #   ARR_VERSION       a release tag such as v0.4.0 (default: the latest release)
 #   ARR_AUTO_UPDATE   1 to install new versions automatically, 0 to turn that off
+#   ARR_ERROR_REPORTS 1 to start the setup page with error reports ticked (docs/PRIVACY.md)
 #   ARR_PORT          Arr's port on this computer (default 8787)
 #   ARR_STATE_DIR     Arr's folder: config, secrets, database (default %LOCALAPPDATA%\Arr)
 #   ARR_BIN_DIR       where arr.exe goes (default %LOCALAPPDATA%\Programs\Arr)
@@ -121,8 +122,9 @@ function Install-Arr {
 		if ($m) { $Port = [int]$m.Matches[0].Groups[1].Value }
 	} else {
 		Step 'Setting up Arr in your web browser'
+		$reports = @(if ($env:ARR_ERROR_REPORTS -eq '1') { '--error-reports' })
 		& $Arr wizard --state-dir $StateDir --port $Port --torrent-port $TorrentPort `
-			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open
+			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open @reports
 		if ($LASTEXITCODE -ne 0) { throw "setup wasn't finished; run this again to start over" }
 		# The page asked about automatic updates; the answer is used once, below.
 		$choices = Join-Path $StateDir 'setup-choices'
@@ -609,6 +611,8 @@ try {
 	Log "$latest didn't start; going back to $current"
 	Roll-Back
 	if (-not (Healthy $current)) { Log "$current didn't start either; check $(Join-Path $StateDir 'arr.log')" }
+	# Told to Arr's developer only if the config says so (docs/PRIVACY.md).
+	try { & $arr report --config (Join-Path $StateDir 'config.toml') --component updater --message "$latest didn't start, so Arr went back to $current" 2>&1 | Out-Null } catch {}
 	exit 1
 } catch {
 	Log "update failed: $($_.Exception.Message)"
@@ -624,6 +628,16 @@ try {
 try {
 	Install-Arr
 } catch {
-	Write-Host "error: $($_.Exception.Message)" -ForegroundColor Red
-	if ($env:ARR_INSTALL_STRICT -eq '1') { throw } # tests want a failing exit code
+	$failure = $_
+	Write-Host "error: $($failure.Exception.Message)" -ForegroundColor Red
+	# Told to Arr's developer only if this install's config says so (docs/PRIVACY.md).
+	$bin = if ($env:ARR_BIN_DIR) { $env:ARR_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\Arr' }
+	$state = if ($env:ARR_STATE_DIR) { $env:ARR_STATE_DIR } else { Join-Path $env:LOCALAPPDATA 'Arr' }
+	if ((Test-Path (Join-Path $bin 'arr.exe')) -and (Test-Path (Join-Path $state 'config.toml'))) {
+		try {
+			& (Join-Path $bin 'arr.exe') report --config (Join-Path $state 'config.toml') --component installer `
+				--message $failure.Exception.Message 2>&1 | Out-Null
+		} catch {}
+	}
+	if ($env:ARR_INSTALL_STRICT -eq '1') { throw $failure } # tests want a failing exit code
 }

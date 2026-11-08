@@ -42,8 +42,15 @@ fn serve(config: PathBuf) -> Result<()> {
         .with_ansi(false)
         .with_writer(std::sync::Mutex::new(file))
         .init();
-    let result = tokio::runtime::Runtime::new()?
-        .block_on(async { arr::api::serve(arr::config::load(&config)?).await });
+    let result = tokio::runtime::Runtime::new()?.block_on(async {
+        let cfg = arr::config::load(&config)?;
+        let _reporting = arr::report::start(cfg.reporting, "server");
+        let result = arr::api::serve(cfg).await;
+        if let Err(e) = &result {
+            arr::report::error("server", &format!("Arr stopped: {e:#}"));
+        }
+        result
+    });
     if let Err(e) = &result {
         tracing::error!("Arr stopped: {e:#}");
     }
