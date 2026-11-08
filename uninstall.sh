@@ -1,0 +1,301 @@
+#!/bin/sh
+# Removes Arr, Plex Media Server, or both, from this computer:
+#
+#   curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.sh | sh
+#
+# It asks what to remove, and separately whether to delete each one's data (settings,
+# database). Your movie and TV files, and anything in the download folder, are never deleted.
+# Run with --dry-run to see what it would do, or --help for the options.
+set -eu
+TARGET=""          # arr, plex or all; asked if empty
+DELETE_DATA="${ARR_DELETE_DATA:-}"
+YES="${ARR_YES:-0}"
+DRY_RUN=0
+BIN_DIR="${ARR_BIN_DIR:-}"
+STATE_DIR="${ARR_STATE_DIR:-}"
+
+usage() {
+	cat <<'EOF'
+Remove Arr, Plex Media Server, or both.
+
+Usage: uninstall.sh [options]
+
+  --arr            remove Arr (the default with --yes)
+  --plex           remove Plex Media Server
+  --all            remove both
+  --delete-data    also delete their settings and databases (asked if not given;
+                   with --yes, data is kept unless this is given)
+  --keep-data      keep them, without asking
+  --yes            don't ask anything
+  --dry-run        only show what would be done
+  --bin-dir DIR    where arr is, if it isn't found
+  --state-dir DIR  Arr's folder, if it isn't found
+
+Your movie and TV files, and the download folder, are never deleted.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--arr) if [ "$TARGET" = plex ]; then TARGET=all; else TARGET=arr; fi ;;
+	--plex) if [ "$TARGET" = arr ]; then TARGET=all; else TARGET=plex; fi ;;
+	--all) TARGET=all ;;
+	--delete-data) DELETE_DATA=1 ;;
+	--keep-data) DELETE_DATA=0 ;;
+	--yes | -y) YES=1 ;;
+	--dry-run) DRY_RUN=1 ;;
+	--bin-dir) BIN_DIR="$2"; shift ;;
+	--state-dir) STATE_DIR="$2"; shift ;;
+	-h | --help) usage; exit 0 ;;
+	*) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
+	esac
+	shift
+done
+
+say() { printf '%s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+interactive() { [ "$YES" != 1 ] && [ -r /dev/tty ] && (: </dev/tty) 2>/dev/null; }
+ask() { # ask "Question" default -> answer
+	if interactive; then
+		printf '%s [%s]: ' "$1" "$2" >/dev/tty
+		read -r a </dev/tty || a=""
+		printf '%s' "${a:-$2}"
+	else printf '%s' "$2"; fi
+}
+confirm() { case "$(ask "$1 (y/n)" "$2")" in [Yy]*) return 0 ;; *) return 1 ;; esac; }
+# Runs a command, or only shows it with --dry-run.
+run() {
+	if [ "$DRY_RUN" = 1 ]; then say "  would run: $*"; else "$@"; fi
+}
+os=$(uname -s)
+SUDO=""
+[ "$(id -u)" = 0 ] || SUDO="sudo"
+# Deletes a folder, refusing anything that isn't clearly a data folder of the app.
+remove_dir() { # remove_dir <dir> <why>
+	case "${1%/}" in
+	"" | "$HOME" | /home | /Users | /var | /var/lib | /usr | /usr/local | /etc | /opt | /srv | /mnt | /media | \
+		/Applications | "$HOME/Library" | "$HOME/Library/Application Support" | "$HOME/.local" | "$HOME/.local/share")
+		say "  not deleting $1: that's not a folder of its own"
+		return 0
+		;;
+	esac
+	[ -e "$1" ] || return 0
+	if [ -w "$(dirname "$1")" ]; then run rm -rf -- "$1"; else run $SUDO rm -rf -- "$1"; fi
+	[ "$DRY_RUN" = 1 ] || say "  deleted $1 ($2)"
+}
+remove_file() { # remove_file <file>
+	[ -e "$1" ] || [ -L "$1" ] || return 0
+	if [ -w "$(dirname "$1")" ]; then run rm -f -- "$1"; else run $SUDO rm -f -- "$1"; fi
+}
+
+# ---------------------------------------------------------------- what's here
+
+# Arr: the service files say where the binary and config are; otherwise the defaults.
+ARR_FOUND=""
+SYSTEM_UNIT=/etc/systemd/system/arr.service
+USER_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/arr.service"
+PLIST="$HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
+unquote() { sed 's/%%/%/g; s/\$\$/$/g; s/\\"/"/g; s/\\\\/\\/g'; }
+from_unit() { # from_unit <unit file>: sets ARR_BIN and ARR_CONFIG from ExecStart
+	line=$(sed -n 's/^ExecStart=//p' "$1" | head -n1)
+	ARR_BIN=$(printf '%s' "$line" | sed -n 's/^"\(\([^"\\]\|\\.\)*\)".*/\1/p' | unquote)
+	ARR_CONFIG=$(printf '%s' "$line" | sed -n 's/.* --config "\(\([^"\\]\|\\.\)*\)".*/\1/p' | unquote)
+}
+from_plist() {
+	strings=$(sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p' "$1" |
+		sed 's/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&amp;/\&/g')
+	ARR_BIN=$(printf '%s\n' "$strings" | sed -n 2p)
+	ARR_CONFIG=$(printf '%s\n' "$strings" | sed -n 5p)
+}
+ARR_BIN="" ARR_CONFIG=""
+if [ -f "$SYSTEM_UNIT" ]; then from_unit "$SYSTEM_UNIT"; ARR_FOUND="system service"
+elif [ -f "$USER_UNIT" ]; then from_unit "$USER_UNIT"; ARR_FOUND="user service"
+elif [ -f "$PLIST" ]; then from_plist "$PLIST"; ARR_FOUND="login item"; fi
+[ -z "$BIN_DIR" ] || ARR_BIN="$BIN_DIR/arr"
+[ -z "$STATE_DIR" ] || ARR_CONFIG="$STATE_DIR/config.toml"
+if [ -z "$ARR_BIN" ]; then
+	for b in "$(command -v arr 2>/dev/null || true)" /usr/local/bin/arr "$HOME/.local/bin/arr"; do
+		if [ -n "$b" ] && [ -x "$b" ] && "$b" --version 2>/dev/null | grep -q '^arr '; then ARR_BIN=$b; break; fi
+	done
+fi
+if [ -z "$ARR_CONFIG" ]; then
+	for d in /var/lib/arr "${XDG_DATA_HOME:-$HOME/.local/share}/arr" "$HOME/Library/Application Support/arr"; do
+		if [ -f "$d/config.toml" ] || [ -f "$d/state.sqlite" ]; then ARR_CONFIG="$d/config.toml"; break; fi
+	done
+fi
+ARR_STATE=""
+[ -z "$ARR_CONFIG" ] || ARR_STATE=$(dirname "$ARR_CONFIG")
+[ -n "$ARR_FOUND" ] || { [ -z "$ARR_BIN$ARR_STATE" ] || ARR_FOUND="files"; }
+DOWNLOADS=""
+[ -z "$ARR_CONFIG" ] || [ ! -r "$ARR_CONFIG" ] ||
+	DOWNLOADS=$(sed -n 's/^download_dir = "\(.*\)"$/\1/p' "$ARR_CONFIG" | head -n1)
+
+# Plex: a system package, a snap, Docker containers, or the macOS app.
+PLEX_KIND="" PLEX_DATA="" PLEX_CONTAINERS=""
+if have dpkg-query && dpkg-query -W -f='${Status}' plexmediaserver 2>/dev/null | grep -q 'ok installed'; then
+	PLEX_KIND=deb PLEX_DATA=/var/lib/plexmediaserver
+elif have rpm && rpm -q plexmediaserver >/dev/null 2>&1; then
+	PLEX_KIND=rpm PLEX_DATA=/var/lib/plexmediaserver
+elif have snap && snap list plexmediaserver >/dev/null 2>&1; then
+	PLEX_KIND=snap
+elif [ "$os" = Darwin ] && [ -d "/Applications/Plex Media Server.app" ]; then
+	PLEX_KIND=mac PLEX_DATA="$HOME/Library/Application Support/Plex Media Server"
+fi
+if have docker; then
+	PLEX_CONTAINERS=$(docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null |
+		awk '$2 ~ /(^|\/)(pms-docker|plex)(:|$)/ { print $1 }' || true)
+fi
+
+say "Found on this computer:"
+if [ -n "$ARR_FOUND" ]; then
+	say "  Arr: ${ARR_BIN:-program not found}${ARR_STATE:+, data in $ARR_STATE} ($ARR_FOUND)"
+else
+	say "  Arr: not installed"
+fi
+case "$PLEX_KIND" in
+deb | rpm) say "  Plex Media Server: system package, data in $PLEX_DATA" ;;
+snap) say "  Plex Media Server: snap package" ;;
+mac) say "  Plex Media Server: /Applications/Plex Media Server.app, data in $PLEX_DATA" ;;
+esac
+for c in $PLEX_CONTAINERS; do say "  Plex Media Server: Docker container \"$c\""; done
+[ -n "$PLEX_KIND$PLEX_CONTAINERS" ] || say "  Plex Media Server: not installed"
+
+# ---------------------------------------------------------------- what to remove
+
+if [ -z "$TARGET" ]; then
+	if ! interactive; then
+		TARGET=arr
+	else
+		say ""
+		say "What should be removed?"
+		say "  1) Arr"
+		say "  2) Plex Media Server"
+		say "  3) Both"
+		case "$(ask "Choose 1, 2 or 3" 1)" in
+		1) TARGET=arr ;; 2) TARGET=plex ;; 3) TARGET=all ;;
+		*) die "nothing chosen; nothing was changed" ;;
+		esac
+	fi
+fi
+DO_ARR=0 DO_PLEX=0
+case "$TARGET" in arr) DO_ARR=1 ;; plex) DO_PLEX=1 ;; all) DO_ARR=1 DO_PLEX=1 ;; esac
+[ "$DO_ARR" = 0 ] || [ -n "$ARR_FOUND" ] || { say "Arr isn't installed here."; DO_ARR=0; }
+[ "$DO_PLEX" = 0 ] || [ -n "$PLEX_KIND$PLEX_CONTAINERS" ] || { say "Plex isn't installed here."; DO_PLEX=0; }
+[ "$DO_ARR$DO_PLEX" != 00 ] || { say "Nothing to remove."; exit 0; }
+
+ARR_DATA=0 PLEX_WIPE=0
+if [ "$DO_ARR" = 1 ] && [ -n "$ARR_STATE" ] && { [ -f "$ARR_STATE/config.toml" ] || [ -f "$ARR_STATE/state.sqlite" ]; }; then
+	case "$DELETE_DATA" in
+	1) ARR_DATA=1 ;;
+	0) ;;
+	*) confirm "Also delete Arr's settings, secrets and database in $ARR_STATE?" n && ARR_DATA=1 ;;
+	esac
+fi
+if [ "$DO_PLEX" = 1 ]; then
+	case "$DELETE_DATA" in
+	1) PLEX_WIPE=1 ;;
+	0) ;;
+	*) confirm "Also delete Plex's own data (its library database, watch history, posters and settings)?" n &&
+		PLEX_WIPE=1 ;;
+	esac
+fi
+
+say ""
+say "This will:"
+[ "$DO_ARR" = 0 ] || say "  - stop and remove Arr$([ "$ARR_DATA" = 1 ] && echo ", and delete its data" || echo ", keeping its data")"
+[ "$DO_PLEX" = 0 ] || say "  - stop and remove Plex Media Server$([ "$PLEX_WIPE" = 1 ] && echo ", and delete its data" || echo ", keeping its data")"
+say "  - keep your movie and TV files${DOWNLOADS:+, and the download folder $DOWNLOADS}"
+if interactive && ! confirm "Go ahead?" n; then die "nothing was changed"; fi
+
+# ---------------------------------------------------------------- Arr
+
+if [ "$DO_ARR" = 1 ]; then
+	step "Removing Arr"
+	if [ -f "$SYSTEM_UNIT" ]; then
+		for u in arr-update.timer arr-update.service arr-tunnel.service arr.service; do
+			run $SUDO systemctl disable --now "$u" >/dev/null 2>&1 || true
+			remove_file "/etc/systemd/system/$u"
+		done
+		run $SUDO systemctl daemon-reload || true
+	fi
+	udir=$(dirname "$USER_UNIT")
+	if [ -f "$USER_UNIT" ]; then
+		for u in arr-update.timer arr-update.service arr-tunnel.service arr.service; do
+			run systemctl --user disable --now "$u" >/dev/null 2>&1 || true
+			remove_file "$udir/$u"
+		done
+		run systemctl --user daemon-reload || true
+	fi
+	for p in arr arr-tunnel arr-update; do
+		f="$HOME/Library/LaunchAgents/io.github.newtonharry.$p.plist"
+		[ -f "$f" ] || continue
+		run launchctl unload "$f" 2>/dev/null || true
+		remove_file "$f"
+	done
+	if [ -n "$ARR_BIN" ]; then
+		d=$(dirname "$ARR_BIN")
+		for f in arr arr.previous arr.new arr-update arr.update-lock; do remove_file "$d/$f"; done
+		[ "$DRY_RUN" = 1 ] || say "  removed the arr program from $d"
+	fi
+	if [ "$ARR_DATA" = 1 ]; then
+		remove_dir "$ARR_STATE" "Arr's settings and database"
+	elif [ -n "$ARR_STATE" ]; then
+		say "  kept $ARR_STATE (delete it yourself, or run this again with --delete-data)"
+	fi
+	[ ! -x "${ARR_BIN%/arr}/ngrok" ] || say "  kept ${ARR_BIN%/arr}/ngrok (remote access tunnel; delete it if you don't use ngrok)"
+fi
+
+# ---------------------------------------------------------------- Plex
+
+if [ "$DO_PLEX" = 1 ]; then
+	step "Removing Plex Media Server"
+	case "$PLEX_KIND" in
+	deb)
+		run $SUDO apt-get remove -y plexmediaserver
+		for f in /etc/apt/sources.list.d/*plex*; do
+			if [ -f "$f" ] && grep -qi 'plex\.tv' "$f"; then remove_file "$f"; fi
+		done
+		remove_file /usr/share/keyrings/plexmediaserver.v2.gpg
+		;;
+	rpm)
+		if have dnf; then run $SUDO dnf remove -y plexmediaserver; else run $SUDO yum remove -y plexmediaserver; fi
+		for f in /etc/yum.repos.d/*plex*; do
+			if [ -f "$f" ] && grep -qi 'plex\.tv' "$f"; then remove_file "$f"; fi
+		done
+		;;
+	snap)
+		if [ "$PLEX_WIPE" = 1 ]; then run $SUDO snap remove --purge plexmediaserver
+		else run $SUDO snap remove plexmediaserver; fi
+		;;
+	mac)
+		run osascript -e 'quit app "Plex Media Server"' 2>/dev/null || true
+		remove_dir "/Applications/Plex Media Server.app" "the Plex app"
+		;;
+	esac
+	[ "$PLEX_WIPE" != 1 ] || [ -z "$PLEX_DATA" ] || remove_dir "$PLEX_DATA" "Plex's library database and settings"
+	if [ "$PLEX_WIPE" = 1 ] && [ "$PLEX_KIND" = mac ]; then
+		remove_dir "$HOME/Library/Caches/PlexMediaServer" "Plex's cache"
+		remove_file "$HOME/Library/Preferences/com.plexapp.plexmediaserver.plist"
+	fi
+	for c in $PLEX_CONTAINERS; do
+		# Plex's data in a container lives in the folder mounted at /config.
+		cfg=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{end}}{{end}}' "$c" 2>/dev/null || true)
+		project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c" 2>/dev/null || true)
+		run docker rm -f "$c" >/dev/null
+		say "  removed the Docker container \"$c\""
+		[ -z "$project" ] || say "  it came from Docker Compose project \"$project\": remove it from that compose file too, or 'docker compose up' brings it back"
+		if [ "$PLEX_WIPE" = 1 ] && [ -n "$cfg" ]; then
+			remove_dir "$cfg" "Plex's library database and settings"
+		elif [ -n "$cfg" ]; then
+			say "  kept its data in $cfg"
+		fi
+	done
+	[ "$PLEX_WIPE" = 1 ] || [ -z "$PLEX_DATA" ] || [ ! -d "$PLEX_DATA" ] ||
+		say "  kept Plex's data in $PLEX_DATA (it's used again if you reinstall Plex)"
+fi
+
+say ""
+say "Done. Your movie and TV files are untouched."
+[ "$DRY_RUN" = 0 ] || say "(This was a dry run: nothing was changed.)"
