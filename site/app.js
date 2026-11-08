@@ -1,5 +1,5 @@
-// Flip to false when the Windows installer ships.
-const WINDOWS_COMING_SOON = true;
+// Set to true to mark Windows as not available yet.
+const WINDOWS_COMING_SOON = false;
 
 (function () {
   const tabs = [].slice.call(document.querySelectorAll('[role=tab]'));
