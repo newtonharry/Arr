@@ -231,6 +231,8 @@ elif [ -n "$ARR_CONFIG" ] && [ -r "$ARR_CONFIG" ]; then
 		if [ "$p" = "$(printf '\001')escaped" ] || [ -d "$p" ]; then printf '%s\n' "${p%/}"; fi
 	done)
 	case "$PROTECT" in *"$(printf '\001')escaped"*) CONFIG_UNREADABLE=1 ;; esac
+	# Multi-line strings ("""...""" or '''...''') aren't read here either.
+	if grep -q "\"\"\"\|'''" "$ARR_CONFIG"; then CONFIG_UNREADABLE=1; fi
 fi
 
 # Plex: a system package, a snap, Docker containers, or the macOS app.
