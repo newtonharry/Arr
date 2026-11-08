@@ -172,6 +172,14 @@ jobs:
           try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "rerun said: $($_.Exception.Message)" }
           if ((Get-Content "$state\config.toml" -Raw) -ne $before) { Fail 'a rerun changed the config' }
           if (-not (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue)) { Fail 'a rerun lost the tunnel task' }
+          # Uninstalled but data kept, then installed again: ngrok and the tunnel come back.
+          $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '0'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          if (Test-Path "$bin\ngrok.exe") { Fail 'uninstall left ngrok behind' }
+          if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) { Fail 'uninstall left the tunnel task' }
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { "reinstall said: $($_.Exception.Message)" }
+          if (-not (Test-Path "$bin\ngrok.exe")) { Fail 'the reinstall did not bring ngrok back' }
+          if (-not (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue)) { Fail 'the reinstall did not bring the tunnel back' }
           # Uninstalling takes the tunnel with it.
           $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '1'
           Get-Content uninstall.ps1 -Raw | Invoke-Expression

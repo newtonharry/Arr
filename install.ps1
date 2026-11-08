@@ -173,8 +173,9 @@ function Install-Arr {
 	$m = Select-String -Path $Config -Pattern '^public_url = "(https://[^"]+)"$' | Select-Object -First 1
 	if ($m -and (Test-Path $NgrokYml) -and (Select-String -Path $Config -Pattern '^\[mcp\.oauth\]' -Quiet)) {
 		$PublicUrl = $m.Matches[0].Groups[1].Value
+		# Also after an uninstall that kept Arr's data: the tunnel needs ngrok back.
 		$ngrok = Find-Ngrok $BinDir
-		if (-not $ngrok) { throw "the ngrok agent is missing; run this again with `$env:ARR_REMOTE = '1'" }
+		if (-not $ngrok) { $ngrok = Install-Ngrok $BinDir }
 		Step "Starting the tunnel for $PublicUrl"
 		Stop-Tunnel $NgrokYml
 		$tunnelArgs = "--hidden `"$ngrok`" http 127.0.0.1:$Port `"--url=$PublicUrl`" --config `"$NgrokYml`" `"--log=$TunnelLog`" --log-level=warn"
@@ -324,21 +325,7 @@ function Set-RemoteAccess {
 	if ($emails.Count -eq 0) { throw 'remote access needs at least one allowed Google account' }
 
 	$ngrok = Find-Ngrok $BinDir
-	if (-not $ngrok) {
-		Say 'Installing the ngrok agent'
-		$n = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'windows-arm64' } else { 'windows-amd64' }
-		$tmp = Join-Path ([IO.Path]::GetTempPath()) ('arr-ngrok-' + [guid]::NewGuid().ToString('N'))
-		New-Item -ItemType Directory $tmp | Out-Null
-		try {
-			Invoke-WebRequest -UseBasicParsing "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-$n.zip" -OutFile "$tmp\ngrok.zip"
-			Expand-Archive "$tmp\ngrok.zip" -DestinationPath $tmp -Force
-			New-Item -ItemType Directory -Force $BinDir | Out-Null
-			Replace-File "$tmp\ngrok.exe" (Join-Path $BinDir 'ngrok.exe')
-		} finally {
-			Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-		}
-		$ngrok = Join-Path $BinDir 'ngrok.exe'
-	}
+	if (-not $ngrok) { $ngrok = Install-Ngrok $BinDir }
 
 	# The authtoken stays in a private file, never on a command line. web_addr: false turns
 	# off ngrok's local inspection page, which would show the sign-in tokens passing through.
@@ -372,14 +359,21 @@ function Set-RemoteAccess {
 	$list = ($emails | ForEach-Object { "`"$_`"" }) -join ', '
 	$text = $text.TrimEnd() + "`n`n# Google sign-in for ChatGPT and other remote MCP clients (docs/REMOTE.md).`n[mcp.oauth]`npublic_url = `"https://$domain`"`ngoogle_client_id = `"$clientId`"`ngoogle_client_secret_file = `"secrets/google_client_secret`"`nallowed_emails = [$list]`n"
 	Write-Private $Config $text
-	$check = & $Arr check --config $Config 2>&1 | Out-String
-	if ($LASTEXITCODE -ne 0) {
+	# Whatever goes wrong from here, the config goes back as it was. (Windows PowerShell can
+	# turn arr's error output into an exception before its exit code is even read.)
+	try {
+		$ErrorActionPreference = 'Continue'
+		$check = & $Arr check --config $Config 2>&1 | Out-String
+		$failed = $LASTEXITCODE -ne 0
+		$ErrorActionPreference = 'Stop'
+		if ($failed) { throw "arr check rejected the remote access settings:`n$check" }
+		if ($check -notmatch '"mcp_enabled":\s*true') {
+			throw 'your config turns MCP off ([mcp] enabled = false); set it to true and run this again'
+		}
+	} catch {
+		$ErrorActionPreference = 'Stop'
 		Write-Private $Config $before
-		throw "arr check rejected the remote access settings; your previous config is restored:`n$check"
-	}
-	if ($check -notmatch '"mcp_enabled":\s*true') {
-		Write-Private $Config $before
-		throw 'your config turns MCP off ([mcp] enabled = false); set it to true and run this again'
+		throw "$($_.Exception.Message) (your previous config is restored)"
 	}
 	Say "Remote access configured for https://$domain"
 }
@@ -414,6 +408,23 @@ function Write-Private($path, $text) {
 	[IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false))
 }
 
+# Installs the ngrok agent into Arr's program folder; returns its path.
+function Install-Ngrok($binDir) {
+	Say 'Installing the ngrok agent'
+	$n = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'windows-arm64' } else { 'windows-amd64' }
+	$tmp = Join-Path ([IO.Path]::GetTempPath()) ('arr-ngrok-' + [guid]::NewGuid().ToString('N'))
+	New-Item -ItemType Directory $tmp | Out-Null
+	try {
+		Invoke-WebRequest -UseBasicParsing "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-$n.zip" -OutFile "$tmp\ngrok.zip"
+		Expand-Archive "$tmp\ngrok.zip" -DestinationPath $tmp -Force
+		New-Item -ItemType Directory -Force $binDir | Out-Null
+		Replace-File "$tmp\ngrok.exe" (Join-Path $binDir 'ngrok.exe')
+	} finally {
+		Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+	}
+	return (Join-Path $binDir 'ngrok.exe')
+}
+
 function Find-Ngrok($binDir) {
 	$own = Join-Path $binDir 'ngrok.exe'
 	if (Test-Path $own) { return $own }
@@ -438,7 +449,7 @@ function Stop-Arr($background) {
 		Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
 	}
 	Get-CimInstance Win32_Process -Filter "Name = 'arr-background.exe'" -ErrorAction SilentlyContinue |
-		Where-Object { $_.ExecutablePath -eq $background -and $_.CommandLine -like '*--config*' } |
+		Where-Object { $_.ExecutablePath -eq $background -and $_.CommandLine -like '*--config*' -and $_.CommandLine -notlike '*--hidden*' } |
 		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
@@ -529,7 +540,7 @@ $api = "http://127.0.0.1:$Port"
 function Restart-Arr {
 	Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
 	Get-CimInstance Win32_Process -Filter "Name = 'arr-background.exe'" -ErrorAction SilentlyContinue |
-		Where-Object { $_.CommandLine -like '*--config*' } |
+		Where-Object { $_.CommandLine -like '*--config*' -and $_.CommandLine -notlike '*--hidden*' } |
 		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 	Start-ScheduledTask -TaskName 'Arr'
 }
