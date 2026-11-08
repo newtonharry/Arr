@@ -3,12 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fff8ef" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#161d1d" media="(prefers-color-scheme: dark)">
 <title>Arr</title>
 <link rel="icon" href="/app/mascot.svg" type="image/svg+xml">
+<link rel="preload" href="/app/fonts/nunito-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/app/app.css">
+<script type="module" src="/app/app.js"></script>
 </head>
 <body>
-<div id="app"></div>
-<script src="/app/app.js" defer></script>
+<a class="skip" href="#view">Skip to content</a>
+<header class="top" id="top">
+  <a class="brand" href="#/" aria-label="Arr, home"><img src="/app/mascot.svg" alt="" width="34" height="34"><span>Arr</span></a>
+  <nav id="tabs" aria-label="Main"></nav>
+  <form class="search" id="search" role="search" autocomplete="off">
+    <span id="search-ico" aria-hidden="true"></span>
+    <label class="sr" for="q">Find a movie or show</label>
+    <input id="q" name="q" type="search" placeholder="Find a movie or show" enterkeyhint="search" autocapitalize="off" spellcheck="false">
+  </form>
+  <div id="banner" class="banner" role="status"></div>
+</header>
+<main id="view" tabindex="-1"><noscript><p class="hint">Arr needs JavaScript to run.</p></noscript></main>
+<footer class="foot" id="foot" hidden><span id="who"></span><button type="button" class="link" id="signout">Sign out</button></footer>
+<div id="live" class="sr" aria-live="polite"></div>
 </body>
 </html>
