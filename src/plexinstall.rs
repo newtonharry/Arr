@@ -42,6 +42,13 @@ pub async fn run(opts: Options) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("arr plex-install installs system software: run it as administrator (sudo)");
     }
+    // The installer runs with a private umask (077); the media folders must be readable by
+    // Plex's own user, so this process uses the usual 022 whatever it inherited.
+    #[cfg(unix)]
+    // SAFETY: umask only sets this process's file-creation mask.
+    unsafe {
+        libc::umask(0o022);
+    }
     let Some(pm) = package_manager() else {
         bail!(
             "this computer has neither apt nor dnf; install Plex from https://www.plex.tv/media-server-downloads/"
