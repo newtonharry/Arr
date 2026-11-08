@@ -1,9 +1,10 @@
 //! First-run setup in a web browser (`arr wizard`).
 //!
 //! The installer starts this before Arr has a config. It serves one page (see `wizard/`)
-//! that signs in to Plex, picks the server, libraries and folders, then writes the same
-//! config `install.sh` writes, runs `arr setup`, `arr check` and the Plex import, and exits.
-//! The installer then installs the service as before.
+//! that signs in to Plex, finds the Plex on this computer (Arr moves files into Plex's
+//! folders, so it only works with the Plex beside it), picks libraries and folders, then
+//! writes the same config `install.sh` writes, runs `arr setup`, `arr check` and the Plex
+//! import, and exits. The installer then installs the service as before.
 //!
 //! Access needs the link printed in the terminal: its secret code is swapped for an
 //! HttpOnly, SameSite=Strict cookie, and changes also need a custom header, so other sites
@@ -78,17 +79,28 @@ struct Wizard {
 struct Inner {
     pin: Option<(u64, String)>,
     account: Option<Secret>,
-    servers: Vec<Server>,
     plex: Option<Connected>,
+    /// Set when the last look found no Plex on this computer that Arr can use.
+    missing: Option<Missing>,
     phase: Phase,
 }
 
-#[derive(Clone)]
+/// Why the Plex on this computer can't be used.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Missing {
+    /// Nothing answers as Plex on this computer.
+    NotInstalled,
+    /// Plex answers, but it isn't one of the signed-in account's servers.
+    NotLinked,
+}
+
+/// A Plex server the signed-in account owns.
 struct Server {
     id: String,
     name: String,
     token: Secret,
-    candidates: Vec<Url>,
+    ports: Vec<u16>,
 }
 
 #[derive(Clone)]
@@ -96,9 +108,8 @@ struct Connected {
     name: String,
     base_url: Url,
     token: Secret,
-    local: bool,
     sections: Vec<Section>,
-    /// (container path, host path) of a local Plex container's mounts, longest first.
+    /// (container path, host path) of a Plex container's mounts, longest first.
     mounts: Vec<(String, String)>,
 }
 
@@ -201,8 +212,6 @@ fn router(wiz: Arc<Wizard>) -> Router {
         .route("/api/state", get(state))
         .route("/api/plex/signin", post(signin))
         .route("/api/plex/check", post(check_signin))
-        .route("/api/plex/server", post(choose_server))
-        .route("/api/plex/manual", post(manual_server))
         .route("/api/folder", post(folder))
         .route("/api/apply", post(apply))
         .route("/api/finish", post(finish))
@@ -352,7 +361,6 @@ fn snapshot(wiz: &Wizard) -> Value {
         };
         json!({
             "name": p.name,
-            "local": p.local,
             "movies": libs("movie"),
             "tv": libs("show"),
         })
@@ -360,17 +368,14 @@ fn snapshot(wiz: &Wizard) -> Value {
     json!({
         "signed_in": inner.account.is_some(),
         "waiting_for_signin": inner.pin.is_some() && inner.account.is_none(),
-        "servers": inner.servers.iter().map(|s| json!({ "id": s.id, "name": s.name })).collect::<Vec<_>>(),
         "plex": plex,
+        "missing": inner.missing,
         "phase": inner.phase,
     })
 }
 
 /// Where this machine sees a folder Plex reports, if it can tell.
 fn local_path(p: &Connected, plex_path: &str) -> Option<String> {
-    if !p.local {
-        return Path::new(plex_path).is_dir().then(|| plex_path.to_string());
-    }
     for (dst, src) in &p.mounts {
         if let Some(rest) = plex_path.strip_prefix(dst.as_str())
             && (rest.is_empty() || rest.starts_with('/'))
@@ -438,7 +443,7 @@ fn plex_down(e: upstream::UpstreamError) -> Response {
     )
 }
 
-/// Polls the sign-in once; when it's done, lists the servers this account owns.
+/// Polls the sign-in once; once signed in, looks for this computer's Plex.
 async fn check_signin(State(wiz): St) -> Response {
     let (pin, signed_in) = {
         let inner = wiz.inner.lock().unwrap();
@@ -476,24 +481,15 @@ async fn check_signin(State(wiz): St) -> Response {
             None => return Json(snapshot(&wiz)).into_response(),
         }
     }
-    // Until a server is found, every check asks plex.tv again, so a failed lookup can be
-    // retried.
-    let lookup = {
-        let inner = wiz.inner.lock().unwrap();
-        inner.plex.is_none() && inner.servers.is_empty()
-    };
-    if lookup {
+    // Until Plex is found, every check looks again, so a failed lookup or a Plex
+    // installed meanwhile is picked up.
+    if wiz.inner.lock().unwrap().plex.is_none() {
         let servers = match servers(&wiz).await {
             Ok(s) => s,
             Err(e) => return plex_down(e),
         };
-        let only = (servers.len() == 1).then(|| servers[0].clone());
-        wiz.inner.lock().unwrap().servers = servers;
-        if let Some(s) = only
-            && let Err(msg) = connect(&wiz, &s).await
-        {
-            return problem(StatusCode::BAD_GATEWAY, &msg);
-        }
+        let missing = find_local(&wiz, &servers).await.err();
+        wiz.inner.lock().unwrap().missing = missing;
     }
     Json(snapshot(&wiz)).into_response()
 }
@@ -517,21 +513,10 @@ struct Resource {
 #[derive(Deserialize)]
 struct Connection {
     #[serde(default)]
-    uri: String,
-    #[serde(default)]
-    protocol: String,
-    #[serde(default)]
-    address: String,
-    #[serde(default)]
     port: u16,
-    #[serde(default)]
-    local: bool,
-    #[serde(default)]
-    relay: bool,
 }
 
-/// The Plex servers this account owns, each with the addresses to try in order: this
-/// machine first, then the home network, then anything else that isn't Plex's relay.
+/// The Plex servers this account owns, with the ports they listen on.
 async fn servers(wiz: &Wizard) -> Result<Vec<Server>, upstream::UpstreamError> {
     let account = wiz.inner.lock().unwrap().account.clone();
     let Some(account) = account else {
@@ -553,41 +538,6 @@ async fn servers(wiz: &Wizard) -> Result<Vec<Server>, upstream::UpstreamError> {
         .filter(|r| r.owned && r.provides.split(',').any(|p| p.trim() == "server"))
         .filter_map(|r| {
             let token = r.access_token.filter(|t| !t.is_empty())?;
-            let mut candidates: Vec<Url> = vec![];
-            let mut push = |u: Option<Url>| {
-                if let Some(u) = u
-                    && matches!(u.scheme(), "http" | "https")
-                    && !candidates.contains(&u)
-                {
-                    candidates.push(u);
-                }
-            };
-            let mut ports: Vec<u16> = r
-                .connections
-                .iter()
-                .map(|c| c.port)
-                .filter(|p| *p > 0)
-                .collect();
-            ports.push(32400);
-            ports.sort_unstable();
-            ports.dedup();
-            for p in &ports {
-                push(Url::parse(&format!("http://127.0.0.1:{p}/")).ok());
-            }
-            for c in r.connections.iter().filter(|c| c.local && !c.relay) {
-                push(with_slash(&c.uri));
-                if c.protocol == "https" || c.protocol == "http" {
-                    let host = if c.address.contains(':') {
-                        format!("[{}]", c.address)
-                    } else {
-                        c.address.clone()
-                    };
-                    push(Url::parse(&format!("http://{host}:{}/", c.port)).ok());
-                }
-            }
-            for c in r.connections.iter().filter(|c| !c.local && !c.relay) {
-                push(with_slash(&c.uri));
-            }
             Some(Server {
                 id: r.client_identifier,
                 name: if r.name.is_empty() {
@@ -596,20 +546,16 @@ async fn servers(wiz: &Wizard) -> Result<Vec<Server>, upstream::UpstreamError> {
                     r.name
                 },
                 token: Secret::new(token),
-                candidates,
+                ports: r
+                    .connections
+                    .iter()
+                    .map(|c| c.port)
+                    .filter(|p| *p > 0)
+                    .collect(),
             })
         })
         .take(20)
         .collect())
-}
-
-fn with_slash(uri: &str) -> Option<Url> {
-    let mut u = Url::parse(uri).ok()?;
-    if !u.path().ends_with('/') {
-        let p = format!("{}/", u.path());
-        u.set_path(&p);
-    }
-    Some(u)
 }
 
 #[derive(Deserialize)]
@@ -624,56 +570,60 @@ struct IdentityContainer {
     machine_identifier: String,
 }
 
-/// Connects to the first address that answers as this server, then reads its libraries.
-async fn connect(wiz: &Wizard, server: &Server) -> Result<(), String> {
-    for base in &server.candidates {
-        let loopback = base.host_str().is_some_and(is_loopback_host);
-        if loopback {
-            // Another Plex may own this port; only use it if it's the same server.
-            let Ok(url) = base.join("identity") else {
-                continue;
-            };
-            let same = match upstream::send(wiz.http.get(url).header("Accept", "application/json"))
-                .await
-            {
-                Ok(r) => upstream::read_json::<Identity>(r, 64 * 1024)
-                    .await
-                    .is_ok_and(|i| i.container.machine_identifier == server.id),
-                Err(_) => false,
-            };
-            if !same {
-                continue;
-            }
-        }
-        if let Ok(sections) = sections(base.clone(), server.token.clone()).await {
-            let mounts = if loopback && wiz.opts.docker {
-                docker_mounts().await
-            } else {
-                vec![]
-            };
-            wiz.inner.lock().unwrap().plex = Some(Connected {
-                name: server.name.clone(),
-                base_url: base.clone(),
-                token: server.token.clone(),
-                local: loopback,
-                sections,
-                mounts,
-            });
-            return Ok(());
-        }
+/// Connects to the Plex running on this computer, if it's one of the account's servers.
+/// Arr moves files into Plex's folders, so it only works with the Plex beside it.
+async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
+    let mut ports: Vec<u16> = servers
+        .iter()
+        .flat_map(|s| s.ports.iter().copied())
+        .collect();
+    ports.push(32400);
+    ports.sort_unstable();
+    ports.dedup();
+    let mut answered = false;
+    for port in ports {
+        let Ok(base) = Url::parse(&format!("http://127.0.0.1:{port}/")) else {
+            continue;
+        };
+        let Ok(url) = base.join("identity") else {
+            continue;
+        };
+        let Ok(r) = upstream::send(wiz.http.get(url).header("Accept", "application/json")).await
+        else {
+            continue;
+        };
+        let Ok(id) = upstream::read_json::<Identity>(r, 64 * 1024).await else {
+            continue;
+        };
+        answered = true;
+        let Some(server) = servers
+            .iter()
+            .find(|s| s.id == id.container.machine_identifier)
+        else {
+            continue;
+        };
+        let Ok(sections) = sections(base.clone(), server.token.clone()).await else {
+            continue;
+        };
+        let mounts = if wiz.opts.docker {
+            docker_mounts().await
+        } else {
+            vec![]
+        };
+        wiz.inner.lock().unwrap().plex = Some(Connected {
+            name: server.name.clone(),
+            base_url: base,
+            token: server.token.clone(),
+            sections,
+            mounts,
+        });
+        return Ok(());
     }
-    Err(format!(
-        "couldn't reach {} from this computer. Is it switched on? You can also enter its address and token under \"Connect another way\".",
-        server.name
-    ))
-}
-
-fn is_loopback_host(h: &str) -> bool {
-    h == "localhost"
-        || h.trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    Err(if answered {
+        Missing::NotLinked
+    } else {
+        Missing::NotInstalled
+    })
 }
 
 async fn sections(base_url: Url, token: Secret) -> Result<Vec<Section>, upstream::UpstreamError> {
@@ -688,83 +638,6 @@ async fn sections(base_url: Url, token: Secret) -> Result<Vec<Section>, upstream
     })
     .sections()
     .await
-}
-
-#[derive(Deserialize)]
-struct ServerChoice {
-    id: String,
-}
-
-async fn choose_server(State(wiz): St, Json(c): Json<ServerChoice>) -> Response {
-    let server = wiz
-        .inner
-        .lock()
-        .unwrap()
-        .servers
-        .iter()
-        .find(|s| s.id == c.id)
-        .cloned();
-    let Some(server) = server else {
-        return problem(StatusCode::NOT_FOUND, "no such Plex server");
-    };
-    match connect(&wiz, &server).await {
-        Ok(()) => Json(snapshot(&wiz)).into_response(),
-        Err(msg) => problem(StatusCode::BAD_GATEWAY, &msg),
-    }
-}
-
-#[derive(Deserialize)]
-struct Manual {
-    url: String,
-    token: String,
-}
-
-/// For a server sign-in can't find or reach: its address and token, typed in.
-async fn manual_server(State(wiz): St, Json(m): Json<Manual>) -> Response {
-    let Some(base) = with_slash(m.url.trim())
-        .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
-    else {
-        return problem(
-            StatusCode::BAD_REQUEST,
-            "enter an address like http://192.168.1.20:32400",
-        );
-    };
-    let token = m.token.trim();
-    if token.is_empty()
-        || token.len() > 200
-        || token.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return problem(StatusCode::BAD_REQUEST, "enter the Plex token");
-    }
-    let token = Secret::new(token.to_string());
-    match sections(base.clone(), token.clone()).await {
-        Ok(sections) => {
-            let local = base.host_str().is_some_and(is_loopback_host);
-            let mounts = if local && wiz.opts.docker {
-                docker_mounts().await
-            } else {
-                vec![]
-            };
-            let mut inner = wiz.inner.lock().unwrap();
-            inner.plex = Some(Connected {
-                name: "Plex".into(),
-                base_url: base,
-                token,
-                local,
-                sections,
-                mounts,
-            });
-            drop(inner);
-            Json(snapshot(&wiz)).into_response()
-        }
-        Err(e) => problem(
-            StatusCode::BAD_GATEWAY,
-            &format!(
-                "Plex didn't accept that address and token: {}",
-                e.describe()
-            ),
-        ),
-    }
 }
 
 /// The mounts of a running Plex container, as (container path, host path), longest
@@ -1288,7 +1161,6 @@ mod tests {
             name: "Plex".into(),
             base_url: Url::parse("http://127.0.0.1:32400/").unwrap(),
             token: Secret::new("t".into()),
-            local: true,
             sections: vec![],
             mounts: vec![
                 ("/data/movies".into(), "/srv/films".into()),

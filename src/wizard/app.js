@@ -49,8 +49,8 @@ function render(s) {
   $("signed-in").hidden = !s.signed_in;
   $("signin-wait").hidden = !s.waiting_for_signin;
 
-  $("step-server").hidden = !s.signed_in && !s.plex;
-  renderServers(s);
+  $("step-server").hidden = !s.signed_in;
+  renderServer(s);
 
   const ready = !!s.plex;
   $("step-libraries").hidden = !ready;
@@ -58,37 +58,30 @@ function render(s) {
   if (ready && !formFilled) fillLibraries(s.plex);
 }
 
-function renderServers(s) {
-  const box = $("servers");
-  box.replaceChildren();
-  if (s.plex) {
-    $("connected").hidden = false;
-    $("connected").textContent = `Connected to ${s.plex.name}.`;
-    return;
-  }
-  $("connected").hidden = true;
-  if (!s.signed_in) return;
-  if (s.servers.length === 0) {
-    const p = document.createElement("p");
-    p.textContent = "Arr didn't find a Plex server on this account. Check that your server is on and signed in to Plex, then look again, or connect another way below.";
-    const again = document.createElement("button");
-    again.type = "button";
-    again.textContent = "Look again";
-    again.addEventListener("click", () => act(again, () => call("POST", "/api/plex/check")));
-    box.append(p, again);
-    $("manual").open = true;
-    return;
-  }
-  const p = document.createElement("p");
-  p.textContent = s.servers.length === 1 ? "Your server:" : "Which server should Arr use?";
-  box.append(p);
-  for (const srv of s.servers) {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.textContent = `Use ${srv.name}`;
-    b.addEventListener("click", () => act(b, () => call("POST", "/api/plex/server", { id: srv.id })));
-    box.append(b);
-  }
+const MISSING = {
+  not_installed: [
+    "Arr couldn't find Plex on this computer. Arr puts movies and shows where Plex looks, so it has to run on the computer that runs Plex. ",
+    "Install Plex Media Server", "https://www.plex.tv/media-server-downloads/",
+    ", start it, then look again.",
+  ],
+  not_linked: [
+    "Plex is on this computer, but it isn't linked to the Plex account you signed in with. ",
+    // The same computer this page comes from, even when it's opened from another one.
+    "Open Plex", `http://${location.hostname}:32400/web`,
+    " on this computer and sign in with the same account, then look again.",
+  ],
+};
+
+function renderServer(s) {
+  $("connected").hidden = !s.plex;
+  if (s.plex) $("connected").textContent = `Found ${s.plex.name} on this computer.`;
+  const why = !s.plex && s.signed_in && MISSING[s.missing];
+  $("missing").hidden = !why;
+  if (!why) return;
+  const [before, label, href, after] = why;
+  const a = document.createElement("a");
+  a.href = href; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = label;
+  $("missing-text").replaceChildren(before, a, after);
 }
 
 function fillLibraries(plex) {
@@ -212,10 +205,8 @@ $("signin-btn").addEventListener("click", async () => {
   }
 });
 
-$("manual-btn").addEventListener("click", (ev) =>
-  act(ev.target, () => call("POST", "/api/plex/manual", {
-    url: $("manual-url").value, token: $("manual-token").value,
-  })));
+$("look-again").addEventListener("click", (ev) =>
+  act(ev.target, () => call("POST", "/api/plex/check")));
 
 $("form").addEventListener("submit", async (ev) => {
   ev.preventDefault();

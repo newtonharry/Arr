@@ -25,6 +25,8 @@ struct World {
     resources_calls: u32,
     movies_path: String,
     tv_path: String,
+    /// The machine the Plex beside the wizard says it is.
+    identity: String,
     /// The token each request carried, by path.
     tokens: Vec<(String, String)>,
     client_ids: Vec<String>,
@@ -49,6 +51,7 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
     let m: Mock = Arc::new(Mutex::new(World {
         movies_path: movies.to_str().unwrap().into(),
         tv_path: tv.to_str().unwrap().into(),
+        identity: MACHINE.into(),
         ..Default::default()
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -111,7 +114,10 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
         )
         .route(
             "/identity",
-            get(|| async { axum::Json(json!({ "MediaContainer": { "machineIdentifier": MACHINE } })) }),
+            get(|State(m): State<Mock>| async move {
+                let id = m.lock().unwrap().identity.clone();
+                axum::Json(json!({ "MediaContainer": { "machineIdentifier": id } }))
+            }),
         )
         .route(
             "/library/sections",
@@ -193,21 +199,13 @@ impl Page {
     }
 }
 
-#[tokio::test]
-async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
-    let tmp = tempfile::tempdir().unwrap();
-    let movies = tmp.path().join("media/movies");
-    let tv = tmp.path().join("media/tv");
-    std::fs::create_dir_all(&movies).unwrap();
-    std::fs::create_dir_all(&tv).unwrap();
-    let state_dir = tmp.path().join("state");
-    let (mock, world) = start_mock(&movies, &tv).await;
+/// Starts `arr wizard` against the mock; returns it, the link it printed, and its port.
+async fn start_wizard(state_dir: &Path, mock: SocketAddr) -> (tokio::process::Child, String, u16) {
     let port = free_port();
-
     let mut child = tokio::process::Command::new(BIN)
         .args(["wizard", "--no-docker", "--port", &port.to_string()])
         .arg("--state-dir")
-        .arg(&state_dir)
+        .arg(state_dir)
         .args(["--ffprobe", "/usr/bin/ffprobe"])
         .arg(format!("--plex-tv-url=http://{mock}/"))
         .arg(format!("--plex-auth-url=http://{mock}/auth"))
@@ -226,10 +224,19 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     })
     .await
     .unwrap();
-    assert!(
-        link.starts_with(&format!("http://localhost:{port}/?code=")),
-        "{link}"
-    );
+    (child, link, port)
+}
+
+#[tokio::test]
+async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("media/movies");
+    let tv = tmp.path().join("media/tv");
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    let state_dir = tmp.path().join("state");
+    let (mock, world) = start_mock(&movies, &tv).await;
+    let (mut child, link, port) = start_wizard(&state_dir, mock).await;
     let base = format!("http://127.0.0.1:{port}");
     let code = link.split("code=").nth(1).unwrap();
 
@@ -312,13 +319,9 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["signed_in"], true);
     assert!(!v.to_string().contains(ACCOUNT_TOKEN) && !v.to_string().contains(SERVER_TOKEN));
-    // Only the server this account owns is offered, and with one it connects straight away.
-    assert_eq!(
-        v["servers"],
-        json!([{ "id": MACHINE, "name": "Living Room" }])
-    );
+    // The Plex on this computer is the account's own server, so Arr connects straight away.
     assert_eq!(v["plex"]["name"], "Living Room");
-    assert_eq!(v["plex"]["local"], true);
+    assert_eq!(v["missing"], Value::Null);
     assert_eq!(
         v["plex"]["movies"],
         json!([{ "id": "1:0", "title": "Movies", "plex_path": movies, "local_path": movies }])
@@ -459,4 +462,47 @@ async fn an_existing_config_is_never_replaced() {
         std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
         "# mine\n"
     );
+}
+
+#[tokio::test]
+async fn only_the_accounts_plex_on_this_computer_is_used() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mock, world) = start_mock(tmp.path(), tmp.path()).await;
+    // The Plex here belongs to someone else (or isn't signed in yet).
+    world.lock().unwrap().identity = "someone-else".into();
+    world.lock().unwrap().resources_calls = 1; // no plex.tv hiccup in this test
+    let (_child, link, port) = start_wizard(&tmp.path().join("state"), mock).await;
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let r = http
+        .get(link.replace("localhost", "127.0.0.1"))
+        .send()
+        .await
+        .unwrap();
+    let cookie = r.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let page = Page {
+        base: format!("http://127.0.0.1:{port}"),
+        cookie,
+        http,
+    };
+    page.post("/api/plex/signin", json!({})).await;
+    page.post("/api/plex/check", json!({})).await;
+    let (s, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["signed_in"], true);
+    assert_eq!(v["plex"], Value::Null);
+    assert_eq!(v["missing"], "not_linked");
+    // Once that Plex is signed in to this account, looking again connects.
+    world.lock().unwrap().identity = MACHINE.into();
+    let (_, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(v["missing"], Value::Null);
+    assert_eq!(v["plex"]["name"], "Living Room");
 }

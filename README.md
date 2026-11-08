@@ -21,8 +21,10 @@ The script takes a few minutes. It:
 1. downloads the Arr binary for your system and checks its SHA-256 (no compiler needed);
 2. installs FFmpeg if `ffprobe` is missing (it asks first);
 3. opens a setup page in your web browser. You sign in to Plex there, and Arr finds your
-   server, your movie and TV libraries and their folders. You confirm the folders, choose
-   where downloads go and whether Arr installs its own updates, then click **Finish setup**;
+   Plex on this computer, your movie and TV libraries and their folders (Arr moves files
+   into Plex's folders, so it runs on the same computer as Plex). You confirm the folders,
+   choose where downloads go and whether Arr installs its own updates, then click
+   **Finish setup**;
 4. imports your Plex library, so Arr knows what you own. It downloads nothing at this step;
 5. starts Arr as a service (systemd on Linux, launchd on macOS).
 

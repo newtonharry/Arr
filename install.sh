@@ -458,6 +458,24 @@ lan_ip() {
 	fi
 }
 
+# sudo usually drops the desktop's variables. Finds the sudo user's desktop session again,
+# so the setup page can open in their own browser.
+desktop_env() {
+	[ "$os" = Linux ] && [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && have loginctl || return 0
+	[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+	sid=$(loginctl show-user "$SUDO_USER" -p Display --value 2>/dev/null) || return 0
+	[ -n "$sid" ] || return 0
+	rt="/run/user/$(id -u "$SUDO_USER")"
+	case "$(loginctl show-session "$sid" -p Type --value 2>/dev/null)" in
+	wayland) WAYLAND_DISPLAY=$(ls "$rt" 2>/dev/null | grep -m1 '^wayland-[0-9]*$') || return 0 ;;
+	x11) DISPLAY=$(loginctl show-session "$sid" -p Display --value 2>/dev/null) || return 0 ;;
+	esac
+	[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+	DESKTOP_ENV="XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus"
+	[ -z "${DISPLAY:-}" ] || DESKTOP_ENV="$DESKTOP_ENV DISPLAY=$DISPLAY"
+	[ -z "${WAYLAND_DISPLAY:-}" ] || DESKTOP_ENV="$DESKTOP_ENV WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+}
+
 # Setup on a web page: sign in to Plex, pick libraries and folders, import what Plex has.
 # `arr wizard` writes the same config configure() does, then exits.
 browser_setup() {
@@ -465,6 +483,8 @@ browser_setup() {
 	# Over SSH (or on a machine without a screen) the page has to open on another computer,
 	# so it listens on this machine's network address. The link carries a secret code.
 	bind=127.0.0.1
+	DESKTOP_ENV=""
+	desktop_env
 	if [ -n "${SSH_CONNECTION:-}" ]; then
 		bind=$(printf '%s' "$SSH_CONNECTION" | awk '{print $3}')
 	elif [ "$os" = Linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
@@ -480,7 +500,8 @@ browser_setup() {
 	# Arr runs as the user who ran sudo, so the page checks folders as that user too.
 	if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
 		chown "$SUDO_USER" "$STATE_DIR"
-		set -- sudo -u "$SUDO_USER" "$@"
+		# shellcheck disable=SC2086 # NAME=value words without spaces
+		set -- sudo -u "$SUDO_USER" env $DESKTOP_ENV "$@"
 	fi
 	"$@" </dev/null || die "setup wasn't finished; run this script again to start over"
 	# The page asked about automatic updates; the answer is used once, below.

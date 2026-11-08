@@ -28,16 +28,12 @@
     </section>
 
     <section id="step-server" class="card" hidden>
-      <h2><span class="num">2</span> Your Plex server</h2>
-      <div id="servers"></div>
+      <h2><span class="num">2</span> Plex on this computer</h2>
       <p id="connected" class="ok" hidden></p>
-      <details id="manual">
-        <summary>Connect another way</summary>
-        <p class="muted">If Arr can't find your server, enter its address and a Plex token. To find the token, open any movie in Plex Web, choose ⋯ › Get Info › View XML, and copy the value after <code>X-Plex-Token=</code> in the address bar.</p>
-        <label>Server address <input id="manual-url" placeholder="http://192.168.1.20:32400" autocomplete="off"></label>
-        <label>Plex token <input id="manual-token" type="password" autocomplete="off"></label>
-        <button type="button" id="manual-btn">Connect</button>
-      </details>
+      <div id="missing" hidden>
+        <p id="missing-text"></p>
+        <button type="button" id="look-again">Look again</button>
+      </div>
     </section>
 
     <section id="step-libraries" class="card" hidden>
