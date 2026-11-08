@@ -467,6 +467,7 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         std::fs::read_to_string(state_dir.join("setup-choices")).unwrap(),
         "auto_update=1\n"
     );
+    #[cfg(unix)]
     for f in [
         "config.toml",
         "secrets/plex_token",

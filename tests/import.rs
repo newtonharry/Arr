@@ -8,6 +8,7 @@ use arr::{catalog::CatalogIndex, fsutil};
 use common::*;
 use serde_json::{Value, json};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -27,8 +28,12 @@ fn write_snapshot(dir: &Path, name: &str, v: &Value) -> std::path::PathBuf {
     p
 }
 
-fn mode(p: &Path) -> u32 {
-    fs::metadata(p).unwrap().permissions().mode() & 0o777
+/// Asserts a Unix mode; Windows has none (privacy comes from the folder's access list).
+macro_rules! assert_mode {
+    ($p:expr, $want:expr $(, $($msg:tt)*)?) => {
+        #[cfg(unix)]
+        assert_eq!(fs::metadata($p).unwrap().permissions().mode() & 0o777, $want $(, $($msg)*)?);
+    };
 }
 
 fn normalized(v: &Value) -> import::Normalized {
@@ -51,12 +56,12 @@ fn import_is_atomic_repeatable_private_and_secret_free() {
     let a = import::run_import(&opts(&state, &snap)).unwrap();
     assert_eq!(a.status, "created");
     let dir = a.import_dir.clone().unwrap();
-    assert_eq!(mode(&state), 0o700);
-    assert_eq!(mode(&state.join("imports")), 0o700);
-    assert_eq!(mode(&dir), 0o700);
+    assert_mode!(&state, 0o700);
+    assert_mode!(&state.join("imports"), 0o700);
+    assert_mode!(&dir, 0o700);
     for f in fs::read_dir(&dir).unwrap() {
         let f = f.unwrap().path();
-        assert_eq!(mode(&f), 0o600, "{}", f.display());
+        assert_mode!(&f, 0o600, "{}", f.display());
         if f.file_name().unwrap() != "source-native.json" {
             assert_no_leaks(&fs::read_to_string(&f).unwrap());
         }
@@ -66,7 +71,7 @@ fn import_is_atomic_repeatable_private_and_secret_free() {
         fs::read(&snap).unwrap(),
         "original preserved byte-for-byte"
     );
-    assert_eq!(mode(&state.join("active-import.json")), 0o600);
+    assert_mode!(&state.join("active-import.json"), 0o600);
 
     // Same bytes again: no new directory, same id.
     let b = import::run_import(&opts(&state, &snap)).unwrap();
@@ -172,6 +177,7 @@ fn failed_or_dry_run_import_leaves_previous_state() {
     );
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[test]
 fn unsafe_paths_and_tampering_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -424,8 +430,8 @@ fn cli_init_import_check() {
     assert!(out.contains("api_token"));
     let token = fs::read_to_string(state.join("secrets/api_token")).unwrap();
     assert_eq!(token.len(), 64);
-    assert_eq!(mode(&state.join("secrets/api_token")), 0o600);
-    assert_eq!(mode(&state.join("config.toml")), 0o600);
+    assert_mode!(&state.join("secrets/api_token"), 0o600);
+    assert_mode!(&state.join("config.toml"), 0o600);
     let (ok, _, _) = run(&["init", "--state-dir", state.to_str().unwrap()]);
     assert!(ok);
     assert_eq!(

@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -2628,6 +2627,7 @@ pub fn run_import(opts: &ImportOptions) -> Result<ImportSummary> {
     if !meta.is_file() {
         bail!("snapshot {} is not a regular file", opts.snapshot.display());
     }
+    #[cfg(unix)]
     if std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o077 != 0 {
         warnings.push("snapshot file is readable by group/other; it contains credentials (chmod 600 recommended)".into());
     }
@@ -2759,9 +2759,10 @@ fn write_import_dir(
     source: &[u8],
     n: &Normalized,
 ) -> Result<Vec<u8>> {
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(dir)
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
     let files: Vec<(&str, Vec<u8>)> = vec![
         (source_name, source.to_vec()),

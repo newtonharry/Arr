@@ -5,7 +5,8 @@
 //! `file:<canonical absolute path>`. ffprobe gets only the `file` protocol, a demuxer whitelist
 //! of ordinary video containers (no playlists, concat or image sequences), no shell, an empty
 //! environment, a null stdin, CPU/memory/file-size/descriptor rlimits, a wall-clock timeout
-//! and capped output. Only exit 0 with no error output, a non-cover-art video stream with a
+//! and capped output. On Windows a job object stands in for the rlimits: CPU time, memory,
+//! one process (no children), killed with the job; it has no file-size or descriptor caps. Only exit 0 with no error output, a non-cover-art video stream with a
 //! codec and dimensions, packets read and a positive duration is accepted.
 
 use serde::Serialize;
@@ -52,9 +53,10 @@ pub async fn preflight(ffprobe: &Path) -> Result<String, String> {
         "ffprobe is an external dependency: install FFmpeg (Debian/Ubuntu: apt install ffmpeg; Fedora: dnf install ffmpeg-free; Alpine: apk add ffmpeg) or set [library] ffprobe to its absolute path (docs/STANDALONE.md). Completed downloads are never imported without media validation (configured: {})",
         ffprobe.display()
     );
-    let run = tokio::process::Command::new(ffprobe)
-        .arg("-version")
-        .env_clear()
+    let mut cmd = tokio::process::Command::new(ffprobe);
+    cmd.arg("-version").env_clear();
+    keep_system_root(&mut cmd);
+    let run = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -134,13 +136,15 @@ pub async fn run(ffprobe: &Path, file: &Path, timeout: Duration) -> Result<Probe
     .env_clear()
     // Distribution FFmpeg builds can link OpenBLAS, which starts one thread per CPU at load;
     // on many-core hosts that exhausts RLIMIT_AS below and ffprobe fails with EAGAIN.
-    .env("OPENBLAS_NUM_THREADS", "1")
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
+    .env("OPENBLAS_NUM_THREADS", "1");
+    keep_system_root(&mut cmd);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let cpu = timeout.as_secs() + 5;
     // SAFETY: only async-signal-safe `setrlimit` calls between fork and exec.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(move || {
             let set = |res, v: u64| {
@@ -164,6 +168,9 @@ pub async fn run(ffprobe: &Path, file: &Path, timeout: Duration) -> Result<Probe
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start ffprobe: {}", e.kind()))?;
+    // Assigned right after start: ffprobe is still loading, well before it reads the file.
+    #[cfg(windows)]
+    let _job = job::confine(&child, cpu).map_err(|e| format!("cannot limit ffprobe: {e}"))?;
     let mut stdout = child.stdout.take().expect("piped").take(MAX_STDOUT);
     let mut stderr = child.stderr.take().expect("piped").take(MAX_STDERR);
     let work = async {
@@ -191,6 +198,82 @@ pub async fn run(ffprobe: &Path, file: &Path, timeout: Duration) -> Result<Probe
         return Err(format!("media errors while reading packets ({line})"));
     }
     parse(&out)
+}
+
+/// Windows programs can fail to start without `SystemRoot`, even with nothing else set.
+fn keep_system_root(cmd: &mut tokio::process::Command) {
+    if cfg!(windows)
+        && let Some(v) = std::env::var_os("SystemRoot")
+    {
+        cmd.env("SystemRoot", v);
+    }
+}
+
+#[cfg(windows)]
+mod job {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    /// A job object; closing it kills whatever is still in it.
+    pub struct Job(HANDLE);
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: a handle this struct owns, closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    // SAFETY: a kernel handle, usable from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    /// Puts `child` in a new job: `cpu_secs` of CPU time, 2 GiB of memory, no child processes.
+    pub fn confine(child: &tokio::process::Child, cpu_secs: u64) -> std::io::Result<Job> {
+        let last = std::io::Error::last_os_error;
+        let process = child
+            .raw_handle()
+            .ok_or_else(|| std::io::Error::other("ffprobe already exited"))?;
+        // SAFETY: no security attributes and no name; the handle is checked below.
+        let job = Job(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
+        if job.0.is_null() {
+            return Err(last());
+        }
+        // SAFETY: plain-data struct, all zeroes is a valid "no limits" value.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let basic = &mut info.BasicLimitInformation;
+        basic.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_TIME
+            | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        basic.PerProcessUserTimeLimit = (cpu_secs as i64).saturating_mul(10_000_000); // 100 ns
+        basic.ActiveProcessLimit = 1;
+        info.ProcessMemoryLimit = 2 * 1024 * 1024 * 1024;
+        // SAFETY: a valid job handle and a pointer to a struct of the size passed.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(last());
+        }
+        // SAFETY: both handles are open; the child's stays valid while `child` lives.
+        if unsafe { AssignProcessToJobObject(job.0, process as HANDLE) } == 0 {
+            return Err(last());
+        }
+        Ok(job)
+    }
 }
 
 fn first_line(err: &[u8]) -> Option<&str> {

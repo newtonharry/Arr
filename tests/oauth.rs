@@ -153,6 +153,7 @@ impl Env {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(
             dir.path(),
             std::os::unix::fs::PermissionsExt::from_mode(0o700),

@@ -1785,7 +1785,10 @@ async fn managed_setup_api_hot_activation_guards_and_restart() {
     // A tampered import is refused at startup (digest-verified like a snapshot import).
     let settings = dir.join("settings.json");
     let mut perms = std::fs::metadata(&settings).unwrap().permissions();
+    #[cfg(unix)]
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+    #[cfg(not(unix))]
+    perms.set_readonly(false);
     std::fs::set_permissions(&settings, perms).unwrap();
     let mut text = std::fs::read_to_string(&settings).unwrap();
     text = text.replacen("\"seed_ratio\": 1.0", "\"seed_ratio\": 0.0", 1);

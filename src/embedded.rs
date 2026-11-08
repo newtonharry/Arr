@@ -375,18 +375,15 @@ fn real_directories(path: &Path) -> Result<(), UpstreamError> {
 
 /// Takes the exclusive engine lock of a state's session directory (non-blocking).
 fn lock_session(dir: &Path) -> Result<std::fs::File, UpstreamError> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let f = o
         .open(dir.join("engine.lock"))
         .map_err(|e| io_failure("opening the engine lock", &e))?;
-    // SAFETY: flock on a file descriptor this function owns; no memory is involved.
-    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if r != 0 {
+    // flock(LOCK_EX | LOCK_NB) on Unix, LockFileEx on Windows.
+    if f.try_lock().is_err() {
         return Err(unavailable(
             "another engine already runs on this state directory; one state directory has one embedded engine",
         ));
@@ -1481,6 +1478,7 @@ mod tests {
         Layout::of(&t.info.data.validate().unwrap())
     }
 
+    #[cfg(unix)] // makes symlinks
     #[test]
     fn the_piece_check_accepts_exact_data_and_rejects_any_difference() {
         // Files spanning several pieces and a piece boundary between files.

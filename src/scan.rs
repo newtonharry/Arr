@@ -25,7 +25,6 @@ use rusqlite::{TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use time::OffsetDateTime;
 
@@ -158,7 +157,11 @@ fn list_videos(
                 continue;
             }
             if let Ok(rel) = entry.path().strip_prefix(root) {
-                out.push((rel.to_string_lossy().to_string(), meta.len(), meta.mtime()));
+                out.push((
+                    rel.to_string_lossy().to_string(),
+                    meta.len(),
+                    crate::fsutil::mtime(&meta),
+                ));
             }
         }
     }
@@ -494,7 +497,7 @@ fn still_there(root: &Path, rel: Option<&str>, size: Option<i64>, mtime: Option<
     std::fs::symlink_metadata(&path).is_ok_and(|m| {
         m.file_type().is_file()
             && size.is_none_or(|s| s as u64 == m.len())
-            && mtime.is_none_or(|t| t == m.mtime())
+            && mtime.is_none_or(|t| t == crate::fsutil::mtime(&m))
     })
 }
 

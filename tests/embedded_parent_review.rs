@@ -72,6 +72,7 @@ fn disabled_execution_does_not_start_embedded_network_listener() {
     );
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_parent_symlink_is_refused_before_engine_writes() {
     let root = tempfile::tempdir().unwrap();
@@ -231,6 +232,7 @@ async fn tampered_persisted_output_folder_is_refused_before_restoration_writes()
     );
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_symlinked_download_root_is_refused_before_engine_start() {
     let root = tempfile::tempdir().unwrap();

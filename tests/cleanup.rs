@@ -55,6 +55,7 @@ async fn assert_library_intact(i: &Imported) {
     assert!(playable(&i.dest).await, "library file still playable");
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test]
 async fn ownership_moves_and_symlinks_refuse_cleanup() {
     // Category changed by the user: treated as user-managed.

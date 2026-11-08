@@ -2033,7 +2033,6 @@ mode = "coexistence"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn setup(config: &str) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2513,8 +2512,10 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_loopback_requires_explicit_opt_in_and_secret_modes_are_checked() {
+        use std::os::unix::fs::PermissionsExt;
         let (_t, cfg) = setup(
             "[server]\nlisten = \"0.0.0.0:8787\"\nallow_non_loopback = true\napi_token_file = \"secrets/api_token\"\n",
         );

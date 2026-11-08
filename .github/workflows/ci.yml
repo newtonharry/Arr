@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, windows]
   pull_request:
 
 permissions:
@@ -26,5 +26,26 @@ jobs:
             target
           key: ci-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked --no-fail-fast
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      # Keep LF line endings: tests compare files byte for byte.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Install Rust and FFmpeg
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --component clippy
+          rustup default 1.94.1
+          choco install ffmpeg -y --no-progress
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-windows-${{ hashFiles('Cargo.lock') }}
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast

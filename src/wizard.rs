@@ -208,12 +208,16 @@ pub async fn run(opts: Options) -> Result<()> {
     println!("\nOpen this link in your web browser to set up Arr:\n");
     println!("    {link}\n");
     if wiz.opts.open {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
+        // Windows: `start` would treat the link's `&` as a command separator.
+        let (opener, args): (&str, &[&str]) = if cfg!(windows) {
+            ("rundll32", &["url.dll,FileProtocolHandler"])
+        } else if cfg!(target_os = "macos") {
+            ("open", &[])
         } else {
-            "xdg-open"
+            ("xdg-open", &[])
         };
         let _ = Command::new(opener)
+            .args(args)
             .arg(&link)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

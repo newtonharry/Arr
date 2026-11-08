@@ -2442,11 +2442,13 @@ async fn prepare_removal(
             }
             match std::fs::symlink_metadata(&abs) {
                 Ok(m) if m.file_type().is_file() => {
-                    use std::os::unix::fs::MetadataExt;
+                    let ino = crate::fsutil::file_id(&abs)
+                        .map_err(|e| format!("{}: {}", candidate.display(), e.kind()))?
+                        .1;
                     out.push(TrackedFile {
                         path: abs,
                         size: m.len(),
-                        ino: m.ino(),
+                        ino,
                     });
                 }
                 Ok(_) => return Err(format!("{} is not a regular file", candidate.display())),
@@ -2496,7 +2498,6 @@ fn finish_removal(
     local_save: &Path,
     files: &[TrackedFile],
 ) -> Result<usize, String> {
-    use std::os::unix::fs::MetadataExt;
     let mut removed = 0;
     let mut dirs: Vec<PathBuf> = vec![];
     for f in files {
@@ -2508,7 +2509,11 @@ fn finish_removal(
         }
         paths::check_no_symlinks(local_root, &f.path)?;
         match std::fs::symlink_metadata(&f.path) {
-            Ok(m) if m.file_type().is_file() && m.ino() == f.ino && m.len() == f.size => {
+            Ok(m)
+                if m.file_type().is_file()
+                    && m.len() == f.size
+                    && crate::fsutil::file_id(&f.path).is_ok_and(|(_, ino)| ino == f.ino) =>
+            {
                 std::fs::remove_file(&f.path)
                     .map_err(|e| format!("cannot remove {}: {}", f.path.display(), e.kind()))?;
                 removed += 1;
@@ -2973,6 +2978,7 @@ mod tests {
         )));
     }
 
+    #[cfg(unix)] // makes symlinks
     #[test]
     fn finish_removal_refuses_changed_and_symlinked_files() {
         use std::os::unix::fs::MetadataExt;

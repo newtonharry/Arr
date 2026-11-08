@@ -416,6 +416,7 @@ async fn idempotency_concurrency_replan_cancel_and_restart() {
     assert_eq!(s, 201);
     for f in ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"] {
         let p = app.dir.join(f);
+        #[cfg(unix)]
         if p.exists() {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(

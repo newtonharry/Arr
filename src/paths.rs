@@ -115,6 +115,7 @@ pub fn ensure_dirs(root: &Path, rel: &Path) -> Result<PathBuf, String> {
 }
 
 /// Free bytes available to this process on the filesystem holding `path`.
+#[cfg(unix)]
 pub fn free_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -124,6 +125,25 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     #[allow(clippy::unnecessary_cast)] // c_ulong/fsblkcnt_t widths differ across targets
     let free = (s.f_bavail as u64).saturating_mul(s.f_frsize as u64);
     (rc == 0).then_some(free)
+}
+
+/// Free bytes available to this process on the drive holding `path`.
+#[cfg(windows)]
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: a NUL-terminated wide path and a valid out-parameter; the others may be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free)
 }
 
 #[cfg(test)]
@@ -155,6 +175,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // makes symlinks
     #[test]
     fn symlinks_are_refused() {
         let tmp = tempfile::tempdir().unwrap();

@@ -1252,6 +1252,7 @@ async fn an_unreachable_hanging_or_broken_api_fails_closed() {
     s.finish().await;
 }
 
+#[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test]
 async fn the_token_never_leaves_through_stdout_stderr_or_results() {
     // A stand-in API that echoes the Authorization header back, in a success body and in a

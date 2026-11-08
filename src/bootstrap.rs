@@ -37,7 +37,6 @@ use axum::http::StatusCode;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -230,7 +229,7 @@ fn local_file(
         Ok(m) if m.file_type().is_file() => Ok(LocalFile {
             rel: rel.to_string(),
             size: m.len(),
-            mtime: m.mtime(),
+            mtime: crate::fsutil::mtime(&m),
         }),
         Ok(_) => Err(("unsupported", "not a regular file".into())),
         Err(e) => Err((
@@ -986,6 +985,7 @@ fn apply(
 mod tests {
     use super::*;
 
+    #[cfg(unix)] // makes symlinks
     #[test]
     fn local_files_are_mapped_and_validated() {
         let tmp = tempfile::tempdir().unwrap();
