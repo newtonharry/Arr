@@ -112,3 +112,10 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 }
 @media (max-width:359px){.journey li{font-size:11px}.btn{padding:0 10px}}
 @media (prefers-reduced-motion:reduce){*,::before,::after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}
+/* the server's one-time sign-in link pages */
+.link-page{max-width:420px;margin:12vh auto 0;padding:0 20px;text-align:center}
+.link-page img{display:block;margin:0 auto 12px}
+.link-page h1{font-size:26px;font-weight:800;letter-spacing:-.02em;margin:0 0 8px}
+.link-page p{color:var(--muted);margin:0 0 20px}
+.link-page button{font:inherit;display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 24px;border:2px solid var(--teal);border-radius:12px;background:var(--teal);color:var(--on-teal);font-weight:800;font-size:16px;cursor:pointer}
+.link-page button:hover{filter:brightness(1.08)}

@@ -149,7 +149,7 @@ async fn pages_and_assets_carry_the_security_headers() {
         assert_eq!(h["content-security-policy"], csp, "{path}");
         assert_eq!(h["x-frame-options"], "DENY", "{path}");
         assert_eq!(h["x-content-type-options"], "nosniff", "{path}");
-        assert_eq!(h["referrer-policy"], "no-referrer", "{path}");
+        assert_eq!(h["referrer-policy"], "same-origin", "{path}");
         assert!(!r.bytes().await.unwrap().is_empty(), "{path}");
     }
     // The page needs no inline script or style.

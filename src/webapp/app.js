@@ -55,7 +55,10 @@ async function api(path, { method = 'GET', body, signal } = {}) {
   let data = null;
   try { data = await r.json(); } catch { /* empty body */ }
   if (r.status === 401) { showSignin(data); throw new Error('signed out'); }
-  if (r.status >= 500) { banner.textContent = "Can't reach Arr right now. Trying again…"; throw new Error('unreachable'); }
+  const code = data && data.error && data.error.code;
+  if (code === 'catalog_not_imported') { banner.textContent = "Arr is still being set up. Check back soon."; throw new Error(code); }
+  // Only a reply that isn't Arr's own error (a proxy or tunnel failing) means Arr is out of reach.
+  if (r.status >= 500 && !code) { banner.textContent = "Can't reach Arr right now. Trying again…"; throw new Error('unreachable'); }
   banner.textContent = '';
   return { ok: r.ok, status: r.status, data };
 }

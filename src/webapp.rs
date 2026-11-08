@@ -225,9 +225,11 @@ fn secure_headers(r: &mut Response) {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    // Not no-referrer: browsers then send `Origin: null` on same-page form posts, which the
+    // same-origin check refuses. Other sites still get no referrer.
     h.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
 }
 
