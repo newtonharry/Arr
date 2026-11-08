@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Arr: ask for a movie, find it in Plex</title>
-<meta name="description" content="Arr is one small program that runs next to your Plex server. Ask your AI assistant for a movie or show and Arr gets it into your Plex library.">
+<title>Arr: your own movie and TV service, at home</title>
+<meta name="description" content="Arr turns a computer at home into your own movie and TV service. Ask your AI assistant for something to watch and it's found, downloaded and waiting in Plex on your TV. New to Plex? Setup walks you through it.">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="mascot.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
@@ -23,8 +23,8 @@
 <main id="main">
 <section class="hero">
   <img class="mascot" src="mascot.svg" alt="Arr, a friendly round teal helper wearing a tiny captain's hat" width="200" height="200">
-  <h1>Ask for a movie.<br>Find it in Plex.</h1>
-  <p class="lead">Arr is one small program that lives next to your Plex server. Tell your AI assistant what you'd like to watch, and Arr takes it from there.</p>
+  <h1>Your own movie and TV service.<br>Just ask.</h1>
+  <p class="lead">Arr turns a computer at home into a complete media setup. Tell your AI assistant what you'd like to watch, and it's found, downloaded, sorted and waiting in Plex on your TV. Never used Plex? Setup walks you through it.</p>
 
   <div class="install" id="install">
     <div class="tabs" role="tablist" aria-label="Operating system">
@@ -37,7 +37,7 @@
         <code id="cmd-unix">curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh</code>
         <button class="copy" type="button" data-target="cmd-unix" hidden>Copy</button>
       </div>
-      <p class="hint">Paste this into a terminal on the computer that runs Plex.</p>
+      <p class="hint">Paste this into a terminal on the computer that will keep your movies and shows.</p>
     </div>
 
     <div role="tabpanel" id="panel-win" aria-labelledby="tab-win">
@@ -72,8 +72,8 @@
 <section class="section">
   <h2>Small on purpose</h2>
   <div class="cards">
-    <article class="card"><span class="ico" aria-hidden="true">&#9679;</span><h3>One small program</h3><p>Arr replaces the usual Sonarr, Radarr, Prowlarr and qBittorrent line-up. One thing to install, one thing to keep running.</p></article>
-    <article class="card"><span class="ico" aria-hidden="true">&#9654;</span><h3>Works with your Plex</h3><p>It reads your existing libraries and the folders they use, and never overwrites a file it didn't download.</p></article>
+    <article class="card"><span class="ico" aria-hidden="true">&#9679;</span><h3>Everything in one</h3><p>Finding, downloading, checking and filing into Plex, in one program. No Sonarr, Radarr, Prowlarr and qBittorrent to wire together.</p></article>
+    <article class="card"><span class="ico" aria-hidden="true">&#9654;</span><h3>New or existing setup</h3><p>Starting from nothing? Setup gets you going. Already have a Plex library? Arr learns what you own and never overwrites a file it didn't download.</p></article>
     <article class="card"><span class="ico" aria-hidden="true">&#9998;</span><h3>Set up in your browser</h3><p>Paste one line, sign in with Plex, let Arr find your libraries and click Finish.</p></article>
     <article class="card"><span class="ico" aria-hidden="true">&#9728;</span><h3>Light on memory</h3><p>Around 40 MB in everyday use, compared with roughly 600 MB for the stack it replaces.</p></article>
     <article class="card"><span class="ico" aria-hidden="true">&#8635;</span><h3>Updates if you want</h3><p>Automatic updates are off unless you tick the box. If a new version won't start, Arr puts the old one back.</p></article>
@@ -84,14 +84,15 @@
 <section class="section need">
   <h2>What you need</h2>
   <ul class="ticks">
-    <li>A computer that runs Plex: <strong>Linux or macOS</strong> today, <strong>Windows</strong> soon.</li>
-    <li>A Plex account to sign in with.</li>
+    <li>A computer to keep your movies and shows on: <strong>Linux or macOS</strong> today, <strong>Windows</strong> soon.</li>
+    <li>A free Plex account. No Plex yet? Setup points you to it, and soon installs it for you.</li>
     <li>An AI assistant that can talk to Arr, such as ChatGPT or Claude.</li>
   </ul>
 </section>
 
 <section id="faq" class="section">
   <h2>Questions</h2>
+  <details><summary>I've never used Plex. Can I still use Arr?</summary><p>Yes. Plex is the free app that plays your collection on your TV, phone and browser, and Arr fills it for you. During setup, Arr checks this computer for Plex and points you to the download if it's missing. Installing and setting up Plex for you is coming next.</p></details>
   <details><summary>Does it replace Sonarr and Radarr?</summary><p>It does the same job with one program: it replaces Sonarr, Radarr, Prowlarr and qBittorrent. If you'd rather keep them, they can run alongside Arr. Each ignores the titles you add to the other.</p></details>
   <details><summary>How does it download things?</summary><p>With a built-in BitTorrent downloader. By default it searches a public torrent source, and you can add your own indexers. Only download what you have the right to.</p></details>
   <details><summary>Will it update itself?</summary><p>Only if you say so during setup. It checks once a day, verifies the download, swaps it in, and goes back to the old version if the new one doesn't start within 30 seconds. You can also update by hand.</p></details>
