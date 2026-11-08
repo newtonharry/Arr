@@ -476,7 +476,7 @@ async fn a_new_movie_arrives_over_bittorrent_imports_and_seeds_to_ratio_two_acro
         .to_string();
     let g = e.grab(&id);
     assert_eq!((g.category.as_str(), g.seed_ratio), ("radarr", Some(2.0)));
-    assert_eq!(g.save_path, e.downloads.display().to_string());
+    assert_eq!(g.save_path, arr::paths::client_form(&e.downloads));
 
     // Real bytes from the controlled peer, every piece checked, then the normal import.
     e.until(&id, "imported", |g| g.state == "imported").await;

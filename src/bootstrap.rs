@@ -202,6 +202,16 @@ fn local_file(
     root: &Path,
     plex_file: &str,
 ) -> Result<LocalFile, (&'static str, String)> {
+    // Plex on Windows reports D:\Movies\x.mkv: compare in /-form, as relative paths are kept.
+    let windows = |p: &str| {
+        let b = p.as_bytes();
+        (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || p.starts_with("\\\\")
+    };
+    let (plex_root, plex_file) = if windows(plex_root) {
+        (plex_root.replace('\\', "/"), plex_file.replace('\\', "/"))
+    } else {
+        (plex_root.to_string(), plex_file.to_string())
+    };
     let prefix = format!("{}/", plex_root.trim_end_matches('/'));
     let Some(rel) = plex_file.strip_prefix(&prefix) else {
         return Err((

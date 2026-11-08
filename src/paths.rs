@@ -15,6 +15,19 @@ pub fn normalize_client(p: &str) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
+/// A relative path as `/`-separated text on every OS (Windows would use `\\`), which is
+/// how relative paths are stored and compared. None unless every part is a plain name.
+pub fn rel_string(rel: &Path) -> Option<String> {
+    let mut parts = vec![];
+    for c in rel.components() {
+        match c {
+            Component::Normal(p) => parts.push(p.to_string_lossy().into_owned()),
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// A local folder written as a download client path: `/`-separated and starting with `/`.
 /// Unix paths are unchanged; on Windows `C:\\Users\\x` becomes `/C:/Users/x`.
 pub fn client_form(local: &Path) -> String {

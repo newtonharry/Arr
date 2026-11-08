@@ -156,12 +156,13 @@ fn list_videos(
             {
                 continue;
             }
-            if let Ok(rel) = entry.path().strip_prefix(root) {
-                out.push((
-                    rel.to_string_lossy().to_string(),
-                    meta.len(),
-                    crate::fsutil::mtime(&meta),
-                ));
+            if let Some(rel) = entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .and_then(crate::paths::rel_string)
+            {
+                out.push((rel, meta.len(), crate::fsutil::mtime(&meta)));
             }
         }
     }

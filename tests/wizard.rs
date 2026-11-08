@@ -465,13 +465,19 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         format!("base_url = \"http://127.0.0.1:{}/\"", mock.port()),
         "movie_section = 1".into(),
         "tv_section = 2".into(),
-        format!("movies = {:?}", movies.to_str().unwrap()),
-        format!("tv_path = {:?}", tv.to_str().unwrap()),
-        format!("download_dir = {:?}", downloads.to_str().unwrap()),
         "[execution]\nenabled = false".into(),
         "[tmdb]\nenabled = false".into(),
     ] {
         assert!(config.contains(&want), "missing {want:?} in:\n{config}");
+    }
+    // Paths are compared as values: TOML spells Windows paths differently.
+    let parsed: toml::Table = toml::from_str(&config).unwrap();
+    for (table, key, want) in [
+        ("library", "movies", &movies),
+        ("plex", "tv_path", &tv),
+        ("embedded", "download_dir", &downloads),
+    ] {
+        assert_eq!(parsed[table][key].as_str(), want.to_str(), "{table}.{key}");
     }
     assert!(downloads.is_dir());
     assert_eq!(

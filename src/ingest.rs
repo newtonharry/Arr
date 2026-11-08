@@ -212,7 +212,7 @@ pub fn select(
             });
             continue;
         };
-        let rel = rel.to_string_lossy().to_string();
+        let rel = paths::rel_string(&rel).unwrap_or_else(|| rel.to_string_lossy().into_owned());
         let Some(ext) = ext_of(&rel) else { continue };
         if !VIDEO_EXTENSIONS.contains(&ext.as_str()) {
             if OTHER_VIDEO.contains(&ext.as_str()) {
@@ -1211,9 +1211,9 @@ fn stage(
             .map_err(|e| FileError::Internal(e.into()))?;
     let dest_rel = dest
         .strip_prefix(root)
-        .map_err(|_| FileError::Blocked("destination escaped the root".into()))?
-        .to_string_lossy()
-        .to_string();
+        .ok()
+        .and_then(paths::rel_string)
+        .ok_or_else(|| FileError::Blocked("destination escaped the root".into()))?;
     let journal = store.blocking(|c| {
         c.execute(
             "INSERT INTO import_journal (grab_id, source, root, dest, targets, size, method, state, replaced_file_id, replaced_path, quality, revision_version, revision_real, updated_at)
@@ -1379,9 +1379,9 @@ fn publish(
     let dest_rel = s
         .dest
         .strip_prefix(root)
-        .map_err(|_| FileError::Blocked("destination escaped the root".into()))?
-        .to_string_lossy()
-        .to_string();
+        .ok()
+        .and_then(paths::rel_string)
+        .ok_or_else(|| FileError::Blocked("destination escaped the root".into()))?;
     let mtime = std::fs::symlink_metadata(&s.dest)
         .map(|m| crate::fsutil::mtime(&m))
         .ok();

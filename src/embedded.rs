@@ -334,7 +334,10 @@ fn inspect(bytes: &[u8]) -> Result<Inspected, String> {
             return Err("the torrent contains a symlink entry".into());
         }
         let rel = f.filename.to_pathbuf();
-        if paths::safe_rel(&rel.to_string_lossy()).is_none() {
+        if paths::rel_string(&rel)
+            .and_then(|r| paths::safe_rel(&r))
+            .is_none()
+        {
             return Err(format!("unsafe file name {:?}", rel.to_string_lossy()));
         }
         files.push(rel);
@@ -1341,7 +1344,8 @@ impl Embedded {
             if f.attrs.padding {
                 continue;
             }
-            let rel = f.relative_filename.to_string_lossy().to_string();
+            let rel = paths::rel_string(&f.relative_filename)
+                .unwrap_or_else(|| f.relative_filename.to_string_lossy().into_owned());
             let name = if row.multi_file {
                 format!("{}/{rel}", row.name)
             } else {
