@@ -441,10 +441,10 @@ case "$PORT" in "" | *[!0-9]* | 0) die "--port needs a port number" ;; esac
 if [ "$SETUP" = 1 ] && [ -f "$CONFIG" ]; then
 	first_only() { # first_only OPTION VALUE SECTION KEY
 		[ -z "$2" ] || [ "$2" = "$(conf "$3" "$4")" ] ||
-			reject "$1 only applies to the first setup; to change it, edit $4 under [$3] in $CONFIG, then run this again"
+			reject "$1 only applies to the first setup: an existing install keeps it (README: \"Changing library folders, Plex libraries or Arr's port\")"
 	}
 	[ "$PORT_SET" = 0 ] || [ "$PORT" = "$(conf_port)" ] ||
-		reject "--port only applies to the first setup; to change it, edit listen under [server] in $CONFIG, then run this again"
+		reject "--port only applies to the first setup: an existing install keeps it (README: \"Changing library folders, Plex libraries or Arr's port\")"
 	first_only --movies "$MOVIES" library movies
 	first_only --tv "$TV" library tv
 	first_only --downloads "$DOWNLOADS" embedded download_dir
