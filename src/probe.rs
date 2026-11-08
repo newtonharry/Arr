@@ -56,6 +56,9 @@ pub async fn preflight(ffprobe: &Path) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(ffprobe);
     cmd.arg("-version").env_clear();
     keep_system_root(&mut cmd);
+    // Arr in the background has no console: ffprobe mustn't open one.
+    #[cfg(windows)]
+    cmd.creation_flags(job::CREATE_NO_WINDOW);
     let run = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -165,12 +168,19 @@ pub async fn run(ffprobe: &Path, file: &Path, timeout: Duration) -> Result<Probe
             Ok(())
         });
     }
+    // Windows: started suspended and without a console, put in its job, then let run, so
+    // the limits hold from its first instruction.
+    #[cfg(windows)]
+    cmd.creation_flags(job::CREATE_NO_WINDOW | job::CREATE_SUSPENDED);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start ffprobe: {}", e.kind()))?;
-    // Assigned right after start: ffprobe is still loading, well before it reads the file.
     #[cfg(windows)]
-    let _job = job::confine(&child, cpu).map_err(|e| format!("cannot limit ffprobe: {e}"))?;
+    let _job = {
+        let job = job::confine(&child, cpu).map_err(|e| format!("cannot limit ffprobe: {e}"))?;
+        job::resume(child.id().unwrap_or(0)).map_err(|e| format!("cannot start ffprobe: {e}"))?;
+        job
+    };
     let mut stdout = child.stdout.take().expect("piped").take(MAX_STDOUT);
     let mut stderr = child.stderr.take().expect("piped").take(MAX_STDERR);
     let work = async {
@@ -219,6 +229,49 @@ mod job {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject,
     };
+
+    pub const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    /// Lets a process started with CREATE_SUSPENDED run (its only thread, in practice).
+    pub fn resume(pid: u32) -> std::io::Result<()> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        };
+        // SAFETY: a snapshot of all threads; closed below.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snap == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: plain-data struct; dwSize set as the API requires.
+        let mut te: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut resumed = 0;
+        // SAFETY: a valid snapshot and entry for the whole walk.
+        let mut more = unsafe { Thread32First(snap, &mut te) } != 0;
+        while more {
+            if te.th32OwnerProcessID == pid {
+                // SAFETY: a thread id from the snapshot; the handle is closed right away.
+                let h = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, te.th32ThreadID) };
+                if !h.is_null() {
+                    if unsafe { ResumeThread(h) } != u32::MAX {
+                        resumed += 1;
+                    }
+                    unsafe { CloseHandle(h) };
+                }
+            }
+            more = unsafe { Thread32Next(snap, &mut te) } != 0;
+        }
+        unsafe { CloseHandle(snap) };
+        if resumed == 0 {
+            return Err(std::io::Error::other("its thread couldn't be started"));
+        }
+        Ok(())
+    }
 
     /// A job object; closing it kills whatever is still in it.
     pub struct Job(HANDLE);

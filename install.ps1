@@ -341,23 +341,34 @@ try {
 	if ($LASTEXITCODE -ne 0) { Log "$latest doesn't run on this computer; not updating"; exit 1 }
 	# Running programs can be renamed, not overwritten: move each aside, keeping it for a rollback.
 	$exes = 'arr.exe', 'arr-background.exe'
-	foreach ($e in $exes) {
-		$p = Join-Path $BinDir $e
-		Remove-Item "$p.previous" -Force -ErrorAction SilentlyContinue
-		if (Test-Path "$p.previous") { Move-Item "$p.previous" "$p.old-$([guid]::NewGuid().ToString('N').Substring(0, 8))" -Force }
-		Move-Item $p "$p.previous" -Force
-		Copy-Item (Join-Path $new $e) $p -Force
+	$swapped = @()
+	function Roll-Back {
+		Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
+		foreach ($e in $swapped) {
+			$p = Join-Path $BinDir $e
+			if (Test-Path $p) { Move-Item $p "$p.failed-$([guid]::NewGuid().ToString('N').Substring(0, 8))" -Force }
+			Move-Item "$p.previous" $p -Force
+		}
+		Restart-Arr
+	}
+	try {
+		foreach ($e in $exes) {
+			$p = Join-Path $BinDir $e
+			Remove-Item "$p.previous" -Force -ErrorAction SilentlyContinue
+			if (Test-Path "$p.previous") { Move-Item "$p.previous" "$p.old-$([guid]::NewGuid().ToString('N').Substring(0, 8))" -Force }
+			Move-Item $p "$p.previous" -Force
+			$swapped += $e
+			Copy-Item (Join-Path $new $e) $p -Force
+		}
+	} catch {
+		Log "couldn't put $latest in place ($($_.Exception.Message)); going back to $current"
+		Roll-Back
+		exit 1
 	}
 	Restart-Arr
 	if (Healthy $latest) { Log "now running $latest"; exit 0 }
 	Log "$latest didn't start; going back to $current"
-	Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
-	foreach ($e in $exes) {
-		$p = Join-Path $BinDir $e
-		Move-Item $p "$p.failed-$([guid]::NewGuid().ToString('N').Substring(0, 8))" -Force
-		Move-Item "$p.previous" $p -Force
-	}
-	Restart-Arr
+	Roll-Back
 	if (-not (Healthy $current)) { Log "$current didn't start either; check $(Join-Path $StateDir 'arr.log')" }
 	exit 1
 } catch {

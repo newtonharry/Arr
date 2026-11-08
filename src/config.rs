@@ -1171,6 +1171,13 @@ pub fn parse_config(
                 );
             }
             let save_path = remote_path(&q.save_path, "qbittorrent.save_path")?;
+            // Download-client paths are compared in Unix form; qBittorrent on Windows isn't
+            // supported (on Windows, use the built-in downloader: [embedded]).
+            if !q.save_path.trim().starts_with('/') {
+                bail!(
+                    "qbittorrent.save_path must be the folder as qBittorrent sees it, in Unix form such as /downloads (qBittorrent running on Windows isn't supported; use [embedded])"
+                );
+            }
             Some(QbitConfig {
                 base_url: parse_base_url(&q.base_url, "qbittorrent.base_url")?,
                 username,
