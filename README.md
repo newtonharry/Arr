@@ -82,6 +82,22 @@ both keep your config. To stop automatic updates, run the installer with `--no-a
 Update logs go to `journalctl -u arr-update` (`--user` for a user install), or `update.log` in
 the state folder on macOS.
 
+### Adding a TMDB key later
+
+Without a TMDB key Arr can't find movies you don't own yet (TV works without one). Skipped it
+during setup? Get a free key at <https://www.themoviedb.org/settings/api> (create an account,
+choose **Developer**, then copy the API key or the API read access token) and run the install
+command again. Seeing that Arr can't find new movies yet, it asks for the key, checks it with
+TMDB, saves it and restarts Arr. Your settings stay as they are. To skip the question, add the
+key to the command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --tmdb-key YOUR_KEY
+```
+
+On Windows, run `$env:ARR_TMDB_KEY = 'YOUR_KEY'` in PowerShell before the install line. A key
+TMDB doesn't accept changes nothing.
+
 ### Error reports
 
 Setup also asks whether Arr may send error reports when something fails (off unless you tick

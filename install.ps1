@@ -9,6 +9,7 @@
 #   ARR_VERSION       a release tag such as v0.4.0 (default: the latest release)
 #   ARR_AUTO_UPDATE   1 to install new versions automatically, 0 to turn that off
 #   ARR_ERROR_REPORTS 1 to start the setup page with error reports ticked (docs/PRIVACY.md)
+#   ARR_TMDB_KEY      a TMDB key, added to an existing install so Arr can find new movies
 #   ARR_PORT          Arr's port on this computer (default 8787)
 #   ARR_STATE_DIR     Arr's folder: config, secrets, database (default %LOCALAPPDATA%\Arr)
 #   ARR_BIN_DIR       where arr.exe goes (default %LOCALAPPDATA%\Programs\Arr)
@@ -120,6 +121,20 @@ function Install-Arr {
 		Step "Keeping your config in $StateDir"
 		$m = Select-String -Path $Config -Pattern '^listen = "[^"]*:(\d+)"$' | Select-Object -First 1
 		if ($m) { $Port = [int]$m.Matches[0].Groups[1].Value }
+		# A TMDB key can be added on any later run: $env:ARR_TMDB_KEY, or asked here.
+		$tmdbKey = $env:ARR_TMDB_KEY
+		$tmdbOn = (Get-Content $Config -Raw) -match '(?ms)^\[tmdb\][^\[]*?^enabled *= *true'
+		if (-not $tmdbKey -and -not $tmdbOn -and (Interactive)) {
+			Say 'Optional: a free TMDB key lets Arr find movies you don''t own yet'
+			Say '(https://www.themoviedb.org/settings/api). TV search works without one.'
+			$tmdbKey = Read-Host 'TMDB API key or read token (Enter to skip)'
+		}
+		if ($tmdbKey) {
+			Step 'Adding your TMDB key'
+			$tmdbKey.Trim() | & $Arr tmdb-key --config $Config
+			if ($LASTEXITCODE -eq 0) { Say 'Arr can now find movies you don''t own yet.' }
+			else { Write-Warning "the TMDB key wasn't added; Arr carries on without it. Run this again to retry." }
+		}
 	} else {
 		Step 'Setting up Arr in your web browser'
 		$reports = @(if ($env:ARR_ERROR_REPORTS -eq '1') { '--error-reports' })
