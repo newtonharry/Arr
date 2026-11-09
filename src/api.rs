@@ -4293,13 +4293,14 @@ fn movie_state(m: &crate::catalog::Movie) -> Option<&'static str> {
 
 /// The same for a show: some episodes in Plex, some on their way, or only tracked.
 fn series_state(s: &crate::catalog::Series) -> Option<&'static str> {
-    let owned = s
-        .episodes
-        .as_ref()
-        .is_some_and(|e| e.iter().any(|e| e.has_file))
-        || s.seasons
+    // Current episode ownership wins; imported season counts are only for when it is unavailable.
+    let owned = match s.episodes.as_ref() {
+        Some(e) => e.iter().any(|e| e.has_file),
+        None => s
+            .seasons
             .iter()
-            .any(|x| x.number > 0 && x.episode_file_count.unwrap_or(0) > 0);
+            .any(|x| x.number > 0 && x.episode_file_count.unwrap_or(0) > 0),
+    };
     if owned {
         Some("in_plex")
     } else if s
