@@ -192,6 +192,13 @@ enum Command {
         /// Its new value.
         value: Option<String>,
     },
+    /// Prints a sign-in link for the web app: valid for 15 minutes, works once. Anyone who has
+    /// the link can sign in, so send it only to the person it is for.
+    AppLink {
+        /// The install's config.toml.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// The TMDB key (read from stdin): `arr set tmdb-key`, or with --check, only checks it.
     #[command(hide = true)]
     TmdbKey {
@@ -484,6 +491,7 @@ async fn run() -> Result<std::process::ExitCode> {
         | Command::Wizard { .. }
         | Command::Report { .. }
         | Command::Set { .. }
+        | Command::AppLink { .. }
         | Command::TmdbKey { .. }
         | Command::PlexSignin { .. } => "warn",
         _ => "info,arr=info",
@@ -693,6 +701,14 @@ async fn run() -> Result<std::process::ExitCode> {
                 None => value,
             };
             println!("{}", arr::set::run(&config, &name, value.as_deref()).await?);
+            Ok(())
+        }
+        Command::AppLink { config } => {
+            let cfg = config::load(&config)?;
+            println!("{}", arr::webapp::app_link(&cfg)?);
+            eprintln!(
+                "This link works once and expires in 15 minutes. Anyone who has it can sign in to Arr."
+            );
             Ok(())
         }
         Command::TmdbKey {

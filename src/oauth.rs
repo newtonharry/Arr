@@ -155,7 +155,8 @@ struct Txn {
 
 /// An approved request waiting for Google's callback.
 struct Upstream {
-    txn: Txn,
+    /// The connector's request; none when the web app started this sign-in.
+    txn: Option<Txn>,
     verifier: String,
     /// SHA-256 of the `arr_signin` cookie set on the browser that approved; the callback
     /// must come from that browser, so a forwarded Google link cannot complete it.
@@ -187,6 +188,8 @@ pub struct OAuth {
     jwks: Mutex<Pending<Arc<Vec<Jwk>>>>,
     /// Assertion ids seen, with their expiry (unix seconds).
     jtis: Mutex<HashMap<String, i64>>,
+    /// Web app sessions, issued after a web sign-in.
+    web: Arc<crate::webapp::Sessions>,
 }
 
 impl OAuth {
@@ -226,6 +229,7 @@ impl OAuth {
             docs: Pending::new(DOC_TTL),
             jwks: Pending::new(JWKS_TTL),
             jtis: Mutex::new(HashMap::new()),
+            web: crate::webapp::Sessions::open(state_dir)?,
         }))
     }
 
@@ -522,6 +526,7 @@ pub fn router(o: Arc<OAuth>) -> Router {
         .route("/authorize", get(authorize))
         .route("/authorize/consent", post(consent))
         .route("/auth/callback", get(callback))
+        .route("/app/signin", get(web_signin))
         .route("/token", post(token))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES))
         .layer(axum::middleware::from_fn_with_state(o.clone(), guard))
@@ -673,6 +678,18 @@ async fn consent(State(o): Oa, Form(f): Form<ConsentForm>) -> Response {
         }
         _ => return error_page(StatusCode::BAD_REQUEST, "Invalid choice."),
     }
+    start_google(&o, Some(txn))
+}
+
+/// `GET /app/signin`: the web app's Google sign-in (the same flow as an approved consent).
+async fn web_signin(State(o): Oa) -> Response {
+    start_google(&o, None)
+}
+
+/// Sends the browser to Google; the callback finishes the connector request `txn`, or signs
+/// the web app in when there is none.
+fn start_google(o: &OAuth, txn: Option<Txn>) -> Response {
+    let is_web = txn.is_none();
     let (state, verifier, browser) = (random_b64(32), random_b64(32), random_b64(32));
     let challenge = B64.encode(Sha256::digest(verifier.as_bytes()));
     let mut url = o.cfg.google_authorization_endpoint.clone();
@@ -702,7 +719,14 @@ async fn consent(State(o): Oa, Form(f): Form<ConsentForm>) -> Response {
             "Too many sign-ins in progress.",
         );
     }
-    tracing::info!(outcome = "consent_approved", "oauth");
+    tracing::info!(
+        outcome = if is_web {
+            "web_signin_started"
+        } else {
+            "consent_approved"
+        },
+        "oauth"
+    );
     let mut r = redirect(url.as_str(), &[]);
     if let Ok(v) = HeaderValue::from_str(&format!(
         "{SIGNIN_COOKIE}={browser}; Path=/auth/callback; Max-Age=600; HttpOnly; Secure; SameSite=Lax"
@@ -747,7 +771,9 @@ async fn callback(
             "This sign-in was started in another browser. Start again from your assistant.",
         );
     }
-    let txn = &up.txn;
+    let Some(txn) = &up.txn else {
+        return web_callback(&o, &q, &up.verifier).await;
+    };
     let deny = |outcome: &str, code: &str| {
         tracing::info!(outcome, "oauth");
         client_error(&o, &txn.redirect_uri, code, Some(&txn.state))
@@ -755,23 +781,7 @@ async fn callback(
     let (Some(code), None) = (q.get("code"), q.get("error")) else {
         return deny("callback_upstream_error", "access_denied");
     };
-    let form = [
-        ("grant_type", "authorization_code"),
-        ("code", code.as_str()),
-        ("client_id", o.cfg.google_client_id.as_str()),
-        ("client_secret", o.cfg.google_client_secret.expose()),
-        (
-            "redirect_uri",
-            &format!("{}/auth/callback", o.cfg.public_url),
-        ),
-        ("code_verifier", up.verifier.as_str()),
-    ];
-    let rb = o
-        .http
-        .post(o.cfg.google_token_endpoint.clone())
-        .timeout(Duration::from_secs(10))
-        .form(&form);
-    let Some(reply) = o.fetch_json(rb, MAX_GOOGLE_BYTES).await else {
+    let Some(reply) = google_exchange(&o, code, &up.verifier).await else {
         return deny("callback_exchange_failed", "server_error");
     };
     let Some((sub, email)) = reply
@@ -797,6 +807,66 @@ async fn callback(
         &txn.redirect_uri,
         &[("code", &code), ("state", &txn.state), ("iss", &o.issuer)],
     )
+}
+
+/// Exchanges Google's authorization code (with the PKCE verifier) for its token reply.
+async fn google_exchange(o: &OAuth, code: &str, verifier: &str) -> Option<Value> {
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", o.cfg.google_client_id.as_str()),
+        ("client_secret", o.cfg.google_client_secret.expose()),
+        (
+            "redirect_uri",
+            &format!("{}/auth/callback", o.cfg.public_url),
+        ),
+        ("code_verifier", verifier),
+    ];
+    let rb = o
+        .http
+        .post(o.cfg.google_token_endpoint.clone())
+        .timeout(Duration::from_secs(10))
+        .form(&form);
+    o.fetch_json(rb, MAX_GOOGLE_BYTES).await
+}
+
+/// The end of a web app sign-in: a session for an allowed Google account, then the app.
+async fn web_callback(o: &OAuth, q: &HashMap<String, String>, verifier: &str) -> Response {
+    let refused = |outcome: &str, msg: &str| {
+        tracing::info!(outcome, "oauth");
+        error_page(StatusCode::FORBIDDEN, msg)
+    };
+    let (Some(code), None) = (q.get("code"), q.get("error")) else {
+        return refused(
+            "web_upstream_error",
+            "Sign-in was cancelled. Go back and try again.",
+        );
+    };
+    let Some(reply) = google_exchange(o, code, verifier).await else {
+        return refused(
+            "web_exchange_failed",
+            "Google sign-in failed. Go back and try again.",
+        );
+    };
+    let Some((_, email)) = reply
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(|t| check_id_token(o, t, now()))
+    else {
+        return refused("web_identity_refused", "That Google account can't use Arr.");
+    };
+    let Some(id) = o.web.create_session("google", Some(&email)) else {
+        return refused("web_session_failed", "Could not sign you in. Try again.");
+    };
+    tracing::info!(outcome = "web_session_issued", "oauth");
+    let mut r = StatusCode::SEE_OTHER.into_response();
+    r.headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static("/"));
+    let secure = o.cfg.public_url.starts_with("https://");
+    if let Ok(v) = HeaderValue::from_str(&crate::webapp::session_cookie(&id, secure)) {
+        r.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    r
 }
 
 fn decode_part(part: &str) -> Option<Value> {

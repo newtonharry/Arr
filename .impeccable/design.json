@@ -1,0 +1,473 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-09T00:28:25+00:00",
+  "title": "Design System: Arr",
+  "extensions": {
+    "colorMeta": {
+      "teal": {
+        "role": "primary",
+        "displayName": "Sea Teal",
+        "canonical": "#1c8576",
+        "tonalRamp": [
+          "#0c1010",
+          "#11312d",
+          "#15534a",
+          "#1a7467",
+          "#399486",
+          "#72b1a7",
+          "#abcfc7",
+          "#e4ece7"
+        ]
+      },
+      "teal-ink": {
+        "role": "primary",
+        "displayName": "Teal Ink",
+        "canonical": "#17766a",
+        "tonalRamp": [
+          "#0c1010",
+          "#0f2d2a",
+          "#124a43",
+          "#15675d",
+          "#34877c",
+          "#6fa89f",
+          "#a9cac3",
+          "#e3ebe6"
+        ]
+      },
+      "night-teal": {
+        "role": "primary",
+        "displayName": "Night Teal",
+        "canonical": "#4fd1bd",
+        "tonalRamp": [
+          "#0c1010",
+          "#1f4741",
+          "#327e73",
+          "#45b5a4",
+          "#65d6c4",
+          "#91e0d2",
+          "#bdeae0",
+          "#e9f4ee"
+        ]
+      },
+      "coral": {
+        "role": "secondary",
+        "displayName": "Needs-You Coral",
+        "canonical": "#ff7a5c",
+        "tonalRamp": [
+          "#0c1010",
+          "#512e26",
+          "#974d3b",
+          "#dc6b51",
+          "#fe8a70",
+          "#fdab97",
+          "#fccbbe",
+          "#faebe5"
+        ]
+      },
+      "coral-ink": {
+        "role": "secondary",
+        "displayName": "Coral Ink",
+        "canonical": "#a8331a",
+        "tonalRamp": [
+          "#0c1010",
+          "#391a13",
+          "#652416",
+          "#922e19",
+          "#b34c36",
+          "#c87f6e",
+          "#ddb2a6",
+          "#f2e4de"
+        ]
+      },
+      "night-coral-ink": {
+        "role": "secondary",
+        "displayName": "Night Coral Ink",
+        "canonical": "#ff9a82",
+        "tonalRamp": [
+          "#0c1010",
+          "#513731",
+          "#975f51",
+          "#dc8672",
+          "#fea691",
+          "#fdbeae",
+          "#fcd6cb",
+          "#faefe9"
+        ]
+      },
+      "sun-tint": {
+        "role": "tertiary",
+        "displayName": "Sun Tint",
+        "canonical": "#fff1c9",
+        "tonalRamp": [
+          "#0c1010",
+          "#515045",
+          "#97917a",
+          "#dcd1af",
+          "#fef2cf",
+          "#fdf4da",
+          "#fcf6e5",
+          "#faf7f0"
+        ]
+      },
+      "sun-ink": {
+        "role": "tertiary",
+        "displayName": "Sun Ink",
+        "canonical": "#6b4c00",
+        "tonalRamp": [
+          "#0c1010",
+          "#27210b",
+          "#423207",
+          "#5d4302",
+          "#7d621f",
+          "#a28e5e",
+          "#c7bb9d",
+          "#ece7dc"
+        ]
+      },
+      "cream": {
+        "role": "neutral",
+        "displayName": "Cream",
+        "canonical": "#fff8ef",
+        "tonalRamp": [
+          "#0c1010",
+          "#515250",
+          "#97958f",
+          "#dcd7cf",
+          "#fef8f0",
+          "#fdf8f1",
+          "#fcf8f2",
+          "#faf8f4"
+        ]
+      },
+      "card": {
+        "role": "neutral",
+        "displayName": "Card White",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#0c1010",
+          "#515454",
+          "#979999",
+          "#dcdddd",
+          "#fefefe",
+          "#fdfcfb",
+          "#fcfaf8",
+          "#faf9f5"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#23302f",
+        "tonalRamp": [
+          "#0c1010",
+          "#131919",
+          "#192222",
+          "#202b2b",
+          "#3f4a48",
+          "#767d7b",
+          "#adb1ae",
+          "#e4e4e0"
+        ]
+      },
+      "muted-ink": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "#566563",
+        "tonalRamp": [
+          "#0c1010",
+          "#212828",
+          "#36413f",
+          "#4b5957",
+          "#6b7876",
+          "#959e9b",
+          "#bfc4c0",
+          "#eae9e6"
+        ]
+      },
+      "warm-line": {
+        "role": "neutral",
+        "displayName": "Warm Line",
+        "canonical": "#eadfce",
+        "tonalRamp": [
+          "#0c1010",
+          "#4b4b46",
+          "#8b867d",
+          "#cac1b3",
+          "#ece2d3",
+          "#f0e9dd",
+          "#f4efe6",
+          "#f8f6f0"
+        ]
+      },
+      "night": {
+        "role": "neutral",
+        "displayName": "Night",
+        "canonical": "#161d1d",
+        "tonalRamp": [
+          "#0c1010",
+          "#0f1414",
+          "#121717",
+          "#151b1b",
+          "#333939",
+          "#6e7170",
+          "#a9aaa7",
+          "#e3e2de"
+        ]
+      },
+      "night-card": {
+        "role": "neutral",
+        "displayName": "Night Card",
+        "canonical": "#202a2a",
+        "tonalRamp": [
+          "#0c1010",
+          "#121717",
+          "#171f1f",
+          "#1d2626",
+          "#3c4444",
+          "#747978",
+          "#acaeac",
+          "#e4e3e0"
+        ]
+      },
+      "night-ink": {
+        "role": "neutral",
+        "displayName": "Night Ink",
+        "canonical": "#f1ece2",
+        "tonalRamp": [
+          "#0c1010",
+          "#4d4f4c",
+          "#8f8e88",
+          "#d0cdc4",
+          "#f2eee4",
+          "#f4f1e9",
+          "#f7f4ee",
+          "#f9f7f2"
+        ]
+      },
+      "night-line": {
+        "role": "neutral",
+        "displayName": "Night Line",
+        "canonical": "#334141",
+        "tonalRamp": [
+          "#0c1010",
+          "#171e1e",
+          "#222c2c",
+          "#2d3a3a",
+          "#4d5958",
+          "#808886",
+          "#b3b7b4",
+          "#e6e6e2"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "brand": {
+        "displayName": "Brand",
+        "purpose": "The Arr word beside the mascot."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Sign-in and empty-state headings."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Item titles, one line with ellipsis."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default text."
+      },
+      "meta": {
+        "displayName": "Meta",
+        "purpose": "The one next fact under a title."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Uppercase section headings in the feed."
+      }
+    },
+    "shadows": [
+      {
+        "name": "search-drop",
+        "value": "0 5px 0 var(--line)",
+        "purpose": "Solid offset drop on the search field only (hard offset, 0 blur; recorded as built, not a general pattern)."
+      }
+    ],
+    "motion": [
+      {
+        "name": "journey-fill",
+        "value": "transform .9s cubic-bezier(.16,1,.3,1)",
+        "purpose": "Journey line fill as an item progresses."
+      },
+      {
+        "name": "busy-fade",
+        "value": "opacity .2s",
+        "purpose": "Dim a list while it reloads."
+      },
+      {
+        "name": "press",
+        "value": "translateY(1px)",
+        "purpose": "Button active state. All motion is removed under prefers-reduced-motion."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "tablet-desktop",
+        "value": "760px"
+      },
+      {
+        "name": "narrow-phone",
+        "value": "420px"
+      },
+      {
+        "name": "tiny-phone",
+        "value": "359px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "refersTo": "search-field",
+      "description": "Pinned top-of-page search with the one solid drop.",
+      "html": "<form class=\"ds-search\"><svg class=\"ds-ic\" viewBox=\"0 0 24 24\"><circle cx=\"11\" cy=\"11\" r=\"7\"/><path d=\"M20 20l-4-4\"/></svg><input placeholder=\"Find a movie or show\"></form>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-search{display:flex;align-items:center;gap:10px;background:var(--card);border:2px solid var(--line);border-radius:18px;padding:0 16px;min-height:56px;box-shadow:0 5px 0 var(--line);font:500 15px Nunito,ui-rounded,system-ui,sans-serif;color:var(--ink)}.ds-search:focus-within{outline:3px solid var(--ring);outline-offset:3px}.ds-ic{width:22px;height:22px;fill:none;stroke:var(--teal);stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}.ds-search input{flex:1;border:0;background:none;outline:0;font:600 17px inherit;font-family:inherit;padding:14px 0;color:var(--ink)}.ds-search input::placeholder{color:var(--muted);opacity:1;font-weight:500}"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Teal fill for Add and Watch.",
+      "html": "<button class=\"ds-btn\">Add</button>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:0 14px;border:2px solid var(--teal);border-radius:12px;font:800 14px Nunito,ui-rounded,system-ui,sans-serif;cursor:pointer;white-space:nowrap;background:var(--teal);color:var(--on-teal)}.ds-btn:hover{filter:brightness(1.08)}.ds-btn:active{transform:translateY(1px)}.ds-btn:focus-visible{outline:3px solid var(--ring);outline-offset:3px;border-radius:8px}"
+    },
+    {
+      "name": "Needs-You Button",
+      "kind": "button",
+      "refersTo": "button-needs-you",
+      "description": "Coral outline; only inside Needs-you rows.",
+      "html": "<button class=\"ds-btn-coral\">Try again</button>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-btn-coral{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:0 14px;border:2px solid var(--teal);border-radius:12px;font:800 14px Nunito,ui-rounded,system-ui,sans-serif;cursor:pointer;white-space:nowrap;background:transparent;border-color:var(--coral);color:var(--coral-ink)}.ds-btn-coral:hover{filter:brightness(1.08)}.ds-btn-coral:focus-visible{outline:3px solid var(--ring);outline-offset:3px;border-radius:8px}"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Neutral secondary action.",
+      "html": "<button class=\"ds-btn-ghost\">Cancel</button>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-btn-ghost{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:0 14px;border:2px solid var(--teal);border-radius:12px;font:800 14px Nunito,ui-rounded,system-ui,sans-serif;cursor:pointer;white-space:nowrap;background:transparent;border-color:var(--line);color:var(--ink)}.ds-btn-ghost:hover{border-color:var(--teal)}"
+    },
+    {
+      "name": "Arrived Row",
+      "kind": "card",
+      "refersTo": "item-row-arrived",
+      "description": "A finished item: teal border, In Plex tag, Watch button.",
+      "html": "<div class=\"ds-item\"><span class=\"ds-tile\">SE</span><div class=\"ds-what\"><span class=\"ds-tag\">In Plex</span><h3>Severance</h3><p>Season 2 &middot; 2 hours ago</p></div><button class=\"ds-btn\">Watch</button></div>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-item{display:flex;gap:12px;align-items:center;background:var(--card);border:2px solid var(--teal);border-radius:18px;padding:12px;color:var(--ink);font:500 15px Nunito,ui-rounded,system-ui,sans-serif}.ds-what{flex:1;min-width:0}.ds-what h3{margin:0;font-size:16px;font-weight:800}.ds-what p{margin:0;color:var(--muted);font-size:14px}.ds-tag{font-size:12px;font-weight:800;color:var(--teal-ink)}.ds-tile{width:46px;height:68px;border-radius:10px;display:grid;place-items:center;color:#fff;font-weight:800;background:linear-gradient(#2fa391,#0f4f46)}.ds-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:0 14px;border:2px solid var(--teal);border-radius:12px;font:800 14px Nunito,ui-rounded,system-ui,sans-serif;cursor:pointer;white-space:nowrap;background:var(--teal);color:var(--on-teal)}"
+    },
+    {
+      "name": "On-Its-Way Row with Journey Line",
+      "kind": "custom",
+      "refersTo": "item-row",
+      "description": "Row with a four-stop journey line filling as Arr works.",
+      "html": "<div class=\"ds-item\"><span class=\"ds-tile\">DU</span><div class=\"ds-what\"><h3>Dune</h3><p>Movie &middot; 42% downloaded</p><ol class=\"ds-j\"><i class=\"ds-fill\"></i><li class=\"on\">Found</li><li class=\"on cur\">Downloading</li><li>Checking</li><li>In Plex</li></ol></div></div>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-item{display:flex;gap:12px;align-items:center;background:var(--card);border:2px solid var(--line);border-radius:18px;padding:12px;color:var(--ink);font:500 15px Nunito,ui-rounded,system-ui,sans-serif}.ds-what{flex:1;min-width:0}.ds-what h3{margin:0;font-size:16px;font-weight:800}.ds-what p{margin:0;color:var(--muted);font-size:14px}.ds-tile{width:46px;height:68px;border-radius:10px;display:grid;place-items:center;color:#fff;font-weight:800;background:linear-gradient(#3f6b8f,#16263a)}.ds-j{list-style:none;padding:0;margin:8px 0 0;position:relative;height:36px}.ds-j::before,.ds-fill{content:'';position:absolute;left:5px;right:5px;top:4px;height:3px;border-radius:2px;background:var(--line)}.ds-fill{background:var(--teal);transform-origin:left;transform:scaleX(.45)}.ds-j li{position:absolute;top:0;display:flex;flex-direction:column;align-items:center;gap:4px;font-size:12px;font-weight:600;color:var(--muted)}.ds-j li::before{content:'';width:11px;height:11px;border-radius:50%;border:2px solid var(--teal);background:var(--card)}.ds-j li.on::before{background:var(--teal)}.ds-j li.cur{color:var(--ink);font-weight:800}.ds-j li:nth-of-type(1){left:0;align-items:flex-start}.ds-j li:nth-of-type(2){left:33.333%;transform:translateX(-50%)}.ds-j li:nth-of-type(3){left:66.666%;transform:translateX(-50%)}.ds-j li:nth-of-type(4){right:0;align-items:flex-end}"
+    },
+    {
+      "name": "Needs-You Row",
+      "kind": "card",
+      "refersTo": "item-row",
+      "description": "Neutral card with a coral-ink problem line and coral outline button.",
+      "html": "<div class=\"ds-item\"><span class=\"ds-tile\">BE</span><div class=\"ds-what\"><h3>The Bear</h3><p class=\"ds-prob\">Could not find a good copy yet</p></div><button class=\"ds-btn-coral\">Try again</button></div>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-item{display:flex;gap:12px;align-items:center;background:var(--card);border:2px solid var(--line);border-radius:18px;padding:12px;color:var(--ink);font:500 15px Nunito,ui-rounded,system-ui,sans-serif}.ds-what{flex:1;min-width:0}.ds-what h3{margin:0;font-size:16px;font-weight:800}.ds-prob{margin:0;color:var(--coral-ink);font-weight:700;font-size:14px}.ds-tile{width:46px;height:68px;border-radius:10px;display:grid;place-items:center;color:#fff;font-weight:800;background:linear-gradient(#d1573a,#7a2a1c)}.ds-btn-coral{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:0 14px;border:2px solid var(--teal);border-radius:12px;font:800 14px Nunito,ui-rounded,system-ui,sans-serif;cursor:pointer;white-space:nowrap;background:transparent;border-color:var(--coral);color:var(--coral-ink)}"
+    },
+    {
+      "name": "Date Chip",
+      "kind": "chip",
+      "refersTo": "date-chip",
+      "description": "Pale sun date lead for coming-up items.",
+      "html": "<time class=\"ds-date\">NOV<b>14</b></time>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-date{width:46px;height:52px;border-radius:12px;background:var(--sun-bg);color:var(--sun-ink);display:grid;place-items:center;align-content:center;text-align:center;font:800 12px/1.05 Nunito,ui-rounded,system-ui,sans-serif;text-transform:uppercase}.ds-date b{font-size:20px;display:block}"
+    },
+    {
+      "name": "Tab Bar",
+      "kind": "nav",
+      "refersTo": "tab-bar",
+      "description": "Bottom bar on phones; top-right pills on desktop.",
+      "html": "<nav class=\"ds-tabs\"><a aria-current=\"page\" href=\"#\">Home</a><a href=\"#\">Ideas</a><a href=\"#\">Library</a></nav>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-tabs{display:flex;background:var(--card);border-top:2px solid var(--line);padding:6px 8px;font-family:Nunito,ui-rounded,system-ui,sans-serif}.ds-tabs a{flex:1;display:flex;align-items:center;justify-content:center;min-height:56px;color:var(--muted);text-decoration:none;font-size:12px;font-weight:800;border-radius:12px}.ds-tabs a[aria-current]{color:var(--teal-ink)}"
+    },
+    {
+      "name": "Segmented Pills",
+      "kind": "chip",
+      "refersTo": "segmented-pill",
+      "description": "Pill choices; selected is teal filled.",
+      "html": "<div class=\"ds-seg\"><button aria-pressed=\"true\">Movies</button><button aria-pressed=\"false\">Shows</button></div>",
+      "css": ":host{--bg:#fff8ef;--card:#fff;--ink:#23302f;--muted:#566563;--line:#eadfce;--teal:#1c8576;--teal-ink:#17766a;--on-teal:#fff;--coral:#ff7a5c;--coral-ink:#a8331a;--sun-bg:#fff1c9;--sun-ink:#6b4c00;--ring:#0b5fff}.ds-seg{display:flex;gap:6px}.ds-seg button{min-height:44px;padding:0 16px;border:2px solid var(--line);background:transparent;color:var(--ink);border-radius:999px;font:800 15px Nunito,ui-rounded,system-ui,sans-serif;cursor:pointer}.ds-seg button[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:var(--on-teal)}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Home Cinema Foyer",
+    "overview": "Arr's web app is one calm feed on a warm cream page: white rounded cards, ink-green text, a single teal for action and arrival, a friendly round typeface, and the mascot as the brand mark. It is the same world as the Arr website, carried into a phone-first, single-column app. It reads like a household noticeboard for a TV room, not an admin console.\n\nThe page answers one question, \"is my thing coming?\". Search is pinned at the top; below it the feed deals out sections. Each row is a title tile or date chip, a title, and one next fact. Colour carries meaning: teal says here or act, coral says needs you, sun-yellow says a date.\n\nDensity is relaxed: 44px minimum targets, 18px card corners, 2px borders. Dark mode is the website's night palette, not an inversion.",
+    "keyCharacteristics": [
+      "Cream page, white cards, every card outlined in a 2px warm line.",
+      "Teal is the only action colour; coral is reserved for \"Needs you\".",
+      "Nunito (self-hosted) at weights 500 to 800; bold, rounded, no thin weights.",
+      "Single centred column, max 680px; bottom tab bar on phones, top-right tabs on desktop.",
+      "Title tiles (coloured initials) stand in for artwork; no posters yet.",
+      "The four-stop journey line is the signature element."
+    ],
+    "rules": [
+      {
+        "name": "The Coral Means Needs-You Rule",
+        "body": "Coral appears only on rows in \"Needs you\" and error messages. If an item is not waiting on a person, it is not coral.",
+        "section": "colors"
+      },
+      {
+        "name": "The Two Teals Rule",
+        "body": "Sea Teal fills; Teal Ink writes. Never set small teal text in `teal` on a white or cream ground.",
+        "section": "colors"
+      },
+      {
+        "name": "The Dates Are Sun Rule",
+        "body": "A date is a pale sun chip. Sun is not used for status, warnings or buttons.",
+        "section": "colors"
+      },
+      {
+        "name": "The Heavy Round Rule",
+        "body": "Titles and controls are 800; supporting text is 500 to 600. No light weights.",
+        "section": "typography"
+      },
+      {
+        "name": "The Plain Words Rule",
+        "body": "Copy is household English. No indexer, grab, queue, quality or seeder vocabulary anywhere a household member reads.",
+        "section": "typography"
+      },
+      {
+        "name": "The One Drop Rule",
+        "body": "Only the search field carries a drop. Rows, buttons and tabs sit flat on their border.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep the cream page, white cards, ink text and 2px `warm-line` borders on every container; dark mode swaps to the `night-` values.",
+      "Do use Sea Teal for fills and arrival (primary button, journey, arrived border) and Teal Ink for teal text.",
+      "Do use coral only for things that need a person, as the outlined button, its border and the coral-ink problem or error text.",
+      "Do give each item a title tile (or date chip when it has a date) and one next fact; let the journey line show progress instead of numbers and states.",
+      "Do write plain household English; say what happened to the person's film (\"In Plex\", \"Out 14 Nov. Arr will get it then.\").",
+      "Do keep 44px minimum targets, the 3px ring focus outline, and visible hover/pressed/busy/done states.",
+      "Do use Nunito at 500 to 800 and 18px/12px/pill radii as listed."
+    ],
+    "donts": [
+      "Don't use coral as a fill, an accent, a badge or decoration; if nothing needs the person, nothing is coral.",
+      "Don't add posters, poster grids or backdrops until artwork is sourced; use title tiles. Never fake a poster with a stock image.",
+      "Don't put jargon, speeds, seeders, quality, indexer, grab or queue rows, tables, charts or settings on a feed screen.",
+      "Don't add a shadow to anything but the search field, and do not apply the drop to rows, buttons or tabs.",
+      "Don't use saturated sun yellow (#ffc94d) in the app; dates use the pale sun tint.",
+      "Don't set small teal text in Sea Teal on white or cream; use Teal Ink.",
+      "Don't introduce a second typeface, light weights, or new radii outside the existing set.",
+      "Don't treat `src/wizard/app.css` as this system (see below)."
+    ]
+  }
+}

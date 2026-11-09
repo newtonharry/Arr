@@ -9,8 +9,8 @@ your TV. It replaces the usual Sonarr, Radarr, Prowlarr and qBittorrent stack. N
 Linux the setup page installs it for you, links it to your Plex account and creates your
 libraries; already run Plex? Arr fits into your existing libraries.
 
-Arr has no web interface. You talk to it through an AI assistant over MCP ("add season 2 of
-Severance") or through its JSON API.
+You use Arr from its web app (search, tap Add, and follow it until it's in Plex), through an
+AI assistant over MCP ("add season 2 of Severance"), or through its JSON API.
 
 ## Install
 
@@ -253,6 +253,23 @@ the Google OAuth client yourself, since both need your logins, then give the age
 secrets as environment variables so they stay out of the process list.
 
 ## Use it
+
+### In your web browser
+
+Arr serves a small web app, made for phones: search for a movie or show and tap **Add** (a
+show gets its latest season and every new episode), then follow it on the home screen until
+it's in Plex. It also lists what's coming up, ideas from shows with new episodes this week,
+and your library.
+
+- **With remote access** (below): open your ngrok address, for example
+  `https://quiet-river-1234.ngrok-free.app`, on any device and sign in with Google. Only the
+  accounts you listed get in.
+- **On the computer that runs Arr**, without remote access: run
+  `arr app-link --config ~/.local/share/arr/config.toml` and open the link it prints. A link
+  works once, within 15 minutes; anyone who has it can sign in, so share it only with people
+  you'd give Arr to.
+
+A sign-in lasts 30 days. **Sign out** is at the bottom of the app.
 
 ### From Claude Desktop, Claude Code or another MCP client on the same machine
 
