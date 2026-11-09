@@ -145,14 +145,10 @@ struct ScheduleShow {
     network: Option<ScheduleNetwork>,
     #[serde(default, rename = "webChannel")]
     web_channel: Option<ScheduleNetwork>,
+    /// Read loosely (`{"average": 8.1}` expected): a rating in any other shape is no rating,
+    /// never a reason to drop the day's schedule.
     #[serde(default)]
-    rating: Option<ScheduleRating>,
-}
-
-#[derive(Deserialize)]
-struct ScheduleRating {
-    #[serde(default)]
-    average: Option<f64>,
+    rating: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -332,7 +328,8 @@ impl Tvmaze {
                         summary: show.summary.as_deref().and_then(|s| plain_summary(s, 200)),
                         rating: show
                             .rating
-                            .and_then(|r| r.average)
+                            .get("average")
+                            .and_then(serde_json::Value::as_f64)
                             .filter(|r| r.is_finite() && *r > 0.0 && *r <= 10.0)
                             .map(|r| (r * 10.0).round() / 10.0),
                     },

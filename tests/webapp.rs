@@ -669,11 +669,18 @@ async fn ideas_come_from_the_web_schedule_and_are_cached() {
             ),
             scheduled(13, "No Tvdb Show", None, 99, &long),
             scheduled(11, "Low Weight", Some(5001), 10, "<p>Plain.</p>"),
+            scheduled(14, "Odd Rating", None, 5, "<p>Plain.</p>"),
+            scheduled(15, "Odder Rating", None, 4, "<p>Plain.</p>"),
+            scheduled(16, "Too High", None, 3, "<p>Plain.</p>"),
         ];
-        // TVmaze's viewer rating: rounded to one decimal; none, zero or junk is no rating.
+        // TVmaze's viewer rating: rounded to one decimal; none, zero, out of range or a
+        // rating in an unexpected shape is no rating, and never costs the day's other shows.
         m.schedule[1]["_embedded"]["show"]["rating"] = json!({ "average": 8.26 });
         m.schedule[2]["_embedded"]["show"]["rating"] = json!({ "average": null });
         m.schedule[0]["_embedded"]["show"]["rating"] = json!({ "average": 0 });
+        m.schedule[4]["_embedded"]["show"]["rating"] = json!("unknown");
+        m.schedule[5]["_embedded"]["show"]["rating"] = json!({ "average": "unknown" });
+        m.schedule[6]["_embedded"]["show"]["rating"] = json!({ "average": 11 });
     }
     let ideas = || async {
         let (s, v) = site
@@ -688,7 +695,14 @@ async fn ideas_come_from_the_web_schedule_and_are_cached() {
     let titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
     assert_eq!(
         titles,
-        ["No Tvdb Show", "Slow Horses", "Low Weight"],
+        [
+            "No Tvdb Show",
+            "Slow Horses",
+            "Low Weight",
+            "Odd Rating",
+            "Odder Rating",
+            "Too High"
+        ],
         "deduped, by weight"
     );
     assert_eq!(items[0]["media_id"], "series:tvmaze:13");
@@ -700,7 +714,9 @@ async fn ideas_come_from_the_web_schedule_and_are_cached() {
     assert_eq!(items[1]["summary"], "Spies & liars.");
     assert_eq!(items[1]["rating"], 8.3);
     assert!(items[0]["rating"].is_null(), "{v}");
-    assert!(items[2]["rating"].is_null(), "{v}");
+    for i in [2, 3, 4, 5] {
+        assert!(items[i]["rating"].is_null(), "{v}");
+    }
     let summary = items[0]["summary"].as_str().unwrap();
     assert!(
         summary.chars().count() <= 200 && !summary.contains('<'),
@@ -717,7 +733,7 @@ async fn ideas_come_from_the_web_schedule_and_are_cached() {
     // Cached for six hours: no further calls.
     let before = dates.len();
     e.mock.lock().unwrap().schedule.clear();
-    assert_eq!(ideas().await["items"].as_array().unwrap().len(), 3);
+    assert_eq!(ideas().await["items"].as_array().unwrap().len(), 6);
     assert_eq!(e.mock.lock().unwrap().schedule_dates.len(), before);
 }
 
