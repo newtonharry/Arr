@@ -14,6 +14,9 @@ let token = 0, pollT = 0, retryT = 0, feedBusy = false, searchSeq = 0, searchAbo
 
 // ---------- drawing ----------
 let rerender = () => {}, pendingFk = null;
+const I = { genre: '', own: false }; // Ideas: the genre picked, and whether shows already here are listed
+const T = { text: '', undo: null, id: 0 }; // the toast
+let toastT = 0;
 const later = [];
 // Focus that a redraw takes away (a button swapped for another) goes to the element with the same data-fk.
 function focusKey() {
@@ -180,6 +183,36 @@ function stretch(text, id) {
 }
 const Title = ({ title, id }) => h('h3', { title }, stretch(title, id));
 
+// A small message at the bottom with one optional action; it goes away by itself.
+function toast(text, undo) {
+  const id = ++T.id;
+  Object.assign(T, { text, undo });
+  clearTimeout(toastT);
+  toastT = setTimeout(() => { if (T.id === id) { T.text = ''; T.undo = null; bump(); } }, 7000);
+  say(text);
+}
+function Toast() {
+  return h('div', { class: 'toast', hidden: !T.text },
+    h('span', null, T.text),
+    T.undo && h('button', { type: 'button', class: 'link', onClick: T.undo }, 'Undo'));
+}
+const owned = (x) => (x.owned ?? x.in_library) === true;
+// "Not interested": the idea goes at once; the server remembers it for everyone using this Arr.
+async function hideIdea(x) {
+  const list = (S.ideas && S.ideas.items) || [], at = list.indexOf(x);
+  if (at < 0) return;
+  S.ideas = { ...S.ideas, items: list.filter((i) => i !== x) };
+  const back = () => { S.ideas = { ...S.ideas, items: S.ideas.items.some((i) => i.media_id === x.media_id) ? S.ideas.items : [...S.ideas.items.slice(0, at), x, ...S.ideas.items.slice(at)] }; };
+  toast('Hidden', async () => {
+    T.text = ''; T.undo = null; back(); bump();
+    try { await api('/v1/ideas/hide/' + encodeURIComponent(x.media_id), { method: 'DELETE' }); } catch { /* shown again for now; hidden again on the next load */ }
+  });
+  let ok = false;
+  try { ok = (await api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } })).ok; } catch { /* below */ }
+  if (!ok) { back(); toast("Couldn't hide that. Try again in a moment."); }
+}
+const notInterested = (x) => h('button', { type: 'button', class: 'link quiet', 'data-fk': 'hide:' + x.media_id, 'aria-label': `Not interested in ${x.title}`, onClick: () => hideIdea(x) }, 'Not interested');
+
 // ---------- rows ----------
 function NeedRow({ it }) {
   const id = retryId(it), st = A.get(id) || {}, off = st.busy || st.state;
@@ -272,14 +305,14 @@ function ideaMeta(x, ...facts) {
   const sc = scoreLine(x.scores), r = sc ? null : rating(x), text = joinDot(...facts);
   return [h('p', { class: 'meta' }, r, r && text ? ' · ' : null, text), sc];
 }
-function IdeaCard({ x }) {
+function IdeaCard({ x, plain }) {
   return h('li', { class: 'idea' }, h(Tile, { title: x.title, mediaId: x.media_id }), h(Title, { title: x.title, id: x.media_id }),
-    ideaMeta(x, x.network || x.year || ''), chooseLink(x));
+    ideaMeta(x, x.network || x.year || ''), chooseLink(x), plain ? null : notInterested(x));
 }
 function IdeaRow({ x }) {
   return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }),
-      ideaMeta(x, x.year, x.network), x.summary && h('p', { class: 'clamp' }, x.summary)), chooseLink(x));
+      ideaMeta(x, x.year, x.network), x.summary && h('p', { class: 'clamp' }, x.summary), notInterested(x)), chooseLink(x));
 }
 
 // ---------- home ----------
@@ -295,7 +328,7 @@ function Home() {
   }
   if (n('looking').length) secs.push(h(Section, { key: 'look', id: 'look', title: 'Looking' }, h(List, null, keyed(n('looking'), (it) => it.media_id, (it, key) => h(LookRow, { key, it })))));
   if (n('coming_up').length) secs.push(h(Section, { key: 'soon', id: 'soon', title: 'Coming up' }, h(List, null, keyed(n('coming_up'), (it) => it.media_id + '|' + it.at, (it, key) => h(SoonRow, { key, it })))));
-  const ideas = ((S.ideas && S.ideas.items) || []).filter((x) => !x.in_library).slice(0, 6);
+  const ideas = ((S.ideas && S.ideas.items) || []).filter((x) => !owned(x)).slice(0, 6);
   if (!secs.length) {
     secs.push(h('section', { key: 'empty', class: 'empty', 'aria-labelledby': 'h-empty' }, h('img', { src: '/app/mascot.svg', alt: '' }),
       h('h2', { id: 'h-empty' }, 'Find something to watch'), h('p', null, ideas.length ? 'Search above for a movie or show, or start with one of these.' : 'Search above for a movie or show.')));
@@ -340,21 +373,43 @@ async function renderHome(t) {
 
 // ---------- ideas ----------
 function IdeasPage() {
-  const d = V.d;
-  const note = d.status === 'disabled' ? "Ideas aren't switched on for this Arr." : d.status === 'unavailable' && !d.items.length ? "Ideas aren't available right now. Check back soon." : !d.items.length ? 'No ideas yet. Check back soon.' : null;
-  return h(Section, { id: 'ideas', title: 'Popular this week' }, note ? h(Hint, { text: note }) : h(List, null, keyed(d.items, (x) => x.media_id, (x, key) => h(IdeaRow, { key, x }))));
+  const d = S.ideas;
+  if (!d) return h(Hint, { text: 'Loading…' });
+  const all = d.items, have = all.filter(owned).length;
+  const base = I.own ? all : all.filter((x) => !owned(x));
+  // The six genres most of the ideas share; one at a time, or all.
+  const count = new Map();
+  for (const x of base) for (const g of x.genres || []) count.set(g, (count.get(g) || 0) + 1);
+  const top = [...count].sort((p, q) => q[1] - p[1]).slice(0, 6).map(([g]) => g);
+  const pick = top.includes(I.genre) ? I.genre : '';
+  const items = pick ? base.filter((x) => (x.genres || []).includes(pick)) : base;
+  const toggle = have > 0 && h('button', { type: 'button', class: 'link', 'aria-pressed': String(I.own), 'data-fk': 'own', onClick: () => { I.own = !I.own; bump(); } }, I.own ? ic('check') : null, 'Show ones I have');
+  const note = d.status === 'disabled' ? "Ideas aren't switched on for this Arr." : d.status === 'unavailable' && !all.length ? "Ideas aren't available right now. Check back soon."
+    : !all.length ? 'No ideas yet. Check back soon.' : !items.length ? (have && !I.own ? 'You already have everything on this list.' : 'No ideas yet. Check back soon.') : null;
+  const chips = top.length > 1 && h('div', { class: 'chips', role: 'group', 'aria-label': 'Genre' },
+    [['', 'All'], ...top.map((g) => [g, g])].map(([g, l]) => h('button', { key: g || 'all', type: 'button', class: 'chip', 'aria-pressed': String(pick === g), 'data-fk': 'g:' + g, onClick: () => { I.genre = g; bump(); } }, l)));
+  return h(Section, { id: 'ideas', title: 'Popular this week', extra: toggle }, chips,
+    note ? h(Hint, { text: note }) : h(List, null, keyed(items, (x) => x.media_id, (x, key) => h(IdeaRow, { key, x }))));
 }
 async function renderIdeas(t) {
   setView(hint('Loading…'));
   const d = await loadIdeas();
   if (t !== token) return;
   if (!d) return failed(t);
-  setView({ t: 'ideas', d });
+  setView({ t: 'ideas' });
 }
 
 // ---------- search ----------
 async function renderSearch(q, t) {
   q = q.trim();
+  if (!q) {
+    // Before typing: what was searched lately, and what is popular.
+    searchSeq++;
+    setView({ t: 'start' });
+    const had = S.ideas;
+    loadIdeas().then(() => { if (t === token && S.ideas !== had) bump(); });
+    return;
+  }
   if (q.length < 2) return setView(hint('Type at least two letters to search.'));
   const seq = ++searchSeq;
   searchAbort?.abort();
@@ -379,20 +434,47 @@ async function renderSearch(q, t) {
   if (!ok(s)) notes.push("Show results aren't available right now.");
   setView({ t: 'search', q, rows, notes, busy: false });
 }
+// What a person searched lately, on this device only.
+function recents() {
+  try { const a = JSON.parse(localStorage.getItem('arr.recent') || '[]'); return Array.isArray(a) ? a.filter((q) => typeof q === 'string' && q.trim()).slice(0, 8) : []; } catch { return []; }
+}
+function saveRecents(a) { try { localStorage.setItem('arr.recent', JSON.stringify(a.slice(0, 8))); } catch { /* private mode: nothing is kept */ } }
+function noteSearch(q) {
+  q = (q || '').trim();
+  if (q.length >= 2) saveRecents([q, ...recents().filter((r) => r.toLowerCase() !== q.toLowerCase())]);
+}
+function dropRecent(q) {
+  saveRecents(recents().filter((r) => r !== q));
+  after(() => ($('.recent-x') || $('#q'))?.focus({ preventScroll: true }));
+}
+function SearchStart() {
+  const rec = recents(), pop = ((S.ideas && S.ideas.items) || []).filter((x) => !owned(x)).slice(0, 6);
+  return h('div', { class: 'stack' },
+    rec.length ? h(Section, { id: 'recent', title: 'Recent', extra: h('button', { type: 'button', class: 'link', onClick: () => { saveRecents([]); after(() => $('#q')?.focus({ preventScroll: true })); } }, 'Clear') },
+      h('ul', { class: 'recent' }, rec.map((q) => h('li', { key: q },
+        h('a', { class: 'recent-q', href: '#/search?q=' + encodeURIComponent(q) }, ic('search'), h('span', null, q)),
+        h('button', { type: 'button', class: 'recent-x', 'aria-label': `Remove ${q} from recent searches`, onClick: () => dropRecent(q) }, ic('close')))))) : null,
+    pop.length ? h(Section, { id: 'pop', title: 'Popular now', extra: h('a', { href: '#/ideas' }, 'See all') }, h('ul', { class: 'ideas-row' }, keyed(pop, (x) => x.media_id, (x, key) => h(IdeaCard, { key, x, plain: true })))) : null,
+    !rec.length && !pop.length ? h(Hint, { text: 'Type at least two letters to search.' }) : null);
+}
+// What Arr already has, as a small badge.
+const HAVE = { in_plex: ['check', 'In Plex'], on_its_way: ['check', 'On its way'], tracking: ['check', 'Tracking'] };
+const haveBadge = (x, label) => HAVE[x.library_state] && !(label === 'Movie' && x.library_state === 'in_plex') && h('span', { class: 'tag' }, ic(HAVE[x.library_state][0]), HAVE[x.library_state][1]);
 function SearchRow({ x, label }) {
   // A movie is one tap; a show opens its page to pick what to get.
   if (label === 'Show') {
     return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
-      h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores)),
-      chooseLink({ media_id: x.media_id, title: x.title, in_library: x.in_catalog && x.monitored }));
+      h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), haveBadge(x, label)),
+      chooseLink({ media_id: x.media_id, title: x.title, in_library: (x.in_catalog && x.monitored) || !!x.library_state }));
   }
-  const it = { id: x.media_id, title: x.title, base: x.has_file ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add' };
+  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add' };
   return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
-    h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), addMsg(it)), addBtn(it));
+    h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
 function SearchResults() {
   const { q, rows, notes, busy } = V;
-  return h('div', { 'data-results': '', class: busy ? 'busy' : null },
+  // Opening or adding a result counts the search as one worth keeping.
+  return h('div', { 'data-results': '', class: busy ? 'busy' : null, onClick: (e) => { if (e.target.closest('a,button')) noteSearch(q); } },
     h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label })))
       : h(Hint, { text: `Nothing found for “${q}”. Check the spelling or try fewer words.` })),
     notes.map((t) => h(Hint, { key: t, text: t })));
@@ -589,6 +671,13 @@ function errorBody() {
 function hero(title, line, extra) {
   return h('header', { class: 'hero' }, h(Tile, { title, mediaId: P.data.media_id, big: true }),
     h('div', { class: 'hero-t' }, h('h1', { id: 'sheet-title' }, title), line && h('p', { class: 'meta' }, line), extra));
+}
+function Genres({ list }) {
+  return list && list.length ? h('ul', { class: 'genres', 'aria-label': 'Genres' }, list.map((g) => h('li', { key: g }, g))) : null;
+}
+function Cast({ list }) {
+  if (!list || !list.length) return null;
+  return h(Section, { id: 'cast', title: 'Cast' }, h('ul', { class: 'cast' }, list.map((c) => h('li', { key: c.name }, h('b', null, c.name), c.character ? h('span', null, c.character) : null))));
 }
 function Summary({ text }) {
   const el = useRef(null), [over, setOver] = useState(false);
@@ -893,14 +982,16 @@ function seasonItem(s) {
 function showBody() {
   const d = P.data, on = d.following;
   return h('div', { key: 'show', class: 'stack' },
-    hero(d.title, joinDot(d.year, d.network, d.status), scoreLine(d.scores)),
+    hero(d.title, joinDot(d.year, d.network, d.status, d.runtime_minutes && `${d.runtime_minutes}m episodes`), scoreLine(d.scores)),
     h(Summary, { text: d.summary }),
+    h(Genres, { list: d.genres }),
     h('div', null, h('button', { type: 'button', role: 'switch', class: 'switch', 'aria-checked': String(on), 'aria-labelledby': 'sw-t', 'data-fk': 'follow', onClick: toggleFollow },
       h('span', { class: 'what' }, h('span', { class: 'sw-t', id: 'sw-t' }, 'Get new episodes as they air'),
         h('span', { class: 'sw-m' }, on ? 'Arr gets each new episode when it airs.' : 'Off. Arr is not looking for new episodes.')),
       h('span', { class: 'track', 'aria-hidden': 'true' }, h('i'))), msgFor('follow')),
     optionsPanel(),
-    h(Section, { id: 'seasons', title: 'Seasons' }, d.seasons.length ? h('ul', { class: 'list' }, d.seasons.map(seasonItem)) : h(Hint, { text: 'No seasons are listed for this show yet. Check back soon.' })));
+    h(Section, { id: 'seasons', title: 'Seasons' }, d.seasons.length ? h('ul', { class: 'list' }, d.seasons.map(seasonItem)) : h(Hint, { text: 'No seasons are listed for this show yet. Check back soon.' })),
+    h(Cast, { list: d.cast }));
 }
 
 // ----- the movie page
@@ -917,6 +1008,7 @@ function movieBody() {
   return h('div', { key: 'movie', class: 'stack' },
     hero(d.title, joinDot(d.year, d.runtime_minutes && fmtRuntime(d.runtime_minutes)), scoreLine(d.scores)),
     h(Summary, { text: d.summary }),
+    h(Genres, { list: d.genres }),
     h('section', { class: 'item state' + (st === 'in_plex' ? ' arrived' : ''), 'aria-label': 'Status' },
       h('div', { class: 'what' },
         st === 'in_plex' ? h('span', { class: 'tag' }, ic('check'), 'In Plex') : null,
@@ -924,7 +1016,8 @@ function movieBody() {
         st === 'on_its_way' ? h(Journey, { stage: p == null ? 0 : 1, p, fkey: 'movie:' + d.media_id }) : null,
         msgFor(key)),
       control && h('div', { class: 'act' }, control)),
-    optionsPanel());
+    optionsPanel(),
+    h(Cast, { list: d.cast }));
 }
 
 // ---------- sign in ----------
@@ -981,6 +1074,7 @@ function View() {
     case 'home': return h(Home);
     case 'ideas': return h(IdeasPage);
     case 'search': return h(SearchResults);
+    case 'start': return h(SearchStart);
     case 'library': return h(Library, { key: V.tok, t: V.tok });
     case 'signin': return h(Signin, { google: V.google });
     default: return h(Hint, { text: V.text, role: V.role });
@@ -1071,25 +1165,30 @@ function App() {
       h('form', { class: 'search', id: 'search', role: 'search', autocomplete: 'off', hidden: S.out, onSubmit: searchSubmit },
         h('span', { id: 'search-ico', 'aria-hidden': 'true' }, ic('search')),
         h('label', { class: 'sr', for: 'q' }, 'Find a movie or show'),
-        h('input', { id: 'q', name: 'q', type: 'search', placeholder: 'Find a movie or show', enterkeyhint: 'search', autocapitalize: 'off', spellcheck: false, onInput: searchInput })),
+        h('input', { id: 'q', name: 'q', type: 'search', placeholder: 'Find a movie or show', enterkeyhint: 'search', autocapitalize: 'off', spellcheck: false, onInput: searchInput, onFocus: openSearch, onClick: openSearch })),
       h('div', { id: 'banner', class: 'banner', role: 'status' }, S.banner || null)),
     h('main', { id: 'view', tabindex: '-1', inert }, h(View)),
     h(Footer),
     h(Sheet),
+    h(Toast),
     h('div', { id: 'live', class: 'sr', 'aria-live': 'polite' }, S.live || null));
 }
 
 function searchSubmit(e) {
   e.preventDefault();
   const q = $('#q').value.trim();
-  if (q.length >= 2) { clearTimeout(debounceT); go(q); }
+  if (q.length >= 2) { clearTimeout(debounceT); noteSearch(q); go(q); }
+}
+// Tapping the search field opens Search, which shows recent searches and popular titles.
+function openSearch() {
+  if (!S.out && !P.shown && parseHash().path !== '/search') location.hash = '#/search';
 }
 function searchInput() {
   clearTimeout(debounceT);
   const q = $('#q').value.trim();
   debounceT = setTimeout(() => {
     if (q.length >= 2) go(q);
-    else if (!q && parseHash().path === '/search') { history.replaceState(null, '', '#/'); route(); }
+    else if (!q && parseHash().path === '/search') { history.replaceState(null, '', '#/search'); bgHash = '#/search'; renderSearch('', ++token); }
   }, 300);
 }
 function go(q) {

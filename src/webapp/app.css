@@ -154,7 +154,7 @@ body.sheet-open{overflow:hidden}
 .hero h1{font-size:24px;font-weight:800;line-height:1.15;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .hero .meta{color:var(--muted)}
 .sum{line-height:1.5}
-.sum.cl{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.sum.cl{display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .more-sum{padding:0;min-height:36px}
 .switch{display:flex;align-items:center;gap:12px;width:100%;min-height:64px;padding:12px;background:var(--card);border:2px solid var(--line);border-radius:18px;text-align:left;cursor:pointer}
 .switch .what{flex:1;min-width:0}
@@ -251,3 +251,31 @@ body.sheet-open{overflow:hidden}
 @media (max-width:359px){.lv-row{grid-template-columns:1fr}.lv-opt{min-height:0}}
 #copies:empty{display:none}
 .lv-s{white-space:nowrap}
+/* ideas: genre chips, not interested */
+.chips{display:flex;gap:8px;overflow-x:auto;margin:0 -20px 10px;padding:2px 20px 6px;scroll-padding-inline:20px}
+.chip{flex:none;min-height:44px;padding:0 16px;border:2px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);font-weight:800;font-size:14px;cursor:pointer;white-space:nowrap}
+.chip:hover{border-color:var(--teal)}
+.chip[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:var(--on-teal)}
+h2 .link[aria-pressed]{display:inline-flex;align-items:center;gap:4px;padding:0}
+h2 .link .ic{width:16px;height:16px;stroke-width:3}
+.link.quiet{display:block;padding:0;min-height:44px;font-size:13px;color:var(--muted);font-weight:700;text-align:left}
+.idea .link.quiet{min-height:36px;text-align:center;width:100%}
+.what .link.quiet{min-height:40px}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(var(--tab-h) + env(safe-area-inset-bottom) + 12px);z-index:40;display:flex;align-items:center;gap:6px;width:max-content;max-width:calc(100vw - 32px);padding:4px 6px 4px 16px;border-radius:14px;background:var(--ink);color:var(--bg);font-weight:700}
+.toast .link{color:inherit}
+/* search before typing */
+.recent{list-style:none;padding:0;display:grid;gap:8px}
+.recent li{display:flex;align-items:center;background:var(--card);border:2px solid var(--line);border-radius:14px}
+.recent-q{flex:1;min-width:0;display:flex;align-items:center;gap:10px;min-height:48px;padding:0 12px;color:var(--ink);text-decoration:none;font-weight:700}
+.recent-q span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.recent-q .ic{color:var(--muted);width:18px;height:18px}
+.recent-x{flex:none;display:grid;place-items:center;width:48px;height:48px;border:0;background:none;color:var(--muted);cursor:pointer;border-radius:12px}
+.recent-x .ic{width:18px;height:18px}
+.what .tag{margin-top:2px}
+/* title pages: genres and cast */
+.genres{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+.genres li{padding:4px 12px;border:2px solid var(--line);border-radius:999px;font-size:13px;font-weight:800;color:var(--muted)}
+.cast{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 12px}
+.cast li{min-width:0;display:grid;line-height:1.3}
+.cast b{font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cast span{color:var(--muted);font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
