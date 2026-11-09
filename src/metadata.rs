@@ -52,6 +52,55 @@ pub struct TvmazeShow {
     pub network: Option<TvmazeNetwork>,
     #[serde(default, rename = "webChannel")]
     pub web_channel: Option<TvmazeNetwork>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    /// Only present when the request asked for `embed=cast`.
+    #[serde(default, rename = "_embedded")]
+    pub embedded: Option<TvmazeEmbedded>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TvmazeEmbedded {
+    #[serde(default)]
+    pub cast: Vec<TvmazeCast>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TvmazeCast {
+    #[serde(default)]
+    pub person: Option<TvmazeNetwork>,
+    #[serde(default)]
+    pub character: Option<TvmazeNetwork>,
+}
+
+/// One billed actor: the person and the character they play, either of which may be unknown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastName {
+    pub name: String,
+    pub character: Option<String>,
+}
+
+/// At most this many cast names go on a title page.
+pub const CAST_MAX: usize = 6;
+
+fn clean_name(n: Option<&str>) -> Option<String> {
+    let n: String = n?.chars().filter(|c| !c.is_control()).collect();
+    let n = n.trim();
+    (!n.is_empty() && n.chars().count() <= 120).then(|| n.to_string())
+}
+
+/// Genre names as a title page lists them: trimmed, no empties or repeats, at most `max`.
+pub fn clean_genres<'a>(names: impl IntoIterator<Item = &'a str>, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for n in names {
+        if let Some(n) = clean_name(Some(n))
+            && !out.iter().any(|o| o.eq_ignore_ascii_case(&n))
+        {
+            out.push(n);
+        }
+    }
+    out.truncate(max);
+    out
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +129,28 @@ impl TvmazeShow {
             .into_iter()
             .flatten()
             .find_map(|n| n.name.clone().filter(|n| !n.trim().is_empty()))
+    }
+
+    /// The top billed cast (TVmaze lists them in billing order).
+    pub fn cast(&self) -> Vec<CastName> {
+        let list = self.embedded.iter().flat_map(|e| e.cast.iter());
+        let mut out: Vec<CastName> = vec![];
+        for c in list {
+            let Some(name) = clean_name(c.person.as_ref().and_then(|p| p.name.as_deref())) else {
+                continue;
+            };
+            if out.iter().any(|o| o.name == name) {
+                continue;
+            }
+            out.push(CastName {
+                name,
+                character: clean_name(c.character.as_ref().and_then(|p| p.name.as_deref())),
+            });
+            if out.len() == CAST_MAX {
+                break;
+            }
+        }
+        out
     }
 }
 
@@ -122,6 +193,7 @@ pub struct WebShow {
     pub summary: Option<String>,
     /// TVmaze viewers' average rating out of 10, when it has one.
     pub rating: Option<f64>,
+    pub genres: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -329,6 +401,7 @@ impl Tvmaze {
                         year: show.show.year(),
                         network,
                         summary: show.summary.as_deref().and_then(|s| plain_summary(s, 200)),
+                        genres: clean_genres(show.show.genres.iter().map(String::as_str), 4),
                         rating: show
                             .rating
                             .get("average")
@@ -400,7 +473,7 @@ impl Tvmaze {
         id: u32,
         fresh: bool,
     ) -> Result<Option<TvmazeShow>, UpstreamError> {
-        let url = self.url(&format!("shows/{id}"), &[])?;
+        let url = self.url(&format!("shows/{id}"), &[("embed", "cast")])?;
         self.cached_show(format!("id:{id}"), url, fresh).await
     }
 
@@ -632,6 +705,11 @@ pub struct TmdbMovie {
     /// A plain-text summary (TMDB's overview, or Plex's summary).
     #[serde(default)]
     pub overview: Option<String>,
+    #[serde(default)]
+    pub genres: Vec<TmdbGenre>,
+    /// TMDB's credits (asked for with the details); Plex's cast is converted into the same shape.
+    #[serde(default)]
+    pub credits: TmdbCredits,
     /// Plex's poster address (Plex answers only; never read from TMDB).
     #[serde(default, skip_deserializing)]
     pub plex_thumb: Option<String>,
@@ -642,6 +720,53 @@ pub struct TmdbMovie {
     /// date: a refresh keeps an earlier recorded date instead of moving it forward.
     #[serde(default, skip_deserializing)]
     pub observed_digital: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TmdbGenre {
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TmdbCredits {
+    #[serde(default)]
+    pub cast: Vec<TmdbCastMember>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TmdbCastMember {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub character: Option<String>,
+}
+
+impl TmdbMovie {
+    pub fn genre_names(&self) -> Vec<String> {
+        clean_genres(self.genres.iter().map(|g| g.name.as_str()), 6)
+    }
+
+    /// The top billed cast.
+    pub fn cast(&self) -> Vec<CastName> {
+        let mut out: Vec<CastName> = vec![];
+        for c in &self.credits.cast {
+            let Some(name) = clean_name(Some(&c.name)) else {
+                continue;
+            };
+            if out.iter().any(|o| o.name == name) {
+                continue;
+            }
+            out.push(CastName {
+                name,
+                character: clean_name(c.character.as_deref()),
+            });
+            if out.len() == CAST_MAX {
+                break;
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -841,7 +966,10 @@ impl Tmdb {
         let movie = match self
             .get::<TmdbMovie>(
                 &format!("3/movie/{id}"),
-                &[("append_to_response", "alternative_titles,release_dates")],
+                &[(
+                    "append_to_response",
+                    "alternative_titles,release_dates,credits",
+                )],
             )
             .await
         {
@@ -935,6 +1063,19 @@ struct PlexMeta {
     summary: Option<String>,
     #[serde(rename = "Rating", default, deserialize_with = "loose_scores")]
     scores: Option<Scores>,
+    #[serde(rename = "Genre", default)]
+    genres: Vec<PlexTag>,
+    #[serde(rename = "Role", default)]
+    roles: Vec<PlexTag>,
+}
+
+/// A Plex tag: a genre, or an actor (`tag`) with the character they play (`role`).
+#[derive(Debug, Clone, Deserialize)]
+struct PlexTag {
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 impl PlexMeta {
@@ -1326,6 +1467,23 @@ fn plex_movie(id: u32, m: &PlexMeta, on_sale: bool) -> TmdbMovie {
         },
         poster_path: None,
         overview: m.summary.clone().filter(|t| !t.trim().is_empty()),
+        genres: m
+            .genres
+            .iter()
+            .map(|g| TmdbGenre {
+                name: g.tag.clone(),
+            })
+            .collect(),
+        credits: TmdbCredits {
+            cast: m
+                .roles
+                .iter()
+                .map(|r| TmdbCastMember {
+                    name: r.tag.clone(),
+                    character: r.role.clone(),
+                })
+                .collect(),
+        },
         plex_thumb: m.thumb.clone(),
         scores: m.scores,
         observed_digital: on_sale,
@@ -1458,6 +1616,12 @@ fn merge(plex: TmdbMovie, mut tmdb: TmdbMovie) -> TmdbMovie {
     tmdb.overview = plex
         .overview
         .or(tmdb.overview.filter(|t| !t.trim().is_empty()));
+    if tmdb.genres.iter().all(|g| g.name.trim().is_empty()) {
+        tmdb.genres = plex.genres;
+    }
+    if tmdb.credits.cast.is_empty() {
+        tmdb.credits = plex.credits;
+    }
     tmdb.original_title = tmdb.original_title.or(plex.original_title);
     tmdb.original_language = tmdb
         .original_language
@@ -1669,5 +1833,70 @@ mod score_tests {
         );
         assert_eq!(scores_json(None), json!(null));
         assert_eq!(scores_json(Some(Scores::default())), json!(null));
+    }
+}
+
+#[cfg(test)]
+mod title_extras_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tvmaze_cast_is_the_top_six_named_people() {
+        let mut cast: Vec<serde_json::Value> = (1..=9)
+            .map(|i| json!({ "person": { "name": format!("Actor {i}") }, "character": { "name": format!("Role {i}") } }))
+            .collect();
+        cast.insert(1, json!({ "person": { "name": "  " }, "character": null }));
+        cast.insert(
+            2,
+            json!({ "person": { "name": "Actor 1" }, "character": { "name": "Again" } }),
+        );
+        let show: TvmazeShow = serde_json::from_value(json!({
+            "id": 1, "name": "x", "genres": ["Drama", "drama", " Thriller "],
+            "_embedded": { "cast": cast },
+        }))
+        .unwrap();
+        let got = show.cast();
+        assert_eq!(got.len(), 6);
+        assert_eq!(got[0].name, "Actor 1");
+        assert_eq!(
+            got[0].character.as_deref(),
+            Some("Role 1"),
+            "the first billing wins"
+        );
+        assert_eq!(got[5].name, "Actor 6");
+        assert_eq!(
+            clean_genres(show.genres.iter().map(String::as_str), 6),
+            ["Drama", "Thriller"]
+        );
+        // No embed: none, never a failure.
+        let bare: TvmazeShow = serde_json::from_value(json!({ "id": 2, "name": "y" })).unwrap();
+        assert!(bare.cast().is_empty() && bare.genres.is_empty());
+    }
+
+    #[test]
+    fn tmdb_credits_and_genres_fill_the_page_and_plex_fills_what_tmdb_lacks() {
+        let tmdb: TmdbMovie = serde_json::from_value(json!({
+            "id": 1, "title": "x", "genres": [{ "id": 18, "name": "Drama" }],
+            "credits": { "cast": [{ "name": "A", "character": "B" }, { "name": "", "character": "C" }] },
+        }))
+        .unwrap();
+        assert_eq!(tmdb.genre_names(), ["Drama"]);
+        assert_eq!(
+            tmdb.cast(),
+            [CastName {
+                name: "A".into(),
+                character: Some("B".into())
+            }]
+        );
+        let bare: TmdbMovie = serde_json::from_value(json!({ "id": 1, "title": "x" })).unwrap();
+        let plex: TmdbMovie = serde_json::from_value(json!({
+            "id": 1, "title": "x", "genres": [{ "name": "Comedy" }],
+            "credits": { "cast": [{ "name": "P", "character": null }] },
+        }))
+        .unwrap();
+        let merged = merge(plex, bare);
+        assert_eq!(merged.genre_names(), ["Comedy"]);
+        assert_eq!(merged.cast()[0].name, "P");
     }
 }

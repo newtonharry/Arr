@@ -222,7 +222,8 @@ async fn prowlarr_search(
 fn tvmaze_show(id: u32, name: &str, premiered: &str, tvdb: Option<u32>) -> Value {
     json!({ "id": id, "name": name, "type": "Scripted", "language": "English", "status": "Running", "runtime": 60,
             "premiered": premiered, "externals": { "tvrage": null, "thetvdb": tvdb, "imdb": null },
-            "network": { "name": "Apple TV+" }, "summary": format!("<p>About <b>{name}</b> &amp; its people.</p>") })
+            "network": { "name": "Apple TV+" }, "genres": ["Drama", "Thriller"],
+            "summary": format!("<p>About <b>{name}</b> &amp; its people.</p>") })
 }
 
 fn shows() -> Vec<Value> {
@@ -270,6 +271,7 @@ async fn tvmaze_lookup(Query(q): Query<HashMap<String, String>>) -> Response {
 async fn tvmaze_show_by_id(
     State(m): State<Mock>,
     headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     match shows()
@@ -286,6 +288,25 @@ async fn tvmaze_show_by_id(
                 .get(&n)
                 .cloned()
                 .unwrap_or(json!({ "medium": format!("http://{host}/uploads/{n}.jpg") }));
+            // Like TVmaze: the cast only comes with `embed=cast`. Slow Horses has eight billed.
+            if q.get("embed").map(String::as_str) == Some("cast") {
+                let names = [
+                    "Gary Oldman",
+                    "Jack Lowden",
+                    "Kristin Scott Thomas",
+                    "Saskia Reeves",
+                    "Christopher Chung",
+                    "Rosalind Eleazar",
+                    "Sope Dirisu",
+                    "Dustin Demri-Burns",
+                ];
+                let cast: Vec<Value> = if n == 9001 {
+                    names.iter().enumerate().map(|(i, p)| json!({ "person": { "name": p }, "character": { "name": format!("Role {}", i + 1) } })).collect()
+                } else {
+                    vec![]
+                };
+                s["_embedded"] = json!({ "cast": cast });
+            }
             axum::Json(s).into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
@@ -450,6 +471,8 @@ fn plex_fixtures() -> Vec<Value> {
             "ratingKey": key, "guid": format!("plex://movie/{key}"), "type": "movie", "title": title,
             "year": date[..4].parse::<u16>().unwrap(), "originallyAvailableAt": date, "duration": 6_000_000,
             "Guid": guids, "Country": [{ "tag": country }], "summary": format!("About {title}."),
+            "Genre": [{ "tag": "Drama" }, { "tag": "Thriller" }],
+            "Role": (1..=8).map(|i| json!({ "tag": format!("Actor {i}"), "role": format!("Character {i}") })).collect::<Vec<_>>(),
             // The host is the mock's (127.0.0.1), except the foreign movie's: not Plex's image host.
             "thumb": if key == "for0001" { format!("https://elsewhere.example/uploads/{key}.jpg") } else { format!("http://127.0.0.1/uploads/{key}.jpg") },
         });

@@ -123,6 +123,15 @@ async fn the_show_page_of_a_catalog_show_says_what_is_in_plex() {
     assert_eq!(v["network"], "Apple TV+");
     assert_eq!(v["status"], "Running");
     assert_eq!(v["summary"], "About Slow Horses & its people.");
+    assert_eq!(v["runtime_minutes"], 60, "{v}");
+    assert_eq!(v["genres"], json!(["Drama", "Thriller"]));
+    let cast = v["cast"].as_array().unwrap();
+    assert_eq!(cast.len(), 6, "the top six only: {v}");
+    assert_eq!(
+        cast[0],
+        json!({ "name": "Gary Oldman", "character": "Role 1" })
+    );
+    assert_eq!(cast[5]["name"], "Rosalind Eleazar");
     assert_eq!(
         v["following"], true,
         "an imported, monitored show follows new episodes"
@@ -607,6 +616,17 @@ async fn the_movie_page_follows_the_movie_through_its_states() {
         )
     );
     assert_eq!(v["runtime_minutes"], 100);
+    assert_eq!(v["genres"], json!(["Drama", "Thriller"]));
+    let cast = v["cast"].as_array().unwrap();
+    assert_eq!(cast.len(), 6, "{v}");
+    assert_eq!(
+        cast[0],
+        json!({ "name": "Actor 1", "character": "Character 1" })
+    );
+    // A show or movie without a cast has an empty list, never a missing key.
+    let v = site.show("series:tvdb:999005").await;
+    assert_eq!(v["cast"], json!([]), "{v}");
+    assert_eq!(v["genres"], json!(["Drama", "Thriller"]));
     // Added before it is out: waiting, with the date.
     site.post("/quick-add", json!({ "media_id": "movie:tmdb:900002" }))
         .await;

@@ -60,6 +60,51 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
+/// `web.sqlite`, private, with its tables (sessions, links, and the ideas people hid).
+fn open_db(state_dir: &Path) -> Result<rusqlite::Connection> {
+    let path = state_dir.join("web.sqlite");
+    if path.exists() {
+        fsutil::check_private_file(&path)?;
+    } else {
+        fsutil::write_new_private_file(&path, b"")?;
+    }
+    let db = rusqlite::Connection::open(&path).context("open web.sqlite")?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            hash TEXT PRIMARY KEY, kind TEXT NOT NULL, email TEXT,
+            created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS links (
+            hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS hidden_ideas (
+            media_id TEXT PRIMARY KEY, at INTEGER);",
+    )?;
+    Ok(db)
+}
+
+/// The shows hidden from Ideas ("Not interested"), for everyone using this Arr.
+pub fn hidden_ideas(state_dir: &Path) -> Result<std::collections::HashSet<String>> {
+    let db = open_db(state_dir)?;
+    let mut q = db.prepare("SELECT media_id FROM hidden_ideas")?;
+    let ids = q.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(ids.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Hides a show from Ideas (again is fine). Nothing else changes: no file, no download.
+pub fn hide_idea(state_dir: &Path, media_id: &str) -> Result<()> {
+    open_db(state_dir)?.execute(
+        "INSERT OR REPLACE INTO hidden_ideas (media_id, at) VALUES (?1, ?2)",
+        rusqlite::params![media_id, now()],
+    )?;
+    Ok(())
+}
+
+/// Shows a hidden show in Ideas again.
+pub fn unhide_idea(state_dir: &Path, media_id: &str) -> Result<()> {
+    open_db(state_dir)?.execute("DELETE FROM hidden_ideas WHERE media_id = ?1", [media_id])?;
+    Ok(())
+}
+
 /// Web sessions and one-time sign-in links (`<state_dir>/web.sqlite`).
 pub struct Sessions {
     db: Mutex<rusqlite::Connection>,
@@ -67,22 +112,9 @@ pub struct Sessions {
 
 impl Sessions {
     pub fn open(state_dir: &Path) -> Result<Arc<Self>> {
-        let path = state_dir.join("web.sqlite");
-        if path.exists() {
-            fsutil::check_private_file(&path)?;
-        } else {
-            fsutil::write_new_private_file(&path, b"")?;
-        }
-        let db = rusqlite::Connection::open(&path).context("open web.sqlite")?;
-        db.busy_timeout(Duration::from_secs(5))?;
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                hash TEXT PRIMARY KEY, kind TEXT NOT NULL, email TEXT,
-                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS links (
-                hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);",
-        )?;
-        Ok(Arc::new(Self { db: Mutex::new(db) }))
+        Ok(Arc::new(Self {
+            db: Mutex::new(open_db(state_dir)?),
+        }))
     }
 
     /// A new one-time link token, valid for `LINK_TTL`.
@@ -598,10 +630,12 @@ fn allowed(method: &Method, path: &str) -> bool {
         ),
         Method::POST => match parts.as_slice() {
             ["quick-add" | "follow" | "stop" | "quality"] => true,
+            ["ideas", "hide"] => true,
             ["copies", id, "get"] => !id.is_empty(),
             ["queue", id, "retry"] => !id.is_empty(),
             _ => false,
         },
+        Method::DELETE => matches!(parts.as_slice(), ["ideas", "hide", id] if !id.is_empty()),
         _ => false,
     }
 }

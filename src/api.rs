@@ -92,6 +92,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/attention"),
     ("get", "/api/v1/feed"),
     ("get", "/api/v1/ideas"),
+    ("post", "/api/v1/ideas/hide"),
+    ("delete", "/api/v1/ideas/hide/{media_id}"),
     ("post", "/api/v1/quick-add"),
     ("post", "/api/v1/follow"),
     ("post", "/api/v1/stop"),
@@ -783,6 +785,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/attention", get(attention))
         .route("/api/v1/feed", get(feed))
         .route("/api/v1/ideas", get(ideas))
+        .route("/api/v1/ideas/hide", post(ideas_hide))
+        .route("/api/v1/ideas/hide/{media_id}", delete(ideas_unhide))
         .route("/api/v1/quick-add", post(quick_add))
         .route("/api/v1/follow", post(titles::follow))
         .route("/api/v1/stop", post(titles::stop))
@@ -2350,7 +2354,7 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
             for m in hits.into_iter().take(25) {
                 add(
                     m.id,
-                    json!({ "kind": "movie", "title": m.title, "year": m.year, "in_catalog": true, "has_file": m.has_file, "monitored": m.monitored, "external_ids": { "tmdb": m.tmdb_id, "imdb": m.imdb_id } }),
+                    json!({ "kind": "movie", "title": m.title, "year": m.year, "in_catalog": true, "has_file": m.has_file, "monitored": m.monitored, "library_state": movie_state(m), "external_ids": { "tmdb": m.tmdb_id, "imdb": m.imdb_id } }),
                     "catalog",
                 );
             }
@@ -2368,7 +2372,7 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
                     .collect();
                 add(
                     s.id,
-                    json!({ "kind": "series", "title": s.title, "year": s.year, "in_catalog": true, "monitored": s.monitored, "seasons": seasons, "external_ids": { "tvdb": s.tvdb_id, "tvmaze": s.tvmaze_id, "imdb": s.imdb_id } }),
+                    json!({ "kind": "series", "title": s.title, "year": s.year, "in_catalog": true, "monitored": s.monitored, "library_state": series_state(s), "seasons": seasons, "external_ids": { "tvdb": s.tvdb_id, "tvmaze": s.tvmaze_id, "imdb": s.imdb_id } }),
                     "catalog",
                 );
             }
@@ -2382,15 +2386,16 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
                     providers.push(json!({ "name": "tvmaze", "status": "ok", "results": shows.len() }));
                     for show in shows.iter().take(25) {
                         let t = crate::target::series_from_tvmaze(show);
-                        let in_catalog = catalog.is_some_and(|c| {
-                            t.tvdb_id.is_some_and(|id| c.series(SeriesKey::Tvdb(id)).is_some()) || c.series(SeriesKey::Tvmaze(show.id)).is_some()
+                        let found = catalog.and_then(|c| {
+                            t.tvdb_id.and_then(|id| c.series(SeriesKey::Tvdb(id))).or_else(|| c.series(SeriesKey::Tvmaze(show.id)))
                         });
+                        let in_catalog = found.is_some();
                         let id = match (t.tvdb_id, catalog) {
                             (Some(tvdb), _) => MediaId::Series(SeriesKey::Tvdb(tvdb)),
                             (None, Some(c)) => c.series(SeriesKey::Tvmaze(show.id)).map(|s| s.id).unwrap_or(t.id),
                             (None, None) => t.id,
                         };
-                        add(id, json!({ "kind": "series", "title": show.name, "year": t.year, "in_catalog": in_catalog, "status": show.status, "language": show.language, "external_ids": { "tvdb": t.tvdb_id, "tvmaze": show.id, "imdb": show.externals.imdb } }), "tvmaze");
+                        add(id, json!({ "kind": "series", "title": show.name, "year": t.year, "in_catalog": in_catalog, "library_state": found.and_then(series_state), "status": show.status, "language": show.language, "external_ids": { "tvdb": t.tvdb_id, "tvmaze": show.id, "imdb": show.externals.imdb } }), "tvmaze");
                     }
                 }
                 Err(e) => providers.push(json!({ "name": "tvmaze", "status": "failed", "error": { "code": e.code(), "message": format!("tvmaze {}", e.describe()) } })),
@@ -2412,7 +2417,7 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
                         movie_scores.insert(m.id, s);
                     }
                     let in_catalog = catalog.is_some_and(|c| c.movie(m.id).is_some());
-                    add(MediaId::Movie { tmdb: m.id }, json!({ "kind": "movie", "title": m.title, "original_title": m.original_title, "year": metadata::year_of(m.release_date.as_deref()), "in_catalog": in_catalog, "external_ids": { "tmdb": m.id } }), source);
+                    add(MediaId::Movie { tmdb: m.id }, json!({ "kind": "movie", "title": m.title, "original_title": m.original_title, "year": metadata::year_of(m.release_date.as_deref()), "in_catalog": in_catalog, "library_state": catalog.and_then(|c| c.movie(m.id)).and_then(movie_state), "external_ids": { "tmdb": m.id } }), source);
                 }
             }
         },
@@ -4272,7 +4277,55 @@ async fn feed(State(st): St) -> ApiResult {
 /// The longest a page waits for review scores; whatever is ready by then is shown.
 pub(crate) const SCORES_BUDGET: Duration = Duration::from_millis(1500);
 
-/// Popular shows with new episodes this week (TVmaze web schedule).
+/// Where a movie stands in the library, in one word: `in_plex`, `on_its_way`, `tracking`
+/// (Arr is looking for it), or none.
+fn movie_state(m: &crate::catalog::Movie) -> Option<&'static str> {
+    if m.has_file {
+        Some("in_plex")
+    } else if m.queued {
+        Some("on_its_way")
+    } else if m.monitored && managed(&m.provenance.source_app) {
+        Some("tracking")
+    } else {
+        None
+    }
+}
+
+/// The same for a show: some episodes in Plex, some on their way, or only tracked.
+fn series_state(s: &crate::catalog::Series) -> Option<&'static str> {
+    let owned = s
+        .episodes
+        .as_ref()
+        .is_some_and(|e| e.iter().any(|e| e.has_file))
+        || s.seasons
+            .iter()
+            .any(|x| x.number > 0 && x.episode_file_count.unwrap_or(0) > 0);
+    if owned {
+        Some("in_plex")
+    } else if s
+        .episodes
+        .as_ref()
+        .is_some_and(|e| e.iter().any(|e| e.queued))
+    {
+        Some("on_its_way")
+    } else if s.monitored && managed(&s.provenance.source_app) {
+        Some("tracking")
+    } else {
+        None
+    }
+}
+
+/// The shows people said they are not interested in.
+async fn hidden_ideas(st: &AppState) -> Result<std::collections::HashSet<String>, ApiError> {
+    let dir = st.cfg.state_dir.clone();
+    tokio::task::spawn_blocking(move || crate::webapp::hidden_ideas(&dir))
+        .await
+        .map_err(|e| ApiError::internal("ideas", e.to_string()))?
+        .map_err(internal("ideas"))
+}
+
+/// Popular shows with new episodes this week (TVmaze web schedule), without the ones people
+/// hid. Each item says whether the show is already here (`owned`, `library_state`).
 async fn ideas(State(st): St) -> ApiResult {
     let Some(tv) = &st.tvmaze else {
         return ok(json!({ "status": "disabled", "items": [] }));
@@ -4280,6 +4333,7 @@ async fn ideas(State(st): St) -> ApiResult {
     let Ok(shows) = tv.ideas().await else {
         return ok(json!({ "status": "unavailable", "items": [] }));
     };
+    let hidden = hidden_ideas(&st).await.unwrap_or_default();
     let index = st.index();
     let refs: Vec<(Option<u32>, Option<String>)> =
         shows.iter().map(|s| (s.tvdb, s.imdb.clone())).collect();
@@ -4290,23 +4344,82 @@ async fn ideas(State(st): St) -> ApiResult {
     let items: Vec<Value> = shows
         .iter()
         .zip(scores)
+        .filter(|(s, _)| {
+            let tvmaze = MediaId::Series(SeriesKey::Tvmaze(s.id)).to_string();
+            let tvdb = s
+                .tvdb
+                .map(|t| MediaId::Series(SeriesKey::Tvdb(t)).to_string());
+            !hidden.contains(&tvmaze) && !tvdb.is_some_and(|t| hidden.contains(&t))
+        })
         .map(|(s, scores)| {
             let key = s.tvdb.map_or(SeriesKey::Tvmaze(s.id), SeriesKey::Tvdb);
-            let in_library = [
+            let found: Vec<&crate::catalog::Series> = [
                 SeriesKey::Tvdb(s.tvdb.unwrap_or(0)),
                 SeriesKey::Tvmaze(s.id),
             ]
             .into_iter()
             .filter_map(|k| index.series(k))
-            .any(|x| x.monitored && managed(&x.provenance.source_app));
+            .collect();
+            let in_library = found
+                .iter()
+                .any(|x| x.monitored && managed(&x.provenance.source_app));
+            let state = found.iter().find_map(|x| series_state(x));
             json!({
                 "media_id": MediaId::Series(key), "title": s.name, "year": s.year,
                 "network": s.network, "in_library": in_library, "summary": s.summary,
-                "rating": s.rating, "scores": metadata::scores_json(scores),
+                "rating": s.rating, "scores": metadata::scores_json(scores), "genres": s.genres,
+                "owned": in_library || state.is_some(), "library_state": state,
             })
         })
         .collect();
     ok(json!({ "status": "ok", "items": items }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HideBody {
+    media_id: String,
+}
+
+fn idea_id(raw: &str) -> Result<String, ApiError> {
+    match parse_media_id(raw)? {
+        id @ MediaId::Series(_) => Ok(id.to_string()),
+        _ => Err(ApiError::bad_request(
+            ErrorCode::InvalidMediaId,
+            "expected a series id",
+        )),
+    }
+}
+
+async fn change_hidden(st: &AppState, id: String, hide: bool) -> Result<(), ApiError> {
+    let dir = st.cfg.state_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        if hide {
+            crate::webapp::hide_idea(&dir, &id)
+        } else {
+            crate::webapp::unhide_idea(&dir, &id)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal("ideas", e.to_string()))?
+    .map_err(internal("ideas"))
+}
+
+/// `POST /ideas/hide`: "Not interested". Hides the show from Ideas for everyone using this
+/// Arr. It changes nothing else: no download, no file, no library entry.
+async fn ideas_hide(State(st): St, ApiJson(body): ApiJson<HideBody>) -> ApiResult {
+    let id = idea_id(&body.media_id)?;
+    change_hidden(&st, id.clone(), true).await?;
+    ok(json!({ "media_id": id, "hidden": true }))
+}
+
+/// `DELETE /ideas/hide/{media_id}`: show it in Ideas again (also fine if it was not hidden).
+async fn ideas_unhide(State(st): St, p: Result<Path<String>, PathRejection>) -> ApiResult {
+    let Path(raw) =
+        p.map_err(|e| ApiError::bad_request(ErrorCode::InvalidMediaId, e.body_text()))?;
+    let id = idea_id(&raw)?;
+    change_hidden(&st, id.clone(), false).await?;
+    ok(json!({ "media_id": id, "hidden": false }))
 }
 
 #[derive(Deserialize)]
