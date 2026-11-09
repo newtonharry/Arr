@@ -4826,6 +4826,7 @@ async fn ideas(State(st): St) -> ApiResult {
             json!({
                 "media_id": MediaId::Series(key), "title": s.name, "year": s.year,
                 "network": s.network, "in_library": in_library, "summary": s.summary,
+                "rating": s.rating,
             })
         })
         .collect();

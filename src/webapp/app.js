@@ -21,6 +21,7 @@ const ICONS = {
   close: 'M6 6l12 12M18 6L6 18',
   down: 'M6 9l6 6l6-6',
   right: 'M9 6l6 6l-6 6',
+  star: 'M12 3.5l2.6 5.4l5.9.8l-4.3 4.1l1 5.9L12 16.9l-5.2 2.8l1-5.9l-4.3-4.1l5.9-.8z',
 };
 const NS = 'http://www.w3.org/2000/svg';
 function ic(name) {
@@ -226,14 +227,26 @@ function soonRow(it) {
 function chooseLink(x) {
   return h('a', { class: 'btn' + (x.in_library ? ' ghost' : ''), href: titleHref(x.media_id), 'aria-label': `${x.in_library ? 'Open' : 'Choose'} ${x.title}` }, x.in_library ? 'Open' : 'Choose', ic('right'));
 }
+// TVmaze viewers' average out of 10: a star and the number, read out in words.
+function rating(x) {
+  const r = Number(x.rating);
+  if (!(r > 0 && r <= 10)) return null;
+  const n = r.toFixed(1);
+  return h('span', { class: 'rating', title: `Rated ${n} out of 10 by TVmaze viewers` },
+    ic('star'), h('span', { 'aria-hidden': 'true' }, n), h('span', { class: 'sr' }, `Rated ${n} out of 10`));
+}
+function ideaMeta(...facts) {
+  const r = rating(facts.shift()), text = joinDot(...facts);
+  return h('p', { class: 'meta' }, r, r && text ? ' · ' : null, text);
+}
 function ideaCard(x) {
   return h('li', { class: 'idea' }, tile(x.title, x.media_id), h('h3', { title: x.title }, stretch(x.title, x.media_id)),
-    h('p', { class: 'meta' }, x.network || x.year || ''), chooseLink(x));
+    ideaMeta(x, x.network || x.year || ''), chooseLink(x));
 }
 function ideaRow(x) {
   return h('li', { class: 'item top-align' }, tile(x.title, x.media_id),
     h('div', { class: 'what' }, h('h3', { title: x.title }, stretch(x.title, x.media_id)),
-      h('p', { class: 'meta' }, joinDot(x.year, x.network)), x.summary && h('p', { class: 'clamp' }, x.summary)), chooseLink(x));
+      ideaMeta(x, x.year, x.network), x.summary && h('p', { class: 'clamp' }, x.summary)), chooseLink(x));
 }
 
 // ---------- home ----------

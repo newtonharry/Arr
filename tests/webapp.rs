@@ -670,6 +670,10 @@ async fn ideas_come_from_the_web_schedule_and_are_cached() {
             scheduled(13, "No Tvdb Show", None, 99, &long),
             scheduled(11, "Low Weight", Some(5001), 10, "<p>Plain.</p>"),
         ];
+        // TVmaze's viewer rating: rounded to one decimal; none, zero or junk is no rating.
+        m.schedule[1]["_embedded"]["show"]["rating"] = json!({ "average": 8.26 });
+        m.schedule[2]["_embedded"]["show"]["rating"] = json!({ "average": null });
+        m.schedule[0]["_embedded"]["show"]["rating"] = json!({ "average": 0 });
     }
     let ideas = || async {
         let (s, v) = site
@@ -694,6 +698,9 @@ async fn ideas_come_from_the_web_schedule_and_are_cached() {
     assert_eq!(items[1]["network"], "Apple TV+");
     assert_eq!(items[1]["year"], 2022);
     assert_eq!(items[1]["summary"], "Spies & liars.");
+    assert_eq!(items[1]["rating"], 8.3);
+    assert!(items[0]["rating"].is_null(), "{v}");
+    assert!(items[2]["rating"].is_null(), "{v}");
     let summary = items[0]["summary"].as_str().unwrap();
     assert!(
         summary.chars().count() <= 200 && !summary.contains('<'),
