@@ -639,7 +639,7 @@ pub async fn scan_item(
     let media = crate::downloads::media_kind(media_id);
     let Some(root) = ingest::root_for(&lib, media).map(Path::to_path_buf) else {
         return Ok(
-            json!({ "status": "not_configured", "detail": format!("no [library] root for {}", media.native_app()) }),
+            json!({ "status": "not_configured", "detail": format!("no [library] root for {}", media.label()) }),
         );
     };
     let index = st.index();

@@ -199,27 +199,24 @@ fn d_mcp_timeout() -> u64 {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct MigrationSection {
-    /// `coexistence` (the default) or `legacy`. Required explicitly when execution is enabled.
+    /// `coexistence` (the only mode). Still required explicitly when execution is enabled, and
+    /// still written by the installers and the wizard: the previous release refuses a config
+    /// with downloading on and no `[migration] mode`, so a rolled-back binary needs the line.
+    /// `legacy` (Sonarr/Radarr import) is refused.
     mode: Option<String>,
 }
 
-/// How imported native titles relate to acquisition while the native apps keep running.
+/// The migration mode. Only `coexistence` remains: it is the monitored-only acquisition
+/// gate, which is now unconditional. The type is kept so `[migration]` stays parseable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationMode {
-    /// Imported titles are catalog and ownership evidence only. Nothing imported is acquired
-    /// until it is adopted through `POST /library` (with the native handoff confirmed), and
-    /// qBittorrent categories must differ from every enabled native client category.
     Coexistence,
-    /// Every imported item is managed with its native monitoring (earlier builds; the
-    /// selected-title pilot whose catalog holds only adopted titles).
-    Legacy,
 }
 
 impl MigrationMode {
     pub fn as_str(self) -> &'static str {
         match self {
             MigrationMode::Coexistence => "coexistence",
-            MigrationMode::Legacy => "legacy",
         }
     }
 }
@@ -1615,12 +1612,14 @@ pub fn parse_config(
     }
     let migration = match fc.migration.mode.as_deref() {
         None if execution_enabled => bail!(
-            "execution.enabled requires an explicit [migration] mode: \"coexistence\" (imported titles acquire only after adoption through POST /api/v1/library; dedicated qBittorrent categories) or \"legacy\" (every imported item acquires with its native monitoring)"
+            "execution.enabled requires an explicit [migration] mode: add `[migration]` with `mode = \"coexistence\"`"
         ),
         None | Some("coexistence") => MigrationMode::Coexistence,
-        Some("legacy") => MigrationMode::Legacy,
+        Some("legacy") => bail!(
+            "migration.mode = \"legacy\" was for importing from Sonarr/Radarr, which Arr no longer supports; set mode = \"coexistence\" or remove the line"
+        ),
         Some(other) => {
-            bail!("migration.mode must be \"coexistence\" or \"legacy\" (got {other:?})")
+            bail!("migration.mode must be \"coexistence\" (got {other:?})")
         }
     };
     let pending = pending.into_inner();
@@ -1994,8 +1993,8 @@ download_cleanup = true
 # max_active_downloads = 3
 
 [migration]
-# No native apps run beside a standalone deployment; coexistence keeps imported titles
-# (if any) out of acquisition until adopted.
+# Still written so a rolled-back older release (which requires it) keeps working; "coexistence"
+# is the only mode.
 mode = "coexistence"
 
 # [library]
@@ -2025,113 +2024,10 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-/// Template written by `init`. Placeholders only; no secrets inline. Without a Prowlarr URL
-/// it is the standalone layout (native indexers, embedded engine); with one, the legacy
-/// Prowlarr-backed layout.
-pub fn template(listen: &str, prowlarr_url: Option<&str>) -> String {
-    let Some(url) = prowlarr_url else {
-        return standalone_template(listen);
-    };
-    let listen = quote(listen);
-    let prowlarr = format!(
-        "[prowlarr]\nbase_url = {}\n# Owner-only file containing the Prowlarr API key (chmod 600).\napi_key_file = \"secrets/prowlarr_api_key\"\n",
-        quote(url)
-    );
-    format!(
-        r#"# arr runtime configuration. Relative paths resolve against this file's directory.
-[server]
-listen = {listen}
-allow_non_loopback = false
-api_token_file = "secrets/api_token"
-max_body_bytes = 65536
-request_timeout_secs = 180
-max_concurrent_requests = 16
-
-[state]
-dir = "."
-
-{prowlarr}# timeout_secs = 60
-# page_size = 100
-# max_pages = 2
-# max_concurrent = 2
-# cache_ttl_secs = 900
-
-[tvmaze]
-# Free public TV metadata (no key). Used for discovery and season episode lists.
-enabled = false
-base_url = "https://api.tvmaze.com"
-
-[tmdb]
-# Movie discovery requires a user-provided TMDB credential; none is bundled.
-enabled = false
-base_url = "https://api.themoviedb.org"
-# credential_file = "secrets/tmdb_credential"
-
-[execution]
-# Master switch for writes outside this server's own state: torrent submission to the
-# [qbittorrent] client, completed-download import into [library], Plex refreshes and
-# scheduled acquisition searches. Keep false until verified in an isolated sandbox.
-enabled = false
-# Follow the imported removeCompletedDownloads/removeFailedDownloads policy: after a verified
-# import and a met share limit, remove the managed torrent and its download data (library
-# files are never touched). false = always keep downloads in qBittorrent.
-download_cleanup = true
-
-# [qbittorrent]
-# base_url = "http://127.0.0.1:8080"
-# username_file = "secrets/qbittorrent_username"
-# password_file = "secrets/qbittorrent_password"
-# save_path = "/downloads"          # download directory as qBittorrent sees it
-# local_path = "/data/downloads"    # the same directory as this server sees it
-# movie_category = "um-movies"      # coexistence mode: must differ from every native category
-# tv_category = "um-tv"             # (default: the imported native client category)
-
-# Or the embedded BitTorrent engine (librqbit, in this process) INSTEAD of [qbittorrent]:
-# no qBittorrent URL, credential or API. Never both; there is no fallback between them.
-# A state directory is bound to the first backend it runs with (docs/EMBEDDED-DOWNLOADER.md).
-# [embedded]
-# download_dir = "/data/um-embedded"  # dedicated; not a library root, not the state directory
-# listen = "0.0.0.0:6881"             # BitTorrent TCP listen address (port 0 = random)
-# trackers = true                     # announce to the torrent's trackers
-# dht = false                         # mainline DHT (state under STATE/embedded)
-# local_discovery = false             # LSD multicast
-# max_active_downloads = 3            # further grabs wait in the outbox
-# ratio_limit = 2.0                   # share limits when the indexer sets none (optional)
-# seeding_time_limit_minutes = 4320
-# movie_category = "um-movies"        # labels (default: the imported native client category)
-# tv_category = "um-tv"
-
-[migration]
-# coexistence: Sonarr/Radarr keep running. Imported titles are catalog and ownership evidence
-#   only; nothing imported is acquired until it is adopted with POST /api/v1/library
-#   (native_handoff_confirmed: native monitoring for that scope suspended, no native download
-#   active). qBittorrent categories must differ from the enabled native client categories.
-# legacy: every imported item is managed and acquires with its native monitoring.
-# Required explicitly when [execution] enabled = true.
-mode = "coexistence"
-
-# [library]
-# movies = "/data/movies"           # local path of the imported Radarr root
-# tv = "/data/tvshows"              # local path of the imported Sonarr root
-# movies_native_root = "/movies"   # default: the only imported Radarr root folder
-# tv_native_root = "/tvshows"       # default: the only imported Sonarr root folder
-# ffprobe = "/usr/bin/ffprobe"
-# sample_detection = true           # native minimum durations by runtime (15 s .. 600 s)
-
-# [automation]
-# rss_interval_minutes = 15        # default: the imported rssSyncInterval (0 disables RSS)
-# searches_per_run = 5             # explicit backlog searches / request retries per pass
-# request_retry_minutes = 60       # retry delay for explicit requests that found nothing
-# request_expiry_days = 14
-# poll_seconds = 30
-
-# [plex]
-# base_url = "http://127.0.0.1:32400"
-# token_file = "secrets/plex_token"
-# movie_section = 1
-# tv_section = 2
-"#
-    )
+/// Template written by `init`. Placeholders only; no secrets inline: the standalone layout
+/// (native indexers, embedded engine).
+pub fn template(listen: &str) -> String {
+    standalone_template(listen)
 }
 
 #[cfg(test)]
@@ -2173,12 +2069,6 @@ mod tests {
 
     #[test]
     fn templates_quote_what_they_are_given() {
-        let t = template("127.0.0.1:8787", Some("http://x/\"\nevil = \"1"));
-        let parsed: toml::Table = toml::from_str(&t).unwrap();
-        assert_eq!(
-            parsed["prowlarr"]["base_url"].as_str(),
-            Some("http://x/\"\nevil = \"1")
-        );
         assert!(standalone_template("127.0.0.1:8787").contains("listen = \"127.0.0.1:8787\""));
     }
 
@@ -2274,35 +2164,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn example_config_documents_only_real_keys() {
-        let example = include_str!("../config/local.example.toml");
-        toml::from_str::<FileConfig>(example).unwrap();
-        // Every commented-out key and section also parses (no stale or misspelled keys).
-        let enabled: String = example
-            .lines()
-            .map(|l| match l.strip_prefix("# ") {
-                Some(rest)
-                    if rest.starts_with('[')
-                        || rest
-                            .split_once(" = ")
-                            .is_some_and(|(k, _)| !k.contains(' ')) =>
-                {
-                    rest
-                }
-                _ => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let fc: FileConfig = toml::from_str(&enabled).unwrap();
-        assert!(fc.qbittorrent.is_some() && fc.library.is_some() && fc.plex.is_some());
-        assert!(
-            fc.embedded.is_some(),
-            "the documented [embedded] keys are real"
-        );
-        assert!(fc.execution.download_cleanup && !fc.execution.enabled);
-    }
-
     #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn execution_sections_are_validated() {
@@ -2310,11 +2171,18 @@ mod tests {
         let qb = "[qbittorrent]\nbase_url = \"http://127.0.0.1:8080\"\nsave_path = \"/downloads/\"\nlocal_path = \"/srv/dl\"\n";
         let lib = "[library]\nmovies = \"/srv/movies\"\ntv = \"/srv/tv\"\n";
         let (_t, cfg) = setup(&format!(
-            "{base}[execution]\nenabled = true\ndownload_cleanup = false\n{qb}{lib}[automation]\nrss_interval_minutes = 0\n[migration]\nmode = \"legacy\"\n"
+            "{base}[execution]\nenabled = true\ndownload_cleanup = false\n{qb}{lib}[automation]\nrss_interval_minutes = 0\n[migration]\nmode = \"coexistence\"\n"
         ));
         let c = load(&cfg).unwrap();
         assert!(c.execution_enabled && !c.download_cleanup);
-        assert_eq!(c.migration, MigrationMode::Legacy);
+        assert_eq!(c.migration, MigrationMode::Coexistence);
+        // Legacy mode (Sonarr/Radarr import) is refused with a pointer to the fix.
+        let (_t5, cfg5) = setup(&format!("{base}[migration]\nmode = \"legacy\"\n"));
+        let err = format!("{:#}", load(&cfg5).unwrap_err());
+        assert!(
+            err.contains("no longer supports") && err.contains("coexistence"),
+            "{err}"
+        );
         // Execution needs an explicit mode; without execution the default is coexistence.
         let (_t2, cfg2) = setup(&format!("{base}[execution]\nenabled = true\n{qb}{lib}"));
         let err = format!("{:#}", load(&cfg2).unwrap_err());
@@ -2587,14 +2455,11 @@ mod tests {
 
     #[test]
     fn template_loads_and_defaults_are_safe() {
-        let (_t, cfg) = setup(&template("127.0.0.1:8787", Some("http://127.0.0.1:9696")));
+        let (_t, cfg) = setup(&template("127.0.0.1:8787"));
         let c = load(&cfg).unwrap();
         assert!(c.listen.ip().is_loopback());
-        assert_eq!(
-            c.prowlarr.as_ref().unwrap().base_url.as_str(),
-            "http://127.0.0.1:9696/"
-        );
-        assert!(c.tvmaze.is_none() && c.tmdb.is_none());
+        assert!(c.prowlarr.is_none());
+        assert!(c.tmdb.is_none());
         assert!(!c.execution_enabled);
         assert!(c.qbittorrent.is_none() && c.library.is_none() && c.plex.is_none());
         assert!(

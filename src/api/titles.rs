@@ -473,27 +473,6 @@ pub(super) async fn follow(State(st): St, ApiJson(body): ApiJson<FollowBody>) ->
         None => false,
     };
     let sid = if body.on {
-        // The same rules as adding the show (native titles in coexistence mode).
-        if st.cfg.migration == MigrationMode::Coexistence
-            && let Some(app) = native_app_of(&index, id)
-        {
-            if let Some(why) = adoption_unsupported(&st, &index, id, now) {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    ErrorCode::UnsupportedScope,
-                    why,
-                ));
-            }
-            if !handoff_on_record(&st, &index, id).await? {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    ErrorCode::NativeHandoffRequired,
-                    format!(
-                        "{id} is a native {app} title. In coexistence mode it is adopted only after its {app} monitoring is handed over"
-                    ),
-                ));
-            }
-        }
         if managed_now {
             known.unwrap_or(id)
         } else {
@@ -505,8 +484,8 @@ pub(super) async fn follow(State(st): St, ApiJson(body): ApiJson<FollowBody>) ->
                 root_folder: None,
                 search: false,
                 metadata: None,
-                native_handoff_confirmed: false,
-                preserve_monitoring: false,
+                native_handoff_confirmed: None,
+                preserve_monitoring: None,
             };
             ensure_series(&st, &l, key, &add, MonitorMode::None, false, now)
                 .await?

@@ -709,7 +709,7 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
     let Some(root) = root_for(&lib, media).map(Path::to_path_buf) else {
         return Ok(Outcome::Blocked(format!(
             "no [library] root for {}",
-            media.native_app()
+            media.label()
         )));
     };
     let info = match qb.info(std::slice::from_ref(&g.info_hash)).await {

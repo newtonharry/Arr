@@ -11,10 +11,10 @@
 //! Bodies are bounded, redirects are never followed automatically, and errors never quote a
 //! URL, a credential or a response body. Per-indexer health is kept for diagnostics.
 //!
-//! Imported settings keep their ids: an imported Radarr/Sonarr indexer that referenced
-//! Prowlarr indexer `N` is served by the native indexer with `id = N`, but only when the
-//! native provider implements what the import recorded (its Prowlarr definition, site
-//! settings and query/grab limits). Anything else is reported unusable (fail closed).
+//! Settings name their indexers by id: the setup's `[[indexers]] id = N` is served by the
+//! native indexer with `id = N`, but only when the native provider implements what the
+//! settings record (its Prowlarr definition, site settings and query/grab limits). Anything
+//! else is reported unusable (fail closed).
 
 use crate::config::{IndexerConfig, IndexerKind};
 use crate::import::rfc3339;

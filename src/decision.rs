@@ -427,7 +427,7 @@ pub fn revision_upgrade(
 ) -> Result<(), String> {
     if !ctx.policy().is_some_and(|x| x.revision_upgrades) {
         return Err(format!(
-            "{}; revision upgrades need downloadPropersAndRepacks = preferAndUpgrade",
+            "{}; revision upgrades are off (revision_upgrades = true in the setup enables them)",
             owned_reason(ctx)
         ));
     }

@@ -587,7 +587,7 @@ async fn process(
                 st,
                 &r,
                 "ignored",
-                format!("the indexer is not RSS-enabled for {}", media.native_app()),
+                format!("the indexer is not RSS-enabled for {}", media.label()),
                 None,
                 now,
             )

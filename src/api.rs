@@ -3,7 +3,7 @@
 
 use crate::catalog::CatalogIndex;
 use crate::client::Client;
-use crate::config::{MigrationMode, RuntimeConfig};
+use crate::config::RuntimeConfig;
 use crate::decision::{Rejection, Scope};
 use crate::downloads::{self, ActionError, CancelOptions, EnqueueError, EnqueueRequest, Removal};
 use crate::embedded::Embedded;
@@ -115,27 +115,21 @@ pub struct Loaded {
     pub imported_at: String,
     pub settings: Settings,
     pub report: Value,
-    /// `native_snapshot` (an imported Radarr/Sonarr/Prowlarr snapshot) or `managed_setup`.
+    /// Always `managed_setup` (state made by the removed Sonarr/Radarr importer is refused at
+    /// startup); kept so API clients that read `origin` keep working.
     pub origin: &'static str,
 }
 
 impl From<import::LoadedImport> for Loaded {
     fn from(l: import::LoadedImport) -> Self {
-        let managed = l.manifest.files.contains_key(crate::setup::SOURCE_FILE);
         Loaded {
-            origin: if managed {
-                "managed_setup"
-            } else {
-                "native_snapshot"
-            },
+            origin: "managed_setup",
             import_id: l.manifest.import_id,
             observed_at: l.manifest.observed_at,
             imported_at: l.manifest.imported_at,
             settings: {
                 let mut settings = l.settings;
-                if managed {
-                    crate::setup::with_levels(&mut settings);
-                }
+                crate::setup::with_levels(&mut settings);
                 settings
             },
             report: l.report,
@@ -145,7 +139,7 @@ impl From<import::LoadedImport> for Loaded {
 
 pub struct AppState {
     pub cfg: RuntimeConfig,
-    /// The active settings import (a native snapshot import or managed setup). Replaced only
+    /// The active settings import (made by managed setup). Replaced only
     /// by `activate`, under `setup_lock`; readers take an `Arc` snapshot per operation.
     active: RwLock<Option<Arc<Loaded>>>,
     pub store: Store,
@@ -161,22 +155,12 @@ pub struct AppState {
     index: RwLock<Arc<CatalogIndex>>,
     plans_lock: tokio::sync::Mutex<()>,
     /// Serialises library mutations (add, PATCH, DELETE): each one checks and changes
-    /// handoff authority and monitoring against the state the previous one left.
+    /// monitoring against the state the previous one left.
     library_lock: tokio::sync::Mutex<()>,
     /// Serialises managed setup (validation against the active settings and activation).
     pub(crate) setup_lock: tokio::sync::Mutex<()>,
     slots: Arc<Semaphore>,
     started_at: OffsetDateTime,
-    /// Operator-recorded evidence (`STATE/verification.toml`).
-    verification: Verification,
-}
-
-/// Operator-recorded evidence: `[verified]` capability levels (`sandbox`/`production`) and
-/// `[decisions]` (e.g. `broad_migration = "approved"`). A record, not a live check.
-#[derive(Debug, Default, Clone)]
-pub struct Verification {
-    levels: BTreeMap<String, String>,
-    decisions: BTreeMap<String, String>,
 }
 
 type St = State<Arc<AppState>>;
@@ -186,35 +170,6 @@ type ApiResult = Result<Response, ApiError>;
 pub struct Acquired {
     pub plan: Plan,
     pub created: bool,
-}
-
-fn read_verification(state_dir: &std::path::Path) -> Verification {
-    let path = state_dir.join("verification.toml");
-    let Ok(bytes) = fsutil::read_bounded(&path, 64 * 1024) else {
-        return Verification::default();
-    };
-    let Ok(v) = toml::from_str::<toml::Table>(&String::from_utf8_lossy(&bytes)) else {
-        tracing::warn!("verification.toml is not valid TOML; ignored");
-        return Verification::default();
-    };
-    let table = |name: &str, ok: fn(&str) -> bool| -> BTreeMap<String, String> {
-        v.get(name)
-            .and_then(|t| t.as_table())
-            .map(|t| {
-                t.iter()
-                    .filter_map(|(k, v)| {
-                        v.as_str()
-                            .filter(|s| ok(s))
-                            .map(|s| (k.clone(), s.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    Verification {
-        levels: table("verified", |s| matches!(s, "sandbox" | "production")),
-        decisions: table("decisions", |s| matches!(s, "approved")),
-    }
 }
 
 /// Binds the state to the download backend it first runs with. Grabs record torrents of one
@@ -268,20 +223,20 @@ fn embedded_client(
 impl AppState {
     pub fn new(cfg: RuntimeConfig) -> anyhow::Result<Self> {
         let active = import::load_active(&cfg.state_dir)?;
+        if let Some(l) = &active
+            && !l.manifest.files.contains_key(crate::setup::SOURCE_FILE)
+        {
+            anyhow::bail!(
+                "the state folder {} holds a Sonarr/Radarr snapshot import (made by `arr import`), which Arr no longer supports; nothing in it was changed. Set up a new state folder with `arr setup` and `arr bootstrap` (see docs/STANDALONE.md)",
+                cfg.state_dir.display()
+            );
+        }
         let store = Store::open(&cfg.state_dir.join("state.sqlite"))?;
         if let Some(backend) = cfg.download_backend() {
             store.blocking(|c| bind_backend(c, backend))?;
         }
         let now = OffsetDateTime::now_utc();
-        if let Some(l) = &active {
-            let mode = cfg.migration;
-            let (added, refreshed) = store.blocking(|c| library::seed(c, &l.catalog, now, mode))?;
-            if added + refreshed > 0 {
-                tracing::info!(import_id = %l.manifest.import_id, added, refreshed, "seeded the managed catalog");
-            }
-        }
-        let mode = cfg.migration;
-        let index = store.blocking(|c| library::load_index(c, mode))?;
+        let index = store.blocking(|c| library::load_index(c))?;
         let loaded = active.map(|l| Arc::new(Loaded::from(l)));
         let search = if !cfg.indexers.is_empty() {
             Some(Backend::Native(Arc::new(Registry::new(
@@ -321,7 +276,6 @@ impl AppState {
             setup_lock: tokio::sync::Mutex::new(()),
             slots: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
             started_at: now,
-            verification: read_verification(&cfg.state_dir),
             active: RwLock::new(loaded),
             store,
             cfg,
@@ -336,16 +290,9 @@ impl AppState {
             .clone()
     }
 
-    /// Makes a verified import (written by managed setup) the active one in this process:
-    /// seeds the managed catalog from it (insert-only, as at startup) and swaps the settings.
-    /// The caller holds `setup_lock` and has activated it on disk.
+    /// Makes a verified import (written by managed setup) the active one in this process by
+    /// swapping the settings. The caller holds `setup_lock` and has activated it on disk.
     pub(crate) async fn activate(&self, l: import::LoadedImport) -> anyhow::Result<()> {
-        let mode = self.cfg.migration;
-        let now = OffsetDateTime::now_utc();
-        let catalog = l.catalog.clone();
-        self.store
-            .with(move |c| library::seed(c, &catalog, now, mode).map(|_| ()))
-            .await?;
         *self.active.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Loaded::from(l)));
         self.reload_index().await?;
         self.worker.notify.notify_one();
@@ -382,11 +329,7 @@ impl AppState {
 
     /// Rebuilds the index from the managed catalog tables.
     pub async fn reload_index(&self) -> anyhow::Result<()> {
-        let mode = self.cfg.migration;
-        let idx = self
-            .store
-            .with(move |c| library::load_index(c, mode))
-            .await?;
+        let idx = self.store.with(|c| library::load_index(c)).await?;
         *self.index.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(idx);
         Ok(())
     }
@@ -396,7 +339,7 @@ impl AppState {
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::CatalogNotImported,
-                "no settings are active: create managed settings (`arr setup`, or POST /api/v1/setup) or import a native snapshot (`arr import`, then restart)",
+                "no settings are active: create managed settings (`arr setup`, or POST /api/v1/setup)",
             )
         })
     }
@@ -773,7 +716,6 @@ fn refusal_code(code: &str) -> ErrorCode {
         "foreign_torrent" => ErrorCode::ForeignTorrent,
         "wrong_payload" => ErrorCode::WrongPayload,
         "not_adopted" => ErrorCode::NotAdopted,
-        "category_shared" => ErrorCode::CategoryShared,
         "indexer_limit_reached" => ErrorCode::IndexerLimitReached,
         "no_peer_discovery" => ErrorCode::NoPeerDiscovery,
         "quality_changed" => ErrorCode::QualityChanged,
@@ -1102,11 +1044,11 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
             .map(|m| match l.settings.download_client(*m) {
                 Some(dc) => format!(
                     "{}: removeCompleted={:?} removeFailed={:?}",
-                    m.native_app(),
+                    m.label(),
                     dc.remove_completed_downloads,
                     dc.remove_failed_downloads
                 ),
-                None => format!("{}: no torrent client", m.native_app()),
+                None => format!("{}: no torrent client", m.label()),
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -1126,7 +1068,7 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
         Cap { name: name("download_submission", "embedded_download_submission"), implemented: true, configured: exec && qb, tested, detail: if embedded { "embedded engine (no qBittorrent API): .torrent bytes or magnet metadata fetched from peers, names validated by the engine's parser before anything is written, durable record before the add, reconciliation by hash, never overwrites existing files, outbox queue limit".into() } else { "qBittorrent WebAPI 2.8.2 (4.3.9) to 2.11 (5.x): hash identity persisted before add, ambiguous-add reconciliation, category + unified-media tag ownership".into() } },
         Cap { name: name("download_monitoring", "embedded_download_monitoring"), implemented: true, configured: exec && qb, tested, detail: "queue status mapping, stall/error/missing/removed classification, pause/resume/cancel/retry".into() },
         Cap { name: name("completed_download_import", "embedded_completed_download_import"), implemented: true, configured: exec && qb && lib, tested, detail: "rename off, native scene names, payload identity checks (torrent, folder and file names vs title/aliases/year), ffprobe validation, effective quality from measured resolution against the profile, sample durations, hardlink/copy, no overwrite, journal and crash recovery".into() },
-        Cap { name: "revision_upgrades", implemented: true, configured: exec && st.current().is_some_and(|l| [MediaKind::Movie, MediaKind::Series].iter().any(|m| l.settings.policy(*m).is_some_and(|p| p.revision_upgrades))), tested: "loopback_mocks", detail: "native preferAndUpgrade: exact quality, higher known revision; journaled reversible replacement; quality upgrades are not implemented".into() },
+        Cap { name: "revision_upgrades", implemented: true, configured: exec && st.current().is_some_and(|l| [MediaKind::Movie, MediaKind::Series].iter().any(|m| l.settings.policy(*m).is_some_and(|p| p.revision_upgrades))), tested: "loopback_mocks", detail: "exact quality, higher known revision (PROPER/REPACK); journaled reversible replacement; quality upgrades are not implemented".into() },
         Cap { name: name("download_cleanup", "embedded_download_cleanup"), implemented: true, configured: exec && qb && st.cfg.download_cleanup, tested, detail: format!("removeCompleted/removeFailedDownloads after a verified import and a met share limit; journaled; library files kept ({})", cleanup_policy.unwrap_or_else(|| "no import".into())) },
         Cap { name: name("failed_download_handling", "embedded_failed_download_handling"), implemented: true, configured: exec && qb, tested, detail: "blocklist, autoRedownloadFailed re-search, cancel cooldown".into() },
         Cap { name: "embedded_download_engine", implemented: true, configured: exec && embedded, tested: "loopback_peers", detail: format!("{} in this process: persistent session with fast-resume under the state directory, lifetime upload/download/seeding counters persisted in SQLite (the engine's reset on every restart), share limits enforced from them, explicit listen address, DHT/LSD only when configured, UPnP never", crate::embedded::ENGINE) },
@@ -1135,7 +1077,7 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
         Cap { name: "metadata_refresh", implemented: true, configured: exec && st.tvmaze.is_some(), tested: "loopback_mocks", detail: "fresh TVmaze episode lists for managed series and movie release evidence (Plex, or TMDB) (availability); never changes monitoring or ownership".into() },
         Cap { name: "library_scan", implemented: true, configured: exec && lib, tested: "loopback_mocks", detail: "per-root reconciliation; unavailable/incomplete/suspect-empty roots change nothing; lazy bounded ffprobe".into() },
         Cap { name: "plex", implemented: true, configured: exec && st.plex.is_some(), tested: "loopback_mocks", detail: "section refresh after imports (optional)".into() },
-        Cap { name: "coexistence_guard", implemented: true, configured: exec && st.cfg.migration == MigrationMode::Coexistence, tested: "loopback_mocks", detail: format!("coexistence mode: imported titles acquire only after adoption (POST /library with native_handoff_confirmed); one acquisition gate for plans, grabs, RSS, searches and retries{}", if embedded { "; the embedded engine is private to this process (no shared client category)" } else { "; native qBittorrent categories refused" }) },
+        Cap { name: "coexistence_guard", implemented: true, configured: exec, tested: "loopback_mocks", detail: "one acquisition gate for plans, grabs, RSS, searches and retries: only titles adopted and monitored here are acquired".into() },
         Cap { name: "quality_upgrades", implemented: false, configured: false, tested: "none", detail: {
             let upgrading: Vec<String> = st.current().map(|l| l.settings.profiles.iter().filter(|p| p.upgrade_allowed).map(|p| p.id.clone()).collect()).unwrap_or_default();
             if upgrading.is_empty() {
@@ -1148,215 +1090,24 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
     ]
 }
 
-fn verified_level(st: &AppState, c: &Cap) -> String {
-    st.verification
-        .levels
-        .get(c.name)
-        .cloned()
-        .unwrap_or_else(|| c.tested.to_string())
+fn verified_level(c: &Cap) -> String {
+    c.tested.to_string()
 }
 
-/// One migration stage: what blocks it here, what still needs recorded evidence, what this
-/// server cannot observe at all.
-struct Stage {
-    configuration_blockers: Vec<String>,
-    pending_verification: Vec<String>,
-    external_requirements: Vec<String>,
-}
-
-impl Stage {
-    fn json(&self, name: &str, scope: &str) -> Value {
-        let status = if !self.configuration_blockers.is_empty() {
-            "blocked"
-        } else if !self.pending_verification.is_empty() {
-            "pending_verification"
-        } else {
-            "prerequisites_met"
-        };
-        json!({
-            "stage": name, "scope": scope, "status": status,
-            "ready": status == "prerequisites_met",
-            "configuration_blockers": self.configuration_blockers,
-            "pending_verification": self.pending_verification,
-            "external_requirements": self.external_requirements,
-        })
-    }
-}
-
-/// Migration readiness per stage, derived from the configuration, the active import, the
-/// acquisition gates, ownership counts and operator-recorded evidence. Never a hardcoded
-/// verdict: a stage is `ready` only when every prerequisite this server can check holds, and
-/// even then the external requirements (the native apps' state) stay the operator's.
+/// The `migration` object of `GET /api/v1/readiness`. The staged Sonarr/Radarr migration
+/// readiness is gone; the keys stay (`stages` is empty) for clients that read them.
 fn migration_readiness(st: &AppState, counts: &BTreeMap<String, usize>) -> Value {
-    let exec = st.cfg.execution_enabled;
-    let coexistence = st.cfg.migration == MigrationMode::Coexistence;
-    let count = |k: &str| counts.get(k).copied().unwrap_or(0);
-    // Limited adoption: selected titles, native monitoring suspended per title.
-    let mut limited = Stage {
-        configuration_blockers: vec![],
-        pending_verification: vec![],
-        external_requirements: vec![
-            "for every adopted title, native acquisition is suspended in Sonarr/Radarr and stays suspended while it is adopted here (native preferAndUpgrade still grabs PROPER/REPACK revisions even with quality upgrades off); it is restored only after release, drain or rollback. The operator or bridge does this; this server cannot observe or change the native apps".into(),
-        ],
-    };
-    match st.current() {
-        None => limited
-            .configuration_blockers
-            .push("no configuration import is active".into()),
-        Some(l) => {
-            if !l.settings.blocking_issues.is_empty() {
-                let codes: Vec<&str> = l
-                    .settings
-                    .blocking_issues
-                    .iter()
-                    .map(|b| b.code.as_str())
-                    .collect();
-                limited.configuration_blockers.push(format!("imported policy issues block plans or imports: {} (see /api/v1/migration-report)", codes.join(", ")));
-            }
-        }
-    }
-    if !exec {
-        limited
-            .configuration_blockers
-            .push("execution is disabled ([execution] enabled = false)".into());
-    } else {
-        let blocked: Vec<String> = [MediaKind::Movie, MediaKind::Series]
-            .iter()
-            .filter_map(|m| {
-                downloads::execution_blocker(st, *m)
-                    .map(|(code, msg)| format!("{} {code}: {msg}", m.native_app()))
-            })
-            .collect();
-        if blocked.len() == 2 {
-            limited.configuration_blockers.extend(blocked);
-        } else {
-            // One working media kind is enough for limited adoption; the other is reported.
-            limited.pending_verification.extend(
-                blocked
-                    .into_iter()
-                    .map(|b| format!("not usable for this media kind: {b}")),
-            );
-        }
-    }
-    let in_use: Vec<(&'static str, String)> = capability_rows(st)
-        .into_iter()
-        .filter(|c| {
-            c.implemented && c.configured && c.name != "http_api" && c.name != "coexistence_guard"
-        })
-        .map(|c| (c.name, verified_level(st, &c)))
-        .collect();
-    for (name, level) in &in_use {
-        if level != "production" {
-            limited.pending_verification.push(format!("{name}: verified at {level}, not production (record it in STATE/verification.toml [verified] only after observing it)"));
-        }
-    }
-    // Coexistence: the full catalog with the native apps acquiring everything not adopted.
-    let mut coex = Stage {
-        configuration_blockers: limited.configuration_blockers.clone(),
-        pending_verification: limited.pending_verification.clone(),
-        external_requirements: limited.external_requirements.clone(),
-    };
-    if !coexistence {
-        coex.configuration_blockers.push("[migration] mode = legacy: every imported item acquires with its native monitoring, competing with Sonarr/Radarr; use coexistence".into());
-    }
-    if coexistence && count("legacy_managed") > 0 {
-        coex.configuration_blockers.push(format!("{} imported item(s) were seeded as managed by a legacy import and never adopted: they are refused here but still appear managed; start from a fresh state with a coexistence import, or adopt/remove them", count("legacy_managed")));
-    }
-    if coexistence && exec {
-        let guard = capability_rows(st)
-            .into_iter()
-            .find(|c| c.name == "coexistence_guard")
-            .map(|c| verified_level(st, &c))
-            .unwrap_or_default();
-        if guard != "production" {
-            coex.pending_verification.push(format!("coexistence_guard: verified at {guard}, not production (a full-catalog instance with execution on, observed to acquire only adopted scopes)"));
-        }
-    }
-    coex.external_requirements.push("before each adoption: native monitoring for exactly that scope suspended and no native download active (POST /library native_handoff_confirmed); after release (DELETE /library) restore it".into());
-    if st.cfg.qbittorrent.is_some() {
-        coex.external_requirements.push("native qBittorrent categories are checked against the imported snapshot only; a native category changed since then is not visible here".into());
-    }
-    if let Some(n) = counts.get("adopted_series_with_native_specials") {
-        coex.external_requirements.push(format!("{n} adopted series have natively monitored specials: season 0 is never acquired here, so it stays monitored natively (suspend only the regular seasons)"));
-    }
-    // Broad migration: most or all titles adopted; the native apps stay as a suspended fallback.
-    let mut broad = Stage {
-        configuration_blockers: coex.configuration_blockers.clone(),
-        pending_verification: coex.pending_verification.clone(),
-        external_requirements: coex.external_requirements.clone(),
-    };
-    let rss_on = st
-        .current()
-        .and_then(|l| crate::rss::interval(&l.settings, st.cfg.automation.rss_interval_minutes))
-        .is_some();
-    if !rss_on {
-        broad.configuration_blockers.push("RSS sync is disabled: new episodes and releases of adopted titles would be acquired only through explicit requests".into());
-    }
-    if st.movies.is_none() {
-        broad
-            .configuration_blockers
-            .push(crate::tmdbkey::MISSING.into());
-    }
-    if st.tvmaze.is_none() {
-        broad.configuration_blockers.push(
-            "TVmaze is disabled: new series and episode-list refreshes are unavailable".into(),
-        );
-    }
-    if count("adopted") == 0 {
-        broad
-            .configuration_blockers
-            .push("nothing is adopted yet".into());
-    }
-    if st
-        .verification
-        .decisions
-        .get("broad_migration")
-        .map(String::as_str)
-        != Some("approved")
-    {
-        broad.pending_verification.push("no explicit user decision recorded (STATE/verification.toml [decisions] broad_migration = \"approved\")".into());
-    }
-    broad.external_requirements.push("adopted titles stay unmonitored natively, movies included; a native app re-monitoring one would compete with this server, revision upgrades included".into());
-    let index = st.index();
-    let unsupported_series = index
-        .catalog
-        .series
-        .iter()
-        .filter(|s| s.series_type != "standard" || s.scene_numbering)
-        .count();
-    let unsupported_availability = index
-        .catalog
-        .movies
-        .iter()
-        .filter(|m| {
-            m.minimum_availability
-                .as_deref()
-                .is_some_and(|a| a != "released")
-        })
-        .count();
-    let limitations = vec![
-        "Torznab RSS sees only each feed's latest window; missed windows are flagged gap_possible (the native apps share this limit)".to_string(),
-        "Prowlarr does not report per-indexer search completeness".to_string(),
-        "specials (season 0) are never acquired".to_string(),
-        format!("{unsupported_series} series with anime/daily or scene numbering are blocked"),
-        format!("{unsupported_availability} movies with a minimumAvailability other than released are never available"),
-        "quality/cutoff upgrades, renaming, custom formats and release-profile terms are not implemented; imported settings needing them block plans or imports".to_string(),
-    ];
     json!({
         "mode": st.cfg.migration.as_str(),
         "ownership": counts,
-        "stages": [
-            limited.json("limited", "selected titles adopted one by one; the native apps keep everything else"),
-            coex.json("coexistence", "the full native catalog imported, with only adopted scopes acquired here"),
-            broad.json("broad", "most or all titles adopted; the native apps kept running with monitoring suspended as a fallback"),
+        "stages": [],
+        "accepted_limitations": [
+            "Torznab RSS sees only each feed's latest window; missed windows are flagged gap_possible",
+            "specials (season 0) are never acquired",
+            "quality/cutoff upgrades, renaming, custom formats and release-profile terms are not implemented",
         ],
-        "accepted_limitations": limitations,
-        "evidence": {
-            "source": "operator-recorded STATE/verification.toml ([verified] levels, [decisions]); a record, not a live health check",
-            "recorded": st.verification.levels,
-            "decisions": st.verification.decisions,
-        },
-        "note": "ready means this server's checkable prerequisites hold; the native apps' state (monitoring, queues, categories) is not observable here and remains the operator's responsibility",
+        "evidence": {},
+        "note": "migration from Sonarr/Radarr is no longer supported; service readiness is the top-level ready",
     })
 }
 
@@ -1483,9 +1234,12 @@ async fn readiness(State(st): St) -> Response {
             "movies": index.catalog.movies.len(), "series": index.catalog.series.len(),
             "blocking_issues": l.settings.blocking_issues.len(),
         })),
-        None => checks.push(json!({ "name": "import", "status": "missing", "message": "run `arr import`" })),
+        None => checks.push(json!({ "name": "import", "status": "missing", "message": "run `arr setup`" })),
     }
     checks.push(json!({ "name": "prowlarr", "status": if st.cfg.prowlarr.is_some() { "configured" } else { "not_configured" }, "note": "not contacted by readiness; see /api/v1/diagnostics" }));
+    if st.movies.is_none() {
+        checks.push(json!({ "name": "movie_search", "status": "not_configured", "message": crate::tmdbkey::MISSING }));
+    }
     checks.push(search_readiness(&st));
     checks.push(peer_discovery_readiness(&st));
     checks.push(json!({ "name": "tvmaze", "status": if st.tvmaze.is_some() { "enabled" } else { "disabled" } }));
@@ -1495,7 +1249,7 @@ async fn readiness(State(st): St) -> Response {
     if st.cfg.execution_enabled {
         for m in [MediaKind::Movie, MediaKind::Series] {
             let b = downloads::execution_blocker(&st, m);
-            checks.push(json!({ "name": format!("execution_{}", m.native_app()), "status": if b.is_none() { "ok" } else { "blocked" }, "reason": b.map(|x| json!({ "code": x.0, "message": x.1 })) }));
+            checks.push(json!({ "name": format!("execution_{}", if m == MediaKind::Movie { "radarr" } else { "sonarr" }), "status": if b.is_none() { "ok" } else { "blocked" }, "reason": b.map(|x| json!({ "code": x.0, "message": x.1 })) }));
         }
     }
     let ready = db_ok && st.current().is_some();
@@ -1506,7 +1260,7 @@ async fn readiness(State(st): St) -> Response {
         .unwrap_or_default();
     let body = json!({
         "ready": ready,
-        "ready_note": "service readiness (state and import loaded); migration readiness is per stage below",
+        "ready_note": "service readiness (state and import loaded)",
         "mode": mode(&st),
         "started_at": rfc3339(st.started_at),
         "checks": checks,
@@ -1530,14 +1284,14 @@ async fn capabilities(State(st): St) -> Json<Value> {
                 (true, false) if !st.cfg.execution_enabled && !matches!(c.name, "http_api" | "managed_catalog" | "release_search" | "release_decisions" | "movie_discovery" | "tv_discovery" | "plans") => "disabled",
                 (true, false) => "not_configured",
             };
-            json!({ "name": c.name, "state": state, "implemented": c.implemented, "configured": c.configured, "verified": verified_level(&st, c), "detail": c.detail })
+            json!({ "name": c.name, "state": state, "implemented": c.implemented, "configured": c.configured, "verified": verified_level(c), "detail": c.detail })
         })
         .collect();
     Json(json!({
         "mode": mode(&st),
         "execution_enabled": st.cfg.execution_enabled,
         "verification_levels": ["none", "unit_tests", "loopback_mocks", "sandbox", "production"],
-        "verification_note": "unit_tests/loopback_mocks come from this build's test suite; sandbox/production only from an operator-written STATE/verification.toml",
+        "verification_note": "the level this build's test suite reaches for the capability (unit_tests, loopback_mocks or loopback_peers)",
         "capabilities": caps,
         "policy_blocking_issues": st.current().map(|l| l.settings.blocking_issues.clone()).unwrap_or_default(),
     }))
@@ -1584,7 +1338,7 @@ async fn diagnostics(State(st): St) -> ApiResult {
                                 .as_deref()
                                 == Some(p.category.as_str())
                             {
-                                warnings.push(format!("category {} is shared with native {}; ownership also requires the unified-media tag", p.category, m.native_app()));
+                                warnings.push(format!("category {} is shared with native {}; ownership also requires the unified-media tag", p.category, m.label()));
                             }
                         }
                     }
@@ -1628,7 +1382,12 @@ async fn diagnostics(State(st): St) -> ApiResult {
     let mut exec = serde_json::Map::new();
     for m in [MediaKind::Movie, MediaKind::Series] {
         exec.insert(
-            m.native_app().into(),
+            (if m == MediaKind::Movie {
+                "radarr"
+            } else {
+                "sonarr"
+            })
+            .into(),
             json!(
                 downloads::execution_blocker(&st, m)
                     .map(|(c, msg)| json!({ "code": c, "message": msg }))
@@ -1821,10 +1580,7 @@ fn choose_profile(
             Some(x) if x.media == media => Ok(x.id.clone()),
             _ => Err(ApiError::bad_request(
                 ErrorCode::InvalidRequest,
-                format!(
-                    "{p} is not an imported {} quality profile",
-                    media.native_app()
-                ),
+                format!("{p} is not an imported {} quality profile", media.label()),
             )),
         },
         None => settings
@@ -1835,7 +1591,7 @@ fn choose_profile(
                     ErrorCode::ProfileRequired,
                     format!(
                         "several {} profiles exist; pass quality_profile",
-                        media.native_app()
+                        media.label()
                     ),
                 )
             }),
@@ -1858,7 +1614,7 @@ fn choose_root(
         Some(r) if roots.contains(&r) => Ok(Some(r.to_string())),
         Some(r) => Err(ApiError::bad_request(
             ErrorCode::InvalidRequest,
-            format!("{r} is not an imported {} root folder", media.native_app()),
+            format!("{r} is not an imported {} root folder", media.label()),
         )),
         None => Ok(crate::ingest::native_root(st, media)
             .or_else(|| (roots.len() == 1).then(|| roots[0].to_string()))),
@@ -1889,17 +1645,14 @@ struct AddBody {
     /// Operator-supplied movie metadata (when neither Plex nor TMDB can answer).
     #[serde(default)]
     metadata: Option<SuppliedMetadata>,
-    /// Coexistence mode, native (imported) titles only: the caller confirms that native
-    /// monitoring for exactly this scope is suspended in Sonarr/Radarr and that no native
-    /// download for it is active. This server cannot observe or change the native apps.
+    /// Accepted and ignored: older clients still send it (Sonarr/Radarr hand-over is gone).
     #[serde(default)]
-    native_handoff_confirmed: bool,
-    /// Coexistence mode, a whole imported movie or series: adopt it with its current imported
-    /// monitoring exactly as it is (series, season, episode flags and "monitor new seasons";
-    /// the latest import's native intent, not a fresh native query). Needs `search: false`
-    /// and `native_handoff_confirmed`; refuses `monitor`/`monitored` and scoped ids.
+    #[allow(dead_code)]
+    native_handoff_confirmed: Option<serde::de::IgnoredAny>,
+    /// Accepted and ignored, like `native_handoff_confirmed`.
     #[serde(default)]
-    preserve_monitoring: bool,
+    #[allow(dead_code)]
+    preserve_monitoring: Option<serde::de::IgnoredAny>,
 }
 
 fn date_field(v: &Option<String>, what: &str) -> Result<Option<String>, ApiError> {
@@ -2043,259 +1796,6 @@ async fn new_movie_record(
         source,
         now,
     ))
-}
-
-/// Coexistence: why an imported title cannot be adopted here at all. Adopting it would leave
-/// it acquired by nobody once its native monitoring is suspended, so it stays native.
-fn adoption_unsupported(
-    st: &AppState,
-    index: &crate::catalog::CatalogIndex,
-    id: MediaId,
-    now: OffsetDateTime,
-) -> Option<String> {
-    let keep = "it stays with the native app (do not suspend its native monitoring)";
-    match id {
-        MediaId::Movie { tmdb } => {
-            let m = index.movie(tmdb)?;
-            if m.identity_conflict {
-                return Some(format!(
-                    "{id} has an identity conflict in the import; {keep}"
-                ));
-            }
-            match m.availability(now, st.availability_delay_days()) {
-                crate::catalog::Availability::Unsupported(why) => Some(format!("{why}; {keep}")),
-                _ => None,
-            }
-        }
-        other => {
-            let s = index.series(other.series_key()?)?;
-            if s.identity_conflict {
-                Some(format!(
-                    "{} has an identity conflict in the import; {keep}",
-                    s.id
-                ))
-            } else if s.series_type != "standard" {
-                Some(format!(
-                    "{} is a {} series, which is not supported here; {keep}",
-                    s.id, s.series_type
-                ))
-            } else if s.scene_numbering {
-                Some(format!(
-                    "{} uses scene numbering, which is not supported here; {keep}",
-                    s.id
-                ))
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// `POST /library` with `preserve_monitoring`: transfers a whole imported title to this
-/// server with its current imported monitoring untouched. Every precondition is checked
-/// before anything changes; a replay changes nothing.
-async fn adopt_preserved(
-    st: &Arc<AppState>,
-    id: MediaId,
-    body: &AddBody,
-    native: Option<&'static str>,
-    now: OffsetDateTime,
-) -> ApiResult {
-    let refuse = |m: &str| {
-        Err(ApiError::bad_request(
-            ErrorCode::InvalidRequest,
-            m.to_string(),
-        ))
-    };
-    if st.cfg.migration != MigrationMode::Coexistence {
-        return refuse(
-            "preserve_monitoring transfers an imported title in coexistence mode; in legacy mode imported titles are already managed with their native monitoring",
-        );
-    }
-    if !matches!(id, MediaId::Movie { .. } | MediaId::Series(_)) {
-        return refuse(
-            "preserve_monitoring adopts a whole imported movie or series; for one season or episode use a normal scoped add without it",
-        );
-    }
-    if body.monitor.is_some() || body.monitored.is_some() {
-        return refuse(
-            "preserve_monitoring keeps the imported monitoring as it is; monitor and monitored cannot be combined with it",
-        );
-    }
-    if body.search {
-        return refuse(
-            "preserve_monitoring transfers without searching: pass search: false (search later, explicitly)",
-        );
-    }
-    if body.metadata.is_some() || body.quality_profile.is_some() || body.root_folder.is_some() {
-        return refuse(
-            "preserve_monitoring keeps the imported title as it is; metadata, quality_profile and root_folder cannot be combined with it",
-        );
-    }
-    let index = st.index();
-    let Some(app) = native else {
-        return Err(if native_app_of_any(&index, id) {
-            ApiError::bad_request(
-                ErrorCode::InvalidRequest,
-                "preserve_monitoring applies to titles imported from Sonarr/Radarr; titles added here use the normal add",
-            )
-        } else {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                ErrorCode::NotManaged,
-                format!("{id} is not an imported title"),
-            )
-        });
-    };
-    if !body.native_handoff_confirmed {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            ErrorCode::NativeHandoffRequired,
-            format!(
-                "{id} is a native {app} title. preserve_monitoring adopts all of its imported scope: first suspend its {app} acquisition for that scope (specials excepted, which stay native) and confirm no {app} download is active, then repeat with native_handoff_confirmed: true"
-            ),
-        ));
-    }
-    if let Some(why) = adoption_unsupported(st, &index, id, now) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            ErrorCode::UnsupportedScope,
-            why,
-        ));
-    }
-    // The canonical row (a TVmaze-keyed series id resolves to the stored one).
-    let canonical = match id {
-        MediaId::Series(k) => index.series(k).map(|s| s.id).unwrap_or(id),
-        other => other,
-    };
-    let outcome = st
-        .store
-        .with(move |c| library::adopt_preserving(c, canonical, now))
-        .await
-        .map_err(internal("adopt"))?;
-    let result = match outcome {
-        library::Preserved::Adopted => "adopted",
-        library::Preserved::AlreadyAdopted => "already_adopted",
-        library::Preserved::Released => {
-            return Err(ApiError::conflict(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "{canonical} was released by an earlier DELETE /library, so its flags are no longer the imported intent; adopt it with a normal add"
-                ),
-            ));
-        }
-        library::Preserved::NotFound => {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                ErrorCode::NotManaged,
-                format!("{id} is not an imported title"),
-            ));
-        }
-    };
-    // A whole-title handoff, confirmed by this request.
-    record_handoff(st, &index, canonical, now).await?;
-    st.reload_index().await.map_err(internal("index"))?;
-    // Ownership is reconciled from the item's folder; nothing is searched.
-    let scan = crate::scan::scan_item(st, canonical, now)
-        .await
-        .map_err(internal("scan"))?;
-    let key = canonical.to_string();
-    let (items, _) = st
-        .store
-        .with(move |c| library::ownership(c, None, Some(&key), 1, 0))
-        .await
-        .map_err(internal("ownership"))?;
-    let index = st.index();
-    let retained = match canonical {
-        MediaId::Series(k) => index.series(k).map(native_retained).unwrap_or_default(),
-        _ => vec![],
-    };
-    let observed_at = st.current().map(|l| l.observed_at.clone());
-    created(json!({
-        "created": false,
-        "media_id": canonical,
-        "scope": canonical,
-        "preserve_monitoring": true,
-        "result": result,
-        "ownership": items.into_iter().next(),
-        "native_retained": retained,
-        "whole_title": retained.is_empty(),
-        "scan": scan,
-        "search": { "skipped": "preserve_monitoring transfers without searching" },
-        "adoption": {
-            "mode": st.cfg.migration.as_str(),
-            "native_app": app,
-            "native_handoff_confirmed": true,
-            "imported_intent_observed_at": observed_at,
-            "note": format!("adopted with the monitoring of the import observed at {}, not a fresh native query; keep {app} acquisition suspended for this scope while it is adopted here, and keep the external before/after ledger", observed_at.as_deref().unwrap_or("?")),
-        },
-    }))
-}
-
-/// Whether the catalog has this title at all (native or added here).
-fn native_app_of_any(index: &crate::catalog::CatalogIndex, id: MediaId) -> bool {
-    match id {
-        MediaId::Movie { tmdb } => index.movie(tmdb).is_some(),
-        other => other.series_key().and_then(|k| index.series(k)).is_some(),
-    }
-}
-
-/// The native app a catalog title was imported from (`None` for titles added here).
-fn native_app_of(index: &crate::catalog::CatalogIndex, id: MediaId) -> Option<&'static str> {
-    let native = |app: &str| !app.starts_with("unified-media");
-    match id {
-        MediaId::Movie { tmdb } => index
-            .movie(tmdb)
-            .filter(|m| native(&m.provenance.source_app))
-            .map(|_| "Radarr"),
-        other => other
-            .series_key()
-            .and_then(|k| index.series(k))
-            .filter(|s| native(&s.provenance.source_app))
-            .map(|_| "Sonarr"),
-    }
-}
-
-/// The catalog title (its stored movie or series id) that `id` belongs to.
-fn title_of(index: &CatalogIndex, id: MediaId) -> Option<MediaId> {
-    match id {
-        MediaId::Movie { tmdb } => index.movie(tmdb).map(|_| id),
-        other => other
-            .series_key()
-            .and_then(|k| index.series(k))
-            .map(|s| s.id),
-    }
-}
-
-/// Whether the operator's confirmed handoff of a native title covers `id` (coexistence).
-async fn handoff_on_record(
-    st: &AppState,
-    index: &CatalogIndex,
-    id: MediaId,
-) -> Result<bool, ApiError> {
-    match title_of(index, id) {
-        Some(t) if st.cfg.migration == MigrationMode::Coexistence => st
-            .store
-            .with(move |c| library::handoff_covers(c, t, id))
-            .await
-            .map_err(internal("handoff")),
-        _ => Ok(false),
-    }
-}
-
-async fn record_handoff(
-    st: &AppState,
-    index: &CatalogIndex,
-    id: MediaId,
-    now: OffsetDateTime,
-) -> Result<(), ApiError> {
-    let Some(t) = title_of(index, id) else {
-        return Ok(());
-    };
-    st.store
-        .with(move |c| library::record_handoff(c, t, id, now))
-        .await
-        .map_err(internal("handoff"))
 }
 
 /// Whether a season or episode is in a series' known episode list (or season list).
@@ -2488,55 +1988,12 @@ async fn ensure_series(
 
 async fn library_add(State(st): St, ApiJson(body): ApiJson<AddBody>) -> ApiResult {
     // Library mutations are serialised: a replayed or concurrent request sees the first
-    // one's result, and a release cannot fall between a handoff check and its change.
+    // one's result.
     let _guard = st.library_lock.lock().await;
     let l = st.loaded()?;
     let id = parse_media_id(&body.media_id)?;
     let now = OffsetDateTime::now_utc();
     let index = st.index();
-    // Coexistence: a native (imported) title is adopted only once the caller confirms the
-    // native side was handed over for exactly this scope. Titles new to the native apps stay
-    // one-call adds.
-    let native = native_app_of(&index, id);
-    let monitors = match id {
-        MediaId::Movie { .. } => body.monitored != Some(false),
-        MediaId::Series(_) => {
-            body.monitored != Some(false) && body.monitor != Some(MonitorMode::None)
-        }
-        _ => true,
-    };
-    if body.preserve_monitoring {
-        return adopt_preserved(&st, id, &body, native, now).await;
-    }
-    if st.cfg.migration == MigrationMode::Coexistence
-        && monitors
-        && native.is_some()
-        && let Some(why) = adoption_unsupported(&st, &index, id, now)
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            ErrorCode::UnsupportedScope,
-            why,
-        ));
-    }
-    // The operator's confirmed handoff is durable, whatever the current monitoring: a request
-    // inside a confirmed scope needs no new confirmation. A wider scope (a sibling, its
-    // season or series) or a released title still does.
-    let on_record = native.is_some() && handoff_on_record(&st, &index, id).await?;
-    if st.cfg.migration == MigrationMode::Coexistence
-        && monitors
-        && !body.native_handoff_confirmed
-        && !on_record
-        && let Some(app) = native
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            ErrorCode::NativeHandoffRequired,
-            format!(
-                "{id} is a native {app} title. In coexistence mode it is adopted only after its {app} monitoring for exactly this scope is suspended and no {app} download for it is active; this server cannot observe or change {app}. Then repeat the request with native_handoff_confirmed: true"
-            ),
-        ));
-    }
     let mut v = match id {
         MediaId::Movie { tmdb } => {
             let monitored = body.monitored.unwrap_or(true);
@@ -2586,12 +2043,7 @@ async fn library_add(State(st): St, ApiJson(body): ApiJson<AddBody>) -> ApiResul
                     .map_err(internal("monitor"))?;
             }
             st.reload_index().await.map_err(internal("index"))?;
-            let retained = st
-                .index()
-                .series(sid.series_key().unwrap_or(key))
-                .map(native_retained)
-                .unwrap_or_default();
-            json!({ "created": created, "media_id": sid, "scope": sid, "native_retained": retained })
+            json!({ "created": created, "media_id": sid, "scope": sid, "native_retained": [] })
         }
         MediaId::Season(key, _) | MediaId::Episode(key, _, _) => {
             if body.monitor.is_some() || body.monitored == Some(false) {
@@ -2640,21 +2092,9 @@ async fn library_add(State(st): St, ApiJson(body): ApiJson<AddBody>) -> ApiResul
                 .await
                 .map_err(internal("monitor"))?;
             st.reload_index().await.map_err(internal("index"))?;
-            let retained = st
-                .index()
-                .series(sid.series_key().unwrap_or(key))
-                .map(native_retained)
-                .unwrap_or_default();
-            json!({ "created": created, "media_id": sid, "scope": scope, "native_retained": retained })
+            json!({ "created": created, "media_id": sid, "scope": scope, "native_retained": [] })
         }
     };
-    if st.cfg.migration == MigrationMode::Coexistence
-        && monitors
-        && body.native_handoff_confirmed
-        && native.is_some()
-    {
-        record_handoff(&st, &index, id, now).await?;
-    }
     {
         let index = st.index();
         let acquisition = v["media_id"]
@@ -2670,13 +2110,9 @@ async fn library_add(State(st): St, ApiJson(body): ApiJson<AddBody>) -> ApiResul
         v["adoption"] = json!({
             "mode": st.cfg.migration.as_str(),
             "acquisition": acquisition,
-            "native_app": native,
-            "native_handoff_confirmed": native.is_some() && body.native_handoff_confirmed,
-            "note": match (st.cfg.migration, native) {
-                (MigrationMode::Coexistence, Some(app)) => format!("adopted from {app}: keep its native monitoring suspended for this scope while this server acquires it; GET /api/v1/ownership lists adopted scopes"),
-                (MigrationMode::Coexistence, None) => "not a native title: acquired here only".to_string(),
-                (MigrationMode::Legacy, _) => "legacy mode: imported titles acquire with their native monitoring".to_string(),
-            },
+            "native_app": Value::Null,
+            "native_handoff_confirmed": false,
+            "note": "acquired here only; GET /api/v1/ownership lists adopted scopes",
         });
     }
     let parent = plan_media(id);
@@ -2727,10 +2163,10 @@ async fn library_add(State(st): St, ApiJson(body): ApiJson<AddBody>) -> ApiResul
 #[serde(deny_unknown_fields)]
 struct PatchBody {
     monitored: bool,
-    /// Coexistence mode: required to monitor a native (imported) title's scope here (see
-    /// `POST /library`).
+    /// Accepted and ignored (see `AddBody`).
     #[serde(default)]
-    native_handoff_confirmed: bool,
+    #[allow(dead_code)]
+    native_handoff_confirmed: Option<serde::de::IgnoredAny>,
 }
 
 async fn library_patch(
@@ -2742,23 +2178,6 @@ async fn library_patch(
     st.loaded()?;
     let id = media_id(p)?;
     let now = OffsetDateTime::now_utc();
-    let index = st.index();
-    let native = native_app_of(&index, id);
-    let on_record = native.is_some() && handoff_on_record(&st, &index, id).await?;
-    if st.cfg.migration == MigrationMode::Coexistence
-        && body.monitored
-        && !body.native_handoff_confirmed
-        && !on_record
-        && let Some(app) = native
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            ErrorCode::NativeHandoffRequired,
-            format!(
-                "{id} is a native {app} title: monitoring it here in coexistence mode needs native_handoff_confirmed (its {app} monitoring for this scope suspended, no {app} download active)"
-            ),
-        ));
-    }
     let changed = st
         .store
         .with(move |c| library::set_monitored(c, id, body.monitored, now))
@@ -2770,13 +2189,6 @@ async fn library_patch(
             ErrorCode::NotManaged,
             format!("{id} is not a managed item"),
         ));
-    }
-    if st.cfg.migration == MigrationMode::Coexistence
-        && body.monitored
-        && body.native_handoff_confirmed
-        && native.is_some()
-    {
-        record_handoff(&st, &index, id, now).await?;
     }
     st.reload_index().await.map_err(internal("index"))?;
     ok(json!({ "media_id": id, "monitored": body.monitored }))
@@ -4164,8 +3576,7 @@ struct OwnershipQuery {
 }
 
 /// Acquisition ownership: which titles (and, for series, which seasons and episodes) this
-/// server acquires, which stay with the native apps, plus the handoff the operator or bridge
-/// performs outside this server.
+/// server acquires. (`handoff` is kept as a constant note for older clients.)
 async fn ownership(State(st): St, ApiQuery(q): ApiQuery<OwnershipQuery>) -> ApiResult {
     st.loaded()?;
     let (limit, offset) = page_bounds(q.limit, q.offset)?;
@@ -4190,27 +3601,11 @@ async fn ownership(State(st): St, ApiQuery(q): ApiQuery<OwnershipQuery>) -> ApiR
         .map_err(internal("ownership"))?;
     ok(json!({
         "mode": st.cfg.migration.as_str(),
-        "acquiring": match st.cfg.migration {
-            MigrationMode::Coexistence => "adopted items only (effective monitored scopes)",
-            MigrationMode::Legacy => "every managed item (adopted and legacy_managed) with its monitoring",
-        },
+        "acquiring": "adopted items only (effective monitored scopes)",
         "counts": counts,
         "total": total,
         "items": items,
-        "handoff": {
-            "before_adoption": [
-                "suspend native monitoring for exactly the adopted scope (record the original value)",
-                "confirm the native app has no active download for that scope",
-                "POST /api/v1/library with the scope and native_handoff_confirmed: true",
-            ],
-            "after_release": [
-                "DELETE /api/v1/library/{media_id} (refused while downloads are active)",
-                "restore the recorded native monitoring",
-            ],
-            "after_import": "keep native acquisition suspended for the adopted scope while this server owns it, movies included: the copied downloadPropersAndRepacks = preferAndUpgrade lets the native app replace files with PROPER/REPACK revisions even with quality upgrades disabled, so restoring native monitoring after an import brings back competition. Restore it only when this server stops acquiring the scope: release (DELETE /api/v1/library/{media_id}), drain or roll back. A bounded legacy pilot's post-import restoration with RSS off is a separate verification procedure, not this handoff",
-            "specials": "specials (season 0) are never acquired here; leave them monitored natively (native_specials_monitored)",
-            "note": "this server never contacts Sonarr or Radarr; native state is the operator's",
-        },
+        "handoff": { "note": "this server does not contact or depend on Sonarr or Radarr" },
     }))
 }
 
@@ -4291,21 +3686,6 @@ fn grab_brief(g: &downloads::Grab) -> Value {
         "failure": g.failure, "last_error": g.last_error.as_deref().map(|e| e.chars().take(300).collect::<String>()),
         "retry": g.retry, "updated_at": g.updated_at,
     })
-}
-
-/// Scopes of a series that stay with the native app whatever is adopted here: specials
-/// (season 0) it effectively monitors, which this server never acquires.
-fn native_retained(s: &crate::catalog::Series) -> Vec<Value> {
-    s.native_specials_monitored
-        .map(|n| {
-            json!({
-                "series": s.id, "season": 0, "scope": "specials",
-                "monitored_episodes": n,
-                "reason": "specials (season 0) are not acquired here; keep them monitored natively, so suspend only the regular seasons there",
-            })
-        })
-        .into_iter()
-        .collect()
 }
 
 /// The attention item for a series' metadata numbering hold, if it has one.
@@ -4469,7 +3849,7 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
                 "title": s.title, "acquisition": s.acquisition, "monitored": s.monitored,
                 "episode_list": if s.episodes.is_some() { "known" } else { "unknown" },
                 "metadata_hold": s.metadata_hold,
-                "native_retained": native_retained(s),
+                "native_retained": Vec::<Value>::new(),
                 "seasons": season_summaries(s, now, only),
             });
             if only.is_some() {
@@ -4857,8 +4237,8 @@ async fn add_value(
         root_folder: None,
         search,
         metadata: None,
-        native_handoff_confirmed: false,
-        preserve_monitoring: false,
+        native_handoff_confirmed: None,
+        preserve_monitoring: None,
     };
     let resp = library_add(State(st.clone()), ApiJson(body)).await?;
     let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)

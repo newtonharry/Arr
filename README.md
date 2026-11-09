@@ -285,7 +285,7 @@ The installer prints this block with your paths filled in:
 
 The assistant gets seven tools: `search_titles`, `add_media`, `media_status`, `requests`,
 `library`, `release_choices` and `start_download`. Ask "what's in my library" or "which
-seasons of Severance do I have" and it reads your catalog, including everything Arr imported
+seasons of Severance do I have" and it reads your catalog, including everything Arr read
 from Plex. By default it adds what you ask for and Arr picks the release. Ask to "choose a
 release" if you want to pick one yourself.
 
@@ -369,8 +369,9 @@ right to.
   feature, which `cargo test` switches on through a dev-dependency of the crate on itself; a
   release build never contains it and rejects the `[test_client]` config section it uses.
 
-- **Migrating from Sonarr/Radarr, Prowlarr or qBittorrent.** Arr can import their settings
-  and keep using Prowlarr or qBittorrent; see [docs/MIGRATION.md](docs/MIGRATION.md).
+- **Coming from Sonarr/Radarr.** Arr no longer imports their settings or titles. Set Arr up
+  fresh (`arr setup`), then let it read what Plex already has (`arr bootstrap`). A state
+  folder made by the old importer is refused at startup; make a new one.
 
 ## Documentation
 
@@ -381,11 +382,9 @@ right to.
 - [docs/API.md](docs/API.md): endpoints, errors and examples.
 - [docs/EMBEDDED-DOWNLOADER.md](docs/EMBEDDED-DOWNLOADER.md): the BitTorrent engine, seeding
   and limits.
-- [docs/MIGRATION.md](docs/MIGRATION.md): importing Sonarr/Radarr/Prowlarr settings.
 - [docs/TMDB.md](docs/TMDB.md): getting a free TMDB key, so Arr can find new movies.
 - [docs/PRIVACY.md](docs/PRIVACY.md): what Arr sends (nothing, unless you allow error
   reports) and what's removed first.
-- [docs/READINESS.md](docs/READINESS.md): what the tests cover and the known limits.
 - [docs/EXECUTION-SANDBOX.md](docs/EXECUTION-SANDBOX.md): testing downloads safely in a
   sandbox.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the pieces fit together.

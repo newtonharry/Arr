@@ -867,7 +867,7 @@ async fn a_state_is_bound_to_its_first_download_backend() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("state");
     let lib = format!(
-        "[library]\nmovies = '{}'\n[migration]\nmode = \"legacy\"\n[execution]\nenabled = true\n",
+        "[library]\nmovies = '{}'\n[migration]\nmode = \"coexistence\"\n[execution]\nenabled = true\n",
         tmp.path().join("movies").display()
     );
     let embedded = format!(

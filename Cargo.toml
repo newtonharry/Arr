@@ -4,7 +4,7 @@ version = "0.11.0"
 edition = "2024"
 rust-version = "1.94"
 publish = false
-description = "Standalone movie/TV API server: native TPB/Torznab indexers, embedded BitTorrent engine, verified import into your Plex library, managed setup, remote MCP; optional Sonarr/Radarr snapshot import, Prowlarr and qBittorrent (shadow by default)"
+description = "Standalone movie/TV API server: native TPB/Torznab indexers, embedded BitTorrent engine, verified import into your Plex library, managed setup, remote MCP; optional Prowlarr and qBittorrent (shadow by default)"
 
 [features]
 # An in-memory download client for the integration tests (`Client::Fake`, selected by a

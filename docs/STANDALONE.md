@@ -4,11 +4,12 @@ One `arr` binary, one `config.toml`, one private state directory. Release search
 goes straight to native indexers (The Pirate Bay's JSON API, or any Torznab endpoint),
 downloads run in the embedded BitTorrent engine, completed downloads are validated with
 `ffprobe` and imported into your library, and Plex is refreshed for the imported folder.
-Policy (quality profiles, seed goals, cleanup) is created by `setup`, not copied from a
-Sonarr/Radarr snapshot. Nothing writes outside the state directory until you enable execution.
+Policy (quality profiles, seed goals, cleanup) is created by `setup`. Nothing writes outside
+the state directory until you enable execution.
 
-The legacy layouts (an imported Sonarr/Radarr snapshot, `[prowlarr]`, `[qbittorrent]`) keep working
-unchanged; see the main [README](../README.md).
+Arr no longer imports Sonarr/Radarr settings: a state folder made by the removed `arr import`
+is refused at startup (nothing in it is changed). Set up a new state folder with `arr init`,
+`arr setup` and `arr bootstrap`. The `[prowlarr]` and `[qbittorrent]` sections still work.
 
 ## Requirements
 
@@ -143,14 +144,6 @@ settings in the running process (no restart). Connections and credentials stay i
   bounded bodies, a result cache, optional durable `query_limit`/`grab_limit` per hour or day,
   and health in `/api/v1/diagnostics`. Searches report one status per indexer and query;
   `completeness.provider` is `complete` only when every indexer the settings name answered.
-- **Imported policies** keep their ids: an imported Radarr/Sonarr indexer that referenced
-  Prowlarr indexer `N` is served by `[[indexer]] id = N` when the native provider implements
-  what the import recorded (Cardigann `thepiratebay`: API host = `base_url` host, empty or
-  matching `uploader`, `top100 = 6` (All = the recent feed), Prowlarr limits preserved by equal
-  or stricter native limits). Anything else is reported unusable (fail closed). Seed goals
-  come from Radarr/Sonarr's criteria, else from the Prowlarr indexer's own settings (a copied
-  ratio 2 stays 2). Other Cardigann definitions are not reproduced: keep them behind a Torznab
-  endpoint with `prowlarr_definition` set explicitly.
 
 ## Running it as a service
 

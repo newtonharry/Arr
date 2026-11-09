@@ -19,7 +19,6 @@
 
 use crate::api::AppState;
 use crate::client::Client;
-use crate::config::MigrationMode;
 use crate::ids::MediaId;
 use crate::import::rfc3339;
 use crate::library;
@@ -600,7 +599,7 @@ pub fn client_policy(
     let dc = settings.download_client(media).ok_or_else(|| {
         format!(
             "the imported {} configuration has no enabled torrent download client",
-            media.native_app()
+            media.label()
         )
     })?;
     // An imported qBittorrent client's policy, or managed setup's own download policy.
@@ -662,70 +661,30 @@ pub fn client_policy(
         content_layout,
         remove_completed: cleanup && dc.remove_completed_downloads == Some(true),
         remove_failed: cleanup && dc.remove_failed_downloads == Some(true),
-        // Coexistence: the native post-import category belongs to the native app; our
-        // downloads stay in their dedicated category.
-        post_import_category: dc
-            .post_import_category
-            .clone()
-            .filter(|c| !c.trim().is_empty())
-            .filter(|_| st.cfg.migration == MigrationMode::Legacy),
+        // The native post-import category belongs to a native app (no longer supported);
+        // our downloads stay in their dedicated category.
+        post_import_category: None,
     })
 }
 
-/// Coexistence mode: the effective qBittorrent category must not be any category an enabled
-/// native torrent client (Radarr or Sonarr) uses, including post-import categories. A shared
-/// category would let the native app's completed-download handling act on our downloads.
-fn shared_category(settings: &Settings, media: MediaKind, category: &str) -> Option<String> {
-    let key = match media {
-        MediaKind::Movie => "movie_category",
-        MediaKind::Series => "tv_category",
-    };
-    settings
-        .download_clients
-        .iter()
-        .filter(|c| c.enabled && c.protocol.eq_ignore_ascii_case("torrent"))
-        // Only native clients compete; managed setup's own policy is this server's.
-        .filter(|c| matches!(c.native.app.as_str(), "radarr" | "sonarr"))
-        .flat_map(|c| {
-            [c.category.as_deref(), c.post_import_category.as_deref()]
-                .into_iter()
-                .flatten()
-                .map(move |cat| (c.media, cat))
-        })
-        .find(|(_, cat)| cat.trim().eq_ignore_ascii_case(category.trim()))
-        .map(|(native, cat)| {
-            format!(
-                "the qBittorrent category '{cat}' is also used by the native {} download client; coexistence mode needs a dedicated category: set [qbittorrent] {key} to a category no native client uses",
-                match native {
-                    MediaKind::Movie => "Radarr",
-                    MediaKind::Series => "Sonarr",
-                }
-            )
-        })
-}
-
-/// Coexistence mode: why this server may not acquire these targets, which stay with the
-/// native app until they are adopted (`POST /api/v1/library` with `native_handoff_confirmed`)
-/// and monitored here. `None` in legacy mode, or when every target is adopted and monitored.
+/// Why this server may not acquire these targets: they are not adopted and monitored here.
+/// `None` when every target is adopted and monitored.
 /// This is the one acquisition gate: every grab goes through `enqueue`, whatever started it
 /// (a plan, an interactive grab, RSS, a worker search or a request retry).
 pub fn not_adopted(st: &AppState, targets: &[MediaId]) -> Option<String> {
-    if st.cfg.migration != MigrationMode::Coexistence {
-        return None;
-    }
     let index = st.index();
     targets.iter().find_map(|t| not_adopted_one(&index, *t))
 }
 
 fn not_adopted_one(index: &crate::catalog::CatalogIndex, target: MediaId) -> Option<String> {
-    let hint = "adopt it with POST /api/v1/library (native_handoff_confirmed, after suspending its native monitoring and confirming no native download is active)";
+    let hint = "add and monitor it with POST /api/v1/library";
     let series = |k| index.series(k);
     let state = |a: &Option<String>| a.clone().unwrap_or_else(|| "unknown".into());
     match target {
         MediaId::Movie { tmdb } => match index.movie(tmdb) {
             Some(m) if m.monitored => None,
             Some(m) => Some(format!(
-                "{target} is not adopted and monitored here ({}); Radarr keeps it until you {hint}",
+                "{target} is not adopted and monitored here ({}); {hint}",
                 state(&m.acquisition)
             )),
             None => Some(format!(
@@ -740,7 +699,7 @@ fn not_adopted_one(index: &crate::catalog::CatalogIndex, target: MediaId) -> Opt
             };
             if !s.monitored {
                 return Some(format!(
-                    "{target} is not adopted and monitored here ({}); Sonarr keeps it until you {hint}",
+                    "{target} is not adopted and monitored here ({}); {hint}",
                     state(&s.acquisition)
                 ));
             }
@@ -811,7 +770,7 @@ pub fn execution_blocker(st: &AppState, media: MediaKind) -> Option<(&'static st
     {
         return Some((
             "client_not_configured",
-            format!("no [library] root is configured for {}", media.native_app()),
+            format!("no [library] root is configured for {}", media.label()),
         ));
     }
     if l.settings.media_management(media).is_none() {
@@ -819,7 +778,7 @@ pub fn execution_blocker(st: &AppState, media: MediaKind) -> Option<(&'static st
             "import_unsupported",
             format!(
                 "the active import has no {} media-management settings (made by an earlier build); re-import the snapshot to enable file import",
-                media.native_app()
+                media.label()
             ),
         ));
     }
@@ -830,22 +789,13 @@ pub fn execution_blocker(st: &AppState, media: MediaKind) -> Option<(&'static st
             "import_unsupported",
             format!(
                 "imported {} settings block file import ({}); nothing is downloaded that could not be imported",
-                media.native_app(),
+                media.label(),
                 codes.join(", ")
             ),
         ));
     }
-    let policy = match client_policy(st, &l.settings, media) {
-        Ok(p) => p,
-        Err(e) => return Some(("client_not_configured", e)),
-    };
-    // Only a shared client exposes our downloads to the native apps' completed-download
-    // handling; the embedded engine is private to this process.
-    if st.cfg.migration == MigrationMode::Coexistence
-        && st.cfg.qbittorrent.is_some()
-        && let Some(why) = shared_category(&l.settings, media, &policy.category)
-    {
-        return Some(("category_shared", why));
+    if let Err(e) = client_policy(st, &l.settings, media) {
+        return Some(("client_not_configured", e));
     }
     None
 }
@@ -1096,7 +1046,6 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
     let origin = req.origin;
     let id2 = id.clone();
     let category = policy.category.clone();
-    let coexistence = st.cfg.migration == MigrationMode::Coexistence;
     let loaded = loaded.clone();
     let result = st
         .store
@@ -1106,9 +1055,7 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
             // rows in this transaction, which a release cannot interleave with: either the
             // release committed first and nothing is recorded, or this grab is recorded first
             // and the release is refused as an active download.
-            if coexistence
-                && let Some(why) = library::not_adopted_now(&tx, link.media_id, &link.covers)?
-            {
+            if let Some(why) = library::not_adopted_now(&tx, link.media_id, &link.covers)? {
                 return Ok(Err(("not_adopted", why)));
             }
             // The copy's quality must be one the title's profile allows now. A list of

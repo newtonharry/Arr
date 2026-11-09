@@ -345,8 +345,8 @@ fn monitored_unit(index: &CatalogIndex, id: MediaId) -> Option<bool> {
 }
 
 /// `POST /copies/{media_id}/get`: download the copy a person picked. It goes through the same
-/// checks as any download Arr starts (Arr must be getting the title, and it is held back for
-/// a native Radarr/Sonarr title that was not handed over). A title Arr does not have yet is
+/// checks as any download Arr starts (Arr must be getting the title). A title Arr does not
+/// have yet is
 /// added first, monitored, without a search of its own.
 pub(super) async fn copies_get(
     State(st): St,

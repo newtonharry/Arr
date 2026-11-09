@@ -497,10 +497,7 @@ pub fn normalize(
             continue;
         };
         if !enabled.contains_key(&m) {
-            errs.push(format!(
-                "{what} is for {}, which is not enabled",
-                m.native_app()
-            ));
+            errs.push(format!("{what} is for {}, which is not enabled", m.label()));
         }
         if p.tiers.is_empty() || p.tiers.iter().any(Vec::is_empty) {
             errs.push(format!(
@@ -577,7 +574,7 @@ pub fn normalize(
         if n > 1 {
             warnings.push(format!(
                 "{} has {n} profiles: adds must name quality_profile (the MCP add_media tool cannot)",
-                m.native_app()
+                m.label()
             ));
         }
     }
@@ -698,7 +695,7 @@ pub fn normalize(
             availability_delay_days: p.availability_delay_days.unwrap_or(0),
         };
         rep.item(
-            m.native_app(),
+            m.label(),
             "release policy",
             json!(rp),
             "decisions, delay, revision handling, failed-download re-search and RSS interval",
@@ -710,7 +707,7 @@ pub fn normalize(
             minimum_free_space_mb: p.minimum_free_space_mb.unwrap_or(100),
             replace_illegal_characters: p.replace_illegal_characters.unwrap_or(true),
         };
-        rep.item(m.native_app(), "file import", json!(mm), "completed-download import: hardlink when possible, free-space floor, safe names (rename off)");
+        rep.item(m.label(), "file import", json!(mm), "completed-download import: hardlink when possible, free-space floor, safe names (rename off)");
         media_management.push(mm);
         let (key, default) = match m {
             MediaKind::Movie => ("download.movie_category", "um-movies"),
@@ -747,7 +744,7 @@ pub fn normalize(
             credential_fields_in_snapshot: vec![],
             execution: "server_config".into(),
         };
-        rep.item(m.native_app(), "download policy", json!({ "category": dc.category, "initial_state": initial_state, "remove_completed": dc.remove_completed_downloads, "remove_failed": dc.remove_failed_downloads }), "applied through the configured download client ([embedded] or [qbittorrent]); cleanup waits for the seed goal and share limit");
+        rep.item(m.label(), "download policy", json!({ "category": dc.category, "initial_state": initial_state, "remove_completed": dc.remove_completed_downloads, "remove_failed": dc.remove_failed_downloads }), "applied through the configured download client ([embedded] or [qbittorrent]); cleanup waits for the seed goal and share limit");
         download_clients.push(dc);
     }
 
@@ -873,7 +870,7 @@ pub fn normalize(
                 {
                     errs.push(format!(
                         "{what} is enabled for {}, which is not enabled",
-                        m.native_app()
+                        m.label()
                     ));
                 }
                 continue;
@@ -914,7 +911,7 @@ pub fn normalize(
             };
             rep.item(
                 &format!("indexer[{}] {name}", ix.id),
-                m.native_app(),
+                m.label(),
                 json!({ "categories": setting.categories, "priority": priority, "minimum_seeders": min_seeders, "automatic_search": setting.enable_automatic_search, "interactive_search": setting.enable_interactive_search, "rss": setting.enable_rss, "seed_ratio": ratio, "seed_time_minutes": minutes, "season_pack_seed_time_minutes": pack }),
                 "searched with these categories; priority and minimum seeders applied; seed goal: ratio or seeding time, whichever comes first (negative = the client's limit)",
             );
@@ -1096,7 +1093,7 @@ pub fn replace_conflicts(
     with_levels(&mut with);
     let new = &with;
     if active_origin == Some("native_snapshot") {
-        out.push("a native snapshot import is active: managed setup never replaces imported settings (use a fresh state directory for a standalone deployment)".into());
+        out.push("this state folder holds a Sonarr/Radarr snapshot import, which Arr no longer supports and managed setup never replaces; set up a new state folder with `arr setup` and `arr bootstrap`".into());
         return out;
     }
     for g in grabs {
@@ -1108,7 +1105,7 @@ pub fn replace_conflicts(
         {
             let msg = format!(
                 "indexer {id} has active {} downloads and must remain until they finish",
-                g.media.native_app()
+                g.media.label()
             );
             if !out.contains(&msg) {
                 out.push(msg);
@@ -1122,7 +1119,7 @@ pub fn replace_conflicts(
         if active_origin.is_some() && cat.is_some_and(|c| c != g.category) {
             let msg = format!(
                 "the {} download category {} has active downloads and must not change until they finish",
-                g.media.native_app(),
+                g.media.label(),
                 g.category
             );
             if !out.contains(&msg) {
@@ -1152,7 +1149,7 @@ pub fn replace_conflicts(
         if !new.profiles.iter().any(|x| x.id == p && x.media == m) {
             out.push(format!(
                 "profile {p} is used by {} titles in the catalog and must remain",
-                m.native_app()
+                m.label()
             ));
         }
     }
@@ -1164,7 +1161,7 @@ pub fn replace_conflicts(
         {
             out.push(format!(
                 "root folder {r} is used by {} titles in the catalog and must remain",
-                m.native_app()
+                m.label()
             ));
         }
     }
@@ -1223,7 +1220,7 @@ pub fn plex_check(plex: &PlexConfig, cfg: &RuntimeConfig, sections: &[Section]) 
                 .cloned()
         });
         let (status, hint) = match (plex_path, &covered) {
-            (None, _) => ("path_unmapped", Some(format!("set [plex] {} to the {} root as Plex sees it (one of {:?}); refreshes then target the imported folder", if m == MediaKind::Movie { "movies_path" } else { "tv_path" }, m.native_app(), s.locations))),
+            (None, _) => ("path_unmapped", Some(format!("set [plex] {} to the {} root as Plex sees it (one of {:?}); refreshes then target the imported folder", if m == MediaKind::Movie { "movies_path" } else { "tv_path" }, m.label(), s.locations))),
             (Some(_), None) => ("path_not_in_section", Some(format!("the configured Plex path is not inside the section's folders {:?}", s.locations))),
             (Some(_), Some(_)) => ("ok", None),
         };
@@ -1444,7 +1441,7 @@ mod tests {
         let why = replace_conflicts(Some("managed_setup"), &new, &empty, &grabs);
         assert!(
             why.iter()
-                .any(|w| w.contains("indexer 1 has active radarr downloads")),
+                .any(|w| w.contains("indexer 1 has active movies downloads")),
             "{why:?}"
         );
     }
