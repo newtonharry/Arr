@@ -1304,7 +1304,7 @@ pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         .cfg
         .embedded
         .as_ref()
-        .filter(|_| qb.embedded().is_some())
+        .filter(|_| qb.embedded_semantics())
         .map(|e| e.max_active_downloads);
     let now_s = ts(now);
     let due = st

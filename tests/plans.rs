@@ -1107,21 +1107,33 @@ fn legacy_state(dir: &std::path::Path, fingerprint: &str) {
 
 #[tokio::test]
 async fn legacy_idempotency_keys_replay_after_the_upgrade() {
-    let app = start_exec(ExecOptions::shadow()).await;
-    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
-    // The state database is replaced by one the previous release wrote, then the server
-    // starts over it.
-    let mut app = app;
-    let dir = app.dir.clone();
-    for f in ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"] {
-        let _ = std::fs::remove_file(dir.join(f));
-    }
+    // The state database is one the previous release wrote, created before the server starts
+    // over it (and migrates it).
+    let (addr, mock) = start_mock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let (movies, tv) = (tmp.path().join("movies"), tmp.path().join("tv"));
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    write_managed_config(
+        &dir,
+        addr,
+        false,
+        &format!(
+            "[library]\nmovies = '{}'\ntv = '{}'\n[migration]\nmode = \"coexistence\"\n",
+            movies.display(),
+            tv.display()
+        ),
+    );
     // The previous release fingerprinted the canonical body {media_id, quality_profile,
     // replan}, serialised in this order.
     let fp = hex_digest(br#"{"media_id":"movie:tmdb:603","quality_profile":null,"replan":false}"#);
     legacy_state(&dir, &fp);
-    app.restart().await;
-    let base = app.base.clone();
+    let base = serve_dir(&dir).await;
+    let c = reqwest::Client::new();
+    setup_managed(&base, &c).await;
+    add_movie_to(&base, &c, 603, "The Matrix", 1999, 136, "English", &[]).await;
+    mock.lock().unwrap().log.clear();
     let client = reqwest::Client::new();
     for body in [
         json!({ "media_id": "movie:tmdb:603" }),

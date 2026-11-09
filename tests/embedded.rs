@@ -166,7 +166,6 @@ async fn silent_peer(to: SocketAddr, t: &TorrentFixture) -> tokio::task::JoinHan
 }
 
 struct Opts {
-    mode: &'static str,
     tmdb: bool,
     download_limit: Option<u32>,
     max_active: u32,
@@ -176,7 +175,6 @@ struct Opts {
 impl Default for Opts {
     fn default() -> Self {
         Opts {
-            mode: "coexistence",
             tmdb: false,
             download_limit: None,
             max_active: 3,
@@ -241,13 +239,12 @@ async fn start(o: Opts) -> Emb {
     let extra = format!(
         "[execution]\nenabled = true\ndownload_cleanup = true\n\
          [embedded]\ndownload_dir = '{dl}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ndht = false\nlocal_discovery = false\ninitial_peers = [\"{seed}\"]\nmax_active_downloads = {max}\n{limit}\
-         [migration]\nmode = '{mode}'\n\
+         [migration]\nmode = \"coexistence\"\n\
          [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = false\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 3600\n{stall}{tmdb}",
         dl = downloads.display(),
         seed = seeder.addr(),
         max = o.max_active,
-        mode = o.mode,
         movies = movies.display(),
         tv = tv.display(),
         stall = o
@@ -696,7 +693,6 @@ async fn a_season_pack_pauses_resumes_and_survives_an_abrupt_engine_stop() {
 #[tokio::test]
 async fn a_magnet_resolves_from_its_peer_and_unsafe_foreign_or_unaccounted_downloads_fail_closed() {
     let e = start(Opts {
-        mode: "legacy",
         ..Default::default()
     })
     .await;
@@ -805,7 +801,6 @@ async fn a_magnet_resolves_from_its_peer_and_unsafe_foreign_or_unaccounted_downl
 #[tokio::test]
 async fn grabs_beyond_the_active_download_limit_wait_in_the_outbox() {
     let e = start(Opts {
-        mode: "legacy",
         download_limit: Some(16 * 1024),
         max_active: 1,
         ..Default::default()
@@ -1279,7 +1274,6 @@ async fn the_engine_lock_is_held_until_its_session_has_actually_stopped() {
 #[tokio::test]
 async fn concurrent_controls_fabricate_no_bytes_and_seeding_time_accrues_below_a_second() {
     let e = start(Opts {
-        mode: "legacy",
         ..Default::default()
     })
     .await;
@@ -1374,7 +1368,6 @@ async fn concurrent_controls_fabricate_no_bytes_and_seeding_time_accrues_below_a
 #[tokio::test]
 async fn a_replayed_add_of_an_active_torrent_counts_nothing_again_and_keeps_its_check() {
     let e = start(Opts {
-        mode: "legacy",
         ..Default::default()
     })
     .await;
@@ -1477,7 +1470,6 @@ async fn connected_without_data(e: &Emb, hash: &str) {
 #[tokio::test]
 async fn a_download_with_peers_connected_but_no_data_fails_at_the_stall_timeout() {
     let mut e = start(Opts {
-        mode: "legacy",
         stall_minutes: Some(30),
         ..Default::default()
     })
@@ -1565,7 +1557,6 @@ async fn a_download_with_peers_connected_but_no_data_fails_at_the_stall_timeout(
 #[tokio::test]
 async fn a_completed_payload_changed_while_stopped_is_checked_again_before_any_import() {
     let mut e = start(Opts {
-        mode: "legacy",
         ..Default::default()
     })
     .await;
