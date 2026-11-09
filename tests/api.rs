@@ -424,8 +424,8 @@ async fn catalog_lookup_discovery_and_capabilities() {
     let (_, settings, text) = body(app.get("/api/v1/settings").send().await.unwrap()).await;
     assert_eq!(
         settings["settings"]["profiles"].as_array().unwrap().len(),
-        2,
-        "one movie and one TV profile"
+        6,
+        "Smaller, Standard and Best for movies and for TV"
     );
     assert_no_leaks(&text);
     let (_, _, report) = body(app.get("/api/v1/migration-report").send().await.unwrap()).await;

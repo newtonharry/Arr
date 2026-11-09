@@ -44,6 +44,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
+mod options;
 mod titles;
 
 /// Every route, for the OpenAPI coverage test: (method, path).
@@ -94,6 +95,9 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("post", "/api/v1/quick-add"),
     ("post", "/api/v1/follow"),
     ("post", "/api/v1/stop"),
+    ("post", "/api/v1/quality"),
+    ("get", "/api/v1/copies/{media_id}"),
+    ("post", "/api/v1/copies/{media_id}/get"),
     ("get", "/api/v1/show/{media_id}"),
     ("get", "/api/v1/show/{media_id}/season/{n}"),
     ("get", "/api/v1/movie/{media_id}"),
@@ -117,8 +121,9 @@ pub struct Loaded {
 
 impl From<import::LoadedImport> for Loaded {
     fn from(l: import::LoadedImport) -> Self {
+        let managed = l.manifest.files.contains_key(crate::setup::SOURCE_FILE);
         Loaded {
-            origin: if l.manifest.files.contains_key(crate::setup::SOURCE_FILE) {
+            origin: if managed {
                 "managed_setup"
             } else {
                 "native_snapshot"
@@ -126,7 +131,13 @@ impl From<import::LoadedImport> for Loaded {
             import_id: l.manifest.import_id,
             observed_at: l.manifest.observed_at,
             imported_at: l.manifest.imported_at,
-            settings: l.settings,
+            settings: {
+                let mut settings = l.settings;
+                if managed {
+                    crate::setup::with_levels(&mut settings);
+                }
+                settings
+            },
             report: l.report,
         }
     }
@@ -832,6 +843,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/quick-add", post(quick_add))
         .route("/api/v1/follow", post(titles::follow))
         .route("/api/v1/stop", post(titles::stop))
+        .route("/api/v1/quality", post(options::quality))
+        .route("/api/v1/copies/{media_id}", get(options::copies))
+        .route("/api/v1/copies/{media_id}/get", post(options::copies_get))
         .route("/api/v1/show/{media_id}", get(titles::show))
         .route("/api/v1/show/{media_id}/season/{n}", get(titles::season))
         .route("/api/v1/movie/{media_id}", get(titles::movie))
@@ -3042,39 +3056,46 @@ fn scope_of(target: &Target) -> Scope {
     }
 }
 
-async fn releases(
-    State(st): St,
-    p: Result<Path<String>, PathRejection>,
-    ApiQuery(q): ApiQuery<ReleasesQuery>,
-) -> ApiResult {
-    let id = media_id(p)?;
+/// Searches for the copies of one target and keeps the links of the approved ones, so they
+/// can be grabbed. Shared by `GET /media/{id}/releases` and the web app's copies list.
+/// `profile` names a profile for a target outside the catalog.
+async fn release_run(
+    st: &Arc<AppState>,
+    id: MediaId,
+    refresh: bool,
+    profile: Option<&str>,
+) -> Result<(Target, search::SearchRun, Option<String>), ApiError> {
     let loaded = st.loaded()?;
     let now = OffsetDateTime::now_utc();
     let index = st.index();
     let target = st.resolver(&index, now).target(id).await?;
-    let profile = search::profile_for(&loaded.settings, &target, None)?;
+    let profile = search::profile_for(&loaded.settings, &target, profile)?;
     let media = target_media(&target);
     let blocked = st
         .store
         .with(move |c| downloads::blocked_for(c, media))
         .await
         .map_err(internal("blocklist"))?;
-    let inputs = st.search_inputs(
-        &loaded,
-        &index,
-        now,
-        false,
-        q.refresh.unwrap_or(false),
-        Some(&blocked),
-    );
+    let inputs = st.search_inputs(&loaded, &index, now, false, refresh, Some(&blocked));
     let scope = scope_of(&target);
-    let run = search::run(&inputs, &target, profile.clone(), &[scope], scope).await?;
+    let profile_id = profile.1.clone();
+    let run = search::run(&inputs, &target, profile, &[scope], scope).await?;
     // Approved results can be grabbed with POST /grabs; keep their link material privately.
     let links = downloads::links_for(&run, &target, true);
     st.store
         .with(move |c| downloads::save_links(c, &links, now))
         .await
         .map_err(internal("links"))?;
+    Ok((target, run, profile_id))
+}
+
+async fn releases(
+    State(st): St,
+    p: Result<Path<String>, PathRejection>,
+    ApiQuery(q): ApiQuery<ReleasesQuery>,
+) -> ApiResult {
+    let id = media_id(p)?;
+    let (target, run, profile_id) = release_run(&st, id, q.refresh.unwrap_or(false), None).await?;
     let approved = run
         .candidates
         .iter()
@@ -3125,7 +3146,7 @@ async fn releases(
     ok(json!({
         "target": plan::canonical_id(&target),
         "requested": id,
-        "profile": profile.1,
+        "profile": profile_id,
         "policy_blockers": run.blockers,
         "outcome": outcome,
         "completeness": completeness,
@@ -4814,6 +4835,9 @@ async fn ideas(State(st): St) -> ApiResult {
 #[serde(deny_unknown_fields)]
 struct QuickAddBody {
     media_id: String,
+    /// smaller, standard or best: the quality the person picked on the page.
+    #[serde(default)]
+    level: Option<String>,
 }
 
 /// `POST /library` with the defaults, in-process; the reply's JSON.
@@ -4822,12 +4846,13 @@ async fn add_value(
     media_id: String,
     monitor: Option<MonitorMode>,
     search: bool,
+    profile: Option<String>,
 ) -> Result<Value, ApiError> {
     let body = AddBody {
         media_id,
         monitored: None,
         monitor,
-        quality_profile: None,
+        quality_profile: profile,
         root_folder: None,
         search,
         metadata: None,
@@ -4905,9 +4930,17 @@ fn quick_outcome(v: &Value) -> (&'static str, Option<String>, String) {
 async fn quick_add(State(st): St, ApiJson(body): ApiJson<QuickAddBody>) -> ApiResult {
     st.loaded()?;
     let id = parse_media_id(&body.media_id)?;
+    // The picked level applies to a title Arr already has, and to one it adds now.
+    let profile = match &body.level {
+        Some(l) => Some(options::level_profile(&st, id, l)?),
+        None => None,
+    };
+    if let Some(p) = &profile {
+        options::apply_profile(&st, id, p).await?;
+    }
     match id {
         MediaId::Movie { tmdb } => {
-            let v = match add_value(&st, id.to_string(), None, true).await {
+            let v = match add_value(&st, id.to_string(), None, true, profile).await {
                 Ok(v) => v,
                 Err(e)
                     if e.status == StatusCode::CONFLICT
@@ -4930,7 +4963,14 @@ async fn quick_add(State(st): St, ApiJson(body): ApiJson<QuickAddBody>) -> ApiRe
             }))
         }
         MediaId::Series(_) => {
-            let v = add_value(&st, id.to_string(), Some(MonitorMode::Future), false).await?;
+            let v = add_value(
+                &st,
+                id.to_string(),
+                Some(MonitorMode::Future),
+                false,
+                profile.clone(),
+            )
+            .await?;
             let sid: MediaId = v["media_id"]
                 .as_str()
                 .and_then(|s| s.parse().ok())
@@ -4961,13 +5001,20 @@ async fn quick_add(State(st): St, ApiJson(body): ApiJson<QuickAddBody>) -> ApiRe
                     "message": "Arr will get new episodes as they air.",
                 }));
             };
-            let v = add_value(&st, MediaId::Season(key, season).to_string(), None, true).await?;
+            let v = add_value(
+                &st,
+                MediaId::Season(key, season).to_string(),
+                None,
+                true,
+                profile,
+            )
+            .await?;
             let (outcome, until, message) = quick_outcome(&v);
             ok(json!({
                 "media_id": sid, "title": title, "detail": format!("Season {season}"),
                 "outcome": outcome, "until": until, "message": message,
             }))
         }
-        MediaId::Season(..) | MediaId::Episode(..) => titles::quick_scope(&st, id).await,
+        MediaId::Season(..) | MediaId::Episode(..) => titles::quick_scope(&st, id, profile).await,
     }
 }

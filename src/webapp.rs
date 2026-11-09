@@ -571,9 +571,11 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | ["show", _]
                 | ["show", _, "season", _]
                 | ["movie", _]
+                | ["copies", _]
         ),
         Method::POST => match parts.as_slice() {
-            ["quick-add" | "follow" | "stop"] => true,
+            ["quick-add" | "follow" | "stop" | "quality"] => true,
+            ["copies", id, "get"] => !id.is_empty(),
             ["queue", id, "retry"] => !id.is_empty(),
             _ => false,
         },
