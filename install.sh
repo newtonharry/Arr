@@ -223,6 +223,18 @@ sha256() {
 }
 fetch() { curl -fsSL --retry 3 "$@"; }
 
+# Arr's own release downloads: GitHub's download pages sometimes answer 504 for a long
+# while, so these retry longer than fetch, then (GitHub's default address only) go through
+# GitHub's API, which stays up. Parsed with tr and awk, as there is no jq.
+rfetch() { curl -fsSL --retry 6 --retry-delay 10 "$@"; }
+gh_api() { curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/$1"; }
+# The API address of release asset $2 in release $1 (latest, or tags/<tag>)
+api_asset_url() {
+	gh_api "releases/$1" | tr ',' '\n' | awk -v want="$2" '
+		/\/releases\/assets\/[0-9]+"/ { u = $0; sub(/.*"https/, "https", u); sub(/".*/, "", u) }
+		/"name": *"/ { v = $0; sub(/.*"name": *"/, "", v); sub(/".*/, "", v); if (v == want && u != "") { print u; exit } }'
+}
+
 # On a re-run the arr this run replaced stays as arr.previous, and config.toml and secrets/
 # as they were stay in SNAP (inside this run's private temp folder), until the new one
 # answers. A run that stops before then puts them back (restarting Arr if this run had
@@ -470,7 +482,9 @@ if [ "$SETUP" = 1 ] && [ -f "$CONFIG" ]; then
 	fi
 fi
 
+VIA_API=0 GH_DEFAULT=0
 if [ -z "$DOWNLOAD_BASE" ]; then
+	GH_DEFAULT=1
 	if [ "$VERSION" = latest ]; then
 		DOWNLOAD_BASE="https://github.com/$REPO/releases/latest/download"
 	else
@@ -489,8 +503,21 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 asset="arr-$target.tar.gz"
-fetch -o "$tmp/$asset" "$DOWNLOAD_BASE/$asset" || die "download failed: $DOWNLOAD_BASE/$asset"
-fetch -o "$tmp/$asset.sha256" "$DOWNLOAD_BASE/$asset.sha256" || die "checksum download failed"
+# Release asset $1 into $2. If GitHub's download page won't answer (default address only),
+# the same file comes through the API, and the next one goes straight there.
+release_get() {
+	if [ "$VIA_API" = 0 ] && rfetch -o "$2" "$DOWNLOAD_BASE/$1"; then return 0; fi
+	[ "$GH_DEFAULT" = 1 ] || return 1
+	if [ "$VIA_API" = 0 ]; then
+		echo "GitHub's download page didn't answer; trying GitHub's API instead"
+		VIA_API=1
+	fi
+	if [ "$VERSION" = latest ]; then rel=latest; else rel="tags/$VERSION"; fi
+	api_url=$(api_asset_url "$rel" "$1") && [ -n "$api_url" ] || return 1
+	curl -fsSL --retry 3 -H 'Accept: application/octet-stream' -o "$2" "$api_url"
+}
+release_get "$asset" "$tmp/$asset" || die "download failed: $DOWNLOAD_BASE/$asset"
+release_get "$asset.sha256" "$tmp/$asset.sha256" || die "checksum download failed"
 [ "$(sha256 "$tmp/$asset")" = "$(cut -d' ' -f1 "$tmp/$asset.sha256")" ] || die "checksum mismatch for $asset"
 tar -xzf "$tmp/$asset" -C "$tmp"
 # A binary that doesn't run here never replaces one that does.
@@ -1321,7 +1348,15 @@ if [ "$AUTO_UPDATE" = 1 ]; then
 		cat <<'EOF'
 set -eu
 log() { printf 'arr-update: %s\n' "$*"; }
-fetch() { curl -fsSL --retry 3 "$@"; }
+rfetch() { curl -fsSL --retry 6 --retry-delay 10 "$@"; }
+# GitHub's download pages sometimes answer 504 for a long while; its API stays up. Parsed with
+# tr and awk, as there is no jq.
+gh_api() { curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/$1"; }
+api_asset_url() { # release $1 (latest, or tags/<tag>), asset $2
+	gh_api "releases/$1" | tr ',' '\n' | awk -v want="$2" '
+		/\/releases\/assets\/[0-9]+"/ { u = $0; sub(/.*"https/, "https", u); sub(/".*/, "", u) }
+		/"name": *"/ { v = $0; sub(/.*"name": *"/, "", v); sub(/".*/, "", v); if (v == want && u != "") { print u; exit } }'
+}
 sha256() {
 	if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
@@ -1375,8 +1410,17 @@ shlock)
 	;;
 esac
 
+GH_DEFAULT=0 VIA_API=0
+[ -n "${ARR_RELEASES_URL:-}" ] || GH_DEFAULT=1
 RELEASES=${ARR_RELEASES_URL:-https://github.com/$REPO/releases}
-latest=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" | sed 's#.*/tag/##')
+latest=$(curl -fsSLI --retry 6 --retry-delay 10 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" | sed 's#.*/tag/##') || latest=
+case "$latest" in v[0-9]*) ;; *)
+	if [ "$GH_DEFAULT" = 1 ]; then
+		log "GitHub's download page didn't answer; trying GitHub's API instead"
+		VIA_API=1
+		latest=$(gh_api releases/latest | tr ',' '\n' | awk '/"tag_name": *"/ { v = $0; sub(/.*"tag_name": *"/, "", v); sub(/".*/, "", v); print v; exit }') || latest=
+	fi ;;
+esac
 case "$latest" in v[0-9]*) ;; *) log "couldn't find the latest release"; exit 1 ;; esac
 current="v$("$ARR" --version | awk '{print $2}')"
 if ! newer "$latest" "$current"; then
@@ -1387,8 +1431,18 @@ log "updating $current to $latest"
 tmp=$(mktemp -d)
 asset="arr-$TARGET.tar.gz"
 base="$RELEASES/download/$latest"
-fetch -o "$tmp/$asset" "$base/$asset"
-fetch -o "$tmp/$asset.sha256" "$base/$asset.sha256"
+release_get() { # asset $1 into $2; through the API if GitHub's download page won't answer
+	if [ "$VIA_API" = 0 ] && rfetch -o "$2" "$base/$1"; then return 0; fi
+	[ "$GH_DEFAULT" = 1 ] || return 1
+	if [ "$VIA_API" = 0 ]; then
+		log "GitHub's download page didn't answer; trying GitHub's API instead"
+		VIA_API=1
+	fi
+	api_url=$(api_asset_url "tags/$latest" "$1") && [ -n "$api_url" ] || return 1
+	curl -fsSL --retry 3 -H 'Accept: application/octet-stream' -o "$2" "$api_url"
+}
+release_get "$asset" "$tmp/$asset"
+release_get "$asset.sha256" "$tmp/$asset.sha256"
 if [ "$(sha256 "$tmp/$asset")" != "$(cut -d' ' -f1 "$tmp/$asset.sha256")" ]; then
 	log "checksum mismatch; not updating"
 	exit 1
