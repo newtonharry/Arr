@@ -3,10 +3,10 @@
 
 mod common;
 
-use arr::catalog::{AltTitle, CatalogIndex, FileEvidence};
+use arr::catalog::{AltTitle, CATALOG_SCHEMA_VERSION, Catalog, CatalogIndex, FileEvidence};
 use arr::decision::{Decision, EvalContext, Scope, evaluate};
 use arr::ids::{MediaId, SeriesKey};
-use arr::import;
+use arr::library::{new_movie, new_series};
 use arr::prowlarr::ProwlarrRelease;
 use arr::quality::Quality;
 use arr::release;
@@ -15,24 +15,85 @@ use arr::settings::{LanguageRequirement, Settings};
 use arr::target::{
     EpisodeInfo, MovieTarget, Ownership, SeasonTarget, SeriesTarget, Source, Target,
 };
-use common::{
-    ExecOptions, FRANCHISE_ALIASES, FRANCHISE_FILE, managed_settings, release, snapshot,
-    with_franchise_movie,
-};
+use common::{ExecOptions, FRANCHISE_ALIASES, FRANCHISE_FILE, managed_settings, release};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-fn load(v: &Value) -> (Settings, CatalogIndex) {
-    let n = import::normalize(
-        v,
-        "imp-test",
-        "2026-10-01T12:00:00Z",
-        "sha",
-        0,
-        "2026-10-01T12:00:00Z",
+fn dates() -> arr::catalog::ReleaseDates {
+    arr::catalog::ReleaseDates {
+        in_cinemas: None,
+        physical_release: None,
+        digital_release: Some("2000-01-01".into()),
+    }
+}
+
+/// A managed-catalog movie, as `POST /library` stores it.
+fn catalog_movie(tmdb: u32, title: &str, year: u16, aliases: &[&str]) -> arr::catalog::Movie {
+    new_movie(
+        tmdb,
+        title.into(),
+        Some(year),
+        Some(120),
+        Some("english".into()),
+        aliases.iter().map(|a| a.to_string()).collect(),
+        None,
+        Some("setup:movies-hd".into()),
+        Some("/movies".into()),
+        None,
+        dates(),
+        "unified-media",
+        OffsetDateTime::now_utc(),
     )
-    .unwrap();
-    (n.settings, CatalogIndex::new(n.catalog))
+}
+
+/// A managed-catalog series, as `POST /library` stores it.
+fn catalog_series(tvdb: u32, title: &str, year: u16, aliases: &[&str]) -> arr::catalog::Series {
+    let mut s = new_series(
+        SeriesKey::Tvdb(tvdb),
+        title.into(),
+        Some(year),
+        Some(50),
+        Some("english".into()),
+        None,
+        Some("setup:tv-hd".into()),
+        Some("/tvshows".into()),
+        None,
+        "unified-media",
+        OffsetDateTime::now_utc(),
+    );
+    s.alternate_titles = aliases
+        .iter()
+        .map(|t| AltTitle {
+            title: (*t).into(),
+            season: None,
+        })
+        .collect();
+    s
+}
+
+fn catalog_of(movies: Vec<arr::catalog::Movie>, series: Vec<arr::catalog::Series>) -> CatalogIndex {
+    CatalogIndex::new(Catalog {
+        schema_version: CATALOG_SCHEMA_VERSION,
+        import_id: String::new(),
+        observed_at: String::new(),
+        movies,
+        series,
+    })
+}
+
+/// The harness's standard titles (see `seed_standard_library`).
+fn standard_catalog() -> CatalogIndex {
+    catalog_of(
+        vec![
+            catalog_movie(603, "The Matrix", 1999, &[]),
+            catalog_movie(604, "The Matrix Reloaded", 2003, &[]),
+            catalog_movie(194, "Amélie", 2001, &["Amelie from Montmartre"]),
+        ],
+        vec![
+            catalog_series(372264, "Slow Horses", 2022, &[]),
+            catalog_series(269613, "Fargo", 2014, &[]),
+        ],
+    )
 }
 
 fn series(title: &str, tvdb: u32, year: Option<u16>, aliases: Vec<AltTitle>) -> SeriesTarget {
@@ -120,9 +181,6 @@ struct Env {
     settings: Settings,
     catalog: CatalogIndex,
     blocked: Option<std::collections::HashSet<String>>,
-    /// Settings from a Sonarr/Radarr snapshot (`with`): the targets' managed profile ids are
-    /// mapped to the snapshot's.
-    snapshot_profiles: bool,
 }
 
 impl Env {
@@ -144,35 +202,25 @@ impl Env {
     }
 
     fn managed(o: ExecOptions) -> Self {
-        let (_, catalog) = load(&snapshot());
         Env {
             settings: managed_settings(&o),
-            catalog,
+            catalog: standard_catalog(),
             blocked: None,
-            snapshot_profiles: false,
         }
     }
 
-    fn with(v: &Value) -> Self {
-        let (settings, catalog) = load(v);
+    /// As `new`, over a different catalog.
+    fn with_catalog(catalog: CatalogIndex) -> Self {
         Env {
-            settings,
             catalog,
-            blocked: None,
-            snapshot_profiles: true,
+            ..Env::new()
         }
     }
 
     fn eval_release(&self, target: &Target, scope: Scope, r: Value) -> Decision {
         let r: ProwlarrRelease = serde_json::from_value(r).unwrap();
         let p = release::parse(r.title.as_deref().unwrap());
-        let profile_id = target
-            .quality_profile()
-            .map(|p| match (self.snapshot_profiles, p) {
-                (true, "setup:movies-hd") => "radarr:6".to_string(),
-                (true, "setup:tv-hd") => "sonarr:6".to_string(),
-                _ => p.to_string(),
-            });
+        let profile_id = target.quality_profile().map(str::to_string);
         let ctx = EvalContext {
             target,
             scope,
@@ -439,24 +487,14 @@ fn titles_years_aliases_and_ambiguity() {
     assert!(c("Slow.Horses.2019.S01E04.1080p.WEB-DL").contains(&"year_mismatch".into()));
 
     // Two catalog series share a title: no year -> ambiguous; the right year disambiguates.
-    let mut v = snapshot();
-    let mut us = v["sonarr"]["series"][0].clone();
-    us["id"] = json!(30);
-    us["title"] = json!("The Office (US)");
-    us["tvdbId"] = json!(73244);
-    us["year"] = json!(2005);
-    us["alternateTitles"] = json!([{ "title": "The Office", "seasonNumber": -1 }]);
-    let mut uk = us.clone();
-    uk["id"] = json!(31);
-    uk["title"] = json!("The Office");
-    uk["tvdbId"] = json!(78107);
-    uk["year"] = json!(2001);
-    uk["alternateTitles"] = json!([]);
-    v["sonarr"]["series"]
-        .as_array_mut()
-        .unwrap()
-        .extend([us, uk]);
-    let env = Env::with(&v);
+    let env = Env::with_catalog(catalog_of(
+        vec![],
+        vec![
+            catalog_series(372264, "Slow Horses", 2022, &[]),
+            catalog_series(73244, "The Office (US)", 2005, &["The Office"]),
+            catalog_series(78107, "The Office", 2001, &[]),
+        ],
+    ));
     let office_us = season(
         series(
             "The Office (US)",
@@ -601,17 +639,20 @@ fn movie_scope_rules() {
 }
 
 #[test]
-fn imported_policy_variants() {
-    // Global maximum size, torrent delay with top-tier bypass, required flags, Original language.
-    let mut v = snapshot();
-    v["radarr"]["config/indexer"]["maximumSize"] = json!(5000);
-    v["sonarr"]["delayprofile"][0]["torrentDelay"] = json!(60);
-    v["sonarr"]["indexer"][0]["fields"][7]["value"] = json!([1]);
-    v["radarr"]["qualityprofile"][0]["language"] = json!({ "id": -2, "name": "Original" });
-    let env = Env::with(&v);
+fn configured_policy_variants() {
+    // Global maximum size, torrent delay with top-tier bypass, Original language.
+    let tiers = "tiers = [[\"hdtv_720p\"], [\"webdl_720p\", \"webrip_720p\"], [\"bluray_720p\"], [\"hdtv_1080p\"], [\"webdl_1080p\", \"webrip_1080p\"]]\n";
+    let env = Env::managed(ExecOptions {
+        movies_extra: "maximum_size_mb = 5000\n".into(),
+        tv_extra: "torrent_delay_minutes = 60\n".into(),
+        profiles: format!(
+            "[[profiles]]\nid = \"movies-hd\"\nmedia = \"movie\"\n{tiers}language = \"original\"\nunmarked = \"assume_original\"\n[[profiles]]\nid = \"tv-hd\"\nmedia = \"series\"\n{tiers}"
+        ),
+        ..Default::default()
+    });
     assert_eq!(
         env.settings
-            .profile("radarr:6")
+            .profile("setup:movies-hd")
             .unwrap()
             .language
             .requirement,
@@ -669,12 +710,6 @@ fn imported_policy_variants() {
     assert!(
         !d.rejections.iter().any(|r| r.code == "delay_profile_wait"),
         "top tier bypasses the delay"
-    );
-    assert!(
-        d.rejections
-            .iter()
-            .any(|r| r.code == "indexer_policy_unsupported"),
-        "required flags are not evaluated"
     );
     let mut undated = fresh("Slow.Horses.S01E04.720p.WEBRip.x264");
     undated["publishDate"] = Value::Null;
@@ -878,11 +913,8 @@ fn revision_upgrades_follow_native_rules() {
     );
     assert!(!d.approved);
 
-    // Policy without preferAndUpgrade: no revision upgrades.
-    let mut snap = snapshot();
-    snap["radarr"]["config/mediamanagement"]["downloadPropersAndRepacks"] =
-        json!("preferAndUpgrade".replace("AndUpgrade", ""));
-    let strict = Env::with(&snap);
+    // Policy with revision upgrades off (the default): nothing owned is replaced.
+    let strict = Env::new();
     let d = strict.eval(
         &known,
         Scope::Movie,
@@ -894,7 +926,7 @@ fn revision_upgrades_follow_native_rules() {
         !d.approved
             && d.rejections
                 .iter()
-                .any(|r| r.message.contains("preferAndUpgrade"))
+                .any(|r| r.message.contains("revision upgrades are off"))
     );
 }
 
@@ -981,7 +1013,14 @@ fn season_pack_replaces_owned_episodes_only_by_revision() {
 #[test]
 fn franchise_prefixed_alias_is_one_title_for_decisions_and_rss() {
     use arr::rss::{Match, match_item};
-    let env = Env::with(&with_franchise_movie(snapshot()));
+    let mut franchise = catalog_movie(
+        990001,
+        "Nebula Arin: The Last Keeper",
+        2026,
+        &FRANCHISE_ALIASES,
+    );
+    franchise.runtime_minutes = Some(110);
+    let env = Env::with_catalog(catalog_of(vec![franchise], vec![]));
     let mut m = movie(
         "Nebula Arin: The Last Keeper",
         990001,

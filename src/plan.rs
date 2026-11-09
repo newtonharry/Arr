@@ -404,7 +404,7 @@ pub async fn build(
         return Ok(Built { plan, links });
     }
     if inputs.revisions {
-        plan.notes.push("revision search: owned units are searched for exact-quality higher revisions (native downloadPropersAndRepacks = preferAndUpgrade)".into());
+        plan.notes.push("revision search: owned units are searched for exact-quality higher revisions (PROPER/REPACK)".into());
     }
     match target {
         Target::Movie(m) => {

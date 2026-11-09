@@ -37,7 +37,7 @@ checks that every route is documented.
 | `catalog_not_imported` | 503 | no active settings (no managed setup and no import) |
 | `provider_not_configured` / `no_usable_indexers` | 503 | no search backend (native `[[indexer]]` or `[prowlarr]`) / no indexer in the settings can be searched (with native indexers the message lists why: not configured, or an imported policy the native provider does not implement) |
 | `invalid_setup` | 422 | a managed setup document failed validation; `details.errors` lists every problem |
-| `setup_conflict` | 409 | managed setup or the Plex bootstrap refused: a native snapshot import is active, or the replacement would drop a profile/root folder the catalog uses, or an indexer/download category active downloads use |
+| `setup_conflict` | 409 | managed setup or the Plex bootstrap refused: this state folder holds a Sonarr/Radarr snapshot import, or the replacement would drop a profile/root folder the catalog uses, or an indexer/download category active downloads use |
 | `indexer_limit_reached` | 409 | a native indexer's configured `grab_limit` is used up for its window |
 | `no_peer_discovery` | 409 | the embedded engine could find no peer for the payload (no tracker it may use, DHT off or a private torrent, no initial peers); nothing was queued |
 | `overloaded` / `request_timeout` | 503 | load shedding or server deadline |
@@ -71,65 +71,34 @@ response bodies or credentials.
 | method | path | notes |
 |---|---|---|
 | GET | `/api/v1/health` | Liveness, no auth: `{"status":"ok","mode":"shadow"|"execution",...}` |
-| GET | `/api/v1/readiness` | `200` when the state DB and an import are available, otherwise `503`. Includes the import's `observed_at` and catalog age, provider configuration (providers are not contacted), the execution gates per media kind, and `migration`: readiness per stage (`limited`, `coexistence`, `broad`). Each stage has a `status` (`blocked`, `pending_verification` or `prerequisites_met`), `ready`, `configuration_blockers`, `pending_verification` (production evidence for the capabilities in use, as the operator records it in `STATE/verification.toml` `[verified]`; `broad` also needs `[decisions] broad_migration = "approved"`) and `external_requirements` that this server cannot observe. The object also has `accepted_limitations`, the ownership counts and the evidence source. Service `ready` is not migration readiness |
-| GET | `/api/v1/capabilities` | The capability matrix. Each entry has `state` (`available`, `not_configured`, `disabled` or `not_implemented`), `implemented`, `configured` and `verified` (`none`, `unit_tests`, `loopback_mocks`, `loopback_peers`, `sandbox` or `production`). With the embedded engine the client-dependent capabilities are named `embedded_*` (plus `embedded_download_engine`), so evidence recorded for qBittorrent never counts for it. `sandbox`/`production` come only from an operator-written `STATE/verification.toml`. Also returns `execution_enabled` and `policy_blocking_issues` |
+| GET | `/api/v1/readiness` | `200` when the state DB and an import are available, otherwise `503`. Includes the import's `observed_at` and catalog age, provider configuration (providers are not contacted), the execution gates per media kind, and a `migration` object kept for older clients: `mode` (`coexistence`), the `ownership` counts, `accepted_limitations`, and an always-empty `stages` list (the staged Sonarr/Radarr migration readiness is gone). Service `ready` is the top-level field |
+| GET | `/api/v1/capabilities` | The capability matrix. Each entry has `state` (`available`, `not_configured`, `disabled` or `not_implemented`), `implemented`, `configured` and `verified` (`none`, `unit_tests`, `loopback_mocks`, `loopback_peers`, `sandbox` or `production`). With the embedded engine the client-dependent capabilities are named `embedded_*` (plus `embedded_download_engine`). `verified` is the level this build's tests reach (`STATE/verification.toml` is no longer read, so `sandbox` and `production` are no longer produced). Also returns `execution_enabled` and `policy_blocking_issues` |
 | GET | `/api/v1/diagnostics` | Read-only live checks: `download_client` (`backend`, `running`); qBittorrent (WebAPI version, 4.x/5.x naming, categories, global share limits, warnings) or `embedded` (engine, status, listen address, transport, DHT/LSD/UPnP/PEX/tracker settings, share limits used without an indexer goal, and read-only aggregates: torrent count, `engine_states`, `live_peers`, measured download/upload bytes per second; no hashes, paths or peer addresses), ffprobe, library roots (existence, free space, native root mapping), execution blockers, download counts by status, RSS state |
 | GET | `/api/v1/settings` | Normalised imported settings: profiles, tiers, size limits, indexer mapping, release policy, download-client descriptions. No secrets |
-| GET | `/api/v1/migration-report` | The active import's report: every relevant native setting with status and effect, credential field names, catalog conflicts and skips, cutover blockers |
+| GET | `/api/v1/migration-report` | The active import's report (for managed setup: each applied setting with status and effect, and catalog notes) |
 
 ### Managed catalog
 
 - **`POST /api/v1/library`** adds a movie, a series, or a single season or episode, in one call:
-  `{"media_id", "search"?: true, "monitored"?, "monitor"?: "all"|"future"|"none", "quality_profile"?, "root_folder"?, "metadata"?, "native_handoff_confirmed"?: false}`.
+  `{"media_id", "search"?: true, "monitored"?, "monitor"?: "all"|"future"|"none", "quality_profile"?, "root_folder"?, "metadata"?}`. Older clients may still send `native_handoff_confirmed` and
+  `preserve_monitoring`: both are accepted and ignored.
   - **Scope.** `movie:tmdb:N` and `series:…` add the whole item. `season:…:S` and
     `episode:…:S:E` add the series too when it is new, but then monitor **only that scope**:
     other seasons stay unmonitored, and seasons that appear later are not monitored.
   - **Active series.** For a series that is already *active* here (managed, monitored and,
-    in coexistence mode, adopted), only the requested scope is added and its other choices
+    adopted), only the requested scope is added and its other choices
     are untouched. A series that is not active is re-activated with exactly the requested
-    scope. That covers a new series, an observed or released one, or one that is
-    unmonitored. Any dormant flags it carried are cleared first, including native episode
-    flags kept while the series was unmonitored. `monitor` and `monitored: false` are
-    refused for scoped adds (use PATCH).
-  - **Coexistence mode** (`[migration] mode = "coexistence"`). Imported native titles are
-    *observed*: catalog and ownership evidence only, never acquired. Adopting one needs
-    `native_handoff_confirmed: true`: the caller confirms that native monitoring for exactly
-    this scope is suspended in Sonarr/Radarr and that no native download for it is active.
-    Without it the answer is `409 native_handoff_required` and nothing changes.
-    - **Durable confirmations.** A confirmation is recorded for its scope (the whole title, a
-      season or an episode) and lasts until the title is released with `DELETE /library`.
-      Current monitoring flags play no part.
-    - **Inside a confirmed scope.** A later add or `PATCH monitored: true` needs no new
-      confirmation, through either series id namespace.
-    - **Wider scopes.** A sibling episode, its season or the series still needs one. So does
-      a released title, and an unmonitored registration is not a confirmation.
-    - **Earlier adoptions.** Scopes adopted before this build have no record. Confirm them
-      once more (`search: false`), and the add changes nothing else.
-
-    Titles that are new to the native apps (TMDB or TVmaze adds) remain one-call adds. The response
-    includes `adoption`: the `mode`, the `acquisition` state, `native_app` and
-    `native_handoff_confirmed`.
-  - **Unsupported titles** (anime/daily or scene-numbered series, identity conflicts, movies
-    with an unsupported availability mode) cannot be acquired here. Adopting one is refused
-    with `409 unsupported_scope`, so it stays native.
-  - **Specials** (season 0) are never acquired here. Series responses list them in
-    `native_retained` when the native app monitors them: keep them monitored natively and
-    suspend only the regular seasons there.
-  - **Whole-title transfer with its current monitoring:**
-    `{"media_id": "movie:…" or "series:…", "preserve_monitoring": true, "search": false, "native_handoff_confirmed": true}`.
-    - **What it does.** The imported title becomes managed and adopted in one step, and no
-      flag changes: series, season and episode monitoring and "monitor new seasons" stay as
-      imported. These are the native intent of the latest import, not a fresh native query,
-      so the external before/after ledger is still needed.
-    - **Nothing is searched.** `result` is `adopted` or `already_adopted`; a replay changes
-      nothing, so later choices made here are kept.
-    - **Refused before any change:** `monitor`, `monitored`, `metadata`, `quality_profile`,
-      `root_folder`, season or episode ids, `search: true`, a missing confirmation, legacy
-      mode, titles added here, and released titles (adopt those with a normal add). The
-      response gives the resulting `ownership` row, `native_retained` and `whole_title`
-      (false when specials stay native).
-    - **Normal adds are unchanged.** They still monitor everything (series) or exactly the
-      requested scope.
+    scope. That covers a new series, a released one, or one that is unmonitored. Any dormant
+    flags it carried are cleared first. `monitor` and `monitored: false` are refused for
+    scoped adds (use PATCH).
+  - **Adoption.** Adding is adopting: only titles added here (or read from Plex and then
+    added or followed) are acquired. The response includes `adoption`: the `mode`
+    (`coexistence`, the only mode), the `acquisition` state, and the constant `native_app`
+    (`null`) and `native_handoff_confirmed` (`false`) that older clients read. There is no
+    hand-over step any more, and `409 native_handoff_required` / `409 unsupported_scope` are
+    no longer returned.
+  - **Specials** (season 0) are never acquired here. Series responses keep a
+    `native_retained` list, now always empty.
   - **Movie acquisition blockers.** Movie adds return `acquisition_blockers`: metadata that
     would stop every release from being grabbed. `runtime_unknown` (size limits apply),
     `original_language_unknown` (the profile needs the original language) and
@@ -177,22 +146,15 @@ response bodies or credentials.
 - **`GET /api/v1/ownership?state=&limit=&offset=`** lists acquisition ownership. Each row has
   one state:
   - `adopted`: acquired here;
-  - `legacy_managed`: seeded as managed by a legacy import and never adopted; it acquires in
-    legacy mode only;
-  - `observed`: imported in coexistence mode; the native app keeps it;
+  - `legacy_managed` and `observed`: only in state written by an older release (never
+    acquired);
   - `released`: removed after an adoption.
 
   Series rows carry their effective `scope` per season (`season_monitored`,
-  `monitored_episodes`, `episodes_known`, `native_monitored_episodes` from the latest
-  import), plus `monitor_new_seasons` and `native_specials_monitored`. Every row lists its
-  confirmed native `handoffs` (`scope` as a canonical id, `confirmed_at`): compare them
-  with the native ledger. `native` gives the native app, its monitored flag and the
-  observation time. `handoff` lists the steps the
-  operator or bridge performs outside this server, which never contacts Sonarr/Radarr. The
-  native app's acquisition stays suspended for an adopted scope, movies included, while this
-  server owns it: the copied `preferAndUpgrade` lets the native app still grab PROPER/REPACK
-  revisions even with quality upgrades off. Restore it only after release
-  (`DELETE /library`), drain or rollback.
+  `monitored_episodes`, `episodes_known`, `native_monitored_episodes` as stored), plus
+  `monitor_new_seasons` and `native_specials_monitored`. Rows keep `handoffs` and `native`
+  as stored by older releases (nothing writes them now); `handoff` is a constant note that
+  this server does not contact or depend on Sonarr/Radarr.
 - **`GET /api/v1/status/{media_id}`** gives the live status of a movie, series, season or
   episode (TVDB- or TVmaze-keyed scopes resolve to the same series):
   - `acquisition` and `monitored`;
@@ -211,9 +173,7 @@ response bodies or credentials.
     an episode the request of its season);
   - `attention`.
 - **`GET /api/v1/attention`** lists, bounded:
-  - metadata numbering holds (`metadata_hold`: a refresh found episodes that contradict the
-    imported numbering, so those and any new seasons are not appended; it clears only with a
-    refresh that finds no conflict and lists every imported episode);
+  - metadata numbering holds (`metadata_hold`, only on series an older release imported);
   - imports that cannot proceed (`import_blocked`, with the reason and the retry action);
   - failed downloads of the last 7 days;
   - requests retrying 3 or more times;
@@ -405,8 +365,7 @@ Plan shape (abridged, from the synthetic Slow Horses test scenario: E01 and E03 
   - `POST /api/v1/plans/{plan_id}/cancel` changes local state only, and returns `409
     plan_not_active` if the plan is already inactive.
 
-Release decisions use the codes in the `RejectionCode` schema. `docs/MIGRATION.md` explains
-the rule behind each code.
+Release decisions use the codes in the `RejectionCode` schema.
 
 
 ### Grabs and the download queue
@@ -505,7 +464,7 @@ Queue actions:
 ### Standalone setup, Plex discovery and the library bootstrap
 
 - `GET /api/v1/setup` — what the deployment has (active settings and their `origin`:
-  `managed_setup` or `native_snapshot`; search and download backends; library; Plex mapping;
+  `managed_setup`; search and download backends; library; Plex mapping;
   metadata; MCP) and `next_steps`. Nothing is contacted.
 - `POST /api/v1/setup` `{"document": {...}, "dry_run": false}` — creates or replaces managed
   settings from a setup document (the TOML of `config/setup.example.toml` as JSON; every key
@@ -513,7 +472,7 @@ Queue actions:
   with `import_id`, `replaced`, profiles, roots, indexer policy with seed goals, download
   policy, `warnings`) or `200` (`unchanged`, `dry_run`). Policy only: URLs and credentials
   stay in `config.toml`. Never enables execution or queues searches. Refused (`409
-  setup_conflict`) over a native snapshot import, or when the catalog or active downloads use
+  setup_conflict`) over a state folder that holds a Sonarr/Radarr snapshot import, or when the catalog or active downloads use
   what the replacement drops; invalid documents give `422 invalid_setup` with every error.
 - `GET /api/v1/setup/plex` — read-only Plex discovery: `sections` (key, title, type,
   locations) and `mapping` per media kind (`ok`, `not_configured`, `section_not_found`,
@@ -530,7 +489,7 @@ Queue actions:
   (`GET /shows/{id}/akas`, read only when such files exist) are kept as alternate titles, each
   reported as a `note`. A metadata outage
   stops the batch at that item (`last_error`) and the next call resumes there. Needs managed
-  settings (`409` over a native snapshot import). `GET` lists the stored runs.
+  settings (`409` over a Sonarr/Radarr snapshot import). `GET` lists the stored runs.
 
 `GET /api/v1/readiness` adds `search_backend` (native: per-indexer health and the
 `settings_mapping` of every indexer id, `ok`/`degraded`/`blocked`) and `peer_discovery`

@@ -70,24 +70,9 @@ async fn auth_routing_and_schema() {
     assert_eq!(s, 200);
     assert_eq!(v["ready"], true);
     assert_eq!(v["mode"], "shadow");
-    // Service readiness is not migration readiness: with execution off every stage is
-    // blocked, each for stated configuration reasons.
-    let stages = v["migration"]["stages"].as_array().unwrap();
-    assert_eq!(stages.len(), 3);
-    for st in stages {
-        assert_eq!(
-            (st["status"].as_str(), st["ready"].as_bool()),
-            (Some("blocked"), Some(false)),
-            "{st}"
-        );
-        assert!(
-            st["configuration_blockers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|b| b.as_str().unwrap().contains("execution is disabled"))
-        );
-    }
+    // The old per-stage migration readiness is gone; its keys stay, with constant values.
+    assert_eq!(v["migration"]["stages"], json!([]));
+    assert_eq!(v["migration"]["mode"], "coexistence");
     assert!(v.get("replacement").is_none());
 
     let (s, v, _) = body(app.get("/api/v1/nope").send().await.unwrap()).await;

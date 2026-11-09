@@ -20,13 +20,12 @@ the end of this guide.
 | library roots | One movie root and one TV root, used only by the sandbox. Put them on the **same filesystem** as the download directory if hardlinks should be used (native `copyUsingHardlinks`); otherwise files are copied. Roots and the download directory must not contain each other. |
 | ffprobe | `/usr/bin/ffprobe` (Debian package `ffmpeg`; the Docker runtime image installs it). Override with `[library] ffprobe`. |
 | Prowlarr | The configured `[prowlarr] base_url`, either a sandbox Prowlarr or a mock implementing the contract in section 6. |
-| metadata | `[tvmaze]` for series outside the snapshot (a mock is fine). `[tmdb]` is optional; without it, movies outside the snapshot need explicit metadata. |
+| metadata | `[tvmaze]` for series (a mock is fine). `[tmdb]` is optional; without it, movies need explicit metadata. |
 | Plex | Optional `[plex]` (a mock is fine). |
 
 ## 2. Configuration
 
-Use a fresh state directory (`arr init`), then import a snapshot (sanitized or
-sandbox). Each secret goes in its own owner-only file (mode 0600, no other content).
+Use a fresh state directory (`arr init`), then run `arr setup`. Each secret goes in its own owner-only file (mode 0600, no other content).
 
 ```toml
 [server]
@@ -43,7 +42,7 @@ base_url = "http://127.0.0.1:19001"       # mock or the public API
 
 [execution]
 enabled = true                            # sandbox only
-download_cleanup = true                   # follow imported removeCompleted/FailedDownloads
+download_cleanup = true                   # follow the setup's remove_completed / remove_failed
 
 [qbittorrent]
 base_url = "http://127.0.0.1:18080"
@@ -51,22 +50,20 @@ username_file = "secrets/qbittorrent_username"
 password_file = "secrets/qbittorrent_password"
 save_path = "/downloads"                  # as qBittorrent sees it
 local_path = "/srv/sandbox/downloads"     # the same directory as arr sees it
-movie_category = "um-sandbox-movies"      # required in coexistence: no native app uses it
+movie_category = "um-sandbox-movies"
 tv_category = "um-sandbox-tv"
 
 [migration]
-mode = "coexistence"                      # required with execution: coexistence or legacy
+mode = "coexistence"                      # required with execution (the only mode)
 
 [library]
-movies = "/srv/sandbox/library/movies"    # stands for the imported Radarr root
-tv = "/srv/sandbox/library/tv"            # stands for the imported Sonarr root
-# movies_native_root = "/movies"          # needed only if the import has several roots
-# tv_native_root = "/tvshows"
+movies = "/srv/sandbox/library/movies"
+tv = "/srv/sandbox/library/tv"
 # sample_detection = true                 # see section 5
 # probe_timeout_secs = 600
 
 [automation]
-# rss_interval_minutes = 15               # default: the imported rssSyncInterval
+# rss_interval_minutes = 15               # default: the setup's rss_sync_interval_minutes
 poll_seconds = 15
 
 [plex]                                    # optional
@@ -79,16 +76,8 @@ tv_section = 2
 `arr check --config STATE/config.toml` validates the file modes and paths without
 touching the network. With `[execution] enabled = true` the server also needs
 `[qbittorrent]`, `[library]`, `[prowlarr]` and an explicit `[migration] mode`, or startup
-fails. In coexistence mode a native title is acquired only after `POST /api/v1/library`
-with `native_handoff_confirmed: true` (see [MIGRATION.md](MIGRATION.md#coexistence-with-the-running-native-apps)). `serve` then starts the
-background worker. You can record verification evidence for the capability matrix in
-`STATE/verification.toml`:
-
-```toml
-[verified]
-download_submission = "sandbox"     # levels: sandbox | production (operator-written only)
-completed_download_import = "sandbox"
-```
+fails. Only titles added with `POST /api/v1/library` are acquired. `serve` then starts the
+background worker. (`STATE/verification.toml` is no longer read.)
 
 ## 3. Ownership, paths and what is never touched
 
@@ -183,7 +172,7 @@ Use `Authorization: Bearer $(cat STATE/secrets/api_token)` on every request. Bod
 
    Follow progress with `GET /api/v1/commands/{id}`. `GET /api/v1/system/tasks` shows the
    scheduled tasks; `GET /api/v1/requests` shows explicit requests being retried.
-9. **RSS:** `GET /api/v1/rss` shows the feeds (RSS-enabled imported indexers), the
+9. **RSS:** `GET /api/v1/rss` shows the feeds (RSS-enabled indexers), the
    per-indexer state (last success, newest publish date, failures, backoff, `gap_possible`)
    and the last 200 items seen, with their status (`grabbed`, `rejected`, `deferred` or
    `ignored`) and the reason. It never shows links.
@@ -337,7 +326,7 @@ UM_SANDBOX_LIBRARY=/srv/sandbox/library \
 cargo test --locked --test sandbox -- --ignored --nocapture
 ```
 
-The harness starts an in-process mock Prowlarr and imports the synthetic snapshot. It
+The harness starts an in-process mock Prowlarr, writes a managed setup and adds the movie. It
 generates a movie fixture, places its data in the sandbox download directory, and then:
 
 1. grabs the movie through the API (category `um-sandbox-movies`, tag `unified-media`);

@@ -1,10 +1,9 @@
 //! Managed catalog: the durable, mutable library state in `state.sqlite`.
 //!
-//! Imports stay immutable. Each newly activated import seeds the managed catalog insert-only:
-//! user choices (monitoring, removal, added items) are never overwritten, and snapshot
-//! ownership evidence is refreshed only for items without live scan/import evidence. Every
-//! route resolves media through a `CatalogIndex` rebuilt from these tables, so ownership,
-//! monitoring and pending downloads are always current.
+//! The settings import (see `import.rs`) stays immutable; the catalog lives here. Titles are
+//! added with `POST /library` or by the Plex bootstrap, and user choices (monitoring, removal)
+//! are kept. Every route resolves media through a `CatalogIndex` rebuilt from these tables, so
+//! ownership, monitoring and pending downloads are always current.
 //!
 //! Ownership is tri-state per movie/episode: a present file => owned; else a completed scan of
 //! the item => missing; else the snapshot's own flag; else unknown (snapshot series without
@@ -77,256 +76,6 @@ pub fn insert_file(
     Ok(id)
 }
 
-fn has_live_evidence(c: &Connection, media_id: &str) -> Result<bool> {
-    let scanned: Option<String> = c
-        .query_row(
-            "SELECT scanned_at FROM media WHERE id = ?1",
-            [media_id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    let live: i64 = c.query_row(
-        "SELECT COUNT(*) FROM files WHERE media_id = ?1 AND source != 'snapshot'",
-        [media_id],
-        |r| r.get(0),
-    )?;
-    Ok(scanned.is_some() || live > 0)
-}
-
-fn replace_snapshot_files(
-    c: &Connection,
-    media_id: &str,
-    files: &[(FileEvidence, Vec<MediaId>)],
-) -> Result<()> {
-    c.execute(
-        "UPDATE files SET present = 0 WHERE media_id = ?1 AND source = 'snapshot' AND present = 1",
-        [media_id],
-    )?;
-    for (ev, targets) in files {
-        insert_file(c, media_id, ev, targets, None, None)?;
-    }
-    Ok(())
-}
-
-fn snapshot_evidence(file: Option<&FileEvidence>, observed_at: &str) -> FileEvidence {
-    file.cloned().unwrap_or(FileEvidence {
-        path: None,
-        size: None,
-        quality: None,
-        revision: None,
-        source: "snapshot".into(),
-        observed_at: observed_at.into(),
-        probe: None,
-    })
-}
-
-/// Seeds the managed catalog from an import (insert-only for user state). Idempotent per
-/// import id. Returns `(new_items, refreshed_items)`.
-///
-/// In coexistence mode new items are seeded *observed* (`managed = 0`): their catalog data,
-/// ownership evidence and native monitoring are kept, but nothing about them is acquired
-/// until they are adopted. In legacy mode they are managed with their native monitoring.
-/// Existing rows keep their managed state and user choices. Episodes and seasons that a later
-/// import adds to a managed series follow that series' own rules (series flag, season flag,
-/// "monitor new seasons"), never the native flags, so a re-import cannot widen an adopted
-/// scope. Native episode flags are always recorded in `native_monitored`.
-pub fn seed(
-    c: &mut Connection,
-    catalog: &Catalog,
-    now: OffsetDateTime,
-    mode: crate::config::MigrationMode,
-) -> Result<(usize, usize)> {
-    let seed_managed = mode == crate::config::MigrationMode::Legacy;
-    let tx = c.transaction()?;
-    let done: Option<String> = tx
-        .query_row(
-            "SELECT import_id FROM seeded_imports WHERE import_id = ?1",
-            [&catalog.import_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if done.is_some() {
-        return Ok((0, 0));
-    }
-    let now = now_s(now);
-    let (mut added, mut refreshed) = (0, 0);
-    for m in &catalog.movies {
-        let id = m.id.to_string();
-        // (managed, adopted): an observed row (neither) still carries the native intent.
-        let exists: Option<(bool, bool)> = tx
-            .query_row(
-                "SELECT managed, adopted_at IS NOT NULL FROM media WHERE id = ?1",
-                [&id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let files: Vec<(FileEvidence, Vec<MediaId>)> = if m.has_file {
-            vec![(
-                snapshot_evidence(m.file.as_ref(), &catalog.observed_at),
-                vec![m.id],
-            )]
-        } else {
-            vec![]
-        };
-        match exists {
-            None => {
-                tx.execute(
-                    "INSERT INTO media (id, kind, data, monitored, managed, origin, added_at, updated_at) VALUES (?1, 'movie', ?2, ?3, ?5, 'snapshot', ?4, ?4)",
-                    params![id, serde_json::to_string(m)?, m.monitored, now, seed_managed],
-                )?;
-                replace_snapshot_files(&tx, &id, &files)?;
-                added += 1;
-            }
-            Some((managed, adopted)) => {
-                // Newer native metadata for snapshot items; never the user's monitoring choice.
-                tx.execute(
-                    "UPDATE media SET data = ?2, updated_at = ?3 WHERE id = ?1 AND origin = 'snapshot'",
-                    params![id, serde_json::to_string(m)?, now],
-                )?;
-                if !managed && !adopted {
-                    // Observed: nobody chose anything here yet, so it follows the native intent.
-                    tx.execute(
-                        "UPDATE media SET monitored = ?2 WHERE id = ?1 AND origin = 'snapshot'",
-                        params![id, m.monitored],
-                    )?;
-                }
-                if !has_live_evidence(&tx, &id)? {
-                    replace_snapshot_files(&tx, &id, &files)?;
-                }
-                refreshed += 1;
-            }
-        }
-    }
-    for s in &catalog.series {
-        let id = s.id.to_string();
-        let existing: Option<(bool, bool, bool)> = tx
-            .query_row(
-                "SELECT managed, monitored, monitor_new FROM media WHERE id = ?1",
-                [&id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        // Observed (imported in coexistence mode, never adopted): it follows the latest native
-        // intent, flags included, until it is adopted.
-        let observed: bool = existing.is_some_and(|(managed, _, _)| !managed)
-            && tx.query_row(
-                "SELECT adopted_at IS NULL AND origin = 'snapshot' FROM media WHERE id = ?1",
-                [&id],
-                |r| r.get(0),
-            )?;
-        // Specials the native app effectively monitors: they stay native (season 0 is never
-        // acquired here).
-        let native_specials = if s.monitored {
-            s.episodes
-                .iter()
-                .flatten()
-                .filter(|e| e.season == 0 && e.monitored)
-                .count()
-        } else {
-            0
-        };
-        let mut data = s.clone();
-        data.episodes = None;
-        // Native "monitor new seasons" (Sonarr monitorNewItems; absent = all).
-        let native_new = s.monitor_new_items.as_deref() != Some("none");
-        // A series this server already manages keeps its own rules for anything new.
-        let own_rules = existing.filter(|(managed, _, _)| *managed);
-        match existing {
-            None => {
-                tx.execute(
-                    "INSERT INTO media (id, kind, data, monitored, managed, origin, added_at, updated_at, monitor_new) VALUES (?1, 'series', ?2, ?3, ?5, 'snapshot', ?4, ?4, ?6)",
-                    params![id, serde_json::to_string(&data)?, s.monitored, now, seed_managed, native_new],
-                )?;
-                added += 1;
-            }
-            Some(_) => {
-                tx.execute(
-                    "UPDATE media SET data = ?2, updated_at = ?3 WHERE id = ?1 AND origin = 'snapshot'",
-                    params![id, serde_json::to_string(&data)?, now],
-                )?;
-                if observed {
-                    tx.execute(
-                        "UPDATE media SET monitored = ?2, monitor_new = ?3 WHERE id = ?1",
-                        params![id, s.monitored, native_new],
-                    )?;
-                }
-                refreshed += 1;
-            }
-        }
-        tx.execute(
-            "UPDATE media SET native_specials = ?2 WHERE id = ?1",
-            params![id, native_specials as i64],
-        )?;
-        for season in &s.seasons {
-            let flag = match own_rules {
-                Some((_, monitored, monitor_new)) => monitored && monitor_new,
-                None => season.monitored,
-            };
-            tx.execute(
-                "INSERT INTO seasons (series_id, season, monitored) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (series_id, season) DO UPDATE SET monitored = CASE WHEN ?4 THEN excluded.monitored ELSE seasons.monitored END",
-                params![id, season.number, flag, observed],
-            )?;
-        }
-        let live = has_live_evidence(&tx, &id)?;
-        let mut files = vec![];
-        for e in s.episodes.iter().flatten() {
-            if e.season == 0 {
-                continue;
-            }
-            let eid = episode_id(s.id, e.season, e.number);
-            let flag = match own_rules {
-                Some((_, monitored, monitor_new)) => {
-                    let season: Option<bool> = tx
-                        .query_row(
-                            "SELECT monitored FROM seasons WHERE series_id = ?1 AND season = ?2",
-                            params![id, e.season],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    monitored && season.unwrap_or(monitor_new)
-                }
-                None => e.monitored,
-            };
-            let inserted = tx.execute(
-                "INSERT OR IGNORE INTO episodes (series_id, season, number, title, air_date_utc, runtime, monitored, snapshot_owned, origin, native_monitored)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'snapshot', ?9)",
-                params![id, e.season, e.number, e.title, e.air_date_utc, e.runtime_minutes, flag, e.has_file, e.monitored],
-            )?;
-            if inserted == 0 {
-                tx.execute(
-                    "UPDATE episodes SET title = ?4, air_date_utc = ?5, runtime = ?6, native_monitored = ?7,
-                       monitored = CASE WHEN ?8 THEN ?7 ELSE monitored END
-                     WHERE series_id = ?1 AND season = ?2 AND number = ?3",
-                    params![id, e.season, e.number, e.title, e.air_date_utc, e.runtime_minutes, e.monitored, observed],
-                )?;
-                if !live {
-                    tx.execute(
-                        "UPDATE episodes SET snapshot_owned = ?4 WHERE series_id = ?1 AND season = ?2 AND number = ?3",
-                        params![id, e.season, e.number, e.has_file],
-                    )?;
-                }
-            }
-            if e.has_file {
-                files.push((
-                    snapshot_evidence(e.file.as_ref(), &catalog.observed_at),
-                    vec![eid],
-                ));
-            }
-        }
-        if !live {
-            replace_snapshot_files(&tx, &id, &files)?;
-        }
-    }
-    tx.execute(
-        "INSERT INTO seeded_imports (import_id, seeded_at) VALUES (?1, ?2)",
-        params![catalog.import_id, now],
-    )?;
-    tx.commit()?;
-    Ok((added, refreshed))
-}
-
 /// Present file evidence per target (best = newest live evidence, else snapshot).
 fn file_evidence_by_target(c: &Connection) -> Result<HashMap<String, FileEvidence>> {
     let mut stmt = c.prepare(
@@ -366,7 +115,7 @@ fn queued_targets(c: &Connection) -> Result<HashSet<String>> {
 }
 
 /// Rebuilds the in-memory index used by every route.
-pub fn load_index(c: &Connection, mode: crate::config::MigrationMode) -> Result<CatalogIndex> {
+pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
     let files = file_evidence_by_target(c)?;
     let queued = queued_targets(c)?;
     let (import_id, observed_at): (String, String) = c
@@ -410,7 +159,6 @@ pub fn load_index(c: &Connection, mode: crate::config::MigrationMode) -> Result<
             ))
         })?
         .collect::<std::result::Result<_, _>>()?;
-    let coexistence = mode == crate::config::MigrationMode::Coexistence;
     let mut episodes: HashMap<String, Vec<(Episode, Option<bool>)>> = HashMap::new();
     let mut ep_stmt = c.prepare(
         "SELECT series_id, season, number, title, air_date_utc, runtime, monitored, snapshot_owned FROM episodes ORDER BY series_id, season, number",
@@ -451,9 +199,8 @@ pub fn load_index(c: &Connection, mode: crate::config::MigrationMode) -> Result<
     }
     for (id, kind, data, monitored, managed, origin, scanned, adopted, specials, hold) in rows {
         let acquisition = crate::catalog::acquisition_state(managed, &origin, adopted);
-        // Effective monitoring: only what this server acquires. In coexistence mode an item
-        // must also have been adopted; imported items stay with the native app until then.
-        let acquiring = managed && (!coexistence || acquisition == "adopted");
+        // Effective monitoring: only what this server acquires, i.e. adopted items.
+        let acquiring = managed && acquisition == "adopted";
         if kind == "movie" {
             let mut m: Movie =
                 serde_json::from_str(&data).with_context(|| format!("media {id}"))?;
@@ -971,48 +718,7 @@ pub fn set_following(
     Ok(changed > 0)
 }
 
-fn handoff_scope(scope: MediaId) -> String {
-    match scope {
-        MediaId::Movie { .. } | MediaId::Series(_) => String::new(),
-        MediaId::Season(_, s) => s.to_string(),
-        MediaId::Episode(_, s, e) => format!("{s}:{e}"),
-    }
-}
-
-/// Records that the operator confirmed the native handoff of `scope` of the catalog title
-/// `title` (coexistence mode). It lasts until the title is released.
-pub fn record_handoff(
-    c: &Connection,
-    title: MediaId,
-    scope: MediaId,
-    now: OffsetDateTime,
-) -> Result<()> {
-    c.execute(
-        "INSERT OR IGNORE INTO handoffs (media_id, scope, confirmed_at) VALUES (?1, ?2, ?3)",
-        params![title.to_string(), handoff_scope(scope), now_s(now)],
-    )?;
-    Ok(())
-}
-
-/// Whether a confirmed handoff covers `scope`: one for the whole title, its season or the
-/// episode itself. Current monitoring flags play no part.
-pub fn handoff_covers(c: &Connection, title: MediaId, scope: MediaId) -> Result<bool> {
-    let mut keys = vec![String::new()];
-    match scope {
-        MediaId::Season(_, s) => keys.push(s.to_string()),
-        MediaId::Episode(_, s, e) => keys.extend([s.to_string(), format!("{s}:{e}")]),
-        _ => {}
-    }
-    let mut stmt = c.prepare("SELECT 1 FROM handoffs WHERE media_id = ?1 AND scope = ?2")?;
-    for k in keys {
-        if stmt.exists(params![title.to_string(), k])? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Coexistence mode, from the stored rows: why a grab of `covers` (the movie `title`, or
+/// From the stored rows: why a grab of `covers` (the movie `title`, or
 /// episodes of the series `title`) would not be adopted and monitored here now, or `None`.
 /// Read in the transaction that records the grab, so a release, or a monitoring change
 /// committed while the torrent was being fetched, is seen.
@@ -1057,61 +763,6 @@ pub fn not_adopted_now(
         }
     }
     Ok(None)
-}
-
-/// Outcome of `adopt_preserving`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Preserved {
-    /// Observed (or legacy-seeded) until now: adopted with its current flags untouched.
-    Adopted,
-    /// Already adopted: nothing changed (later choices are kept).
-    AlreadyAdopted,
-    /// Released by an earlier `DELETE /library`: its flags are no longer the native intent.
-    Released,
-    NotFound,
-}
-
-/// Adopts a whole imported movie or series *as it is*: the row becomes managed and adopted
-/// in one transaction, and no monitoring flag (series, season, episode, "monitor new
-/// seasons") is changed. The flags are those of the latest import (the native intent at that
-/// snapshot), not a fresh native query. A replay changes nothing.
-pub fn adopt_preserving(c: &mut Connection, id: MediaId, now: OffsetDateTime) -> Result<Preserved> {
-    let tx = c.transaction()?;
-    let key = id.to_string();
-    let row: Option<(bool, String, bool)> = tx
-        .query_row(
-            "SELECT managed, origin, adopted_at IS NOT NULL FROM media WHERE id = ?1",
-            [&key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let Some((managed, origin, adopted)) = row else {
-        return Ok(Preserved::NotFound);
-    };
-    let outcome = match crate::catalog::acquisition_state(managed, &origin, adopted) {
-        "adopted" => Preserved::AlreadyAdopted,
-        "released" => Preserved::Released,
-        _ => {
-            let now_s = now_s(now);
-            tx.execute(
-                "UPDATE media SET managed = 1, adopted_at = ?2, updated_at = ?2 WHERE id = ?1",
-                params![key, now_s],
-            )?;
-            event(
-                &tx,
-                &now_s,
-                "adopted",
-                Some(&key),
-                None,
-                None,
-                &format!("{key} adopted with its imported monitoring preserved"),
-                Some(&serde_json::json!({ "preserve_monitoring": true })),
-            )?;
-            Preserved::Adopted
-        }
-    };
-    tx.commit()?;
-    Ok(outcome)
 }
 
 /// Stops managing an item (unmonitored, hidden from library views). Files, history and

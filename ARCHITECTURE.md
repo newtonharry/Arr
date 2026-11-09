@@ -2,32 +2,34 @@
 
 This document is the contract for operators and API clients. The machine-readable
 API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
-[`docs/API.md`](docs/API.md), import semantics in [`docs/MIGRATION.md`](docs/MIGRATION.md),
-and the sandbox procedure in [`docs/EXECUTION-SANDBOX.md`](docs/EXECUTION-SANDBOX.md).
+[`docs/API.md`](docs/API.md) and the sandbox procedure in [`docs/EXECUTION-SANDBOX.md`](docs/EXECUTION-SANDBOX.md).
 
 ## Boundaries
 
-- The project is one Rust binary, `arr`. It has no frontend.
-- **Modes.** With `[execution] enabled = false` (the default) it runs in **shadow mode**: the
+- The project is one Rust binary, `arr`. It serves the JSON API, a small web app for Plex
+  users (sign in with Plex; `webapp.rs`) and remote MCP; it needs no other application but Plex.
+- **Modes.** With `[execution] enabled = false` (the config default; the installers and the
+  wizard turn it on) it runs in **shadow mode**: the
   outbound calls are read-only searches and metadata lookups. Plans are shadow plans, and no
   background worker runs. With `enabled = true` the server also:
   - submits torrents to the configured download client: qBittorrent, or the embedded engine
     (`[embedded]`, librqbit inside this process; [`docs/EMBEDDED-DOWNLOADER.md`](docs/EMBEDDED-DOWNLOADER.md)).
     Exactly one is configured; a state directory is bound to the first one it runs with;
   - imports completed downloads into the configured `[library]` roots;
-  - follows the imported download-client cleanup policy;
+  - follows the download cleanup policy of the managed settings;
   - reads Torznab RSS feeds and refreshes metadata;
   - scans the library roots and refreshes Plex.
 
   Enabling execution requires a download client (`[qbittorrent]` or `[embedded]`),
   `[library]` and a search backend (native `[[indexer]]` entries or `[prowlarr]`), or the
   configuration is rejected. Keep it in an isolated sandbox until you have verified it.
-- **Settings come from one of two sources**, both written as immutable, digest-verified
-  imports under `imports/` and activated by `active-import.json`: an offline snapshot import
-  (`arr import`, `source-native.json`) or managed setup (`arr setup` /
-  `POST /api/v1/setup`, `source-setup.json`, an empty catalog). Managed setup is activated in
-  the running process (an `Arc` swap under a setup lock; every operation uses one snapshot);
-  it never replaces a native snapshot import or anything the catalog or active downloads use.
+- **Settings come from managed setup** (`arr setup` / `POST /api/v1/setup`): written as an
+  immutable, digest-verified import under `imports/` (`source-setup.json`, an empty catalog)
+  and activated by `active-import.json`. Managed setup is activated in the running process
+  (an `Arc` swap under a setup lock; every operation uses one snapshot); it never replaces
+  anything the catalog or active downloads use. A state folder whose active import came from
+  the removed Sonarr/Radarr snapshot importer (`source-native.json`) is refused at startup and
+  left untouched; its stored fields stay readable so a rolled-back older release still works.
 - **Search backend: exactly one.** Native indexers (`[[indexer]]`: The Pirate Bay's JSON API,
   generic Torznab) or Prowlarr; configuring both is refused and nothing falls back.
 - Outbound requests go only to base URLs from `config.toml`. API callers cannot supply a URL
@@ -38,15 +40,15 @@ and the sandbox procedure in [`docs/EXECUTION-SANDBOX.md`](docs/EXECUTION-SANDBO
     configured `download_origins` (no key there). Per-indexer gate: provider backoff, durable
     query limit, concurrency, spacing; redirects handled manually (one hop).
   - **Prowlarr:** `GET /api/v1/search`; `GET {id}/download` for a result's own link; and
-    `GET {id}/api?t=search` (Torznab RSS) for indexers imported with `enableRss`. The key
+    `GET {id}/api?t=search` (Torznab RSS) for RSS-enabled indexers. The key
     goes in `X-Api-Key`, and also in the Torznab query of a URL that is never logged.
   - **qBittorrent WebUI API v2:** WebAPI 2.8.2 (4.3.9) to 2.11+ (5.x).
   - **TVmaze/TMDB:** when enabled.
   - **Plex:** a section or folder refresh (`?path=` from `movies_path`/`tv_path`); read-only
     `GET /library/sections`, paginated `/library/sections/{id}/all?includeGuids=1` and
     `/library/metadata/{key}/allLeaves` for discovery and the library bootstrap.
-- **The runtime never contacts Sonarr or Radarr.** Their exported JSON is an offline import
-  source for configuration and catalog data only.
+- **The runtime never contacts Sonarr or Radarr** and imports nothing from them. Titles they
+  manage are unknown to Arr until added or read from Plex.
 - The server listens on loopback by default. A non-loopback bind requires
   `server.allow_non_loopback = true`.
 - `arr mcp` is a separate stdio process: an MCP server (rmcp, the official Rust
@@ -60,7 +62,7 @@ and the sandbox procedure in [`docs/EXECUTION-SANDBOX.md`](docs/EXECUTION-SANDBO
 | module | role |
 |---|---|
 | `ids`, `title`, `quality`, `release` | typed media IDs; title folding/keys; qualities; the release parser (numbering, quality, native revision `version`/`real`, languages, flags) |
-| `import`, `settings`, `catalog` | offline snapshot import (normalised settings, catalog with native file evidence, migration report); lookup index |
+| `import`, `settings`, `catalog` | the versioned import store (immutable settings/catalog/report directories and the active pointer; the name is historical), normalised settings, catalog lookup index |
 | `config`, `fsutil`, `paths` | runtime config validation; owner-only files; client-to-local path mapping, safe relative names, symlink-free checks, free space |
 | `client`, `embedded` | the download client: qBittorrent or the embedded librqbit engine (own records, persisted lifetime counters, share limits, piece verification, confinement checks) behind one normalised view |
 | `upstream`, `prowlarr`, `metadata`, `qbit`, `plex` | bounded HTTP with classified errors (`Retry-After`); Prowlarr search, download fetch and Torznab feed; TVmaze/TMDB (incl. TMDB find by IMDB id); qBittorrent client (cookie session, 4.x/5.x naming); Plex refresh, sections and paginated library enumeration |
@@ -104,52 +106,43 @@ schema or fixtures. Private link material (download URLs, magnets, payloads) is 
 ## CLI
 
 ```
-arr init      --state-dir STATE [--listen 127.0.0.1:8787] [--prowlarr-url URL]
+arr init      --state-dir STATE [--listen 127.0.0.1:8787]
 arr setup     --config STATE/config.toml [--settings setup.toml] [--dry-run]
 arr bootstrap --config STATE/config.toml [--media movies|tv|all] [--restart] [--dry-run] [--batch N]
-arr import    --state-dir STATE --snapshot /private/native.json [--observed-at RFC3339] [--dry-run]
 arr check   --config STATE/config.toml
 arr serve   --config STATE/config.toml
 arr fixture --out DIR --name NAME [--file REL]... [--seconds N] [--ffmpeg PATH]
 arr mcp     --api-url URL --token-file FILE [--timeout-secs N]
 ```
 
-`init` writes the standalone template (native indexers, embedded engine, execution off)
-unless `--prowlarr-url` asks for the legacy layout. `setup` validates the config without its
+`init` writes the standalone template (native indexers, embedded engine, execution off).
+`setup` validates the config without its
 secret files (listing the missing ones), writes and activates managed settings, and reports
 the ffprobe preflight; it never enables execution. `bootstrap` runs the Plex library bootstrap
 to completion in bounded batches. `check` fails when execution is enabled and ffprobe cannot
 run; `serve` refuses to start then.
 
-`import` makes no network calls and writes a new immutable import atomically. Restart `serve`
-to activate it: the managed catalog is then seeded from it (insert-only). `fixture` writes
-authored test releases (see the sandbox guide). The other commands behave as before; `check`
-also reports whether execution, qBittorrent, library and Plex are configured.
+`fixture` writes authored test releases (see the sandbox guide). `check` also reports whether
+execution, the download client, library and Plex are configured. (`arr import`, which read a
+Sonarr/Radarr snapshot, and `init --prowlarr-url` were removed.)
 
 ## Managed catalog
 
-**Acquisition ownership** (`[migration] mode`):
+**Acquisition ownership.** Every catalog row has an acquisition state: `adopted`,
+`legacy_managed`, `observed` or `released` (`catalog::acquisition_state`; the last three are
+only seen in state written by older releases). Only adopted items are effectively monitored in
+the index, so wanted, RSS matching and worker searches see only them.
+`downloads::not_adopted` is checked in `enqueue`, the single acquisition funnel, and by the
+explicit endpoints. Adding through `POST /library` adopts exactly the requested scope. This is
+the `[migration] mode = "coexistence"` behaviour, now unconditional; the section stays
+parseable (and is still written by the installers and the wizard, because the previous
+release requires it with downloading on), `mode = "legacy"` is refused, and the old
+`native_handoff_confirmed` / `preserve_monitoring` request fields are accepted and ignored.
+The `handoffs` table and the other stored native columns are kept for rollback and are no
+longer written.
 
-- **States.** Every catalog row has an acquisition state: `adopted`, `legacy_managed`,
-  `observed` or `released` (`catalog::acquisition_state`).
-- **Coexistence mode.** Fresh imports seed native titles as observed. Only adopted items are
-  effectively monitored in the index, so wanted, RSS matching and worker searches see only
-  them. `downloads::not_adopted` is checked in `enqueue`, the single acquisition funnel, and
-  by the explicit endpoints. Adoption through `POST /library` makes exactly the requested
-  scope effective, and a native title needs `native_handoff_confirmed`. Each confirmation
-  is recorded in the `handoffs` table (per title, season or episode) until the title is
-  released. Requests inside a confirmed scope need no new confirmation, whatever the
-  current monitoring.
-- **Legacy mode.** Every imported item is managed with its native monitoring.
-
-Imports stay immutable. At startup, a newly activated import seeds the managed catalog
-**insert-only**, once per import id:
-
-- New native items are added.
-- Native metadata of snapshot-origin items is refreshed.
-- User choices are never overwritten: monitoring, removals, and items added through the API.
-- Snapshot ownership evidence is replaced only for items without live evidence, i.e. never
-  scanned and with no file imported by this server.
+Titles come from `POST /library` and the Plex bootstrap (`bootstrap_*`); user choices
+(monitoring, removals) are never overwritten.
 
 Every route resolves media through an in-memory index rebuilt from these tables after each
 mutation.
@@ -157,8 +150,8 @@ mutation.
 Ownership is tri-state per movie and episode:
 
 - **owned** when a present file is recorded;
-- otherwise **missing** after a completed scan, or according to the snapshot's own flag;
-- otherwise **unknown**: a snapshot series with only partial season statistics.
+- otherwise **missing** after a completed scan;
+- otherwise **unknown**: only for rows an older release recorded without per-episode data.
 
 Files are recorded with root-relative paths, size, quality, revision (only when the evidence
 states it) and a probe result. A metadata refresh never changes ownership or monitoring.
@@ -170,8 +163,8 @@ scans the item's folder, then searches (the default).
   Seasons that appear later are not monitored (`media.monitor_new = 0`). An existing
   series keeps its other choices.
 - **Concurrency.** Library mutations (add, `PATCH`, `DELETE`) are serialised by one lock,
-  so a release cannot fall between another request's handoff check and its change.
-- **Grabs and releases.** In coexistence mode every grab re-reads adoption from the stored
+  so a release cannot fall between another request's check and its change.
+- **Grabs and releases.** Every grab re-reads adoption from the stored
   rows (`library::not_adopted_now`) inside the SQLite transaction that records it. That
   covers manual, plan, request, RSS and worker grabs. The release and the grab transaction
   run on the same serialised connection, so one of them is first:
@@ -180,8 +173,8 @@ scans the item's folder, then searches (the default).
   - **Grab first.** The release is refused as an active download.
 - **Movie availability** follows native `minimumAvailability = released`: the earliest
   physical/digital release, else in-cinemas + 90 days, plus `availabilityDelay`. Release
-  evidence comes from the native import, TMDB, or the operator, and is never invented.
-  Without a date the movie is not available, unless the native snapshot said it was. Other
+  evidence comes from Plex, TMDB, or the operator, and is never invented.
+  Without a date the movie is not available. Other
   modes are reported as not implemented. Availability is evaluated against the clock, so a
   dated movie becomes available without any refresh; TMDB refreshes update the evidence.
 
@@ -193,7 +186,7 @@ reported (`RejectionCode` schema). Codes added in this phase:
 - `covers_queued`: the release overlaps a download in progress.
 - `blocklisted`: by release ref or info-hash, per item.
 
-Native **revision upgrades** (`downloadPropersAndRepacks = preferAndUpgrade`): an owned file
+**Revision upgrades** (`downloadPropersAndRepacks = preferAndUpgrade`): an owned file
 may be replaced only by a release of exactly the same quality with a higher known revision
 (`real` first, then `version`; PROPER/REPACK/RERIP/`vN`), even with profile upgrades off. The
 decision fails closed when any of these is unknown:
@@ -452,5 +445,3 @@ RSS reports retrieval status separately and never promises gap-free coverage.
 - multi-file movie imports (more than one non-sample video blocks the import);
 - partial replacement of multi-episode files (fail closed).
 
-Readiness for replacement needs sandbox and production evidence plus an explicit decision;
-see [`docs/READINESS.md`](docs/READINESS.md).

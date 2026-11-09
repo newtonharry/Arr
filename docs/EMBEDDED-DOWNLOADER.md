@@ -7,7 +7,7 @@ inside the `arr` process instead of qBittorrent.
 - **No daemon or UI.** There is no rqbit HTTP daemon, web UI, extra frontend or stub.
 - **Selection.** It is selected by an `[embedded]` section; then no qBittorrent section,
   URL, credential or API is involved.
-- **Shared paths.** Acquisition, monitoring, import, cleanup and the coexistence gates are
+- **Shared paths.** Acquisition, monitoring, import, cleanup and the acquisition gates are
   the same code paths as with qBittorrent, through a small client enum (`src/client.rs`).
   The qBittorrent backend is unchanged.
 
@@ -115,9 +115,7 @@ template must be qBittorrent's (its fields are what is mapped).
 | removeCompletedDownloads / removeFailedDownloads | the same cleanup policy as with qBittorrent |
 | indexer seed ratio / seed time | per-torrent share limits, enforced by this app |
 
-The coexistence "category shared with a native client" check applies only to qBittorrent.
-That shared client is what exposes downloads to the native apps; the embedded engine is
-private to this process.
+The embedded engine is private to this process.
 
 ## Adding, layout and data safety
 
@@ -301,7 +299,7 @@ cargo test --locked --test embedded_parent_review --test embedded_process   # re
 ```
 
 - **`a_new_movie_arrives_over_bittorrent_imports_and_seeds_to_ratio_two_across_restarts`.**
-  - A TMDB movie new to the native apps is added in one coexistence call. Its multi-file
+  - A TMDB movie new to the catalog is added in one call. Its multi-file
     torrent (video, sample, nfo) downloads from the controlled peer, whose upload counter
     proves the bytes went over TCP.
   - Every piece is verified, then the movie is imported, hardlinked and playable, without
@@ -313,7 +311,7 @@ cargo test --locked --test embedded_parent_review --test embedded_process   # re
   - At ratio 2 the engine pauses the torrent and the normal cleanup removes the download;
     the library file stays playable. A replayed add downloads nothing.
 - **`a_season_pack_pauses_resumes_and_survives_an_abrupt_engine_stop`.**
-  - A Fargo S05 handoff is followed by the normal add. The 10-file season pack is rate
+  - A Fargo S05 add is followed by the normal add. The 10-file season pack is rate
     limited so the steps land mid-download.
   - An API pause stops fetching; resume continues.
   - An abrupt engine stop mid-download, then a new process state: the engine re-checks the
@@ -442,7 +440,6 @@ accrues only then. A stopped server stops seeding until it starts again; torrent
 1. Leave or cancel the download: `remove: torrent` forgets it in the engine and keeps the
    data.
 2. Release the scope (`DELETE /library`). It is refused while a download is active.
-3. Restore native monitoring from the ledger.
 
 The download data and the engine state live in the instance's own directories. Library
 files are separate hardlinks or copies.

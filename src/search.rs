@@ -403,7 +403,7 @@ pub async fn run(
             ErrorCode::NoUsableIndexers,
             format!(
                 "no {} indexer in the active settings has {mode} search enabled",
-                media.native_app(),
+                media.label(),
             ),
         ));
     }
@@ -469,7 +469,7 @@ pub async fn run(
                     ErrorCode::NoUsableIndexers,
                     format!(
                         "no {} indexer with {mode} search enabled can be searched natively: {}",
-                        media.native_app(),
+                        media.label(),
                         unavailable
                             .iter()
                             .map(|u| u.2.clone())

@@ -1854,167 +1854,6 @@ async fn managed_setup_api_hot_activation_guards_and_restart() {
     assert!(format!("{err:#}").contains("manifest digest"), "{err:#}");
 }
 
-/// The test snapshot with The Pirate Bay indexer as a current Prowlarr export shapes it.
-fn snapshot_with_tpb(host: &str, top100: i64, uploader: &str) -> Value {
-    let mut v = common::snapshot();
-    let field =
-        |name: &str, value: Value| json!({ "name": name, "value": value, "privacy": "normal" });
-    v["prowlarr"]["indexer"][0] = json!({
-        "id": 1, "name": "The Pirate Bay", "enable": true, "protocol": "torrent", "privacy": "public", "priority": 25,
-        "implementation": "Cardigann", "definitionName": "thepiratebay", "tags": [],
-        "fields": [
-            field("definitionFile", json!("thepiratebay")),
-            field("baseUrl", json!("https://thepiratebay.org/")),
-            field("apiurl", json!(host)),
-            field("uploader", json!(uploader)),
-            field("top100", json!(top100)),
-            field("baseSettings.queryLimit", Value::Null),
-            field("baseSettings.grabLimit", Value::Null),
-            field("baseSettings.limitsUnit", json!(0)),
-            field("torrentBaseSettings.appMinimumSeeders", Value::Null),
-            field("torrentBaseSettings.seedRatio", json!(2)),
-            field("torrentBaseSettings.seedTime", Value::Null),
-            field("torrentBaseSettings.packSeedTime", Value::Null),
-            field("torrentBaseSettings.preferMagnetUrl", json!(false)),
-            json!({ "name": "cookie", "value": common::FAKE_COOKIE, "privacy": "normal" }),
-        ],
-    });
-    v
-}
-
-#[tokio::test]
-async fn an_imported_policy_is_served_by_the_native_tpb_provider_or_refused() {
-    let (mock_addr, mock) = start_mock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let p = fresh(
-        tmp.path(),
-        mock_addr,
-        Some("127.0.0.1:9".parse().unwrap()),
-        false,
-    );
-    let import = |snap: Value, name: &str| {
-        let f = tmp.path().join(name);
-        std::fs::write(&f, serde_json::to_vec(&snap).unwrap()).unwrap();
-        let (ok, v, text) = cli(&[
-            "import",
-            "--state-dir",
-            p.state.to_str().unwrap(),
-            "--snapshot",
-            f.to_str().unwrap(),
-        ]);
-        assert!(ok, "{text}");
-        v
-    };
-    import(snapshot_with_tpb("127.0.0.1", 6, ""), "native.json");
-    enable_execution(&p, mock_addr, Some("127.0.0.1:9".parse().unwrap()), false);
-    let app = serve(&p.state).await;
-    // The copied source keeps the public field semantics (empty uploader, host, select value)
-    // and never a credential.
-    let (_, v, text) = app.get("/api/v1/settings").await;
-    assert!(
-        !text.contains(common::FAKE_COOKIE) && !text.contains("unparseable"),
-        "{text}"
-    );
-    let src = &v["settings"]["indexers"][0]["source"];
-    assert_eq!(src["definition"], "thepiratebay");
-    assert_eq!(src["settings"]["uploader"], "");
-    assert_eq!(src["settings"]["apiurl"], "127.0.0.1");
-    assert_eq!(src["settings"]["top100"], 6);
-    assert_eq!(src["settings"]["torrentBaseSettings.seedRatio"], 2);
-    let (_, v, _) = app.get("/api/v1/readiness").await;
-    let sb = v["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "search_backend")
-        .unwrap()
-        .clone();
-    assert_eq!(sb["status"], "ok", "{sb}");
-    assert!(
-        sb["settings_mapping"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|m| m["status"] == "usable"),
-        "{sb}"
-    );
-    // A title new to the catalog is found through the native provider with the imported id
-    // and categories, and its seed goal is the Prowlarr indexer's ratio 2.
-    let (fc, _) = authored("Fight.Club.1999.1080p.WEB-DL.x264-UM", 2);
-    {
-        let mut w = mock.lock().unwrap();
-        w.tmdb
-            .insert("550".into(), tmdb_details(550, "Fight Club", 1999, 139));
-        w.tpb_results.insert(
-            "Fight Club 1999".into(),
-            json!([tpb_row(7001, &fc, 207, 1_700_000_000)]),
-        );
-    }
-    let (s, v, text) = app
-        .post(
-            "/api/v1/library",
-            json!({ "media_id": "movie:tmdb:550", "quality_profile": "radarr:6" }),
-        )
-        .await;
-    assert_eq!(s, 201, "{text}");
-    no_leaks(&text);
-    let grab = v["plan"]["execution"]["grabs"][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("{v}"))
-        .to_string();
-    let g = app.grab(&grab);
-    assert_eq!(
-        (g.indexer_id, g.seed_ratio),
-        (Some(1), Some(2.0)),
-        "imported id and ratio 2 preserved"
-    );
-    assert!(
-        mock.lock()
-            .unwrap()
-            .tpb_queries
-            .iter()
-            .any(|q| q == "q=Fight%20Club%201999&cat=201,202,207,209,210,211"),
-        "imported movie categories 2000 (parent), 2040, 2045 map to the TPB movie categories: {:?}",
-        mock.lock().unwrap().tpb_queries
-    );
-    app.stop().await;
-    // Site settings the native provider does not implement fail closed.
-    import(snapshot_with_tpb("127.0.0.1", 1, ""), "top100.json");
-    let app = serve(&p.state).await;
-    let (s, v, text) = app.get("/api/v1/media/movie:tmdb:550/releases").await;
-    assert_eq!(s, 503, "{text}");
-    assert_eq!(v["error"]["code"], "no_usable_indexers");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("top100 = 1"),
-        "{v}"
-    );
-    app.stop().await;
-    import(
-        snapshot_with_tpb("apibay.org", 6, "someone"),
-        "uploader.json",
-    );
-    let app = serve(&p.state).await;
-    let (_, v, _) = app.get("/api/v1/readiness").await;
-    let sb = v["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "search_backend")
-        .unwrap()
-        .clone();
-    assert_eq!(sb["status"], "blocked", "{sb}");
-    let reason = sb["settings_mapping"][0]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("uploader") && reason.contains("API host"),
-        "{reason}"
-    );
-    app.stop().await;
-    assert!(mock.lock().unwrap().forbidden.is_empty());
-}
-
 #[tokio::test]
 async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bearer() {
     use rmcp::model::{CallToolRequestParams, ClientConfig, ProtocolVersion};
@@ -2215,7 +2054,7 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
 }
 
 #[tokio::test]
-async fn bootstrap_refuses_unavailable_roots_unmapped_paths_and_native_imports() {
+async fn bootstrap_refuses_unavailable_roots_and_unmapped_paths_and_snapshot_states_are_refused() {
     let (mock_addr, mock) = start_mock().await;
     let tmp = tempfile::tempdir().unwrap();
     let (p, app) = api_setup(tmp.path(), mock_addr, false, None, false).await;
@@ -2268,36 +2107,45 @@ async fn bootstrap_refuses_unavailable_roots_unmapped_paths_and_native_imports()
         "both runs are stored: {status}"
     );
     app.stop().await;
-    // Over a native snapshot import the bootstrap is refused (that catalog carries evidence).
-    let f = tmp.path().join("native.json");
-    std::fs::write(
-        &f,
-        serde_json::to_vec(&snapshot_with_tpb("127.0.0.1", 6, "")).unwrap(),
-    )
-    .unwrap();
-    let state = p.state.to_str().unwrap().to_string();
-    let (ok, _, text) = cli(&[
-        "import",
-        "--state-dir",
-        &state,
-        "--snapshot",
-        f.to_str().unwrap(),
-    ]);
-    assert!(ok, "{text}");
-    let app = serve(&p.state).await;
-    let (s, v, _) = app.post("/api/v1/setup/plex/bootstrap", json!({})).await;
-    assert_eq!(
-        (s, v["error"]["code"].as_str()),
-        (409, Some("setup_conflict")),
-        "{v}"
+    // A state made by the removed Sonarr/Radarr snapshot importer (an import without the
+    // managed setup's source file) is refused at startup with a pointer to a fresh setup, and
+    // `arr setup` never replaces it. Nothing in it is changed.
+    let cfg = config::load(&p.state.join("config.toml")).unwrap();
+    let doc: arr::setup::SetupDoc = toml::from_str(SETUP_DOC).unwrap();
+    let prepared = arr::setup::prepare(&doc, &cfg, time::OffsetDateTime::now_utc()).unwrap();
+    // Source name of the old importer; a different import id keeps the managed one on disk.
+    let mut normalized = prepared.normalized;
+    normalized.report.import_id = "imp-0000000000000000-s1".into();
+    normalized.catalog.import_id = normalized.report.import_id.clone();
+    arr::import::write_and_activate(&p.state, "source-native.json", b"{}", &normalized).unwrap();
+    let pointer = std::fs::read(p.state.join("active-import.json")).unwrap();
+    let db_path = p.state.join("state.sqlite");
+    let db_before = std::fs::read(&db_path).unwrap();
+    let err = api::AppState::new(cfg)
+        .err()
+        .expect("a snapshot import is refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no longer supports") && msg.contains("arr setup"),
+        "{msg}"
     );
-    let (s, v, _) = app.post("/api/v1/setup", json!({})).await;
+    let config_path = p.state.join("config.toml");
+    for extra in [&[][..], &["--dry-run"][..]] {
+        let mut args = vec!["setup", "--config", config_path.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let (ok, _, text) = cli(&args);
+        assert!(!ok && text.contains("no longer supports"), "{text}");
+    }
     assert_eq!(
-        (s, v["error"]["code"].as_str()),
-        (409, Some("setup_conflict")),
-        "managed setup never replaces a snapshot import: {v}"
+        std::fs::read(&db_path).unwrap(),
+        db_before,
+        "neither the startup nor the setup refusal opened or migrated the database"
     );
-    app.stop().await;
+    assert_eq!(
+        std::fs::read(p.state.join("active-import.json")).unwrap(),
+        pointer,
+        "the refused setup changed nothing"
+    );
 }
 
 #[tokio::test]

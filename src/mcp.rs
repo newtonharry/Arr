@@ -10,12 +10,12 @@
 //!   their contracts are identical in both transports.
 //!
 //! It keeps no state and knows no other service. Every tool is one or two REST calls with a
-//! fixed shape, never retried. The API's typed errors come back verbatim (`not_adopted`,
-//! `native_handoff_required` and the rest), and every failure says what it means for the
+//! fixed shape, never retried. The API's typed errors come back verbatim (`not_adopted`
+//! and the rest), and every failure says what it means for the
 //! request (`outcome`): a write whose reply was lost may have been applied, so it is never
 //! reported as unchanged. An unreachable API is an error: there is no fallback. Tool
-//! arguments carry only titles, canonical media ids and release refs. Handoff confirmations,
-//! monitoring and policy overrides, paths, URLs, deletion and torrent control cannot be
+//! arguments carry only titles, canonical media ids and release refs. Monitoring and policy
+//! overrides, paths, URLs, deletion and torrent control cannot be
 //! expressed.
 
 use crate::ids::MediaId;
@@ -47,11 +47,11 @@ const MAX_QUERY_CHARS: usize = 100;
 const DEFAULT_LIST: u32 = 20;
 const MAX_LIST: u32 = 50;
 
-/// What the coexistence refusals mean for a conversational request.
-const NATIVE_ROUTE: &str = "This title is still acquired by Sonarr/Radarr. It moves here only when an operator adopts it outside this assistant (native ledger and pause first). This assistant cannot confirm that handoff and does not fall back to Sonarr/Radarr.";
+/// What the not-adopted refusal means for a conversational request.
+const NOT_ADOPTED_ROUTE: &str = "This title is not added to Arr and monitored yet. Add it with add_media first; this assistant does not change monitoring any other way.";
 const OUTAGE: &str =
     "Nothing else was tried: this adapter has no fallback. Retry later or report the outage.";
-const UNCERTAIN: &str = "The request may have been applied before its reply was lost. Check media_status or requests before repeating it. This adapter never retries a write and has no fallback; Sonarr/Radarr are not contacted.";
+const UNCERTAIN: &str = "The request may have been applied before its reply was lost. Check media_status or requests before repeating it. This adapter never retries a write and has no fallback.";
 
 /// Refusals the API returns before a handler runs.
 const BEFORE_HANDLER: &[&str] = &[
@@ -294,7 +294,7 @@ impl Effect {
         match self {
             Effect::Read => true,
             // Other errors can follow a committed add (for example a failed automatic search).
-            Effect::Add => matches!(code, "native_handoff_required" | "unsupported_scope"),
+            Effect::Add => false,
             // A stop refused for its id or because Arr never had it changed nothing.
             Effect::Stop => matches!(code, "invalid_media_id" | "not_managed"),
             // Every refusal of a grab comes before the download is recorded (a contradicting
@@ -308,7 +308,6 @@ impl Effect {
                     | "not_adopted"
                     | "execution_disabled"
                     | "client_not_configured"
-                    | "category_shared"
                     | "already_queued"
                     | "blocklisted"
                     | "duplicate_torrent"
@@ -765,7 +764,7 @@ impl ServerHandler for Adapter {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Movie and TV requests for the arr server. To answer what the user already has, use library (their whole catalog, including everything imported from Plex) or media_status for one title. To add something, find it with search_titles, then call add_media with its canonical media id: that is the default, automatic path (monitored, then searched and downloaded by this server's own policy). Add exactly the scope the user asked for; do not replace a requested season with individual episodes unless the user agrees. release_choices and start_download are a manual mode, only for when the user explicitly asks to choose a release: start_download downloads only the exact release the user chose. Titles still managed by Sonarr/Radarr are refused (native_handoff_required, not_adopted) and are not adopted; adoption is an operator step outside this assistant. An add_media result's automatic field says what happened; a blocked plan with no release yet is normal with execution enabled, and plans are never executed by hand. Repeating an add or a download creates no duplicate. Errors are returned as is with their outcome; there is no fallback, and a write with an unknown outcome is checked with media_status or requests before it is repeated. If movie search reports that it isn't set up, tell the user what that message says; TV works without it.",
+                "Movie and TV requests for the arr server. To answer what the user already has, use library (their whole catalog, including everything imported from Plex) or media_status for one title. To add something, find it with search_titles, then call add_media with its canonical media id: that is the default, automatic path (monitored, then searched and downloaded by this server's own policy). Add exactly the scope the user asked for; do not replace a requested season with individual episodes unless the user agrees. release_choices and start_download are a manual mode, only for when the user explicitly asks to choose a release: start_download downloads only the exact release the user chose. An add_media result's automatic field says what happened; a blocked plan with no release yet is normal with execution enabled, and plans are never executed by hand. Repeating an add or a download creates no duplicate. Errors are returned as is with their outcome; there is no fallback, and a write with an unknown outcome is checked with media_status or requests before it is repeated. If movie search reports that it isn't set up, tell the user what that message says; TV works without it.",
             )
     }
 
@@ -944,7 +943,7 @@ fn tools() -> Vec<Tool> {
         ),
         tool::<MediaArg>(
             "add_media",
-            "The default way to add what the user asked for: a movie, one season or one episode by canonical id, monitored, then searched and downloaded automatically by this server's policy. Add exactly the requested scope; do not substitute individual episodes for a requested season without the user's agreement. The result's automatic field says whether a download was queued or nothing could be downloaded yet. Repeating an add creates no duplicate. Titles still managed by Sonarr/Radarr are refused with native_handoff_required and are not adopted.",
+            "The default way to add what the user asked for: a movie, one season or one episode by canonical id, monitored, then searched and downloaded automatically by this server's policy. Add exactly the requested scope; do not substitute individual episodes for a requested season without the user's agreement. The result's automatic field says whether a download was queued or nothing could be downloaded yet. Repeating an add creates no duplicate.",
             write.clone(),
         ),
         tool::<MediaArg>(
@@ -1071,10 +1070,8 @@ fn stop_summary(mut v: Value) -> Value {
 }
 
 /// A successful add as the assistant should read it; the core's facts are kept.
-/// - `adoption.native_handoff_confirmed` only says whether this request carried the
-///   operator's acknowledgement, which the adapter never sends. It is dropped. For an adopted
-///   native title, `handoff: "on_record"` says what the success itself establishes: a
-///   confirmed handoff covers the scope. The core's note becomes `operator_note`.
+/// - `adoption.native_handoff_confirmed` (always false now) is dropped, and the core's note
+///   becomes `operator_note`.
 /// - A plan that was not executed because nothing was executable (blocked, already owned or
 ///   in progress) is not shown as a shadow plan to execute by hand.
 /// - `automatic` summarises the outcome from the plan alone.
@@ -1083,12 +1080,6 @@ fn automatic_add(mut v: Value) -> Value {
         a.remove("native_handoff_confirmed");
         if let Some(note) = a.remove("note") {
             a.insert("operator_note".into(), note);
-        }
-        if a.get("native_app").is_some_and(|x| !x.is_null())
-            && a.get("mode") == Some(&json!("coexistence"))
-            && a.get("acquisition") == Some(&json!("adopted"))
-        {
-            a.insert("handoff".into(), json!("on_record"));
         }
     }
     let Some(state) = v["plan"]["state"].as_str().map(str::to_string) else {
@@ -1196,7 +1187,7 @@ fn too_large(effect: Effect) -> CallToolResult {
 }
 
 /// The API's typed error, unchanged, with its outcome, and routing guidance for the
-/// coexistence refusals.
+/// not-adopted refusal.
 fn api_error(effect: Effect, error: Value, status: u16) -> CallToolResult {
     let code = error["code"].as_str().unwrap_or_default().to_string();
     let outcome = outcome(effect, true, effect.refused_unchanged(&code));
@@ -1204,11 +1195,8 @@ fn api_error(effect: Effect, error: Value, status: u16) -> CallToolResult {
     if outcome == "unknown" {
         v["guidance"] = json!(UNCERTAIN);
     }
-    if matches!(
-        code.as_str(),
-        "not_adopted" | "native_handoff_required" | "unsupported_scope"
-    ) {
-        v["routing"] = json!(NATIVE_ROUTE);
+    if code == "not_adopted" {
+        v["routing"] = json!(NOT_ADOPTED_ROUTE);
     }
     CallToolResult::structured_error(v)
 }

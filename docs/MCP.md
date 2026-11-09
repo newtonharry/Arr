@@ -92,7 +92,7 @@ automatically.
 `idempotentHint: true`.
 
 **Not expressible** as tool arguments:
-- `native_handoff_confirmed`, `preserve_monitoring` and adoption in general;
+- `native_handoff_confirmed` and `preserve_monitoring` (retired REST fields) and adoption in general;
 - `monitored`, `monitor`, `quality_profile`, `root_folder` and `metadata`;
 - `search: false` and `refresh`;
 - paths, URLs and endpoints;
@@ -111,12 +111,8 @@ An unknown property is refused as `invalid_arguments` before any request.
 
 **Success.** A success is the API's JSON as structured content. One result is reshaped:
 a successful `add_media`. The REST API and every other tool's results are unchanged.
-- **The per-request flag is dropped.** `adoption.native_handoff_confirmed` only says
-  whether this request carried the operator's acknowledgement, which the adapter never
-  sends. It read as if no handoff existed, so it is removed.
-- **What the success establishes.** For an adopted native title in coexistence mode,
-  `adoption.handoff` is `"on_record"`: a confirmed handoff covers the scope. The core's
-  note is kept as `adoption.operator_note`.
+- **The retired flag is dropped.** `adoption.native_handoff_confirmed` (always `false` now)
+  is removed, and the core's note is kept as `adoption.operator_note`.
 - **Plans with nothing to execute.** With execution enabled, a plan that was not executed
   because it is `blocked`, `already_satisfied` or `in_progress` gets
   `plan.execution.mode: "not_executed"`. Its note no longer says to execute the plan by
@@ -136,7 +132,7 @@ a successful `add_media`. The REST API and every other tool's results are unchan
 
 **Failure.** A failure is a tool error (`isError: true`) shaped as
 `{"error": {...}, "http_status"?, "outcome", "guidance"?, "routing"?}`:
-- `error` is the API's typed error unchanged (`not_adopted`, `native_handoff_required`,
+- `error` is the API's typed error unchanged (`not_adopted`,
   `already_queued` and the rest), or one of the adapter's codes: `invalid_arguments`,
   `api_unreachable`, `api_timeout`, `api_bad_response` or `api_response_too_large`.
 - An unknown tool name is a protocol error.
@@ -147,7 +143,7 @@ a successful `add_media`. The REST API and every other tool's results are unchan
 |---|---|
 | `nothing_changed` | any read |
 | `not_sent` | invalid arguments, or no connection to the API was made |
-| `not_applied` | a typed refusal the API returns before changing anything (an explicit list in `src/mcp.rs`): request-level refusals; `native_handoff_required` and `unsupported_scope` for adds; for grabs, the validation, `release_not_found`, `not_adopted`, execution-blocker, `already_queued`, `duplicate_torrent`, `blocklisted`, payload and upstream refusals |
+| `not_applied` | a typed refusal the API returns before changing anything (an explicit list in `src/mcp.rs`): request-level refusals; for grabs, the validation, `release_not_found`, `not_adopted`, execution-blocker, `already_queued`, `duplicate_torrent`, `blocklisted`, payload and upstream refusals |
 | `unknown` | any other write failure: a timeout after connecting, a lost or unusable reply, a redirect, or a typed error that can follow a committed add |
 
 `unknown` comes with guidance: check `media_status` or `requests` before repeating. A write
@@ -161,43 +157,20 @@ and a later `add_media` searches again without duplicating it.
 **Redaction.** Response bodies have any occurrence of the token replaced by `[redacted]`
 before use (defence in depth; the API never echoes it).
 
-## Coexistence routing
+## Routing
 
-**Native titles not yet adopted** (imported and *observed*):
-- `add_media` gets `409 native_handoff_required`;
-- `start_download` gets `409 not_adopted`;
-- titles this server cannot acquire get `409 unsupported_scope`.
+`start_download` for a title that is not adopted and monitored here (stopped, or never
+added) gets `409 not_adopted`. It is `not_applied`, with a `routing` note: add it with
+`add_media` first. There is no hand-over from Sonarr/Radarr any more, and no
+`native_handoff_required` or `unsupported_scope` error.
 
-These are `not_applied`, with a `routing` note: the title stays with Sonarr/Radarr. The
-adapter never confirms a handoff and never falls back to Sonarr/Radarr.
-
-**Adoption is the operator's step**, outside the assistant: the native ledger and pause
-first, then `POST /api/v1/library` with `native_handoff_confirmed`.
-
-**Once the operator has confirmed a scope,** `add_media` inside it works without a
-confirmation and acquires it. This is a core change from this pass. The confirmation is
-recorded durably, per scope:
-- **Scopes.** The whole title (including `preserve_monitoring`), a season, or an episode.
-- **Lifetime.** Until the title is released with `DELETE /library`. Current monitoring
-  flags play no part: an unmonitored episode inside a confirmed season, or a whole title
-  handed over with its native flags off, stays this server's.
-- **Wider scopes.** A sibling episode, its season or the series is refused again, as is a
-  released title. An unmonitored registration is not a confirmation.
-- **Visibility.** `GET /api/v1/ownership` lists each title's `handoffs`.
-- **Upgrade step (operator).** Scopes adopted before this build have no record. Confirm each
-  exact scope once more with `POST /api/v1/library` and `native_handoff_confirmed: true,
-  search: false` (or `preserve_monitoring` for a whole title); nothing is searched.
-- **Ordering.** Library mutations (add, `PATCH`, `DELETE`) share one lock, so a release
-  cannot fall between another request's handoff check and its change.
-- **Grab against release.** Every grab re-reads adoption from the stored rows in the
-  transaction that records it. A release committed while the torrent was fetched therefore
-  leaves nothing recorded or submitted.
-
-**Titles new to the native apps** (TMDB/TVmaze) follow the existing one-call add.
+Library mutations (add, `PATCH`, `DELETE`) share one lock. Every grab re-reads adoption from
+the stored rows in the transaction that records it, so a release committed while the torrent
+was fetched leaves nothing recorded or submitted.
 
 ## Tests
 
-`tests/mcp.rs` (9 tests) drives the real binary over its stdin/stdout with the official
+`tests/mcp.rs` drives the real binary over its stdin/stdout with the official
 rmcp client (`client` feature). The adapter's raw stdout bytes are recorded too. Every
 child also gets HTTP(S)/ALL proxy variables pointing at a counting sentinel, so a request
 to anything but `--api-url` would be seen.
@@ -212,7 +185,7 @@ to anything but `--api-url` would be seen.
   - **Wording.** `add_media` is the default; `release_choices` and `start_download` are
     manual mode only; no description promises that something changes nothing.
 - **`a_new_title_is_found_added_and_tracked_and_repeating_creates_no_duplicate`.** Against a
-  real API in coexistence mode with TMDB:
+  real API with TMDB:
   - search, add (TMDB metadata, grab), qBittorrent submission in the dedicated category,
     then status (adopted, one download) and requests;
   - a repeated add, `release_choices` (`covers_queued`), and a repeated download of the
@@ -221,17 +194,10 @@ to anything but `--api-url` would be seen.
 - **`an_add_committed_before_its_search_failed_is_reported_as_unknown`.** A real `502` after
   a committed add is `unknown` with guidance, and status shows the title adopted. Once the
   indexer answers, a repeat grabs once.
-- **`an_operator_adopted_scope_is_acquired_through_mcp_and_cannot_be_widened`.**
-  - After an out-of-band adoption of one episode, `add_media` acquires it with no
-    confirmation: one grab, in the TV category.
-  - A sibling episode and the season are refused with `native_handoff_required`.
-  - After the operator confirms the season and unmonitors one of its episodes, `add_media`
-    for that episode still needs no confirmation.
-  - `/ownership` lists exactly the two confirmed scopes.
 - **`an_automatic_add_without_a_release_reads_as_waiting_and_a_real_shadow_plan_stays_shadow`.**
-  - **Execution enabled.** An operator-adopted episode is added through `add_media` with an
+  - **Execution enabled.** A monitored episode is added through `add_media` with an
     empty indexer. The test checks the exact fields:
-    - the adoption keys, with `handoff: "on_record"` and no `native_handoff_confirmed`;
+    - the adoption keys (`acquisition`, `mode`, `native_app`, `operator_note`), without `native_handoff_confirmed`;
     - plan `blocked`, `download_submission: "enabled"`, `mode: "not_executed"`, no grabs;
     - `automatic.status: "not_downloaded_yet"`;
     - no "shadow plan" or `/execute` anywhere.
@@ -240,12 +206,10 @@ to anything but `--api-url` would be seen.
     unchanged.
   - **Execution disabled.** The plan stays `mode: "shadow"` with its note, and the status is
     `execution_disabled`.
-- **`an_unadopted_native_title_is_refused_with_the_core_error_and_nothing_happens`.**
-  - Observed movie, season and episode adds get `native_handoff_required`.
+- **`a_title_that_is_not_monitored_is_refused_with_the_core_error_and_nothing_happens`.**
   - Passing `native_handoff_confirmed` is refused as an unknown argument.
-  - Listing releases works, but downloading one gets `not_adopted`.
-  - Then: no client add, no torrent fetched, an empty queue and request list, nothing
-    adopted, and status still `observed`.
+  - Listing releases works, but downloading one for a stopped movie gets `not_adopted`.
+  - Then: no client add, no torrent fetched, an empty queue.
 - **`malformed_or_overreaching_arguments_never_reach_the_api`.** 32 malformed or overreaching
   calls and an unknown tool reach a recording stand-in API zero times. A 300 KiB message is
   dropped unanswered, and the session stays usable. Six valid calls produce exactly the
@@ -265,38 +229,18 @@ to anything but `--api-url` would be seen.
 - `tests/mcp_parent_review.rs`: a committed `POST` whose reply is delayed past the timeout,
   or replaced by an HTML `502`, is committed once (never retried), reported as uncertain
   with inspect-first guidance, and says there is no fallback.
-- In `tests/migration_review.rs`:
-  - `confirmed_scope_replays_without_handoff_but_never_expands_via_sibling_or_parent`:
-    the replay works, a wider scope is refused, and a release revokes the confirmation;
-  - `unmonitored_registration_cannot_stand_in_for_a_confirmed_native_handoff`;
-  - `a_single_known_episode_does_not_authorize_its_seasons_future_episodes`;
-  - `an_explicit_whole_title_handoff_survives_disabled_monitoring_and_reactivation`
-    (including the TVmaze alias).
 
 **Core ordering regression.**
-`a_release_sent_during_an_add_is_ordered_after_it_and_refused_by_its_download`
-(`tests/coexistence.rs`):
-- **Setup.** An add inside a confirmed scope is held in its automatic search by a slow
-  indexer answer. The test waits for the mock to log the query, so there is no timing
-  guess.
-- **Check.** A release sent meanwhile runs after the add, and the add's download refuses it
-  (`409 active_downloads`).
-- **Result.** The add succeeds, and the title and its handoff stay.
-
+`a_release_sent_during_an_add_is_ordered_after_it_and_refused_by_its_download` and
 `a_release_committed_while_a_torrent_is_fetched_records_and_submits_nothing`
-(`tests/coexistence.rs`):
-- **Setup.** A manual grab passes its adoption check. A mock gate then holds its torrent
-  fetch open until the test sees the fetch.
-- **Check.** A release succeeds meanwhile. When the fetch completes, the grab gets `409
-  not_adopted` from the transaction check. Then there is no grab, outbox entry or client
-  add, even after a worker pass, and the title is `released` with no handoffs.
-- **Re-adoption.** A fresh handoff re-adopts the title, and the same release is grabbed
-  once.
+(`tests/failures.rs`): a release sent while an add is held in its search runs after it and is
+refused as an active download; a release committed while a torrent is fetched makes the
+grab fail with `409 not_adopted` from the transaction check, leaving no grab, outbox entry or
+client add.
 
 **Negative controls.** Each guard was disabled in turn, and at least one test failed:
 - no-proxy;
 - redaction;
-- auto-confirming the handoff;
 - outage fallback;
 - unknown fields allowed;
 - redirects followed;
@@ -304,17 +248,11 @@ to anything but `--api-url` would be seen.
 - the 256 KiB line limit;
 - every add error treated as `not_applied`;
 - every failure treated as `not_sent`;
-- the replay rule reverted, and the handoff never required;
-- a release keeping its handoffs;
-- coverage always granted;
-- `preserve_monitoring` not recorded;
-- a season handoff not covering its episodes;
 - the library lock removed from `DELETE`: the release lands mid-add, and the add then fails
   with `409`;
 - the grab transaction's adoption re-check disabled: the grab is recorded (`201`) after the
   release;
-- the add-result reshaping bypassed: the raw `native_handoff_confirmed: false`,
-  `mode: "shadow"` and the "execute it with POST …" note reappear.
+- the add-result reshaping bypassed: the raw `mode: "shadow"` and the "execute it with POST …" note reappear.
 
 Two guards are not observable: the canonical-id round trip, which the core parser already
 enforces (so it was removed), and the sensitive header flag, since no log prints header
@@ -326,14 +264,10 @@ values (it is kept as a one-line defence).
 - **Scope.**
   - No whole-series adds.
   - No monitoring changes, removal, blocklist or queue control.
-  - No adoption, no `preserve_monitoring`.
   - These stay REST operations for the operator.
 - **Responses pass through.** A large series status can be long; it is bounded at 2 MiB.
   Messages are bounded at 256 KiB: longer lines are dropped by the SDK transport, and the
   request gets no answer.
-- **Native state is not observable.** As with the REST API, the adapter cannot see whether
-  native monitoring is paused. It only relays the core's adoption state.
-
 
 ## Remote MCP (Streamable HTTP)
 
