@@ -2750,6 +2750,35 @@ pub fn queue(
     Ok((rows, total as u64))
 }
 
+/// A failed download no longer needs anyone when every movie or episode it covered is covered
+/// by another download that got into the library, or by one started after it that is still
+/// going (followed on its own). Coverage is what each download actually covers (`grab_targets`,
+/// indexed), not the target of the plan that made it, so a different episode of the same season
+/// never counts.
+pub fn superseded(c: &Connection, g: &Grab) -> Result<bool> {
+    if g.state != "failed" {
+        return Ok(false);
+    }
+    let covered: Vec<String> = if g.targets.is_empty() {
+        vec![g.target.to_string()]
+    } else {
+        g.targets.iter().map(|t| t.target.to_string()).collect()
+    };
+    let mut stmt = c.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM grab_targets t JOIN grabs o ON o.id = t.grab_id
+           WHERE t.target = ?1 AND o.id != ?2
+             AND (o.imported_at IS NOT NULL OR (o.active = 1 AND o.created_at >= ?3)))",
+    )?;
+    for t in &covered {
+        if !stmt.query_row(rusqlite::params![t, g.id, g.created_at], |r| {
+            r.get::<_, bool>(0)
+        })? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Blocked release refs/hashes for a media item (used by searches).
 pub fn blocked_for(c: &Connection, media: MediaId) -> Result<HashSet<String>> {
     let mut stmt = c.prepare("SELECT release_ref, info_hash FROM blocklist WHERE media_id = ?1")?;
@@ -2797,6 +2826,127 @@ pub fn recover(c: &Connection, now: OffsetDateTime) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What makes a failure no longer need anyone: every episode it covered is covered by a
+    /// download that was imported, or one started after it that is still going.
+    #[test]
+    fn a_failure_is_superseded_only_when_everything_it_covered_is_covered_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        drop(crate::store::Store::open(&path).unwrap());
+        let c = Connection::open(&path).unwrap();
+        let ep = |n: u32| format!("episode:tvdb:1:1:{n}");
+        let season = "season:tvdb:1:1";
+        // (id, state, active, imported, created, plan target, covers)
+        let add = |id: &str,
+                   state: &str,
+                   active: bool,
+                   imported: bool,
+                   created: &str,
+                   target: &str,
+                   covers: &[String]| {
+            c.execute(
+                "INSERT INTO grabs (id, media_id, target, release_ref, info_hash, title, category, save_path, remove_completed, remove_failed, origin, payload_kind, payload, state, active, next_attempt_at, created_at, updated_at, imported_at)
+                 VALUES (?1, 'series:tvdb:1', ?2, ?1, ?1, ?1, 'tv', '/d', 0, 0, 'test', 'torrent', x'00', ?3, ?4, ?5, ?5, ?5, ?6)",
+                rusqlite::params![id, target, state, active, created, imported.then_some(created)],
+            )
+            .unwrap();
+            for t in covers {
+                c.execute(
+                    "INSERT INTO grab_targets (grab_id, target) VALUES (?1, ?2)",
+                    [id, t.as_str()],
+                )
+                .unwrap();
+            }
+        };
+        let check = |id: &str| superseded(&c, &select(&c, "id = ?1", &[&id]).unwrap()[0]).unwrap();
+        add(
+            "failed",
+            "failed",
+            false,
+            false,
+            "2026-11-07T00:00:00Z",
+            season,
+            &[ep(2), ep(3)],
+        );
+        assert!(!check("failed"), "nothing else yet");
+        // Another episode of the same season plan: not the same download.
+        add(
+            "other_ep",
+            "imported",
+            false,
+            true,
+            "2026-11-08T00:00:00Z",
+            season,
+            &[ep(4)],
+        );
+        assert!(!check("failed"), "a different episode never counts");
+        // Half of it came in.
+        add(
+            "half",
+            "imported",
+            false,
+            true,
+            "2026-11-08T00:00:00Z",
+            season,
+            &[ep(3)],
+        );
+        assert!(!check("failed"), "partial coverage is not enough");
+        // An older download still going, and a cancelled one: neither counts.
+        add(
+            "older",
+            "downloading",
+            true,
+            false,
+            "2026-11-06T00:00:00Z",
+            season,
+            &[ep(2)],
+        );
+        add(
+            "cancelled",
+            "cancelled",
+            false,
+            false,
+            "2026-11-08T00:00:00Z",
+            season,
+            &[ep(2)],
+        );
+        assert!(!check("failed"));
+        // A newer download of the rest, still going: now all of it is taken care of.
+        add(
+            "newer",
+            "downloading",
+            true,
+            false,
+            "2026-11-08T01:00:00Z",
+            season,
+            &[ep(2)],
+        );
+        assert!(check("failed"));
+        // An episode download made good by an imported season pack.
+        add(
+            "ep5",
+            "failed",
+            false,
+            false,
+            "2026-11-07T00:00:00Z",
+            &ep(5),
+            &[ep(5)],
+        );
+        assert!(!check("ep5"));
+        add(
+            "pack",
+            "imported",
+            false,
+            true,
+            "2026-11-06T00:00:00Z",
+            season,
+            &[ep(5), ep(6)],
+        );
+        assert!(check("ep5"));
+        // Only failures are ever superseded.
+        assert!(!check("half"));
+    }
 
     fn t(state: &str, ratio: f64, ratio_limit: f64, seeding: i64, time_limit: i64) -> TorrentInfo {
         serde_json::from_value(json!({

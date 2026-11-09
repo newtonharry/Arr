@@ -3748,14 +3748,23 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
     let grabs = st
         .store
         .with(move |c| {
-            downloads::select(
+            let grabs = downloads::select(
                 c,
                 "media_id = ?1 AND (active = 1 OR updated_at >= ?2) ORDER BY created_at DESC LIMIT 50",
                 &[&parent_s, &since],
-            )
+            )?;
+            // Failures another download has made good stay in the history, not in attention.
+            let mut superseded = std::collections::HashSet::new();
+            for g in &grabs {
+                if downloads::superseded(c, g)? {
+                    superseded.insert(g.id.clone());
+                }
+            }
+            Ok((grabs, superseded))
         })
         .await
         .map_err(internal("grabs"))?;
+    let (grabs, superseded) = grabs;
     let parent_s = parent.to_string();
     let requests: Vec<Value> = st
         .store
@@ -3917,7 +3926,12 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
             .flatten()
             .collect(),
     };
-    body["attention"] = json!(attention_items(&scoped, &scoped_requests, holds));
+    let needs: Vec<downloads::Grab> = scoped
+        .iter()
+        .filter(|g| !superseded.contains(&g.id))
+        .cloned()
+        .collect();
+    body["attention"] = json!(attention_items(&needs, &scoped_requests, holds));
     body["observed_at"] = json!(rfc3339(now));
     ok(body)
 }
@@ -3940,23 +3954,19 @@ async fn attention_list(
     let grabs = st
         .store
         .with(move |c| {
-            let grabs = downloads::select(
+            // Superseded failures are left out before the bound, so they never crowd out
+            // something that does need a person.
+            let mut grabs = downloads::select(
                 c,
-                "(active = 1 AND state = 'import_blocked') OR (state = 'failed' AND updated_at >= ?1) ORDER BY updated_at DESC LIMIT 100",
+                "(active = 1 AND state = 'import_blocked') OR (state = 'failed' AND updated_at >= ?1) ORDER BY updated_at DESC LIMIT 1000",
                 &[&since],
             )?;
-            // A failure stops needing anyone once another download of the same target got it
-            // into the library, or one started after it is still going (and shown on its own).
-            let mut kept = Vec::with_capacity(grabs.len());
-            for g in grabs {
-                let superseded = g.state == "failed"
-                    && c.query_row(
-                        "SELECT EXISTS (SELECT 1 FROM grabs WHERE target = ?1 AND id != ?2
-                           AND (imported_at IS NOT NULL OR (active = 1 AND created_at >= ?3)))",
-                        rusqlite::params![g.target.to_string(), g.id, g.created_at],
-                        |r| r.get::<_, bool>(0),
-                    )?;
-                if !superseded {
+            let mut kept = Vec::with_capacity(grabs.len().min(100));
+            for g in grabs.drain(..) {
+                if kept.len() == 100 {
+                    break;
+                }
+                if !downloads::superseded(c, &g)? {
                     kept.push(g);
                 }
             }

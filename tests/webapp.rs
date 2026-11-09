@@ -675,6 +675,14 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
         !a.to_string().contains(&failed),
         "the API's attention list drops it too: {a}"
     );
+    let (_, st, _) = e
+        .json(e.get("/api/v1/status/episode:tvdb:372264:1:2"))
+        .await;
+    assert_eq!(st["attention"], json!([]), "and the title's status: {st}");
+    assert!(
+        st["downloads"].to_string().contains(&failed),
+        "the failure stays in its download history: {st}"
+    );
 }
 
 // ------------------------------------------------------------------ ideas
