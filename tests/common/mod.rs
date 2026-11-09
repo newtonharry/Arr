@@ -1,5 +1,11 @@
-//! Shared test harness: a synthetic native snapshot (same shapes as the real export, fake
-//! values only), a loopback mock for Prowlarr/TVmaze/TMDB, and an in-process API server.
+//! Shared test harness. Two stacks (see `Stack`):
+//!
+//! - Managed (the default): the real default layout, with managed setup, a native Torznab
+//!   indexer on a loopback mock, the in-memory download client (`arr::client::fake`, behind
+//!   the `test-client` feature) and the Plex/TVmaze/TMDB mocks.
+//! - LEGACY-ONLY: a synthetic Sonarr/Radarr snapshot import (`snapshot`, `write_state`,
+//!   `start_app`), `[prowlarr]` and the qBittorrent mock (`qb`). Kept for the suites that test
+//!   those integrations until they are deleted; new tests use the managed stack.
 #![allow(dead_code)]
 
 use arr::{api, config, fsutil, import};
@@ -27,7 +33,7 @@ pub const TOKEN: &str = "test-token-0123456789abcdef0123456789";
 pub const TMDB_V3_KEY: &str = "FAKE-TEST-TMDB-V3-KEY-0001";
 pub const TMDB_V4_TOKEN: &str = "eyJGAKE-TEST-TMDB-V4-TOKEN-0001";
 
-// ------------------------------------------------------------------ snapshot
+// ------------------------------------------------------------------ snapshot (LEGACY-ONLY)
 
 fn quality(id: i64, name: &str) -> Value {
     json!({ "id": id, "name": name, "source": "unknown", "resolution": 0 })
@@ -1270,7 +1276,7 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
     (addr, state)
 }
 
-// ------------------------------------------------------------------ app harness
+// ------------------------------------------------------------------ app harness (LEGACY-ONLY)
 
 pub struct App {
     pub base: String,
@@ -2228,8 +2234,7 @@ pub fn managed_settings(o: &ExecOptions) -> arr::settings::Settings {
         ),
     );
     let cfg = config::load(&dir.join("config.toml")).unwrap();
-    let doc: arr::setup::SetupDoc =
-        serde_json::from_value(setup_document(o)).unwrap();
+    let doc: arr::setup::SetupDoc = serde_json::from_value(setup_document(o)).unwrap();
     arr::setup::normalize(&doc, &cfg).unwrap().0
 }
 

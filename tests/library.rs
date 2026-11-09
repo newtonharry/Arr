@@ -584,3 +584,113 @@ async fn previewing_a_movie_without_an_approved_release_changes_nothing_with_exe
     let (_, b, _) = e.json(e.get("/api/v1/blocklist")).await;
     assert_eq!(b["items"], json!([]));
 }
+
+// ------------------------------------------------------------------ status and numbering
+// (moved from migration_review.rs: the behaviour is general, not about Sonarr)
+
+#[tokio::test]
+async fn episode_status_uses_actual_coverage_not_the_original_season_request() {
+    let e = start_exec(ExecOptions::default()).await;
+    for number in [2, 4] {
+        let (_, release) = published(
+            &e,
+            &format!("Slow.Horses.S01E{number:02}.1080p.WEB-DL.x264-UM"),
+            1.5,
+        );
+        e.search_results(&format!("Slow Horses S01E{number:02}"), vec![release]);
+    }
+    let (status, _, body) = e
+        .json(
+            e.post("/api/v1/library")
+                .json(&json!({ "media_id": "season:tvdb:372264:1" })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    e.tick().await;
+    let (status, episode, body) = e
+        .json(e.get("/api/v1/status/episode:tvdb:372264:1:2"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        episode["downloads"].as_array().unwrap().len(),
+        1,
+        "a broader original season request must not attach the other episode's grab: {body}"
+    );
+    assert_eq!(
+        episode["downloads"][0]["id"],
+        episode["episodes"][0]["download"]["id"]
+    );
+}
+
+#[tokio::test]
+async fn season_status_includes_pending_individual_episode_requests() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (status, _, body) = e
+        .json(
+            e.post("/api/v1/library")
+                .json(&json!({ "media_id": "episode:tvdb:372264:1:2" })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (_, requests, _) = e.json(e.get("/api/v1/requests")).await;
+    assert!(
+        requests["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["target"] == "episode:tvdb:372264:1:2" && r["state"] == "active")
+    );
+    let (status, season, body) = e.json(e.get("/api/v1/status/season:tvdb:372264:1")).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        season["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["target"] == "episode:tvdb:372264:1:2" && r["state"] == "active"),
+        "a season must include its episode request despite the different ID kinds: {body}"
+    );
+    let (status, _, body) = e
+        .json(
+            e.post("/api/v1/library")
+                .json(&json!({ "media_id": "season:tvdb:372264:1" })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (_, episode, body) = e
+        .json(e.get("/api/v1/status/episode:tvdb:372264:1:2"))
+        .await;
+    assert!(
+        episode["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["target"] == "season:tvdb:372264:1" && r["state"] == "active"),
+        "the episode should expose its encompassing season request: {body}"
+    );
+}
+
+#[tokio::test]
+async fn season_status_includes_individual_grabs_with_either_series_namespace() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (_, release) = published(&e, "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM", 1.5);
+    e.search_results("Slow Horses S01E02", vec![release]);
+    let (status, _, body) = e
+        .json(
+            e.post("/api/v1/library")
+                .json(&json!({ "media_id": "episode:tvdb:372264:1:2" })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    e.tick().await;
+    for scope in ["season:tvdb:372264:1", "season:tvmaze:9001:1"] {
+        let (status, season, body) = e.json(e.get(&format!("/api/v1/status/{scope}"))).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            season["downloads"].as_array().unwrap().len(),
+            1,
+            "season status must contain the episode grab, including canonical-ID aliases: {body}"
+        );
+        assert_eq!(season["downloads"][0]["target"], "episode:tvdb:372264:1:2");
+    }
+}

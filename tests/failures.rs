@@ -406,3 +406,168 @@ async fn leased_commands_are_requeued_after_restart_and_removal_waits_for_downlo
     let (s, _, _) = e.json(e.delete("/api/v1/library/series:tvdb:372264")).await;
     assert_eq!(s, 200);
 }
+
+// ------------------------------------------------------------------ races with the monitored-only gate
+// (the general parts of the coexistence suite's adoption races)
+
+#[tokio::test]
+async fn a_release_sent_during_an_add_is_ordered_after_it_and_refused_by_its_download() {
+    let e = start_exec(ExecOptions::default()).await;
+    let title = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
+    let (_, ep2) = e.publish(
+        title,
+        title,
+        vec![(format!("{title}.mkv"), mkv(2))],
+        1.5,
+        false,
+    );
+    e.search_results("Slow Horses S01E02", vec![ep2]);
+    // A request for a monitored episode, held in its automatic search by a slow indexer.
+    e.mock.lock().unwrap().slow_queries.push((
+        "Slow Horses S01E02".into(),
+        std::time::Duration::from_millis(1500),
+    ));
+    let add = tokio::spawn(
+        e.post("/api/v1/library")
+            .json(&json!({ "media_id": "episode:tvdb:372264:1:2" }))
+            .send(),
+    );
+    let in_search = || {
+        e.mock
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .any(|q| q.contains("q=Slow+Horses+S01E02"))
+    };
+    for _ in 0..1000 {
+        if in_search() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(in_search(), "the add reached its search");
+
+    // The removal cannot fall between the add's checks and its changes: it runs after the
+    // add, whose download it then finds active.
+    let (s, v, text) = e.json(e.delete("/api/v1/library/series:tvdb:372264")).await;
+    let added = add.await.unwrap().unwrap();
+    assert_eq!(added.status().as_u16(), 201);
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("active_downloads")),
+        "{text}"
+    );
+    let (_, q, _) = e.json(e.get("/api/v1/queue")).await;
+    assert_eq!(q["items"].as_array().map(Vec::len), Some(1), "{q}");
+}
+
+#[tokio::test]
+async fn a_release_committed_while_a_torrent_is_fetched_records_and_submits_nothing() {
+    let e = start_exec(ExecOptions::default()).await;
+    let title = "The.Matrix.1999.1080p.WEB-DL.x264-UM";
+    let (hash, rel) = e.publish(
+        title,
+        title,
+        vec![(format!("{title}.mkv"), mkv(2))],
+        0.05,
+        false,
+    );
+    e.search_results("The Matrix 1999", vec![rel]);
+    let (_, v, text) = e.json(e.get("/api/v1/media/movie:tmdb:603/releases")).await;
+    let release_ref = v["releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["decision"]["approved"] == true)
+        .unwrap_or_else(|| panic!("an approved release: {text}"))["release_ref"]
+        .clone();
+    let grab = json!({ "media_id": "movie:tmdb:603", "release_ref": release_ref });
+
+    // The grab passes its check, then its torrent fetch is held open.
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    e.mock.lock().unwrap().download_gate = Some(gate.clone());
+    let pending = tokio::spawn(e.post("/api/v1/grabs").json(&grab).send());
+    let fetching = || e.mock.lock().unwrap().downloads.contains(&hash);
+    for _ in 0..1000 {
+        if fetching() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(fetching(), "the torrent fetch started");
+    // Nothing is recorded yet, so the removal succeeds while the fetch is pending.
+    let (s, _, text) = e.json(e.delete("/api/v1/library/movie:tmdb:603")).await;
+    assert_eq!(s, 200, "{text}");
+    gate.notify_one();
+    let r = pending.await.unwrap().unwrap();
+    let status = r.status().as_u16();
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (409, Some("not_adopted")),
+        "{v}"
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer adopted"),
+        "{v}"
+    );
+    // No grab, outbox entry or client add, then or after a worker pass.
+    e.tick().await;
+    assert!(e.fake.lock().unwrap().add_fields.is_empty());
+    let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
+    assert_eq!(q["items"], json!([]), "{q}");
+
+    // Adding the movie again, the same release is grabbed once.
+    e.mock.lock().unwrap().download_gate = None;
+    e.add("movie:tmdb:603").await;
+    let (s, _, text) = e.json(e.post("/api/v1/grabs").json(&grab)).await;
+    assert_eq!(s, 201, "{text}");
+    e.tick().await;
+    assert_eq!(e.fake.lock().unwrap().add_fields.len(), 1);
+    assert_eq!(e.fake.lock().unwrap().torrents[&hash].category, "um-movies");
+}
+
+#[tokio::test]
+async fn an_unmonitored_title_is_never_acquired_by_any_path() {
+    let e = start_exec(ExecOptions::default()).await;
+    let title = "The.Matrix.1999.1080p.WEB-DL.x264-UM";
+    let (_, rel) = e.publish(
+        title,
+        title,
+        vec![(format!("{title}.mkv"), mkv(2))],
+        0.05,
+        false,
+    );
+    e.search_results("The Matrix 1999", vec![rel]);
+    let (s, _, text) = e
+        .json(
+            e.patch("/api/v1/library/movie:tmdb:603")
+                .json(&json!({ "monitored": false })),
+        )
+        .await;
+    assert_eq!(s, 200, "{text}");
+    let (_, v, text) = e.json(e.get("/api/v1/media/movie:tmdb:603/releases")).await;
+    let release_ref = v["releases"][0]["release_ref"].clone();
+    for (path, body) in [
+        (
+            "/api/v1/plans",
+            json!({ "media_id": "movie:tmdb:603", "execute": true }),
+        ),
+        (
+            "/api/v1/grabs",
+            json!({ "media_id": "movie:tmdb:603", "release_ref": release_ref }),
+        ),
+    ] {
+        let (s, v, text) = e.json(e.post(path).json(&body)).await;
+        let refused = s == 409 || v["plan"]["execution"]["grabs"] == json!([]);
+        assert!(refused, "{path}: {s} {text}");
+    }
+    e.tick().await;
+    assert!(e.fake.lock().unwrap().add_fields.is_empty(), "{text}");
+    let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
+    assert_eq!(q["items"], json!([]), "{q}");
+}

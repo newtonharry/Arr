@@ -746,3 +746,59 @@ async fn an_episode_added_to_an_unmonitored_season_is_matched_alone_by_rss() {
         "still one download"
     );
 }
+
+fn queries(e: &Exec) -> Vec<String> {
+    e.mock
+        .lock()
+        .unwrap()
+        .log
+        .iter()
+        .filter_map(|q| {
+            q.split('&')
+                .find_map(|p| p.strip_prefix("q="))
+                .map(|v| v.replace('+', " "))
+        })
+        .collect()
+}
+
+async fn search_series(e: &Exec) {
+    let (s, _, text) = e
+        .json(
+            e.post("/api/v1/commands")
+                .json(&json!({ "name": "search_missing", "media_id": "series:tvdb:372264" })),
+        )
+        .await;
+    assert_eq!(s, 202, "{text}");
+    e.tick().await;
+}
+
+/// The whole-season rule: the worker searches a season as a whole only when all of it is
+/// monitored; otherwise its monitored episodes are searched one by one.
+#[tokio::test]
+async fn a_season_is_searched_as_a_whole_only_when_all_of_it_is_monitored() {
+    // Everything monitored (E01 and E03 are owned): the season query is made.
+    let e = start_exec(ExecOptions::default()).await;
+    search_series(&e).await;
+    let q = queries(&e);
+    assert!(q.iter().any(|q| q == "Slow Horses S01"), "{q:?}");
+
+    // One missing episode unmonitored: only the monitored missing episodes are searched.
+    let e = start_exec(ExecOptions::default()).await;
+    let (s, _, text) = e
+        .json(
+            e.patch("/api/v1/library/episode:tvdb:372264:1:4")
+                .json(&json!({ "monitored": false })),
+        )
+        .await;
+    assert_eq!(s, 200, "{text}");
+    search_series(&e).await;
+    let q = queries(&e);
+    assert!(!q.iter().any(|q| q == "Slow Horses S01"), "{q:?}");
+    for ep in ["E02", "E05", "E06"] {
+        assert!(
+            q.iter().any(|q| q == &format!("Slow Horses S01{ep}")),
+            "{ep}: {q:?}"
+        );
+    }
+    assert!(!q.iter().any(|q| q.contains("S01E04")), "{q:?}");
+}

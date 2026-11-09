@@ -926,13 +926,15 @@ async fn the_server_process_killed_mid_download_resumes_and_imports() {
         "[execution]\nenabled = true\ndownload_cleanup = true\n\
          [embedded]\ndownload_dir = '{}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ninitial_peers = [\"{}\"]\ndownload_limit_bytes_per_sec = 16384\n\
          [migration]\nmode = \"coexistence\"\n\
-         [library]\nmovies = '{}'\nsample_detection = false\nprobe_timeout_secs = 30\n\
+         [library]\nmovies = '{}'\ntv = '{}'\nsample_detection = false\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 1\n\
          [tmdb]\nenabled = true\nbase_url = \"http://{mock_addr}/tmdb\"\ncredential_file = \"secrets/tmdb\"\n",
         downloads.display(),
         seeder.addr(),
-        movies.display()
+        movies.display(),
+        root.join("tv").display()
     );
+    std::fs::create_dir_all(root.join("tv")).unwrap();
     write_managed_config(&dir, mock_addr, false, &extra);
     {
         let (state, base, server) = serve(&dir).await;

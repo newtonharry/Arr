@@ -166,11 +166,13 @@ impl Env {
     fn eval_release(&self, target: &Target, scope: Scope, r: Value) -> Decision {
         let r: ProwlarrRelease = serde_json::from_value(r).unwrap();
         let p = release::parse(r.title.as_deref().unwrap());
-        let profile_id = target.quality_profile().map(|p| match (self.snapshot_profiles, p) {
-            (true, "setup:movies-hd") => "radarr:6".to_string(),
-            (true, "setup:tv-hd") => "sonarr:6".to_string(),
-            _ => p.to_string(),
-        });
+        let profile_id = target
+            .quality_profile()
+            .map(|p| match (self.snapshot_profiles, p) {
+                (true, "setup:movies-hd") => "radarr:6".to_string(),
+                (true, "setup:tv-hd") => "sonarr:6".to_string(),
+                _ => p.to_string(),
+            });
         let ctx = EvalContext {
             target,
             scope,

@@ -8,275 +8,6 @@ use arr::ids::SeriesKey;
 use common::*;
 use serde_json::json;
 
-#[tokio::test]
-async fn an_empty_metadata_response_cannot_resolve_a_known_numbering_conflict() {
-    let e = start_exec(ExecOptions {
-        mode: "coexistence",
-        categories: Some(("um-review-movies", "um-review-tv")),
-        ..ExecOptions::legacy()
-    })
-    .await;
-    let (status, _, body) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "series:tvdb:372264", "native_handoff_confirmed": true, "search": false
-        })))
-        .await;
-    assert_eq!(status, 201, "{body}");
-    let mut renumbered = e
-        .state
-        .index()
-        .series(SeriesKey::Tvdb(372264))
-        .unwrap()
-        .episodes
-        .as_ref()
-        .unwrap()[0]
-        .clone();
-    let known_anchor = renumbered.clone();
-    renumbered.season = 3;
-    renumbered.number = 1;
-    let id = "series:tvdb:372264".parse().unwrap();
-    let now = time::OffsetDateTime::now_utc();
-    e.state
-        .store
-        .with(move |c| arr::library::upsert_episodes(c, id, &[renumbered], now))
-        .await
-        .unwrap();
-    e.state.reload_index().await.unwrap();
-    assert!(
-        e.state
-            .index()
-            .series(SeriesKey::Tvdb(372264))
-            .unwrap()
-            .metadata_hold
-            .is_some()
-    );
-    e.state
-        .store
-        .with(move |c| arr::library::upsert_episodes(c, id, &[], now))
-        .await
-        .unwrap();
-    e.state.reload_index().await.unwrap();
-    assert!(
-        e.state
-            .index()
-            .series(SeriesKey::Tvdb(372264))
-            .unwrap()
-            .metadata_hold
-            .is_some(),
-        "an empty provider response is not evidence that the numbering disagreement was resolved"
-    );
-    e.state
-        .store
-        .with(move |c| arr::library::upsert_episodes(c, id, &[known_anchor], now))
-        .await
-        .unwrap();
-    e.state.reload_index().await.unwrap();
-    assert!(
-        e.state
-            .index()
-            .series(SeriesKey::Tvdb(372264))
-            .unwrap()
-            .metadata_hold
-            .is_some(),
-        "a partial response missing other imported episodes cannot prove that the numbering conflict was resolved"
-    );
-}
-
-#[tokio::test]
-async fn episode_status_uses_actual_coverage_not_the_original_season_request() {
-    let e = start_exec(ExecOptions {
-        mode: "coexistence",
-        categories: Some(("um-review-movies", "um-review-tv")),
-        ..ExecOptions::legacy()
-    })
-    .await;
-    for number in [2, 4] {
-        let title = format!("Slow.Horses.S01E{number:02}.1080p.WEB-DL.x264-UM");
-        let (_, release) = e.publish(
-            &title,
-            &title,
-            vec![(format!("{title}.mkv"), mkv(2))],
-            1.5,
-            false,
-        );
-        e.search_results(&format!("Slow Horses S01E{number:02}"), vec![release]);
-    }
-    let (status, _, body) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "season:tvdb:372264:1", "native_handoff_confirmed": true
-        })))
-        .await;
-    assert_eq!(status, 201, "{body}");
-    e.tick().await;
-    let (status, episode, body) = e
-        .json(e.get("/api/v1/status/episode:tvdb:372264:1:2"))
-        .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        episode["downloads"].as_array().unwrap().len(),
-        1,
-        "a broader original season request must not attach the other episode's grab: {body}"
-    );
-    assert_eq!(
-        episode["downloads"][0]["id"],
-        episode["episodes"][0]["download"]["id"]
-    );
-}
-
-#[tokio::test]
-async fn season_status_includes_pending_individual_episode_requests() {
-    let e = start_exec(ExecOptions {
-        mode: "coexistence",
-        categories: Some(("um-review-movies", "um-review-tv")),
-        ..ExecOptions::legacy()
-    })
-    .await;
-    let (status, _, body) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "episode:tvdb:372264:1:2",
-            "native_handoff_confirmed": true
-        })))
-        .await;
-    assert_eq!(status, 201, "{body}");
-    let (_, requests, _) = e.json(e.get("/api/v1/requests")).await;
-    assert!(
-        requests["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| { r["target"] == "episode:tvdb:372264:1:2" && r["state"] == "active" })
-    );
-    let (status, season, body) = e.json(e.get("/api/v1/status/season:tvdb:372264:1")).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(
-        season["requests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| { r["target"] == "episode:tvdb:372264:1:2" && r["state"] == "active" }),
-        "a season must include its episode request despite the different ID kinds: {body}"
-    );
-    let (status, _, body) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "season:tvdb:372264:1", "native_handoff_confirmed": true
-        })))
-        .await;
-    assert_eq!(status, 201, "{body}");
-    let (_, episode, body) = e
-        .json(e.get("/api/v1/status/episode:tvdb:372264:1:2"))
-        .await;
-    assert!(
-        episode["requests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| { r["target"] == "season:tvdb:372264:1" && r["state"] == "active" }),
-        "the episode should expose its encompassing season request: {body}"
-    );
-}
-
-#[tokio::test]
-async fn season_status_includes_individual_grabs_with_either_series_namespace() {
-    let e = start_exec(ExecOptions {
-        mode: "coexistence",
-        categories: Some(("um-review-movies", "um-review-tv")),
-        ..ExecOptions::legacy()
-    })
-    .await;
-    let title = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
-    let (_, release) = e.publish(
-        title,
-        title,
-        vec![(format!("{title}.mkv"), mkv(2))],
-        1.5,
-        false,
-    );
-    e.search_results("Slow Horses S01E02", vec![release]);
-    let (status, _, body) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "episode:tvdb:372264:1:2", "native_handoff_confirmed": true
-        })))
-        .await;
-    assert_eq!(status, 201, "{body}");
-    e.tick().await;
-    for scope in ["season:tvdb:372264:1", "season:tvmaze:9001:1"] {
-        let (status, season, body) = e.json(e.get(&format!("/api/v1/status/{scope}"))).await;
-        assert_eq!(status, 200, "{body}");
-        assert_eq!(
-            season["downloads"].as_array().unwrap().len(),
-            1,
-            "season status must contain the episode grab, including canonical-ID aliases: {body}"
-        );
-        assert_eq!(season["downloads"][0]["target"], "episode:tvdb:372264:1:2");
-    }
-}
-
-#[tokio::test]
-async fn metadata_must_not_append_known_episodes_renumbered_as_a_new_season() {
-    let mut snap = snapshot();
-    let native_id = snap["sonarr"]["series"][0]["id"]
-        .as_i64()
-        .unwrap()
-        .to_string();
-    let original = &mut snap["sonarr"]["episode_samples"][&native_id][0];
-    original["title"] = json!("A distinctive existing episode");
-    original["airDateUtc"] = json!("2022-04-01T02:00:00Z");
-    let e = start_exec(ExecOptions {
-        mode: "coexistence",
-        categories: Some(("um-review-movies", "um-review-tv")),
-        snapshot: snap,
-        ..ExecOptions::legacy()
-    })
-    .await;
-    let (status, _, body) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "series:tvdb:372264",
-            "native_handoff_confirmed": true,
-            "search": false
-        })))
-        .await;
-    assert_eq!(status, 201, "{body}");
-    // The same episode title AND air date at a different season/number is evidence of
-    // numbering disagreement. A larger season number alone does not justify appending it.
-    e.mock.lock().unwrap().tvmaze_extra.insert(
-        "9001".into(),
-        vec![
-            json!({
-                "season": 3, "number": 1, "name": "A distinctive existing episode",
-                "type": "regular", "airstamp": "2022-04-01T02:00:00Z", "runtime": 60
-            }),
-            json!({
-                "season": 4, "number": 1, "name": "A genuinely future provider episode",
-                "type": "regular", "airstamp": "2027-04-01T02:00:00Z", "runtime": 60
-            }),
-        ],
-    );
-    let (status, command, body) = e
-        .json(e.post("/api/v1/commands").json(&json!({
-            "name": "refresh_metadata", "media_id": "series:tvdb:372264"
-        })))
-        .await;
-    assert!(status == 200 || status == 202, "{body}");
-    e.tick().await;
-    let (_, result, body) = e
-        .json(e.get(&format!(
-            "/api/v1/commands/{}",
-            command["id"].as_str().unwrap()
-        )))
-        .await;
-    assert_eq!(result["command"]["state"], "completed", "{body}");
-    let index = e.state.index();
-    let series = index.series(SeriesKey::Tvdb(372264)).unwrap();
-    assert!(
-        !series
-            .episodes
-            .iter()
-            .flatten()
-            .any(|ep| (ep.season == 3 || ep.season == 4) && ep.number == 1),
-        "the provider renumbered an existing episode; appending it would create a phantom target: {body}"
-    );
-}
-
 /// Regression: an MCP replay of an add failed with native_handoff_required AFTER the exact
 /// scope had been adopted with the native monitoring ledger checked. The conversational
 /// tool cannot confirm a handoff; a repeat in the already confirmed scope must work, while
@@ -505,4 +236,147 @@ async fn imported_minimum_availability_gates_acquisition() {
         .await;
     assert!(text.contains("not implemented"), "{text}");
     let _ = v;
+}
+
+// Numbering holds apply to episodes a snapshot import recorded, so these two stay on the
+// legacy stack.
+
+#[tokio::test]
+async fn an_empty_metadata_response_cannot_resolve_a_known_numbering_conflict() {
+    let e = start_exec(ExecOptions {
+        mode: "coexistence",
+        categories: Some(("um-review-movies", "um-review-tv")),
+        ..ExecOptions::legacy()
+    })
+    .await;
+    let (status, _, body) = e
+        .json(e.post("/api/v1/library").json(&json!({
+            "media_id": "series:tvdb:372264", "native_handoff_confirmed": true, "search": false
+        })))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let mut renumbered = e
+        .state
+        .index()
+        .series(SeriesKey::Tvdb(372264))
+        .unwrap()
+        .episodes
+        .as_ref()
+        .unwrap()[0]
+        .clone();
+    let known_anchor = renumbered.clone();
+    renumbered.season = 3;
+    renumbered.number = 1;
+    let id = "series:tvdb:372264".parse().unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    e.state
+        .store
+        .with(move |c| arr::library::upsert_episodes(c, id, &[renumbered], now))
+        .await
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    assert!(
+        e.state
+            .index()
+            .series(SeriesKey::Tvdb(372264))
+            .unwrap()
+            .metadata_hold
+            .is_some()
+    );
+    e.state
+        .store
+        .with(move |c| arr::library::upsert_episodes(c, id, &[], now))
+        .await
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    assert!(
+        e.state
+            .index()
+            .series(SeriesKey::Tvdb(372264))
+            .unwrap()
+            .metadata_hold
+            .is_some(),
+        "an empty provider response is not evidence that the numbering disagreement was resolved"
+    );
+    e.state
+        .store
+        .with(move |c| arr::library::upsert_episodes(c, id, &[known_anchor], now))
+        .await
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    assert!(
+        e.state
+            .index()
+            .series(SeriesKey::Tvdb(372264))
+            .unwrap()
+            .metadata_hold
+            .is_some(),
+        "a partial response missing other imported episodes cannot prove that the numbering conflict was resolved"
+    );
+}
+
+#[tokio::test]
+async fn metadata_must_not_append_known_episodes_renumbered_as_a_new_season() {
+    let mut snap = snapshot();
+    let native_id = snap["sonarr"]["series"][0]["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    let original = &mut snap["sonarr"]["episode_samples"][&native_id][0];
+    original["title"] = json!("A distinctive existing episode");
+    original["airDateUtc"] = json!("2022-04-01T02:00:00Z");
+    let e = start_exec(ExecOptions {
+        mode: "coexistence",
+        categories: Some(("um-review-movies", "um-review-tv")),
+        snapshot: snap,
+        ..ExecOptions::legacy()
+    })
+    .await;
+    let (status, _, body) = e
+        .json(e.post("/api/v1/library").json(&json!({
+            "media_id": "series:tvdb:372264",
+            "native_handoff_confirmed": true,
+            "search": false
+        })))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    // The same episode title AND air date at a different season/number is evidence of
+    // numbering disagreement. A larger season number alone does not justify appending it.
+    e.mock.lock().unwrap().tvmaze_extra.insert(
+        "9001".into(),
+        vec![
+            json!({
+                "season": 3, "number": 1, "name": "A distinctive existing episode",
+                "type": "regular", "airstamp": "2022-04-01T02:00:00Z", "runtime": 60
+            }),
+            json!({
+                "season": 4, "number": 1, "name": "A genuinely future provider episode",
+                "type": "regular", "airstamp": "2027-04-01T02:00:00Z", "runtime": 60
+            }),
+        ],
+    );
+    let (status, command, body) = e
+        .json(e.post("/api/v1/commands").json(&json!({
+            "name": "refresh_metadata", "media_id": "series:tvdb:372264"
+        })))
+        .await;
+    assert!(status == 200 || status == 202, "{body}");
+    e.tick().await;
+    let (_, result, body) = e
+        .json(e.get(&format!(
+            "/api/v1/commands/{}",
+            command["id"].as_str().unwrap()
+        )))
+        .await;
+    assert_eq!(result["command"]["state"], "completed", "{body}");
+    let index = e.state.index();
+    let series = index.series(SeriesKey::Tvdb(372264)).unwrap();
+    assert!(
+        !series
+            .episodes
+            .iter()
+            .flatten()
+            .any(|ep| (ep.season == 3 || ep.season == 4) && ep.number == 1),
+        "the provider renumbered an existing episode; appending it would create a phantom target: {body}"
+    );
 }
