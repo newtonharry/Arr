@@ -202,7 +202,7 @@ body.sheet-open{overflow:hidden}
 .item,.idea{position:relative}
 .item:has(.stretch){cursor:pointer}
 .idea{position:relative}
-.item .btn,.item .link,.idea .btn{position:relative;z-index:1}
+.item .btn,.item .link,.idea .btn,.idea .link{position:relative;z-index:1}
 .item:has(.stretch:hover) h3 .stretch,.idea:has(.stretch:hover) h3 .stretch{text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:2px;text-decoration-color:var(--line)}
 @media (min-width:760px){
   .sheet{background:var(--scrim)}
