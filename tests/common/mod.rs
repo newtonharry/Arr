@@ -494,7 +494,8 @@ async fn prowlarr_search(
 
 fn tvmaze_show(id: u32, name: &str, premiered: &str, tvdb: Option<u32>) -> Value {
     json!({ "id": id, "name": name, "type": "Scripted", "language": "English", "status": "Running", "runtime": 60,
-            "premiered": premiered, "externals": { "tvrage": null, "thetvdb": tvdb, "imdb": null } })
+            "premiered": premiered, "externals": { "tvrage": null, "thetvdb": tvdb, "imdb": null },
+            "network": { "name": "Apple TV+" }, "summary": format!("<p>About <b>{name}</b> &amp; its people.</p>") })
 }
 
 fn shows() -> Vec<Value> {
@@ -704,7 +705,7 @@ fn plex_fixtures() -> Vec<Value> {
         let mut v = json!({
             "ratingKey": key, "guid": format!("plex://movie/{key}"), "type": "movie", "title": title,
             "year": date[..4].parse::<u16>().unwrap(), "originallyAvailableAt": date, "duration": 6_000_000,
-            "Guid": guids, "Country": [{ "tag": country }],
+            "Guid": guids, "Country": [{ "tag": country }], "summary": format!("About {title}."),
             // The host is the mock's (127.0.0.1), except the foreign movie's: not Plex's image host.
             "thumb": if key == "for0001" { format!("https://elsewhere.example/uploads/{key}.jpg") } else { format!("http://127.0.0.1/uploads/{key}.jpg") },
         });

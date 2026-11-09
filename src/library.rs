@@ -869,6 +869,75 @@ pub fn adopt_scope(c: &mut Connection, scope: MediaId, now: OffsetDateTime) -> R
     set_monitored(c, scope, true, now)
 }
 
+/// Whether Arr follows a managed series' new episodes: it acquires the series and a
+/// season that appears later is monitored too.
+pub fn following(c: &Connection, id: MediaId) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT monitored AND monitor_new FROM media WHERE id = ?1 AND managed = 1",
+        [id.to_string()],
+        |r| r.get(0),
+    )
+    .optional()?
+    .unwrap_or(false))
+}
+
+/// Turns "get new episodes as they air" on or off for a managed series. Episodes that have
+/// already aired, and every season someone chose, keep their monitoring; only what has not
+/// aired yet (and any season that appears later) follows the switch. Returns false when the
+/// series is not managed.
+pub fn set_following(
+    c: &mut Connection,
+    id: MediaId,
+    on: bool,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let MediaId::Series(_) = id else {
+        bail!("{id} is not a series");
+    };
+    let tx = c.transaction()?;
+    let (sid, now_s) = (id.to_string(), now_s(now));
+    let changed = if on {
+        tx.execute(
+            "UPDATE media SET monitored = 1, monitor_new = 1, updated_at = ?2, adopted_at = COALESCE(adopted_at, ?2) WHERE id = ?1 AND managed = 1",
+            params![sid, now_s],
+        )?
+    } else {
+        tx.execute(
+            "UPDATE media SET monitor_new = 0, updated_at = ?2 WHERE id = ?1 AND managed = 1",
+            params![sid, now_s],
+        )?
+    };
+    if changed > 0 {
+        // Turning on: a season with something still to air also takes episodes added to it
+        // later. Turning off leaves every season flag alone (a season someone chose keeps
+        // matching season packs).
+        if on {
+            tx.execute(
+                "INSERT INTO seasons (series_id, season, monitored) SELECT DISTINCT series_id, season, 1 FROM episodes WHERE series_id = ?1 AND season > 0 AND (air_date_utc IS NULL OR air_date_utc > ?2)
+                 ON CONFLICT (series_id, season) DO UPDATE SET monitored = 1",
+                params![sid, now_s],
+            )?;
+        }
+        tx.execute(
+            "UPDATE episodes SET monitored = ?3 WHERE series_id = ?1 AND season > 0 AND (air_date_utc IS NULL OR air_date_utc > ?2)",
+            params![sid, now_s, on],
+        )?;
+        let what = if on { "followed" } else { "unfollowed" };
+        event(
+            &tx,
+            &now_s,
+            if on { "monitored" } else { "unmonitored" },
+            Some(&sid),
+            Some(&sid),
+            None,
+            &format!("{id} {what} (new episodes)"),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed > 0)
+}
+
 fn handoff_scope(scope: MediaId) -> String {
     match scope {
         MediaId::Movie { .. } | MediaId::Series(_) => String::new(),

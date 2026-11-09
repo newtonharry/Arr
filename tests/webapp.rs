@@ -760,11 +760,7 @@ async fn quick_add_gets_a_movie_or_a_show() {
         "{v}"
     );
     // Bad requests keep the API's error envelope.
-    for body in [
-        json!({ "media_id": "season:tvdb:999005:1" }),
-        json!({ "media_id": "nope" }),
-        json!({}),
-    ] {
+    for body in [json!({ "media_id": "nope" }), json!({})] {
         let (s, v) = site
             .json(
                 site.app(Method::POST, "/app/api/v1/quick-add", Some(&cookie))

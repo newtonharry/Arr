@@ -18,6 +18,9 @@ const ICONS = {
   plus: 'M12 5v14M5 12h14',
   pause: 'M9 5v14M15 5v14',
   alert: 'M12 4a8 8 0 1 0 0 16a8 8 0 0 0 0-16zM12 8v5M12 16.5v.01',
+  close: 'M6 6l12 12M18 6L6 18',
+  down: 'M6 9l6 6l6-6',
+  right: 'M9 6l6 6l-6 6',
 };
 const NS = 'http://www.w3.org/2000/svg';
 function ic(name) {
@@ -170,7 +173,7 @@ function retryControl(it) {
     try {
       const r = it.grab_id
         ? await api(`/v1/queue/${encodeURIComponent(it.grab_id)}/retry`, { method: 'POST' })
-        : await api('/v1/quick-add', { method: 'POST', body: { media_id: it.media_id } });
+        : await api('/v1/quick-add', { method: 'POST', body: { media_id: it.target || it.media_id } });
       next = r.ok ? { state: 'again', msg: 'Trying again. Check back in a minute.' } : { msg: "Couldn't try again just now. Give it a moment.", err: true };
     } catch { next = { msg: "Couldn't reach Arr. Try again in a moment.", err: true }; }
     A.set(id, next); repaint(id); say(next.msg);
@@ -183,14 +186,14 @@ function retryControl(it) {
 function needRow(it) {
   const [btn, msg] = retryControl(it);
   return h('li', { class: 'item need' }, tile(it.title, it.media_id),
-    h('div', { class: 'what' }, h('h3', { title: it.title }, it.title),
+    h('div', { class: 'what' }, h('h3', { title: it.title }, stretch(it.title, it.media_id)),
       meta(it) && h('p', { class: 'meta' }, meta(it)),
       h('p', { class: 'problem' }, ic('alert'), h('span', null, it.problem)), msg), btn);
 }
 function arrivedRow(it) {
   return h('li', { class: 'item arrived' }, tile(it.title, it.media_id),
     h('div', { class: 'what' }, h('span', { class: 'tag' }, ic('check'), 'In Plex'),
-      h('h3', { title: it.title }, it.title), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))),
+      h('h3', { title: it.title }, stretch(it.title, it.media_id)), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))),
     plexLink(it.title));
 }
 const STAGES = ['Found', 'Downloading', 'Checking', 'In Plex'];
@@ -203,7 +206,7 @@ function wayRow(it) {
   pendingFills.push([fill, target, it.grab_id]);
   const status = it.paused ? 'Paused' : stage === 0 ? 'Found, getting ready' : stage === 1 ? (p == null ? 'Downloading' : `${Math.round(p * 100)}% downloaded`) : 'Checking the file';
   return h('li', { class: 'item' }, tile(it.title, it.media_id),
-    h('div', { class: 'what' }, h('h3', { title: it.title }, it.title),
+    h('div', { class: 'what' }, h('h3', { title: it.title }, stretch(it.title, it.media_id)),
       h('p', { class: 'meta status' }, it.paused && ic('pause'), joinDot(meta(it), status)),
       h('ol', { class: 'journey' + (it.paused ? ' paused' : ''), 'aria-label': 'Progress' }, fill,
         STAGES.map((s, i) => h('li', { class: i <= stage ? 'on' : '', 'aria-current': i === stage ? 'step' : null }, s)))));
@@ -212,26 +215,25 @@ let pendingFills = [];
 function lookRow(it) {
   const until = it.until ? parseDate(it.until) : null;
   return h('li', { class: 'item' }, until ? chip(until, 'month') : tile(it.title, it.media_id),
-    h('div', { class: 'what' }, h('h3', { title: it.title }, it.title),
+    h('div', { class: 'what' }, h('h3', { title: it.title }, stretch(it.title, it.media_id)),
       h('p', { class: 'meta' }, joinDot(meta(it), until ? `Out ${fmtDay(until)}. Arr will get it then.` : 'Arr is looking for a copy'))));
 }
 function soonRow(it) {
   return h('li', { class: 'item' }, chip(new Date(it.at), 'day'),
-    h('div', { class: 'what' }, h('h3', { title: it.title }, it.title), h('p', { class: 'meta' }, it.detail || 'New episode')));
+    h('div', { class: 'what' }, h('h3', { title: it.title }, stretch(it.title, it.media_id)), h('p', { class: 'meta' }, it.detail || 'New episode')));
 }
-function ideaItem(x) {
-  return { id: x.media_id, title: x.title, base: x.in_library ? 'added' : 'add' };
+// Ideas are shows: the button opens the show page, where the person picks what to get.
+function chooseLink(x) {
+  return h('a', { class: 'btn' + (x.in_library ? ' ghost' : ''), href: titleHref(x.media_id), 'aria-label': `${x.in_library ? 'Open' : 'Choose'} ${x.title}` }, x.in_library ? 'Open' : 'Choose', ic('right'));
 }
 function ideaCard(x) {
-  const [btn] = addControl(ideaItem(x), false);
-  return h('li', { class: 'idea' }, tile(x.title, x.media_id), h('h3', { title: x.title }, x.title),
-    h('p', { class: 'meta' }, x.network || x.year || ''), btn);
+  return h('li', { class: 'idea' }, tile(x.title, x.media_id), h('h3', { title: x.title }, stretch(x.title, x.media_id)),
+    h('p', { class: 'meta' }, x.network || x.year || ''), chooseLink(x));
 }
 function ideaRow(x) {
-  const [btn, msg] = addControl(ideaItem(x));
   return h('li', { class: 'item top-align' }, tile(x.title, x.media_id),
-    h('div', { class: 'what' }, h('h3', { title: x.title }, x.title),
-      h('p', { class: 'meta' }, joinDot(x.year, x.network)), x.summary && h('p', { class: 'clamp' }, x.summary), msg), btn);
+    h('div', { class: 'what' }, h('h3', { title: x.title }, stretch(x.title, x.media_id)),
+      h('p', { class: 'meta' }, joinDot(x.year, x.network)), x.summary && h('p', { class: 'clamp' }, x.summary)), chooseLink(x));
 }
 
 // ---------- home ----------
@@ -346,10 +348,16 @@ async function renderSearch(q, t) {
   mount(wrap);
 }
 function searchRow(x, label) {
+  // A movie is one tap; a show opens its page to pick what to get.
+  if (label === 'Show') {
+    return h('li', { class: 'item top-align' }, tile(x.title, x.media_id),
+      h('div', { class: 'what' }, h('h3', { title: x.title }, stretch(x.title, x.media_id)), h('p', { class: 'meta' }, joinDot(x.year, label))),
+      chooseLink({ media_id: x.media_id, title: x.title, in_library: x.in_catalog && x.monitored }));
+  }
   const base = x.has_file ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add';
   const [btn, msg] = addControl({ id: x.media_id, title: x.title, base });
   return h('li', { class: 'item top-align' }, tile(x.title, x.media_id),
-    h('div', { class: 'what' }, h('h3', { title: x.title }, x.title), h('p', { class: 'meta' }, joinDot(x.year, label)), msg), btn);
+    h('div', { class: 'what' }, h('h3', { title: x.title }, stretch(x.title, x.media_id)), h('p', { class: 'meta' }, joinDot(x.year, label)), msg), btn);
 }
 
 // ---------- library ----------
@@ -365,7 +373,7 @@ function renderLibrary(t) {
   const rowFor = (x) => {
     const mv = S.kind === 'movies', title = x.title || 'Untitled';
     const mid = mv ? (x.tmdb_id && `movie:tmdb:${x.tmdb_id}`) : x.tvdb_id ? `series:tvdb:${x.tvdb_id}` : x.tvmaze_id ? `series:tvmaze:${x.tvmaze_id}` : null;
-    return h('li', { class: 'item' }, tile(title, mid), h('div', { class: 'what' }, h('h3', { title }, title),
+    return h('li', { class: 'item' }, tile(title, mid), h('div', { class: 'what' }, h('h3', { title }, stretch(title, mid)),
       h('p', { class: 'meta' }, joinDot(x.year, mv ? 'Movie' : 'Show', mv && x.has_file === false && 'Not in Plex yet'))),
       !(mv && x.has_file === false) && plexLink(title));
   };
@@ -390,6 +398,339 @@ function renderLibrary(t) {
   load(true);
 }
 
+// ---------- title pages (a show or a movie, as a sheet over the current screen) ----------
+const sheet = $('#sheet'), panel = $('#panel');
+const P = { id: '', kind: '', token: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false };
+let bgHash = '', sheetFills = [];
+const sheetOpen = () => !sheet.hidden;
+const enc = encodeURIComponent;
+const pct = (p) => Math.round(p * 100);
+const fmtDate = (s) => {
+  const d = parseDate(s);
+  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', ...(d.getFullYear() !== new Date().getFullYear() ? { year: 'numeric' } : {}) });
+};
+const fmtRuntime = (m) => (m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ''}` : `${m}m`);
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+function titleRoute(path) {
+  const m = /^\/(show|movie)\/(.+)$/.exec(path);
+  if (!m) return null;
+  let id;
+  try { id = decodeURIComponent(m[2]); } catch { return null; }
+  const ok = m[1] === 'show' ? /^series:(tvdb|tvmaze):\d+$/.test(id) : /^movie:tmdb:\d+$/.test(id);
+  return ok ? { kind: m[1], id } : null;
+}
+// The page a media id of any kind belongs to: a movie's, or the show of a season or episode.
+function titleHref(id) {
+  if (/^movie:tmdb:\d+$/.test(id || '')) return '#/movie/' + id;
+  const m = /^(?:series|season|episode):(tvdb|tvmaze):(\d+)/.exec(id || '');
+  return m ? `#/show/series:${m[1]}:${m[2]}` : null;
+}
+// A title that opens its page; the link covers the whole row (see .stretch).
+function stretch(text, id) {
+  const href = titleHref(id);
+  return href ? h('a', { class: 'stretch', href, 'data-fk': 'open:' + href }, text) : text;
+}
+document.addEventListener('click', (e) => {
+  const a = e.target.closest && e.target.closest('a[href^="#/show/"],a[href^="#/movie/"]');
+  if (a) P.opener = a;
+}, true);
+
+function openTitle(t) {
+  if (sheetOpen() && P.id === t.id) return;
+  const first = !sheetOpen();
+  if (first) {
+    P.canBack = !!bgHash; // came from a screen of the app: closing goes back to it
+    if (!bgHash) renderPath('/', '', '#/'); // a link straight to a title: home sits underneath
+    P.scrollY = window.scrollY;
+    sheet.hidden = false;
+    document.body.classList.add('sheet-open');
+    for (const el of [top, view, $('#foot')]) el.inert = true;
+  }
+  clearTimeout(P.pollT); clearTimeout(P.askT);
+  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false });
+  panel.scrollTop = 0;
+  paintSheet();
+  if (first) panel.querySelector('.close')?.focus({ preventScroll: true });
+  loadTitle(false);
+}
+function closeSheet() {
+  if (!sheetOpen()) return;
+  clearTimeout(P.pollT); clearTimeout(P.askT);
+  P.token++;
+  sheet.hidden = true;
+  document.body.classList.remove('sheet-open');
+  for (const el of [top, view, $('#foot')]) el.inert = false;
+  panel.replaceChildren();
+  document.title = pageName(parseHash(bgHash).path) + ' · Arr';
+  window.scrollTo(0, P.scrollY);
+  const o = P.opener, fk = o && o.dataset.fk;
+  const back = (o && o.isConnected && o) || (fk && view.querySelector(`[data-fk="${CSS.escape(fk)}"]`)) || view;
+  back.focus({ preventScroll: true });
+}
+// The person closed it: go back to where they were, or home if the link was the way in.
+function dismiss() {
+  if (P.canBack) history.back();
+  else { history.replaceState(null, '', bgHash || '#/'); route(); }
+}
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !sheetOpen()) return;
+  e.preventDefault();
+  if (P.ask) { P.ask = ''; paintSheet(); } else dismiss();
+});
+sheet.addEventListener('click', (e) => { if (e.target === sheet) dismiss(); });
+
+function errText(r) {
+  if (P.kind === 'movie') return r && r.status === 404 ? (S.feed && S.feed.movies_enabled === false ? "Movie details need movie search, which isn't set up yet." : "Arr doesn't have details for this movie right now.") : "Couldn't load this movie just now.";
+  return r && r.status === 404 ? "Arr doesn't have an episode list for this show right now." : "Couldn't load this show just now.";
+}
+async function loadTitle(quiet) {
+  const tk = P.token;
+  try {
+    const r = await api(`/v1/${P.kind}/${enc(P.id)}`);
+    if (tk !== P.token) return;
+    if (!r.ok) { if (!P.data) P.err = errText(r); paintSheet(); return; }
+    P.data = r.data; P.err = '';
+    document.title = `${r.data.title} · Arr`;
+    if (P.kind === 'show') await Promise.all([...P.open].map((n) => loadSeason(n, tk)));
+  } catch {
+    if (tk !== P.token) return;
+    if (!P.data) P.err = "Couldn't reach Arr just now.";
+  }
+  if (tk !== P.token) return;
+  paintSheet();
+  schedulePoll();
+}
+async function loadSeason(n, tk) {
+  const cur = P.seasons.get(n) || {};
+  try {
+    const r = await api(`/v1/show/${enc(P.id)}/season/${n}`);
+    if (tk !== P.token) return;
+    P.seasons.set(n, r.ok ? { eps: r.data.episodes } : { ...cur, loading: false, err: "Couldn't load the episodes." });
+  } catch {
+    if (tk === P.token) P.seasons.set(n, { ...cur, loading: false, err: "Couldn't load the episodes." });
+  }
+}
+function schedulePoll() {
+  clearTimeout(P.pollT);
+  if (!sheetOpen() || document.hidden || !P.data) return;
+  const moving = P.kind === 'movie' ? P.data.state === 'on_its_way' : P.data.seasons.some((s) => s.state === 'on_its_way');
+  if (!moving) return;
+  const tk = P.token;
+  P.pollT = setTimeout(() => { if (tk === P.token) loadTitle(true); }, 5000);
+}
+
+function paintSheet() {
+  if (!sheetOpen()) return;
+  const fk = panel.contains(document.activeElement) && document.activeElement.dataset.fk;
+  const scroll = panel.scrollTop;
+  sheetFills = [];
+  const body = P.data ? (P.kind === 'show' ? showBody() : movieBody()) : P.err ? errorBody() : skeleton();
+  const close = h('button', { type: 'button', class: 'btn ghost close', 'aria-label': 'Close', 'data-fk': 'close', onclick: dismiss }, ic('close'));
+  panel.replaceChildren(h('div', { class: 'sheet-bar' }, close), h('div', { class: 'sheet-body' }, body));
+  panel.scrollTop = scroll;
+  if (fk) panel.querySelector(`[data-fk="${CSS.escape(fk)}"]`)?.focus({ preventScroll: true });
+  const fl = sheetFills, sum = panel.querySelector('.sum.cl'), more = panel.querySelector('.more-sum');
+  requestAnimationFrame(() => {
+    if (sum && more && sum.scrollHeight > sum.clientHeight + 1) more.hidden = false;
+    requestAnimationFrame(() => { for (const [el, t, id] of fl) { el.style.setProperty('--f', t); fills.set(id, t); } });
+  });
+}
+function skeleton() {
+  const bar = (w) => h('div', { class: 'sk', style: `width:${w}` });
+  return h('div', { class: 'stack', 'aria-busy': 'true' },
+    h('span', { id: 'sheet-title', class: 'sr' }, 'Loading'),
+    h('div', { class: 'hero' }, h('div', { class: 'tile big sk-tile' }), h('div', { class: 'hero-t' }, bar('80%'), bar('50%'))),
+    bar('100%'), bar('70%'),
+    h('ul', { class: 'list' }, [1, 2, 3].map(() => h('li', { class: 'item' }, h('div', { class: 'what' }, bar('40%'), h('div', { class: 'sk', style: 'width:65%;margin-top:8px' }))))));
+}
+function errorBody() {
+  return h('div', { class: 'stack' }, h('span', { id: 'sheet-title', class: 'sr' }, 'Something went wrong'),
+    hint(P.err, 'status'),
+    h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'retry', onclick: () => { P.err = ''; paintSheet(); loadTitle(false); } }, ic('retry'), 'Try again'));
+}
+function hero(title, line) {
+  const t = tile(title, P.data.media_id);
+  t.classList.add('big');
+  return h('header', { class: 'hero' }, t, h('div', { class: 'hero-t' }, h('h1', { id: 'sheet-title' }, title), line && h('p', { class: 'meta' }, line)));
+}
+function summary(text) {
+  if (!text) return null;
+  return h('div', null,
+    h('p', { class: 'sum' + (P.more ? '' : ' cl') }, text),
+    h('button', { type: 'button', class: 'link more-sum', 'aria-expanded': String(P.more), 'data-fk': 'more', hidden: !P.more, onclick: () => { P.more = !P.more; paintSheet(); } }, P.more ? 'Less' : 'More'));
+}
+function msgFor(key) {
+  const m = P.msg.get(key);
+  const p = h('p', { class: 'msg' }, m ? m.text : '');
+  if (m && m.err) p.dataset.err = '';
+  return p;
+}
+
+// One action: Get, or Stop (which asks first). `key` identifies it on the page.
+function actionNode(key, kind, label, noun, scope) {
+  const busy = P.busy.has(key);
+  if (kind === 'stop' && P.ask === key && !busy) {
+    return h('span', { class: 'ask' }, h('span', { class: 'ask-t' }, 'Stop getting it?'),
+      h('button', { type: 'button', class: 'btn', 'data-fk': 'act:' + key, 'aria-label': `Confirm: stop getting ${noun}`, onclick: () => act(key, 'stop', scope) }, 'Confirm'),
+      h('button', { type: 'button', class: 'btn ghost', 'aria-label': `Keep getting ${noun}`, onclick: () => { P.ask = ''; paintSheet(); } }, 'Keep'));
+  }
+  const text = busy ? (kind === 'get' ? 'Getting…' : 'Stopping…') : label;
+  return h('button', {
+    type: 'button', class: 'btn' + (kind === 'stop' ? ' ghost' : ''), 'data-fk': 'act:' + key, 'data-s': busy ? 'busy' : null,
+    'aria-disabled': busy ? 'true' : 'false', 'aria-label': `${label} ${noun}`,
+    onclick: () => {
+      if (P.busy.has(key)) return;
+      if (kind === 'get') return act(key, 'get', scope);
+      P.ask = key; paintSheet();
+      clearTimeout(P.askT);
+      P.askT = setTimeout(() => { if (P.ask === key) { P.ask = ''; paintSheet(); } }, 6000);
+    },
+  }, !busy && kind === 'get' && ic('plus'), text);
+}
+async function act(key, kind, scope) {
+  const tk = P.token;
+  P.busy.add(key); P.ask = ''; P.msg.delete(key); paintSheet();
+  let res;
+  try {
+    const r = await api(kind === 'get' ? '/v1/quick-add' : '/v1/stop', { method: 'POST', body: { media_id: scope } });
+    if (!r.ok) res = { text: "Couldn't do that just now. Try again in a moment.", err: true };
+    else if (kind === 'get') res = { text: r.data.message || 'Done.', err: r.data.outcome === 'movies_off' };
+    else if (r.data.cancelled > 0) res = { text: 'Stopped. Arr cancelled the download and will not look for it.' };
+    else if (r.data.finishing > 0) res = { text: 'Stopped looking. A download that is nearly done will still finish.' };
+    else res = { text: 'Stopped. Arr will not look for it.' };
+  } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  if (tk !== P.token) return;
+  P.busy.delete(key); P.msg.set(key, res); say(res.text);
+  if (res.err) paintSheet(); else await loadTitle(true);
+}
+async function toggleFollow() {
+  if (P.followBusy) return;
+  const want = !P.data.following, tk = P.token;
+  P.followBusy = true; P.data.following = want; P.msg.delete('follow'); paintSheet();
+  let bad = false;
+  try {
+    const r = await api('/v1/follow', { method: 'POST', body: { media_id: P.data.media_id, on: want } });
+    bad = !r.ok;
+  } catch { bad = true; }
+  if (tk !== P.token) return;
+  P.followBusy = false;
+  if (bad) {
+    P.data.following = !want;
+    P.msg.set('follow', { text: "Couldn't change that. Try again in a moment.", err: true });
+    say("Couldn't change that.");
+    return paintSheet();
+  }
+  say(want ? 'Arr will get new episodes as they air.' : 'Arr will not look for new episodes.');
+  await loadTitle(true);
+}
+
+// ----- the show page
+function seasonFact(s) {
+  const left = s.episode_count;
+  switch (s.state) {
+    case 'in_plex': return `${plural(left, 'episode', 'episodes')} · all in Plex`;
+    case 'partly': return `${s.in_plex} of ${left} in Plex` + (s.wanted > 0 ? ' · Arr is looking for the rest' : s.next_air_date ? ` · next ${fmtDate(s.next_air_date)}` : '');
+    case 'on_its_way': return 'On its way' + (typeof s.progress === 'number' ? ` · ${pct(s.progress)}%` : '');
+    case 'wanted': return 'Arr is looking for a copy';
+    case 'upcoming': return s.next_air_date ? `Airs ${fmtDate(s.next_air_date)}` : 'Not aired yet';
+    default: return plural(left, 'episode', 'episodes');
+  }
+}
+function seasonAction(s) {
+  if (s.state === 'none') return ['get', 'Get'];
+  if (s.state === 'partly') return s.wanted > 0 ? ['stop', 'Stop'] : s.missing > 0 ? ['get', 'Get the rest'] : null;
+  if (s.state === 'wanted' || s.state === 'on_its_way') return ['stop', 'Stop'];
+  return null;
+}
+function toggleSeason(n) {
+  if (P.open.has(n)) { P.open.delete(n); return paintSheet(); }
+  P.open.add(n);
+  if (!(P.seasons.get(n) || {}).eps) {
+    P.seasons.set(n, { loading: true });
+    const tk = P.token;
+    loadSeason(n, tk).then(() => { if (tk === P.token) paintSheet(); });
+  }
+  paintSheet();
+}
+function episodesNode(n) {
+  const st = P.seasons.get(n) || {};
+  if (st.eps) {
+    if (!st.eps.length) return hint('No episodes are listed for this season yet.');
+    return h('ul', { class: 'eps' }, st.eps.map(episodeRow));
+  }
+  if (st.err) {
+    return h('div', { class: 'eps-err' }, hint(st.err, 'status'),
+      h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'eretry:' + n, onclick: () => { P.seasons.set(n, { loading: true }); paintSheet(); const tk = P.token; loadSeason(n, tk).then(() => { if (tk === P.token) paintSheet(); }); } }, ic('retry'), 'Try again'));
+  }
+  return h('div', { class: 'eps', 'aria-busy': 'true' }, [1, 2, 3].map(() => h('div', { class: 'ep' }, h('div', { class: 'sk', style: 'width:28px' }), h('div', { class: 'what' }, h('div', { class: 'sk', style: 'width:55%' })))));
+}
+function episodeRow(e) {
+  const key = 'e:' + e.media_id, title = e.title || `Episode ${e.number}`;
+  const kind = e.state === 'none' ? 'get' : e.state === 'wanted' || e.state === 'on_its_way' ? 'stop' : null;
+  const fact = e.state === 'in_plex' ? h('span', { class: 'tag' }, ic('check'), 'In Plex')
+    : e.state === 'on_its_way' ? 'On its way' + (typeof e.progress === 'number' ? ` · ${pct(e.progress)}%` : '')
+      : e.state === 'wanted' ? 'Arr is looking for it'
+        : e.state === 'upcoming' ? (e.air_date ? `Airs ${fmtDate(e.air_date)}` : 'Not aired yet')
+          : e.air_date ? `Aired ${fmtDate(e.air_date)}` : '';
+  return h('li', { class: 'ep' }, h('span', { class: 'num', 'aria-hidden': 'true' }, e.number),
+    h('div', { class: 'what' }, h('h4', { title }, title), fact && h('div', { class: 'meta' }, fact), msgFor(key)),
+    kind && h('div', { class: 'act' }, actionNode(key, kind, kind === 'get' ? 'Get' : 'Stop', `episode ${e.number}, ${title}`, e.media_id)));
+}
+function seasonItem(s) {
+  const n = s.number, key = 's:' + n, open = P.open.has(n), a = seasonAction(s);
+  const scope = P.data.media_id.replace(/^series:/, 'season:') + ':' + n;
+  return h('li', { class: 'item sea' },
+    h('div', { class: 'sea-head' },
+      h('button', { type: 'button', class: 'sbtn', 'aria-expanded': String(open), 'aria-controls': 'eps-' + n, 'data-fk': 'season:' + n, onclick: () => toggleSeason(n) },
+        h('span', { class: 'what' }, h('span', { class: 't' }, 'Season ' + n), h('span', { class: 'meta' }, seasonFact(s))), ic('down')),
+      a && h('div', { class: 'act' }, actionNode(key, a[0], a[1], 'Season ' + n, scope))),
+    msgFor(key),
+    open && h('div', { id: 'eps-' + n }, episodesNode(n)));
+}
+function showBody() {
+  const d = P.data, on = d.following;
+  return h('div', { class: 'stack' },
+    hero(d.title, joinDot(d.year, d.network, d.status)),
+    summary(d.summary),
+    h('div', null, h('button', { type: 'button', role: 'switch', class: 'switch', 'aria-checked': String(on), 'aria-labelledby': 'sw-t', 'data-fk': 'follow', onclick: toggleFollow },
+      h('span', { class: 'what' }, h('span', { class: 'sw-t', id: 'sw-t' }, 'Get new episodes as they air'),
+        h('span', { class: 'sw-m' }, on ? 'Arr gets each new episode when it airs.' : 'Off. Arr is not looking for new episodes.')),
+      h('span', { class: 'track', 'aria-hidden': 'true' }, h('i'))), msgFor('follow')),
+    section('seasons', 'Seasons', d.seasons.length ? h('ul', { class: 'list' }, d.seasons.map(seasonItem)) : hint('No seasons are listed for this show yet. Check back soon.')));
+}
+
+// ----- the movie page
+function journeyEl(stage, p, key) {
+  const target = stage === 1 ? (1 + (p ?? 0)) / 3 : stage / 3;
+  const fill = h('i', { class: 'fill' });
+  fill.style.setProperty('--f', fills.get(key) ?? 0);
+  sheetFills.push([fill, target, key]);
+  return h('ol', { class: 'journey', 'aria-label': 'Progress' }, fill,
+    STAGES.map((s, i) => h('li', { class: i <= stage ? 'on' : '', 'aria-current': i === stage ? 'step' : null }, s)));
+}
+function movieBody() {
+  const d = P.data, st = d.state, key = 'movie';
+  const p = typeof d.progress === 'number' ? d.progress : null;
+  const line = st === 'in_plex' ? 'In Plex' : st === 'on_its_way' ? 'On its way' + (p == null ? '' : ` · ${pct(p)}%`)
+    : st === 'waiting' ? (d.until ? `Out ${fmtDate(d.until)}. Arr will get it then.` : 'Not out yet. Arr will get it then.')
+      : st === 'wanted' ? 'Arr is looking for a copy' : 'Not in Plex yet';
+  let control = null;
+  if (st === 'in_plex') control = plexLink(d.title);
+  else if (st === 'none') control = actionNode(key, 'get', 'Get', d.title, d.media_id);
+  else control = actionNode(key, 'stop', 'Stop', d.title, d.media_id);
+  return h('div', { class: 'stack' },
+    hero(d.title, joinDot(d.year, d.runtime_minutes && fmtRuntime(d.runtime_minutes))),
+    summary(d.summary),
+    h('section', { class: 'item state' + (st === 'in_plex' ? ' arrived' : ''), 'aria-label': 'Status' },
+      h('div', { class: 'what' },
+        st === 'in_plex' ? h('span', { class: 'tag' }, ic('check'), 'In Plex') : null,
+        h('p', { class: 'st' }, st === 'in_plex' ? 'Ready to watch' : line),
+        st === 'on_its_way' ? journeyEl(p == null ? 0 : 1, p, 'movie:' + d.media_id) : null,
+        msgFor(key)),
+      h('div', { class: 'act' }, control)));
+}
+
 // ---------- sign in ----------
 function showSignin(data) {
   S.out = true; token++;
@@ -403,19 +744,32 @@ function showSignin(data) {
 }
 
 // ---------- routing ----------
-function parseHash() {
-  const [path, qs] = (location.hash.slice(1) || '/').split('?');
+function parseHash(hash = location.hash) {
+  const [path, qs] = (hash.slice(1) || '/').split('?');
   return { path, q: new URLSearchParams(qs || '').get('q') || '' };
 }
+const pageName = (path) => (path === '/search' ? 'Search' : path === '/ideas' ? 'Ideas' : path === '/library' ? 'Library' : 'Home');
 const TABS = [['/', 'Home', 'home'], ['/ideas', 'Ideas', 'ideas'], ['/library', 'Library', 'library']];
 function route() {
   if (S.out) return;
-  const t = ++token, { path, q } = parseHash();
+  const { path, q } = parseHash();
+  const tr = titleRoute(path);
+  if (tr) return openTitle(tr);
+  const hash = location.hash || '#/';
+  if (sheetOpen()) {
+    closeSheet();
+    // Back to the screen the sheet was opened over: it is still there as it was.
+    if (hash === bgHash) { if (onHome()) loadFeed(); return; }
+  }
+  renderPath(path, q, hash);
+}
+function renderPath(path, q, hash) {
+  bgHash = hash;
+  const t = ++token;
   clearTimeout(retryT); clearTimeout(pollT); clearTimeout(debounceT);
   for (const a of tabs.children) { if (a.getAttribute('href') === '#' + path) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); }
   searchAbort?.abort();
-  const name = path === '/search' ? 'Search' : path === '/ideas' ? 'Ideas' : path === '/library' ? 'Library' : 'Home';
-  document.title = name + ' · Arr';
+  document.title = pageName(path) + ' · Arr';
   input.value = path === '/search' ? q : '';
   if (path === '/search') renderSearch(q, t);
   else if (path === '/ideas') renderIdeas(t);
@@ -439,7 +793,10 @@ async function boot() {
     try { await api('/signout', { method: 'POST' }); } catch { /* signed out anyway */ }
     location.hash = ''; location.reload();
   });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && onHome()) loadFeed(); else clearTimeout(pollT); });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && onHome()) loadFeed(); else clearTimeout(pollT);
+    if (!document.hidden && sheetOpen()) loadTitle(true);
+  });
   window.addEventListener('hashchange', route);
   try {
     const r = await api('/me');
@@ -456,7 +813,7 @@ async function boot() {
 }
 function go(q) {
   const url = '#/search?q=' + encodeURIComponent(q);
-  if (parseHash().path === '/search') { history.replaceState(null, '', url); token++; renderSearch(q, token); }
+  if (parseHash().path === '/search') { history.replaceState(null, '', url); bgHash = url; token++; renderSearch(q, token); }
   else location.hash = url;
 }
 async function boot2() {
