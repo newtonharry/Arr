@@ -1,5 +1,11 @@
-//! Shared test harness: a synthetic native snapshot (same shapes as the real export, fake
-//! values only), a loopback mock for Prowlarr/TVmaze/TMDB, and an in-process API server.
+//! Shared test harness. Two stacks (see `Stack`):
+//!
+//! - Managed (the default): the real default layout, with managed setup, a native Torznab
+//!   indexer on a loopback mock, the in-memory download client (`arr::client::fake`, behind
+//!   the `test-client` feature) and the Plex/TVmaze/TMDB mocks.
+//! - LEGACY-ONLY: a synthetic Sonarr/Radarr snapshot import (`snapshot`, `write_state`,
+//!   `start_app`), `[prowlarr]` and the qBittorrent mock (`qb`). Kept for the suites that test
+//!   those integrations until they are deleted; new tests use the managed stack.
 #![allow(dead_code)]
 
 use arr::{api, config, fsutil, import};
@@ -27,7 +33,7 @@ pub const TOKEN: &str = "test-token-0123456789abcdef0123456789";
 pub const TMDB_V3_KEY: &str = "FAKE-TEST-TMDB-V3-KEY-0001";
 pub const TMDB_V4_TOKEN: &str = "eyJGAKE-TEST-TMDB-V4-TOKEN-0001";
 
-// ------------------------------------------------------------------ snapshot
+// ------------------------------------------------------------------ snapshot (LEGACY-ONLY)
 
 fn quality(id: i64, name: &str) -> Value {
     json!({ "id": id, "name": name, "source": "unknown", "resolution": 0 })
@@ -380,6 +386,9 @@ pub struct MockState {
     pub plex_meta_log: Vec<(String, bool)>,
     /// Plex keys that have offers now, on top of the built-in ones.
     pub plex_extra_offers: Vec<String>,
+    /// Managed stack: TVmaze also lists Slow Horses season 2 (the legacy snapshot's numbering
+    /// tests rely on season 1 only).
+    pub slow_horses_s2: bool,
 }
 
 pub type Mock = Arc<Mutex<MockState>>;
@@ -506,6 +515,10 @@ fn shows() -> Vec<Value> {
         tvmaze_show(9004, "War", "2019-03-01", None),
         tvmaze_show(9005, "Parity Partial", "2025-01-10", Some(999005)),
         tvmaze_show(9006, "Coming Soon Show", "2099-01-10", Some(999006)),
+        tvmaze_show(9007, "Parity Show", "2024-05-01", Some(999002)),
+        tvmaze_show(9100, "Backlog Show", "2010-01-01", Some(999100)),
+        tvmaze_show(9200, "Scan Show", "2025-01-01", Some(999200)),
+        tvmaze_show(9467, "WAR (2026)", "2025-12-30", Some(467092)),
     ]
 }
 
@@ -575,15 +588,28 @@ async fn tvmaze_episodes(
     if id == "9006" {
         return axum::Json(vec![json!({ "season": 1, "number": 1, "name": "Pilot", "type": "regular", "airstamp": "2099-01-10T02:00:00+00:00", "runtime": 30 })]).into_response();
     }
+    if id == "9007" {
+        let eps: Vec<Value> = (1..=3)
+            .map(|n| json!({ "season": 1, "number": n, "name": format!("Ep {n}"), "type": "regular", "airstamp": format!("2024-05-0{n}T02:00:00+00:00"), "runtime": 50 }))
+            .collect();
+        return axum::Json(eps).into_response();
+    }
     if id == "9005" {
         let mut eps = parity_partial_episodes();
         eps.extend(extra);
         return axum::Json(eps).into_response();
     }
+    let s2 = m.lock().unwrap().slow_horses_s2;
     let seasons: &[(u32, u32)] = match id.as_str() {
         "9002" => &[(4, 11), (5, 10)],
         "9003" => &[(1, 8)],
+        "9001" if s2 => &[(1, 6), (2, 6)],
         "9001" => &[(1, 6)],
+        "9200" => &[(1, 12)],
+        // WAR (2026): its episodes come from `tvmaze_extra`.
+        "9467" => &[],
+        // Backlog Show: its episodes come from `tvmaze_extra`.
+        "9100" => &[],
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let mut eps: Vec<Value> = vec![];
@@ -934,6 +960,210 @@ async fn prowlarr_feed(
     }
 }
 
+// ------------------------------------------------------------------ native Torznab endpoint
+
+pub const TZ_KEY: &str = "FAKE-TEST-TORZNAB-KEY-0001";
+
+const TZ_CAPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><caps><server title="Mock"/><limits max="100" default="50"/><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/><movie-search available="yes" supportedParams="q"/></searching><categories><category id="2000" name="Movies"/><category id="5000" name="TV"><subcat id="5040" name="TV/HD"/></category></categories></caps>"#;
+
+/// A Prowlarr-style release as a Torznab `<item>` of this endpoint: the download link is the
+/// endpoint's own `/tz/dl/<link>` (what Prowlarr's `link` parameter named), the magnet and
+/// the other attributes as given.
+fn torznab_item(r: &Value, host: &str) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('"', "&quot;")
+    };
+    let link = r["downloadUrl"].as_str().and_then(|u| {
+        reqwest::Url::parse(u).ok().and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "link")
+                .map(|(_, v)| format!("http://{host}/tz/dl/{v}"))
+        })
+    });
+    let date = r["publishDate"]
+        .as_str()
+        .and_then(|d| {
+            time::OffsetDateTime::parse(d, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .and_then(|d| {
+            d.format(&time::format_description::well_known::Rfc2822)
+                .ok()
+        })
+        .unwrap_or_else(|| "Mon, 26 Oct 2026 08:00:00 +0000".into());
+    let size = r["size"].as_i64().unwrap_or(0);
+    let seeders_known = r["seeders"].as_i64();
+    let seeders = seeders_known.unwrap_or(0);
+    let leechers = r["leechers"].as_i64().unwrap_or(0);
+    let cats: String = r["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["id"].as_i64())
+        .map(|c| format!("<torznab:attr name=\"category\" value=\"{c}\" />"))
+        .collect();
+    format!(
+        "<item><title>{}</title><guid isPermaLink=\"false\">{}</guid><prowlarrindexer id=\"{}\">{}</prowlarrindexer>{}<pubDate>{date}</pubDate><size>{size}</size>{}{cats}{}{}{}{}</item>\n",
+        esc(r["title"].as_str().unwrap_or("")),
+        esc(r["guid"].as_str().unwrap_or("")),
+        r["indexerId"].as_i64().unwrap_or(1),
+        esc(r["indexer"].as_str().unwrap_or("The Pirate Bay")),
+        link.as_ref()
+            .map(|l| format!("<link>{}</link>", esc(l)))
+            .unwrap_or_default(),
+        link.as_ref()
+            .map(|l| format!(
+                "<enclosure url=\"{}\" length=\"{size}\" type=\"application/x-bittorrent\" />",
+                esc(l)
+            ))
+            .unwrap_or_default(),
+        seeders_known
+            .map(|n| format!("<torznab:attr name=\"seeders\" value=\"{n}\" />"))
+            .unwrap_or_default(),
+        seeders_known
+            .map(|_| format!(
+                "<torznab:attr name=\"peers\" value=\"{}\" />",
+                seeders + leechers
+            ))
+            .unwrap_or_default(),
+        r["infoHash"]
+            .as_str()
+            .map(|h| format!("<torznab:attr name=\"infohash\" value=\"{h}\" />"))
+            .unwrap_or_default(),
+        r["magnetUrl"]
+            .as_str()
+            .map(|m| format!("<torznab:attr name=\"magneturl\" value=\"{}\" />", esc(m)))
+            .unwrap_or_default(),
+    )
+}
+
+fn torznab_rss(items: &str) -> Response {
+    (
+        [("content-type", "application/rss+xml")],
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:torznab=\"http://torznab.com/schemas/2015/feed\">\n<channel><title>Mock</title>\n{items}</channel></rss>"
+        ),
+    )
+        .into_response()
+}
+
+/// The native Torznab endpoint (`/tz/api`): `t=caps`, `t=search&q=` answered from
+/// `releases[q]` (the same data the Prowlarr mock serves), and `t=search` without a query
+/// (RSS) answered from `feeds["1"]`. The modes and faults of the Prowlarr mock apply.
+async fn tz_api(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if q.get("apikey").map(String::as_str) != Some(TZ_KEY) {
+        return (
+            [("content-type", "application/rss+xml")],
+            "<?xml version=\"1.0\"?><error code=\"100\" description=\"Incorrect user credentials\"/>",
+        )
+            .into_response();
+    }
+    if q.get("t").map(String::as_str) == Some("caps") {
+        return ([("content-type", "application/rss+xml")], TZ_CAPS).into_response();
+    }
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let query = q.get("q").cloned().unwrap_or_default();
+    let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100);
+    if query.is_empty() {
+        // RSS.
+        let mut s = m.lock().unwrap();
+        s.feed_log.push(format!(
+            "1 t=search cat={} limit={}",
+            q.get("cat").cloned().unwrap_or_default(),
+            q.get("limit").cloned().unwrap_or_default()
+        ));
+        if let Some(code) = s.feed_status {
+            return StatusCode::from_u16(code).unwrap().into_response();
+        }
+        return match s.feeds.get("1") {
+            Some(x) => ([("content-type", "application/rss+xml")], x.clone()).into_response(),
+            None => ([("content-type", "application/rss+xml")], feed_xml(&[])).into_response(),
+        };
+    }
+    let (mode, releases) = {
+        let mut s = m.lock().unwrap();
+        s.log.push(uri.query().unwrap_or("").to_string());
+        if s.failing_queries.contains(&query) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let delay = s
+            .slow_queries
+            .iter()
+            .find(|(q, _)| *q == query)
+            .map(|(_, d)| *d);
+        (
+            match delay {
+                Some(d) => Mode::Delay(d),
+                None => s.mode.clone(),
+            },
+            s.releases.get(&query).cloned().unwrap_or_default(),
+        )
+    };
+    match mode {
+        Mode::Status(code) => return StatusCode::from_u16(code).unwrap().into_response(),
+        Mode::Delay(d) => tokio::time::sleep(d).await,
+        Mode::Malformed => {
+            return (
+                StatusCode::OK,
+                [("content-type", "application/rss+xml")],
+                "<rss><channel><item><title>",
+            )
+                .into_response();
+        }
+        Mode::Huge => {
+            return torznab_rss(&"<item><title>x</title></item>".repeat(300_000));
+        }
+        Mode::FailAfterFirstPage(code) if offset > 0 => {
+            return StatusCode::from_u16(code).unwrap().into_response();
+        }
+        _ => {}
+    }
+    let items: String = releases
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|r| torznab_item(r, &host))
+        .collect();
+    torznab_rss(&items)
+}
+
+async fn tz_download(
+    State(m): State<Mock>,
+    axum::extract::Path(link): axum::extract::Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if q.get("apikey").map(String::as_str) != Some(TZ_KEY) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let gate = {
+        let mut s = m.lock().unwrap();
+        s.downloads.push(link.clone());
+        s.download_gate.clone()
+    };
+    if let Some(gate) = gate {
+        gate.notified().await;
+    }
+    let s = m.lock().unwrap();
+    if let Some(location) = s.redirects.get(&link) {
+        return (StatusCode::FOUND, [("location", location.clone())]).into_response();
+    }
+    match s.torrents.get(&link) {
+        Some(b) => ([("content-type", "application/x-bittorrent")], b.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn plex_refresh(
     State(m): State<Mock>,
     headers: HeaderMap,
@@ -1012,6 +1242,7 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         plex_meta_fail: false,
         plex_meta_log: vec![],
         plex_extra_offers: vec![],
+        slow_horses_s2: false,
     }));
     let app = Router::new()
         .route("/prowlarr/api/v1/search", get(prowlarr_search))
@@ -1033,6 +1264,8 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         .route("/uploads/{file}", get(image_host))
         .route("/prowlarr/{id}/download", get(prowlarr_download))
         .route("/prowlarr/{id}/api", get(prowlarr_feed))
+        .route("/tz/api", get(tz_api))
+        .route("/tz/dl/{link}", get(tz_download))
         .route(
             "/plex/library/sections/{id}/refresh",
             axum::routing::post(plex_refresh),
@@ -1044,7 +1277,7 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
     (addr, state)
 }
 
-// ------------------------------------------------------------------ app harness
+// ------------------------------------------------------------------ app harness (LEGACY-ONLY)
 
 pub struct App {
     pub base: String,
@@ -1248,9 +1481,22 @@ pub fn audio_only() -> Vec<u8> {
     std::fs::read(out).unwrap()
 }
 
+/// Which stack `start_exec` builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stack {
+    /// The real default stack: managed setup (an empty catalog plus the titles the test adds),
+    /// a native Torznab indexer, the in-memory download client standing in for the embedded
+    /// engine, `[migration] mode = "coexistence"`, and the Plex/TVmaze/TMDB mocks.
+    Managed,
+    /// LEGACY ONLY. A synthetic Sonarr/Radarr snapshot import, `[prowlarr]`, the qBittorrent
+    /// mock and `[migration] mode = "legacy"`. Kept for the suites that test those
+    /// integrations (import, coexistence, migration_review, links, execution, sandbox) until
+    /// they are deleted with them; nothing new belongs here.
+    Legacy,
+}
+
 pub struct ExecOptions {
-    pub api: &'static str,
-    pub snapshot: Value,
+    pub stack: Stack,
     pub sample_detection: bool,
     pub cleanup: bool,
     pub tvmaze: bool,
@@ -1258,27 +1504,88 @@ pub struct ExecOptions {
     pub extra: String,
     /// Configure [tmdb] against the mock (v3 key).
     pub tmdb: bool,
-    /// `[migration] mode` (`legacy` by default for the existing suites).
-    pub mode: &'static str,
-    /// Dedicated `[qbittorrent]` movie/TV categories (default: the imported native ones).
+    /// Download categories: `[qbittorrent]` movie/TV categories (legacy; default the imported
+    /// native ones) or the managed setup's `[download]` (default `um-movies` / `um-tv`).
     pub categories: Option<(&'static str, &'static str)>,
     /// `[automation] stall_timeout_minutes` (default: the configuration's default).
     pub stall_timeout_minutes: Option<u64>,
+    /// Managed: add the standard titles (see `seed_library`) before the test starts.
+    pub library: bool,
+    /// Managed: configure `[plex]` against the mock (the default stack has it).
+    pub plex: bool,
+    /// Managed: execution enabled (the embedded engine's stand-in, the worker's writes).
+    /// False is the shadow-mode stack: planning only, no download client.
+    pub execution: bool,
+    /// Managed: configure the native Torznab indexer (false: no search backend at all).
+    pub indexer: bool,
+    /// Managed: where the Torznab indexer is (default: the mock), its result cache (seconds)
+    /// and page size.
+    pub indexer_addr: Option<SocketAddr>,
+    pub indexer_cache_secs: u64,
+    pub page_size: u32,
+    /// Managed: run the managed setup (false: a server with nothing set up yet).
+    pub setup: bool,
+    /// Managed: extra keys for the `[server]` section.
+    pub server_extra: String,
+    /// Managed: `[[profiles]]` entries for the setup document (replacing the default one).
+    pub profiles: String,
+    /// Managed: extra keys for the setup document's `[download]`, `[tv]` and `[movies]` tables.
+    pub download_extra: String,
+    pub tv_extra: String,
+    pub movies_extra: String,
+    /// LEGACY: qBittorrent WebAPI version of the mock.
+    pub api: &'static str,
+    /// LEGACY: the Sonarr/Radarr/Prowlarr snapshot to import.
+    pub snapshot: Value,
+    /// LEGACY: `[migration] mode` (`legacy` by default for the legacy suites).
+    pub mode: &'static str,
 }
 
 impl Default for ExecOptions {
     fn default() -> Self {
         ExecOptions {
-            api: QB_API_4_3_9,
-            snapshot: snapshot(),
+            stack: Stack::Managed,
             sample_detection: false,
             cleanup: true,
             tvmaze: true,
             extra: String::new(),
             tmdb: false,
-            mode: "legacy",
             categories: None,
             stall_timeout_minutes: None,
+            library: true,
+            plex: true,
+            execution: true,
+            indexer: true,
+            indexer_addr: None,
+            indexer_cache_secs: 0,
+            page_size: 100,
+            setup: true,
+            server_extra: String::new(),
+            profiles: String::new(),
+            download_extra: String::new(),
+            tv_extra: String::new(),
+            movies_extra: String::new(),
+            api: QB_API_4_3_9,
+            snapshot: snapshot(),
+            mode: "legacy",
+        }
+    }
+}
+
+impl ExecOptions {
+    /// The managed stack in shadow mode: execution off, so plans are never executed.
+    pub fn shadow() -> Self {
+        ExecOptions {
+            execution: false,
+            ..Default::default()
+        }
+    }
+
+    /// The legacy stack (snapshot import, Prowlarr, qBittorrent mock).
+    pub fn legacy() -> Self {
+        ExecOptions {
+            stack: Stack::Legacy,
+            ..Default::default()
         }
     }
 }
@@ -1291,8 +1598,13 @@ pub struct Exec {
     pub downloads: PathBuf,
     pub movies: PathBuf,
     pub tv: PathBuf,
+    /// LEGACY stack: the qBittorrent mock (an empty, unused state on the managed stack).
     pub qb: qb::Qb,
     pub qb_addr: SocketAddr,
+    /// Managed stack: the in-memory download client the application uses (the same state, kept
+    /// across `restart`).
+    pub fake: arr::client::fake::Handle,
+    pub stack: Stack,
     pub mock: Mock,
     pub mock_addr: SocketAddr,
     pub _tmp: tempfile::TempDir,
@@ -1372,11 +1684,22 @@ impl Exec {
         magnet: bool,
     ) -> (String, Value) {
         let t = arr::fixture::build_torrent(name, &files);
-        self.qb
-            .lock()
-            .unwrap()
-            .fixtures
-            .insert(t.info_hash.clone(), (t.name.clone(), files));
+        match self.stack {
+            Stack::Managed => {
+                self.fake
+                    .lock()
+                    .unwrap()
+                    .fixtures
+                    .insert(t.info_hash.clone(), (t.name.clone(), files));
+            }
+            Stack::Legacy => {
+                self.qb
+                    .lock()
+                    .unwrap()
+                    .fixtures
+                    .insert(t.info_hash.clone(), (t.name.clone(), files));
+            }
+        }
         self.mock
             .lock()
             .unwrap()
@@ -1411,7 +1734,7 @@ impl Exec {
     }
 }
 
-pub async fn start_exec(o: ExecOptions) -> Exec {
+async fn start_legacy(o: ExecOptions) -> Exec {
     let (mock_addr, mock) = start_mock().await;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -1479,10 +1802,468 @@ pub async fn start_exec(o: ExecOptions) -> Exec {
         tv,
         qb,
         qb_addr,
+        fake: arr::client::fake::handle("legacy-unused"),
+        stack: Stack::Legacy,
         mock,
         mock_addr,
         _tmp: tmp,
     }
+}
+
+pub async fn start_exec(o: ExecOptions) -> Exec {
+    match o.stack {
+        Stack::Managed => start_managed(o).await,
+        Stack::Legacy => start_legacy(o).await,
+    }
+}
+
+// ------------------------------------------------------------------ managed stack
+
+/// The managed setup document of the harness: the default HD profiles, the download
+/// categories, and size limits that bound a release's size per minute of runtime the way the
+/// legacy snapshot's quality definitions did (so claimed sizes in the suites stay valid).
+fn setup_document(o: &ExecOptions) -> Value {
+    let (movies, tv) = o.categories.unwrap_or(("um-movies", "um-tv"));
+    let mut doc = format!(
+        "[download]\nmovie_category = \"{movies}\"\ntv_category = \"{tv}\"\n{}\
+         [tv]\n{}[movies]\n{}",
+        o.download_extra, o.tv_extra, o.movies_extra
+    );
+    if o.profiles.is_empty() {
+        // The legacy snapshot's "HD - 720p/1080p" profiles: no Bluray-1080p; movies want
+        // English, unmarked releases are taken as the original language.
+        let tiers = "tiers = [[\"hdtv_720p\"], [\"webdl_720p\", \"webrip_720p\"], [\"bluray_720p\"], [\"hdtv_1080p\"], [\"webdl_1080p\", \"webrip_1080p\"]]\n";
+        doc.push_str(&format!(
+            "[[profiles]]\nid = \"movies-hd\"\nmedia = \"movie\"\n{tiers}language = [\"english\"]\nunmarked = \"assume_original\"\n[[profiles]]\nid = \"tv-hd\"\nmedia = \"series\"\n{tiers}"
+        ));
+    }
+    doc.push_str(&o.profiles);
+    if o.indexer {
+        doc.push_str("[[indexers]]\nid = 1\nseed_ratio = 2.0\nseed_time_minutes = -1\n");
+    }
+    for q in [
+        "hdtv_720p",
+        "webdl_720p",
+        "webrip_720p",
+        "bluray_720p",
+        "hdtv_1080p",
+        "webdl_1080p",
+        "webrip_1080p",
+    ] {
+        doc.push_str(&format!(
+            "[[size_limits]]\nmedia = \"movie\"\nquality = \"{q}\"\nmin_mib_per_minute = 0.0\nmax_mib_per_minute = 100.0\n"
+        ));
+    }
+    doc.push_str(
+        "[[size_limits]]\nmedia = \"movie\"\nquality = \"bluray_1080p\"\nmin_mib_per_minute = 0.0\n",
+    );
+    for (q, min, max) in [
+        ("hdtv_720p", 3.0, 125.0),
+        ("webdl_720p", 3.0, 130.0),
+        ("webrip_720p", 3.0, 130.0),
+        ("bluray_720p", 4.0, 130.0),
+        ("hdtv_1080p", 4.0, 125.0),
+        ("webdl_1080p", 4.0, 130.0),
+        ("webrip_1080p", 4.0, 130.0),
+        ("bluray_1080p", 4.0, 155.0),
+    ] {
+        doc.push_str(&format!(
+            "[[size_limits]]\nmedia = \"series\"\nquality = \"{q}\"\nmin_mib_per_minute = {min:?}\nmax_mib_per_minute = {max:?}\n"
+        ));
+    }
+    let table: toml::Table = toml::from_str(&doc).unwrap();
+    serde_json::to_value(table).unwrap()
+}
+
+/// The harness config for the managed stack (the real default layout: native Torznab
+/// indexer, embedded download engine replaced by the in-memory client, coexistence).
+#[allow(clippy::too_many_arguments)]
+fn managed_config(
+    o: &ExecOptions,
+    mock: SocketAddr,
+    fake_id: &str,
+    downloads: &Path,
+    movies: &Path,
+    tv: &Path,
+) -> String {
+    let tmdb = if o.tmdb {
+        format!(
+            "[tmdb]\nenabled = true\nbase_url = \"http://{mock}/tmdb\"\nimage_base_url = \"http://{mock}\"\ncredential_file = \"secrets/tmdb\"\n"
+        )
+    } else {
+        String::new()
+    };
+    let tvmaze = if o.tvmaze {
+        format!(
+            "[tvmaze]\nenabled = true\nbase_url = \"http://{mock}/tvmaze\"\nimage_base_url = \"http://{mock}\"\ntimeout_secs = 2\n"
+        )
+    } else {
+        String::new()
+    };
+    let plex = if o.plex {
+        format!(
+            "[plex]\nbase_url = \"http://{mock}/plex\"\ntoken_file = \"secrets/plex_token\"\nmovie_section = 1\ntv_section = 2\n\
+             discover_url = \"http://{mock}/plexmeta\"\nmetadata_url = \"http://{mock}/plexmeta\"\nimage_base_url = \"http://{mock}\"\n"
+        )
+    } else {
+        String::new()
+    };
+    let indexer = if o.indexer {
+        format!(
+            "[[indexer]]\nid = 1\nname = \"The Pirate Bay\"\nkind = \"torznab\"\nbase_url = \"http://{}/tz/\"\napi_key_file = \"secrets/tz_key\"\nmin_interval_ms = 0\ncache_ttl_secs = {}\ntimeout_secs = 2\npage_size = {}\nmax_pages = 2\n",
+            o.indexer_addr.unwrap_or(mock),
+            o.indexer_cache_secs,
+            o.page_size
+        )
+    } else {
+        String::new()
+    };
+    let execution = if o.execution {
+        format!(
+            "[execution]\nenabled = true\ndownload_cleanup = {cleanup}\n\
+             [embedded]\ndownload_dir = '{dl}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ndht = true\nlocal_discovery = false\n\
+             [test_client]\nid = '{fake_id}'\n",
+            cleanup = o.cleanup,
+            dl = downloads.display(),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "[server]\napi_token_file = \"secrets/api_token\"\n{timeout}{server}\
+         {indexer}{tvmaze}{tmdb}{execution}\
+         [migration]\nmode = \"coexistence\"\n\
+         [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = {sample}\nprobe_timeout_secs = 30\n\
+         [automation]\npoll_seconds = 3600\n{stall}\
+         {plex}{extra}",
+        timeout = if o.server_extra.contains("request_timeout_secs") {
+            ""
+        } else {
+            "request_timeout_secs = 30\n"
+        },
+        server = o.server_extra,
+        movies = movies.display(),
+        tv = tv.display(),
+        sample = o.sample_detection,
+        extra = o.extra,
+        stall = o
+            .stall_timeout_minutes
+            .map(|m| format!("stall_timeout_minutes = {m}\n"))
+            .unwrap_or_default(),
+    )
+}
+
+async fn start_managed(o: ExecOptions) -> Exec {
+    let (mock_addr, mock) = start_mock().await;
+    mock.lock().unwrap().slow_horses_s2 = true;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("state");
+    let downloads = root.join("downloads");
+    let movies = root.join("library/movies");
+    let tv = root.join("library/tv");
+    for d in [&downloads, &movies, &tv] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    fsutil::ensure_private_dir(&dir).unwrap();
+    fsutil::ensure_private_dir(&dir.join("secrets")).unwrap();
+    for (name, value) in [
+        ("api_token", TOKEN),
+        ("tz_key", TZ_KEY),
+        ("plex_token", PLEX_TOKEN),
+        ("tmdb", TMDB_V3_KEY),
+    ] {
+        fsutil::write_new_private_file(&dir.join("secrets").join(name), value.as_bytes()).unwrap();
+    }
+    let fake_id = format!("exec-{}", root.display());
+    let cfg_text = managed_config(&o, mock_addr, &fake_id, &downloads, &movies, &tv);
+    fsutil::write_new_private_file(&dir.join("config.toml"), cfg_text.as_bytes()).unwrap();
+    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let state = Arc::new(api::AppState::new(cfg).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let s2 = state.clone();
+    tokio::spawn(async move { axum::serve(listener, api::router(s2)).await.unwrap() });
+    let (qb_addr, qb) = (
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        Arc::new(Mutex::new(qb::QbState::default())),
+    );
+    let e = Exec {
+        base: format!("http://{addr}"),
+        client: reqwest::Client::new(),
+        state,
+        dir,
+        downloads,
+        movies,
+        tv,
+        qb,
+        qb_addr,
+        fake: arr::client::fake::handle(&fake_id),
+        stack: Stack::Managed,
+        mock,
+        mock_addr,
+        _tmp: tmp,
+    };
+    if !o.setup {
+        return e;
+    }
+    let (s, v, text) = e
+        .json(
+            e.post("/api/v1/setup")
+                .json(&json!({ "document": setup_document(&o) })),
+        )
+        .await;
+    assert_eq!(s, 201, "managed setup: {text}");
+    assert_eq!(v["status"], "created", "{v}");
+    arr::worker::recover(&e.state, time::OffsetDateTime::now_utc()).unwrap();
+    if o.library {
+        e.seed_library(o.tvmaze).await;
+    }
+    e
+}
+
+/// A file written under `root` (parents created).
+pub fn put(root: &Path, rel: &str, bytes: &[u8]) {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, bytes).unwrap();
+}
+
+impl Exec {
+    /// Managed: the in-memory client completes the download of `hash` (writes its data).
+    pub fn complete(&self, hash: &str) {
+        self.fake.lock().unwrap().complete(hash);
+    }
+
+    /// Managed: the client reports a share ratio and seeding time, optionally stopped.
+    pub fn seeded(&self, hash: &str, ratio: f64, seeding_secs: i64, stopped: bool) {
+        self.fake
+            .lock()
+            .unwrap()
+            .seeded(hash, ratio, seeding_secs, stopped);
+    }
+
+    /// Managed: forces the client's state and progress for `hash`.
+    pub fn set_state(&self, hash: &str, state: &str, progress: f64) {
+        self.fake.lock().unwrap().set_state(hash, state, progress);
+    }
+
+    /// Adds `media_id` through the API without searching (monitored, as a user would).
+    pub async fn add(&self, media_id: &str) -> Value {
+        add_title(&self.base, &self.client, media_id).await
+    }
+
+    /// Adds a movie from operator-supplied metadata (released long ago, no TMDB needed).
+    pub async fn add_movie(
+        &self,
+        tmdb: u32,
+        title: &str,
+        year: u16,
+        runtime: u32,
+        language: &str,
+        alternates: &[&str],
+    ) {
+        add_movie_to(
+            &self.base,
+            &self.client,
+            tmdb,
+            title,
+            year,
+            runtime,
+            language,
+            alternates,
+        )
+        .await
+    }
+
+    /// The managed counterpart of the legacy `snapshot()` (see `seed_standard_library`).
+    pub async fn seed_library(&self, tvmaze: bool) {
+        seed_standard_library(&self.base, &self.client, &self.movies, &self.tv, tvmaze).await;
+        // Nothing the seeding asked is a test's business.
+        let mut m = self.mock.lock().unwrap();
+        m.log.clear();
+        m.plex_meta_log.clear();
+        m.schedule_dates.clear();
+        m.image_log.clear();
+    }
+}
+
+async fn post_ok(base: &str, client: &reqwest::Client, path: &str, body: Value) -> Value {
+    let r = client
+        .post(format!("{base}{path}"))
+        .bearer_auth(TOKEN)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let text = r.text().await.unwrap();
+    assert!(
+        status == 200 || status == 201,
+        "POST {path}: {status} {text}"
+    );
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// Adds `media_id` (no search) to the server at `base`.
+pub async fn add_title(base: &str, client: &reqwest::Client, media_id: &str) -> Value {
+    post_ok(
+        base,
+        client,
+        "/api/v1/library",
+        json!({ "media_id": media_id, "search": false }),
+    )
+    .await
+}
+
+/// Adds a movie from operator-supplied metadata (no search).
+#[allow(clippy::too_many_arguments)]
+pub async fn add_movie_to(
+    base: &str,
+    client: &reqwest::Client,
+    tmdb: u32,
+    title: &str,
+    year: u16,
+    runtime: u32,
+    language: &str,
+    alternates: &[&str],
+) {
+    post_ok(
+        base,
+        client,
+        "/api/v1/library",
+        json!({
+            "media_id": format!("movie:tmdb:{tmdb}"), "search": false,
+            "metadata": { "title": title, "year": year, "runtime_minutes": runtime,
+                "original_language": language.to_lowercase(), "alternate_titles": alternates,
+                "digital_release": format!("{year}-06-01") },
+        }),
+    )
+    .await;
+}
+
+/// The managed setup of the harness (`POST /api/v1/setup`), for tests that start their own
+/// server over `write_managed_config`.
+pub async fn setup_managed(base: &str, client: &reqwest::Client) {
+    let v = post_ok(
+        base,
+        client,
+        "/api/v1/setup",
+        json!({ "document": setup_document(&ExecOptions::default()) }),
+    )
+    .await;
+    assert_eq!(v["status"], "created", "{v}");
+}
+
+/// The managed counterpart of the legacy `snapshot()`: The Matrix (603, missing), The Matrix
+/// Reloaded (604, on disk), Amélie (194, French, missing), Slow Horses (TVDB 372264: S01E01
+/// and S01E03 on disk) and Fargo (TVDB 269613: S04E01-E03 on disk), all added and monitored.
+pub async fn seed_standard_library(
+    base: &str,
+    client: &reqwest::Client,
+    movies: &Path,
+    tv: &Path,
+    tvmaze: bool,
+) {
+    put(
+        movies,
+        "The Matrix Reloaded (2003)/The.Matrix.Reloaded.2003.1080p.WEB-DL.x264-OLD.mkv",
+        &mkv(1),
+    );
+    add_movie_to(base, client, 603, "The Matrix", 1999, 136, "English", &[]).await;
+    add_movie_to(
+        base,
+        client,
+        604,
+        "The Matrix Reloaded",
+        2003,
+        138,
+        "English",
+        &[],
+    )
+    .await;
+    add_movie_to(
+        base,
+        client,
+        194,
+        "Amélie",
+        2001,
+        122,
+        "French",
+        &[
+            "Amelie from Montmartre",
+            "Le Fabuleux Destin d'Amélie Poulain",
+        ],
+    )
+    .await;
+    if tvmaze {
+        for n in [1, 3] {
+            put(
+                tv,
+                &format!("Slow Horses/Season 1/Slow.Horses.S01E0{n}.1080p.WEB-DL.x264-OLD.mkv"),
+                &mkv(1),
+            );
+        }
+        for n in 1..=3 {
+            put(
+                tv,
+                &format!("Fargo/Season 4/Fargo.S04E0{n}.1080p.WEB-DL.x264-OLD.mkv"),
+                &mkv(1),
+            );
+        }
+        add_title(base, client, "series:tvdb:372264").await;
+        add_title(base, client, "series:tvdb:269613").await;
+    }
+}
+
+/// The settings the managed setup of the harness produces (profiles, size limits, download and
+/// indexer policy), for tests that evaluate decisions without a server.
+pub fn managed_settings(o: &ExecOptions) -> arr::settings::Settings {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let (movies, tv) = (tmp.path().join("movies"), tmp.path().join("tv"));
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    write_managed_config(
+        &dir,
+        SocketAddr::from(([127, 0, 0, 1], 9)),
+        false,
+        &format!(
+            "[library]\nmovies = '{}'\ntv = '{}'\n[migration]\nmode = \"coexistence\"\n",
+            movies.display(),
+            tv.display()
+        ),
+    );
+    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let doc: arr::setup::SetupDoc = serde_json::from_value(setup_document(o)).unwrap();
+    arr::setup::normalize(&doc, &cfg).unwrap().0
+}
+
+/// Config and secrets of the managed stack for tests that run their own server or engine:
+/// `[server]`, the native Torznab `[[indexer]]` (id 1) on the mock, `[tvmaze]` when asked,
+/// then `extra` (whole sections). The state is not set up (`setup_managed` does that).
+pub fn write_managed_config(dir: &Path, mock: SocketAddr, tvmaze: bool, extra: &str) {
+    fsutil::ensure_private_dir(dir).unwrap();
+    fsutil::ensure_private_dir(&dir.join("secrets")).unwrap();
+    for (name, value) in [("api_token", TOKEN), ("tz_key", TZ_KEY)] {
+        let p = dir.join("secrets").join(name);
+        if !p.exists() {
+            fsutil::write_new_private_file(&p, value.as_bytes()).unwrap();
+        }
+    }
+    let mut cfg = format!(
+        "[server]\napi_token_file = \"secrets/api_token\"\nrequest_timeout_secs = 30\n\
+         [[indexer]]\nid = 1\nname = \"The Pirate Bay\"\nkind = \"torznab\"\nbase_url = \"http://{mock}/tz/\"\napi_key_file = \"secrets/tz_key\"\nmin_interval_ms = 0\ncache_ttl_secs = 0\ntimeout_secs = 2\npage_size = 100\nmax_pages = 2\n"
+    );
+    if tvmaze {
+        cfg.push_str(&format!(
+            "[tvmaze]\nenabled = true\nbase_url = \"http://{mock}/tvmaze\"\nimage_base_url = \"http://{mock}\"\ntimeout_secs = 2\n"
+        ));
+    }
+    cfg.push_str(extra);
+    let cfg_path = dir.join("config.toml");
+    let _ = std::fs::remove_file(&cfg_path);
+    fsutil::write_new_private_file(&cfg_path, cfg.as_bytes()).unwrap();
 }
 
 /// ffprobe accepts the file (the library copy is real, readable media).

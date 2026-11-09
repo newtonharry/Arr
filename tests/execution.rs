@@ -38,7 +38,7 @@ fn matrix_files() -> Vec<(String, Vec<u8>)> {
 
 #[tokio::test]
 async fn movie_grab_import_seed_and_cleanup_end_to_end() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (hash, r) = e.publish(
         "The.Matrix.1999.1080p.WEB-DL.x264-UM",
         "The.Matrix.1999.1080p.WEB-DL.x264-UM",
@@ -247,7 +247,7 @@ async fn movie_grab_import_seed_and_cleanup_end_to_end() {
 async fn qbittorrent_5_naming_magnets_and_episode_import() {
     let e = start_exec(ExecOptions {
         api: QB_API_5_0,
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let files = vec![(
@@ -340,7 +340,7 @@ async fn qbittorrent_5_naming_magnets_and_episode_import() {
 
 #[tokio::test]
 async fn ambiguous_add_is_reconciled_by_hash_without_duplicates_across_restart() {
-    let mut e = start_exec(ExecOptions::default()).await;
+    let mut e = start_exec(ExecOptions::legacy()).await;
     let (hash, r) = e.publish(
         "The.Matrix.1999.1080p.WEB-DL.x264-UM",
         "The.Matrix.1999.1080p.WEB-DL.x264-UM",
@@ -409,7 +409,7 @@ async fn ambiguous_add_is_reconciled_by_hash_without_duplicates_across_restart()
 
 #[tokio::test]
 async fn foreign_torrents_are_never_touched() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (hash, r) = e.publish(
         "The.Matrix.1999.1080p.WEB-DL.x264-UM",
         "The.Matrix.1999.1080p.WEB-DL.x264-UM",
@@ -470,7 +470,7 @@ async fn foreign_torrents_are_never_touched() {
 
 #[tokio::test]
 async fn session_expiry_relogs_once_and_bad_credentials_are_reported() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (_, v, _) = e.json(e.get("/api/v1/diagnostics")).await;
     assert_eq!(v["qbittorrent"]["status"], "ok", "{v}");
     assert_eq!(v["qbittorrent"]["webapi"], "2.8.2");

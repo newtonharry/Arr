@@ -701,9 +701,10 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
         ));
     };
     let local_root = local_root.to_path_buf();
-    let cname = match qb.as_ref() {
-        crate::client::Client::Embedded(_) => "the embedded engine",
-        crate::client::Client::Qbit(_) => "qBittorrent",
+    let cname = if qb.embedded_semantics() {
+        "the embedded engine"
+    } else {
+        "qBittorrent"
     };
     let Some(root) = root_for(&lib, media).map(Path::to_path_buf) else {
         return Ok(Outcome::Blocked(format!(

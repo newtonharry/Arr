@@ -1,0 +1,738 @@
+{
+  "schema_version": 1,
+  "import_id": "imp-433458ad4f62827b-s1",
+  "snapshot_sha256": "5f8c839af68a26a8751881dd880d0deef23a4a7ba9341713fc9483d4dd8cb71b",
+  "snapshot_bytes": 1300,
+  "imported_at": "2026-11-09T02:50:47Z",
+  "observed_at": "2026-11-09T02:50:47Z",
+  "tool_version": "0.9.0",
+  "sources": [
+    {
+      "app": "setup",
+      "sections_present": [
+        "movies",
+        "tv",
+        "profiles",
+        "size_limits",
+        "download",
+        "indexers"
+      ],
+      "sections_missing": [],
+      "sections_ignored": []
+    }
+  ],
+  "summary": {
+    "profiles": 2,
+    "size_limits": 58,
+    "indexers_usable": 2,
+    "indexers_unusable": 0,
+    "download_clients": 2,
+    "root_folders": 2,
+    "movies": 0,
+    "series": 0,
+    "series_with_episode_samples": 0,
+    "catalog_skipped": 0,
+    "catalog_identity_conflicts": 0,
+    "blocking_issues": 0,
+    "unsupported_items": 0,
+    "not_implemented_items": 0,
+    "credential_entries": 0
+  },
+  "blocking_issues": [],
+  "items": [
+    {
+      "app": "setup",
+      "area": "movies",
+      "setting": "root folder",
+      "value": "/srv/arr-fixture/media/movies",
+      "status": "enforced",
+      "effect": "new titles are filed here (Root/Folder)"
+    },
+    {
+      "app": "setup",
+      "area": "tv",
+      "setting": "root folder",
+      "value": "/srv/arr-fixture/media/tv",
+      "status": "enforced",
+      "effect": "new titles are filed here (Root/Folder)"
+    },
+    {
+      "app": "setup",
+      "area": "profile setup:movies-hd",
+      "setting": "tiers",
+      "value": [
+        {
+          "name": "HDTV-720p",
+          "qualities": [
+            "hdtv_720p"
+          ]
+        },
+        {
+          "name": "WEB 720p",
+          "qualities": [
+            "webdl_720p",
+            "webrip_720p"
+          ]
+        },
+        {
+          "name": "Bluray-720p",
+          "qualities": [
+            "bluray_720p"
+          ]
+        },
+        {
+          "name": "HDTV-1080p",
+          "qualities": [
+            "hdtv_1080p"
+          ]
+        },
+        {
+          "name": "WEB 1080p",
+          "qualities": [
+            "webdl_1080p",
+            "webrip_1080p"
+          ]
+        },
+        {
+          "name": "Bluray-1080p",
+          "qualities": [
+            "bluray_1080p"
+          ]
+        }
+      ],
+      "status": "enforced",
+      "effect": "releases must match an allowed quality; a higher tier ranks first; upgrades of owned files are not performed"
+    },
+    {
+      "app": "setup",
+      "area": "profile setup:movies-hd",
+      "setting": "language",
+      "value": {
+        "requirement": {
+          "mode": "original"
+        },
+        "source": "setup default (movies: original language)",
+        "unmarked": "assume_original"
+      },
+      "status": "enforced",
+      "effect": "language rule for releases and payload names"
+    },
+    {
+      "app": "setup",
+      "area": "profile setup:tv-hd",
+      "setting": "tiers",
+      "value": [
+        {
+          "name": "HDTV-720p",
+          "qualities": [
+            "hdtv_720p"
+          ]
+        },
+        {
+          "name": "WEB 720p",
+          "qualities": [
+            "webdl_720p",
+            "webrip_720p"
+          ]
+        },
+        {
+          "name": "Bluray-720p",
+          "qualities": [
+            "bluray_720p"
+          ]
+        },
+        {
+          "name": "HDTV-1080p",
+          "qualities": [
+            "hdtv_1080p"
+          ]
+        },
+        {
+          "name": "WEB 1080p",
+          "qualities": [
+            "webdl_1080p",
+            "webrip_1080p"
+          ]
+        },
+        {
+          "name": "Bluray-1080p",
+          "qualities": [
+            "bluray_1080p"
+          ]
+        }
+      ],
+      "status": "enforced",
+      "effect": "releases must match an allowed quality; a higher tier ranks first; upgrades of owned files are not performed"
+    },
+    {
+      "app": "setup",
+      "area": "profile setup:tv-hd",
+      "setting": "language",
+      "value": {
+        "requirement": {
+          "mode": "any"
+        },
+        "source": "setup default (series: any language)",
+        "unmarked": "accept"
+      },
+      "status": "enforced",
+      "effect": "language rule for releases and payload names"
+    },
+    {
+      "app": "setup",
+      "area": "size_limits",
+      "setting": "MiB per minute of runtime",
+      "value": [
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "workprint"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "cam"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "telesync"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "telecine"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "regional"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "dvdscr"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "sdtv"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "dvd"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "dvdr"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "webdl_480p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "webrip_480p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "bluray_480p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "bluray_576p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 3.0,
+          "preferred": null,
+          "quality": "hdtv_720p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 3.0,
+          "preferred": null,
+          "quality": "webdl_720p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 3.0,
+          "preferred": null,
+          "quality": "webrip_720p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 3.0,
+          "preferred": null,
+          "quality": "bluray_720p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 4.0,
+          "preferred": null,
+          "quality": "hdtv_1080p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 4.0,
+          "preferred": null,
+          "quality": "webdl_1080p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 4.0,
+          "preferred": null,
+          "quality": "webrip_1080p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 4.0,
+          "preferred": null,
+          "quality": "bluray_1080p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 50.0,
+          "preferred": null,
+          "quality": "remux_1080p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 10.0,
+          "preferred": null,
+          "quality": "hdtv_2160p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 10.0,
+          "preferred": null,
+          "quality": "webdl_2160p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 10.0,
+          "preferred": null,
+          "quality": "webrip_2160p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 10.0,
+          "preferred": null,
+          "quality": "bluray_2160p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 50.0,
+          "preferred": null,
+          "quality": "remux_2160p"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "brdisk"
+        },
+        {
+          "max": null,
+          "media": "movie",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "rawhd"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "workprint"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "cam"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "telesync"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "telecine"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "regional"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "dvdscr"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "sdtv"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "dvd"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "dvdr"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "webdl_480p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "webrip_480p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "bluray_480p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "bluray_576p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 3.0,
+          "preferred": null,
+          "quality": "hdtv_720p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 3.0,
+          "preferred": null,
+          "quality": "webdl_720p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 3.0,
+          "preferred": null,
+          "quality": "webrip_720p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 3.0,
+          "preferred": null,
+          "quality": "bluray_720p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 4.0,
+          "preferred": null,
+          "quality": "hdtv_1080p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 4.0,
+          "preferred": null,
+          "quality": "webdl_1080p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 4.0,
+          "preferred": null,
+          "quality": "webrip_1080p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 4.0,
+          "preferred": null,
+          "quality": "bluray_1080p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 50.0,
+          "preferred": null,
+          "quality": "remux_1080p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 10.0,
+          "preferred": null,
+          "quality": "hdtv_2160p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 10.0,
+          "preferred": null,
+          "quality": "webdl_2160p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 10.0,
+          "preferred": null,
+          "quality": "webrip_2160p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 10.0,
+          "preferred": null,
+          "quality": "bluray_2160p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 50.0,
+          "preferred": null,
+          "quality": "remux_2160p"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "brdisk"
+        },
+        {
+          "max": null,
+          "media": "series",
+          "min": 1.0,
+          "preferred": null,
+          "quality": "rawhd"
+        }
+      ],
+      "status": "enforced",
+      "effect": "size must fall within min/max x runtime (x episodes for TV); an unknown runtime with a minimum rejects the release"
+    },
+    {
+      "app": "setup",
+      "area": "radarr",
+      "setting": "release policy",
+      "value": {
+        "allow_hardcoded_subs": false,
+        "availability_delay_days": 0,
+        "bypass_delay_if_highest_quality": true,
+        "maximum_size_mb": 0,
+        "media": "movie",
+        "prefer_propers_and_repacks": true,
+        "redownload_failed": true,
+        "redownload_failed_interactive": false,
+        "revision_upgrades": false,
+        "rss_sync_interval_minutes": 15,
+        "torrent_delay_minutes": 0,
+        "torrent_enabled": true
+      },
+      "status": "enforced",
+      "effect": "decisions, delay, revision handling, failed-download re-search and RSS interval"
+    },
+    {
+      "app": "setup",
+      "area": "radarr",
+      "setting": "file import",
+      "value": {
+        "copy_using_hardlinks": true,
+        "media": "movie",
+        "minimum_free_space_mb": 100,
+        "replace_illegal_characters": true
+      },
+      "status": "enforced",
+      "effect": "completed-download import: hardlink when possible, free-space floor, safe names (rename off)"
+    },
+    {
+      "app": "setup",
+      "area": "radarr",
+      "setting": "download policy",
+      "value": {
+        "category": "um-movies",
+        "initial_state": 0,
+        "remove_completed": true,
+        "remove_failed": true
+      },
+      "status": "enforced",
+      "effect": "applied through the configured download client ([embedded] or [qbittorrent]); cleanup waits for the seed goal and share limit"
+    },
+    {
+      "app": "setup",
+      "area": "sonarr",
+      "setting": "release policy",
+      "value": {
+        "allow_hardcoded_subs": false,
+        "availability_delay_days": 0,
+        "bypass_delay_if_highest_quality": true,
+        "maximum_size_mb": 0,
+        "media": "series",
+        "prefer_propers_and_repacks": true,
+        "redownload_failed": true,
+        "redownload_failed_interactive": false,
+        "revision_upgrades": false,
+        "rss_sync_interval_minutes": 15,
+        "torrent_delay_minutes": 0,
+        "torrent_enabled": true
+      },
+      "status": "enforced",
+      "effect": "decisions, delay, revision handling, failed-download re-search and RSS interval"
+    },
+    {
+      "app": "setup",
+      "area": "sonarr",
+      "setting": "file import",
+      "value": {
+        "copy_using_hardlinks": true,
+        "media": "series",
+        "minimum_free_space_mb": 100,
+        "replace_illegal_characters": true
+      },
+      "status": "enforced",
+      "effect": "completed-download import: hardlink when possible, free-space floor, safe names (rename off)"
+    },
+    {
+      "app": "setup",
+      "area": "sonarr",
+      "setting": "download policy",
+      "value": {
+        "category": "um-tv",
+        "initial_state": 0,
+        "remove_completed": true,
+        "remove_failed": true
+      },
+      "status": "enforced",
+      "effect": "applied through the configured download client ([embedded] or [qbittorrent]); cleanup waits for the seed goal and share limit"
+    },
+    {
+      "app": "setup",
+      "area": "indexer[1] The Pirate Bay",
+      "setting": "radarr",
+      "value": {
+        "automatic_search": true,
+        "categories": [
+          2000
+        ],
+        "interactive_search": true,
+        "minimum_seeders": 1,
+        "priority": 25,
+        "rss": true,
+        "season_pack_seed_time_minutes": 4320,
+        "seed_ratio": 1.0,
+        "seed_time_minutes": 4320
+      },
+      "status": "enforced",
+      "effect": "searched with these categories; priority and minimum seeders applied; seed goal: ratio or seeding time, whichever comes first (negative = the client's limit)"
+    },
+    {
+      "app": "setup",
+      "area": "indexer[1] The Pirate Bay",
+      "setting": "sonarr",
+      "value": {
+        "automatic_search": true,
+        "categories": [
+          5000
+        ],
+        "interactive_search": true,
+        "minimum_seeders": 1,
+        "priority": 25,
+        "rss": true,
+        "season_pack_seed_time_minutes": 4320,
+        "seed_ratio": 1.0,
+        "seed_time_minutes": 4320
+      },
+      "status": "enforced",
+      "effect": "searched with these categories; priority and minimum seeders applied; seed goal: ratio or seeding time, whichever comes first (negative = the client's limit)"
+    }
+  ],
+  "credentials": [],
+  "catalog_notes": [
+    "managed setup: the catalog starts empty; titles are added with POST /api/v1/library"
+  ],
+  "catalog_conflicts": [],
+  "catalog_skipped": [],
+  "cutover_blockers": []
+}

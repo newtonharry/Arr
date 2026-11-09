@@ -239,6 +239,21 @@ fn bind_backend(c: &mut rusqlite::Connection, backend: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// The embedded engine; with the `test-client` feature and `[test_client]` configured, the
+/// in-memory stand-in (tests only).
+#[cfg_attr(not(feature = "test-client"), allow(unused_variables))]
+fn embedded_client(
+    cfg: &RuntimeConfig,
+    e: &crate::config::EmbeddedConfig,
+    store: &Store,
+) -> Client {
+    #[cfg(feature = "test-client")]
+    if let Some(id) = &cfg.test_client {
+        return Client::Fake(crate::client::fake::Fake::attach(id, e));
+    }
+    Client::Embedded(Embedded::new(e.clone(), store.clone()))
+}
+
 impl AppState {
     pub fn new(cfg: RuntimeConfig) -> anyhow::Result<Self> {
         let active = import::load_active(&cfg.state_dir)?;
@@ -282,9 +297,9 @@ impl AppState {
                 (Some(q), _) => Some(Arc::new(Client::Qbit(Qbit::new(q.clone())))),
                 // The engine runs only with execution enabled: in shadow mode nothing may open
                 // its listener or resume saved transfers, so there is no client at all.
-                (None, Some(e)) if cfg.execution_enabled => Some(Arc::new(Client::Embedded(
-                    Embedded::new(e.clone(), store.clone()),
-                ))),
+                (None, Some(e)) if cfg.execution_enabled => {
+                    Some(Arc::new(embedded_client(&cfg, e, &store)))
+                }
                 (None, _) => None,
             },
             plex: cfg.plex.clone().map(Plex::new),
@@ -1052,7 +1067,7 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
     let imported = st.current().is_some();
     let exec = st.cfg.execution_enabled;
     let qb = st.client.is_some();
-    let embedded = st.client.as_deref().is_some_and(|c| c.embedded().is_some());
+    let embedded = st.client.as_deref().is_some_and(Client::embedded_semantics);
     // Client-dependent capabilities carry the backend in their name, so evidence recorded
     // for one backend never counts for the other.
     let name = |q: &'static str, e: &'static str| if embedded { e } else { q };

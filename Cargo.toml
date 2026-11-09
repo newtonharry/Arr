@@ -6,6 +6,12 @@ rust-version = "1.94"
 publish = false
 description = "Standalone movie/TV API server: native TPB/Torznab indexers, embedded BitTorrent engine, verified import into your Plex library, managed setup, remote MCP; optional Sonarr/Radarr snapshot import, Prowlarr and qBittorrent (shadow by default)"
 
+[features]
+# An in-memory download client for the integration tests (`Client::Fake`, selected by a
+# `[test_client]` config section). Not a default feature and never in a release build; the
+# self dev-dependency below enables it for `cargo test`.
+test-client = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.23"
@@ -39,6 +45,7 @@ unicode-normalization = "0.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
+arr = { path = ".", features = ["test-client"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "multipart"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 rmcp = { version = "=3.6.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
