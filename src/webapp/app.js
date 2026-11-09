@@ -172,7 +172,7 @@ async function undoToast() {
   t.busy = true; bump();
   let m = null;
   try { m = await t.undo(); } catch { /* said below */ }
-  showToast({ before: m ? 'Undone. ' + m : "Couldn't undo that just now. Try again in a moment.", title: '', after: '' });
+  showToast({ before: m ? (m.ok ? 'Undone. ' : '') + m.text : "Couldn't undo that just now. Try again in a moment.", title: '', after: '' });
   after(() => $('#toast')?.focus({ preventScroll: true }));
 }
 // It waits while the pointer is over it or focus is in it.
@@ -202,18 +202,19 @@ function Toast() {
     h('span', { class: 'toast-t' }, t.before, t.title ? h('b', null, t.title) : null, t.after),
     t.undo && h('button', { type: 'button', class: 'toast-undo', 'data-s': t.busy ? 'busy' : null, 'aria-disabled': t.busy ? 'true' : 'false', 'aria-keyshortcuts': 'Z', onClick: undoToast }, t.busy ? 'Undoing…' : 'Undo')));
 }
-const UNDONE = {
-  stopped: (r) => (r.cancelled > 0 ? 'Arr cancelled the download and will not look for it.' : r.finishing > 0 ? 'Arr stopped looking. A download that is nearly done will still finish.' : 'Arr will not look for it.'),
-};
-// The two ways to take an add back, both existing routes: stop a movie, season or episode (cancels
-// downloads that have not finished, never touches files), or stop following a show.
-async function stopTitle(mediaId) {
-  const r = await api('/v1/stop', { method: 'POST', body: { media_id: mediaId } });
-  return r.ok ? UNDONE.stopped(r.data) : null;
-}
-async function unfollowTitle(mediaId) {
-  const r = await api('/v1/follow', { method: 'POST', body: { media_id: mediaId, on: false } });
-  return r.ok ? 'Arr will not look for new episodes.' : null;
+// Undo takes the add back by removing the title from Arr (POST /remove): downloads that have not
+// finished are cancelled, a request still retrying ends, and Arr stops tracking it. Files already in
+// Plex are never touched. It answers { ok, text }: what happened, in a sentence.
+async function removeTitle(mediaId) {
+  const r = await api('/v1/remove', { method: 'POST', body: { media_id: mediaId } });
+  if (r.ok) {
+    forget(mediaId); S.stale = true; loadFeed();
+    const n = r.data && r.data.cancelled;
+    return { ok: true, text: n > 0 ? 'Arr cancelled the download and stopped tracking it.' : 'Arr stopped tracking it.' };
+  }
+  const code = r.data && r.data.error && r.data.error.code;
+  if (r.status === 409 && code === 'active_downloads') return { ok: false, text: "Too late to undo: it's nearly downloaded." };
+  return { ok: false, text: "Couldn't undo that just now. Try again in a moment." };
 }
 
 // ---------- add / retry controls ----------
@@ -231,8 +232,14 @@ async function addOne(it) {
   const st0 = A.get(it.id) || {};
   if ((st0.busy ? 'busy' : st0.state || it.base) !== 'add') return;
   A.set(it.id, { busy: true }); bump();
-  let next, got = null;
+  let next, got = null, fresh = false;
   try {
+    // Undo is only for a title Arr did not track at all. The movie page says so (a title the catalog
+    // knows but no longer tracks still counts as untracked); if that can't be read, no Undo.
+    try {
+      const pre = await api('/v1/movie/' + encodeURIComponent(it.id));
+      fresh = it.fresh && pre.ok && pre.data.removable === false && pre.data.state === 'none';
+    } catch { /* no Undo */ }
     const r = await api('/v1/quick-add', { method: 'POST', body: { media_id: it.id } });
     if (r.ok && r.data) {
       const o = r.data.outcome;
@@ -244,12 +251,12 @@ async function addOne(it) {
   if (next.err) return;
   // Undo only for a title that was not in the catalog at all before this tap.
   const o = got.outcome;
-  toastAdded(it.title, o, got.detail, it.fresh ? () => undoAdd(it, got) : null);
+  toastAdded(it.title, o, got.detail, fresh ? () => undoAdd(it, got) : null);
   loadFeed();
 }
 async function undoAdd(it, got) {
-  const m = got.outcome === 'following' ? await unfollowTitle(got.media_id) : await stopTitle(got.media_id);
-  if (m) { A.delete(it.id); bump(); loadFeed(); }
+  const m = await removeTitle(got.media_id);
+  if (m.ok) { A.delete(it.id); bump(); }
   return m;
 }
 // Keyed by when it went wrong too, so a later failure of the same item can be retried again.
@@ -596,8 +603,8 @@ function SearchRow({ x, label }) {
       h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), haveBadge(x, label)),
       chooseLink({ media_id: x.media_id, title: x.title, in_library: (x.in_catalog && x.monitored) || !!x.library_state }));
   }
-  // fresh: Arr had never heard of it (not in the catalog, no file), so Undo can put things back.
-  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add' , fresh: !x.in_catalog && !x.has_file && !x.library_state };
+  // fresh: not in Plex; addOne also asks the movie page whether Arr tracked it, before offering Undo.
+  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add', fresh: !x.has_file && !x.library_state };
   return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
@@ -896,16 +903,18 @@ function stateOf(scope) {
   return null;
 }
 // Undo for a Get on the page: only when Arr did not track the title at all before (the page said
-// tracked: false), so stopping it puts things back as they were. Unsure means no Undo.
-function undoGet(scope, tk) {
+// removable: false, meaning Arr does not manage it). It removes the whole title (a movie, or the show a season or episode belongs to).
+// Unsure means no Undo.
+function undoGet(tk) {
+  const id = P.data.media_id;
   return async () => {
-    const m = await stopTitle(scope);
-    if (m) { loadFeed(); if (tk === P.token && P.shown) loadTitle(true); }
+    const m = await removeTitle(id);
+    if (m.ok && tk === P.token && P.shown) loadTitle(true);
     return m;
   };
 }
 async function act(key, kind, scope) {
-  const tk = P.token, title = P.data ? P.data.title : '', was = kind === 'get' && P.data && P.data.tracked === false ? stateOf(scope) : null;
+  const tk = P.token, title = P.data ? P.data.title : '', was = kind === 'get' && P.data && P.data.removable === false ? stateOf(scope) : null;
   P.seq++; // an older read must not overwrite what this changes
   P.busy.add(key); P.ask = ''; P.msg.delete(key); bump();
   let res, got = null;
@@ -919,7 +928,7 @@ async function act(key, kind, scope) {
     else if (r.data.finishing > 0) res = { text: 'Stopped looking. A download that is nearly done will still finish.' };
     else res = { text: 'Stopped. Arr will not look for it.' };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
-  if (got && !res.err) toastAdded(got.title || title, got.outcome, got.detail, was === 'none' ? undoGet(scope, tk) : null);
+  if (got && !res.err) toastAdded(got.title || title, got.outcome, got.detail, was === 'none' ? undoGet(tk) : null);
   if (tk !== P.token) return;
   P.busy.delete(key); P.msg.set(key, res); say(res.text);
   // Reads the action made stale are issued again (also after a failure), so nothing stays loading.
@@ -928,7 +937,7 @@ async function act(key, kind, scope) {
 }
 async function toggleFollow() {
   if (P.followBusy) return;
-  const want = !P.data.following, tk = P.token, fresh = P.data.tracked === false;
+  const want = !P.data.following, tk = P.token, fresh = P.data.removable === false;
   P.seq++;
   P.followBusy = true; P.data.following = want; P.msg.delete('follow'); bump();
   let bad = false;
@@ -949,8 +958,8 @@ async function toggleFollow() {
   if (want) {
     const id = P.data.media_id;
     showToast({ before: 'Following ', title: P.data.title, after: '' }, !fresh ? null : async () => {
-      const m = await unfollowTitle(id);
-      if (m && tk === P.token && P.shown) loadTitle(true);
+      const m = await removeTitle(id);
+      if (m.ok && tk === P.token && P.shown) loadTitle(true);
       return m;
     });
   }
@@ -1086,7 +1095,7 @@ async function pickCopy(c) {
   if (o.picking) return;
   const tk = P.token;
   o.picking = c.id; P.msg.delete('copy'); P.seq++; bump();
-  const scope = o.copies.data.media_id, was = P.data.tracked === false ? stateOf(scope) : null, title = P.data.title;
+  const scope = o.copies.data.media_id, was = P.data.removable === false ? stateOf(scope) : null, title = P.data.title;
   let res;
   try {
     const r = await api(`/v1/copies/${enc(scope)}/get`, { method: 'POST', body: { id: c.id, ...(pickedLevel() ? { level: pickedLevel() } : {}) } });
@@ -1097,7 +1106,7 @@ async function pickCopy(c) {
   o.picking = '';
   if (!res.err) {
     const season = /^season:[a-z]+:\d+:(\d+)$/.exec(scope);
-    toastAdded(title, 'on_its_way', season ? 'Season ' + season[1] : '', was === 'none' ? undoGet(scope, tk) : null);
+    toastAdded(title, 'on_its_way', season ? 'Season ' + season[1] : '', was === 'none' ? undoGet(tk) : null);
   }
   P.msg.set('copy', res); say(res.text);
   if (!res.err) { o.copiesOpen = false; o.copies = { st: 'idle' }; }
