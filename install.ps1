@@ -61,6 +61,8 @@ function Get-ArrAsset($url, $out, $name, $repo, $release, $fallback) {
 }
 
 function Install-Arr {
+	# irm | iex runs in the caller's scope: forget an earlier run's fallback in this window.
+	$script:ViaApi = $false
 	$ErrorActionPreference = 'Stop'
 	$ProgressPreference = 'SilentlyContinue' # the progress bar makes downloads very slow
 	# What this run changed, for the error handler at the bottom to undo (an earlier run in this
