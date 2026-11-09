@@ -511,6 +511,7 @@ fn shows() -> Vec<Value> {
         tvmaze_show(9007, "Parity Show", "2024-05-01", Some(999002)),
         tvmaze_show(9100, "Backlog Show", "2010-01-01", Some(999100)),
         tvmaze_show(9200, "Scan Show", "2025-01-01", Some(999200)),
+        tvmaze_show(9467, "WAR (2026)", "2025-12-30", Some(467092)),
     ]
 }
 
@@ -598,6 +599,8 @@ async fn tvmaze_episodes(
         "9001" if s2 => &[(1, 6), (2, 6)],
         "9001" => &[(1, 6)],
         "9200" => &[(1, 12)],
+        // WAR (2026): its episodes come from `tvmaze_extra`.
+        "9467" => &[],
         // Backlog Show: its episodes come from `tvmaze_extra`.
         "9100" => &[],
         _ => return StatusCode::NOT_FOUND.into_response(),

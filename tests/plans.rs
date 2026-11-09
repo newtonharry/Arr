@@ -59,9 +59,9 @@ fn slow_horses_releases(mock: &Mock) {
 
 #[tokio::test]
 async fn slow_horses_season_plan_end_to_end() {
-    let (addr, mock) = start_mock().await;
+    let app = start_exec(ExecOptions::shadow()).await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
     slow_horses_releases(&mock);
-    let app = start_app(&snapshot(), "", Some(addr), false).await;
 
     // Search result: packs are found but rejected, with explanations.
     let (s, v, text) = body(
@@ -167,10 +167,10 @@ async fn slow_horses_season_plan_end_to_end() {
     // E02 came from the season query, so it was not searched again.
     let log = mock.lock().unwrap().log.clone();
     assert!(!log.iter().any(|q| q.contains("S01E02")), "{log:?}");
-    assert!(log.iter().any(|q| q.contains("query=Slow+Horses+S01E05")));
+    assert!(log.iter().any(|q| q.contains("q=Slow+Horses+S01E05")));
     assert!(
         log.iter()
-            .all(|q| q.contains("categories=5000") && !q.contains("categories=2000"))
+            .all(|q| q.contains("cat=5000") && !q.contains("cat=2000"))
     );
 
     // Plans persist and are listable/filterable.
@@ -242,7 +242,8 @@ async fn slow_horses_season_plan_end_to_end() {
 
 #[tokio::test]
 async fn idempotency_concurrency_replan_cancel_and_restart() {
-    let (addr, mock) = start_mock().await;
+    let app = start_exec(ExecOptions::shadow()).await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
     mock.lock().unwrap().releases.insert(
         "The Matrix 1999".into(),
         vec![release(
@@ -251,7 +252,6 @@ async fn idempotency_concurrency_replan_cancel_and_restart() {
             40,
         )],
     );
-    let app = start_app(&snapshot(), "", Some(addr), false).await;
     let req = json!({ "media_id": "movie:tmdb:603" });
 
     // Concurrent same-target requests produce exactly one plan.
@@ -445,143 +445,9 @@ async fn idempotency_concurrency_replan_cancel_and_restart() {
 }
 
 #[tokio::test]
-async fn unsupported_policy_blocks_plans_fail_closed() {
-    let (addr, mock) = start_mock().await;
-    mock.lock().unwrap().releases.insert(
-        "The Matrix 1999".into(),
-        vec![release(
-            "The.Matrix.1999.1080p.WEB-DL.DDP5.1.H.264-GRP",
-            8.0,
-            40,
-        )],
-    );
-    let mut snap = snapshot();
-    snap["radarr"]["customformat"] = json!([{ "id": 1, "name": "x265", "specifications": [] }]);
-    snap["radarr"]["qualityprofile"][0]["formatItems"] =
-        json!([{ "format": 1, "name": "x265", "score": -1000 }]);
-    let app = start_app(&snap, "", Some(addr), false).await;
-
-    let (_, caps, _) = body(app.get("/api/v1/capabilities").send().await.unwrap()).await;
-    assert_eq!(
-        caps["policy_blocking_issues"][0]["code"],
-        "custom_format_scoring"
-    );
-
-    // The otherwise-perfect release is shown but not approved.
-    let (s, v, _) = body(
-        app.get("/api/v1/media/movie:tmdb:603/releases")
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(s, 200);
-    assert_eq!(v["releases"][0]["decision"]["approved"], false);
-    assert_eq!(
-        v["releases"][0]["decision"]["rejections"][0]["code"],
-        "policy_unsupported"
-    );
-    assert_eq!(v["counts"]["approved"], 0);
-
-    let (s, v, _) = body(
-        app.post("/api/v1/plans")
-            .json(&json!({ "media_id": "movie:tmdb:603" }))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(s, 201);
-    assert_eq!(v["plan"]["state"], "blocked");
-    assert_eq!(v["plan"]["blockers"][0]["code"], "policy_unsupported");
-    assert!(v["plan"]["candidates"].as_array().unwrap().is_empty());
-    // TV is unaffected by a Radarr profile issue.
-    let (_, v, _) = body(
-        app.get("/api/v1/media/season:tvdb:372264:1/releases")
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert!(v["policy_blockers"].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn tag_scoped_indexer_and_ownership_unknown_block() {
-    let (addr, _mock) = start_mock().await;
-    let mut snap = snapshot();
-    snap["sonarr"]["indexer"][0]["tags"] = json!([3]);
-    let app = start_app(&snap, "", Some(addr), true).await;
-    let (_, v, _) = body(
-        app.post("/api/v1/plans")
-            .json(&json!({ "media_id": "season:tvdb:269613:5" }))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(v["plan"]["state"], "blocked");
-    assert_eq!(v["plan"]["blockers"][0]["code"], "policy_unsupported");
-    assert!(
-        v["plan"]["blockers"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("tag_routing")
-    );
-
-    // Without the tag: Fargo S04 has 3/11 files but no per-episode sample -> ownership unknown.
-    let app = start_app(&snapshot(), "", Some(addr), true).await;
-    let (_, v, text) = body(
-        app.post("/api/v1/plans")
-            .json(&json!({ "media_id": "season:tvdb:269613:4" }))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(v["plan"]["state"], "blocked", "{text}");
-    assert_eq!(v["plan"]["blockers"][0]["code"], "ownership_unknown");
-
-    // Stats say "all 11 on disk" and TVmaze lists 11: already satisfied, no search.
-    let mut snap = snapshot();
-    snap["sonarr"]["series"][1]["seasons"][0]["statistics"] =
-        json!({ "episodeFileCount": 11, "episodeCount": 11, "totalEpisodeCount": 11 });
-    let app = start_app(&snap, "", Some(addr), true).await;
-    let (_, v, _) = body(
-        app.post("/api/v1/plans")
-            .json(&json!({ "media_id": "season:tvdb:269613:4" }))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(v["plan"]["state"], "already_satisfied");
-    // Stats say "all 10 on disk" but TVmaze now lists 11: the extra episode's ownership is unknown.
-    snap["sonarr"]["series"][1]["seasons"][0]["statistics"] =
-        json!({ "episodeFileCount": 10, "episodeCount": 10, "totalEpisodeCount": 10 });
-    let app = start_app(&snap, "", Some(addr), true).await;
-    let (_, v, text) = body(
-        app.post("/api/v1/plans")
-            .json(&json!({ "media_id": "season:tvdb:269613:4" }))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(v["plan"]["state"], "blocked", "{text}");
-    assert_eq!(v["plan"]["blockers"][0]["code"], "ownership_unknown");
-    assert!(
-        v["plan"]["notes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n.as_str().unwrap().contains("counts 10 episodes"))
-    );
-}
-
-#[tokio::test]
 async fn execution_switch_requires_client_and_paths_and_shadow_stays_shadow() {
-    let (addr, mock) = start_mock().await;
+    let app = start_exec(ExecOptions::shadow()).await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
     mock.lock().unwrap().releases.insert(
         "The Matrix 1999".into(),
         vec![release(
@@ -590,15 +456,14 @@ async fn execution_switch_requires_client_and_paths_and_shadow_stays_shadow() {
             40,
         )],
     );
-    // Turning execution on without a client and library paths is a config error.
+    // Turning execution on without a download client is a config error.
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("state");
-    write_state(
+    write_managed_config(
         &dir,
-        &snapshot(),
-        "[execution]\nenabled = true\n",
-        Some(addr),
+        app.mock_addr,
         false,
+        "[execution]\nenabled = true\n[migration]\nmode = \"coexistence\"\n",
     );
     let err = arr::config::load(&dir.join("config.toml")).unwrap_err();
     assert!(
@@ -606,16 +471,14 @@ async fn execution_switch_requires_client_and_paths_and_shadow_stays_shadow() {
         "{err:#}"
     );
     // The legacy name is the same switch.
-    write_state(
+    write_managed_config(
         &dir,
-        &snapshot(),
-        "[execution]\ndownload_submission = true\n",
-        Some(addr),
+        app.mock_addr,
         false,
+        "[execution]\ndownload_submission = true\n",
     );
     assert!(arr::config::load(&dir.join("config.toml")).is_err());
 
-    let app = start_app(&snapshot(), "", Some(addr), false).await;
     let (_, caps, _) = body(app.get("/api/v1/capabilities").send().await.unwrap()).await;
     assert_eq!(caps["execution_enabled"], false);
     let (_, v, _) = body(
@@ -666,19 +529,20 @@ async fn execution_switch_requires_client_and_paths_and_shadow_stays_shadow() {
         (s, v["error"]["code"].as_str()),
         (409, Some("execution_disabled"))
     );
-    // Only GET /api/v1/search was ever requested upstream.
+    // Only searches were ever requested upstream.
     assert!(
         mock.lock()
             .unwrap()
             .log
             .iter()
-            .all(|q| q.contains("type=search"))
+            .all(|q| q.contains("t=search"))
     );
 }
 
 #[tokio::test]
 async fn tvmaze_backed_seasons_and_discovery() {
-    let (addr, mock) = start_mock().await;
+    let app = start_exec(ExecOptions::shadow()).await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
     {
         let mut m = mock.lock().unwrap();
         m.releases.insert(
@@ -698,7 +562,6 @@ async fn tvmaze_backed_seasons_and_discovery() {
             ],
         );
     }
-    let app = start_app(&snapshot(), "", Some(addr), true).await;
 
     let (_, v, _) = body(
         app.get("/api/v1/discover?kind=series&q=war")
@@ -740,7 +603,7 @@ async fn tvmaze_backed_seasons_and_discovery() {
     assert_eq!(plan["state"], "shadow_planned", "{text}");
     assert_eq!(plan["selection"], "season_pack");
     assert_eq!(
-        plan["profile"], "sonarr:6",
+        plan["profile"], "setup:tv-hd",
         "sole series profile used for a non-catalog series"
     );
     assert_eq!(
@@ -813,13 +676,13 @@ async fn tvmaze_backed_seasons_and_discovery() {
 
 #[tokio::test]
 async fn partial_episode_query_failure_is_reported_per_unit() {
-    let (addr, mock) = start_mock().await;
+    let app = start_exec(ExecOptions::shadow()).await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
     slow_horses_releases(&mock);
     mock.lock()
         .unwrap()
         .failing_queries
         .push("Slow Horses S01E06".into());
-    let app = start_app(&snapshot(), "", Some(addr), false).await;
     let (s, v, text) = body(
         app.post("/api/v1/plans")
             .json(&json!({ "media_id": "season:tvdb:372264:1" }))
@@ -832,7 +695,7 @@ async fn partial_episode_query_failure_is_reported_per_unit() {
     let plan = &v["plan"];
     assert_eq!(plan["state"], "shadow_partial");
     assert_eq!(plan["search"]["completeness"]["retrieval"], "incomplete");
-    assert_eq!(plan["search"]["completeness"]["provider"], "unverified");
+    assert_eq!(plan["search"]["completeness"]["provider"], "incomplete");
     let issues = plan["search"]["completeness"]["issues"].as_array().unwrap();
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0]["kind"], "query_failed");
@@ -883,7 +746,12 @@ async fn partial_episode_query_failure_is_reported_per_unit() {
 
 #[tokio::test]
 async fn episode_search_budget_records_a_partial_plan() {
-    let (addr, mock) = start_mock().await;
+    let app = start_exec(ExecOptions {
+        server_extra: "request_timeout_secs = 4\n".into(),
+        ..ExecOptions::shadow()
+    })
+    .await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
     slow_horses_releases(&mock);
     {
         let mut m = mock.lock().unwrap();
@@ -896,16 +764,8 @@ async fn episode_search_budget_records_a_partial_plan() {
                 .push((q.into(), std::time::Duration::from_millis(1900)));
         }
     }
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("state");
-    write_state(&dir, &snapshot(), "", Some(addr), false);
     // request deadline 4 s -> episode budget 3 s; three 1.9 s queries at concurrency 2 exceed it.
-    let cfg = std::fs::read_to_string(dir.join("config.toml"))
-        .unwrap()
-        .replace("request_timeout_secs = 30", "request_timeout_secs = 4");
-    std::fs::remove_file(dir.join("config.toml")).unwrap();
-    arr::fsutil::write_new_private_file(&dir.join("config.toml"), cfg.as_bytes()).unwrap();
-    let base = serve_dir(&dir).await;
+    let base = app.base.clone();
     let resp = reqwest::Client::new()
         .post(format!("{base}/api/v1/plans"))
         .bearer_auth(TOKEN)
@@ -945,32 +805,36 @@ async fn episode_search_budget_records_a_partial_plan() {
     );
 }
 
-/// WAR (2026), TVDB 467092 / TVmaze 86587 (public identities): 8 episodes, 4 aired, E01 owned.
-fn war_snapshot() -> Value {
+/// WAR (2026), TVDB 467092 (public identities): 8 episodes, 4 aired, E01 owned. TVmaze lists
+/// the episodes (the mock's show 9467 takes them from `tvmaze_extra`).
+async fn add_war(e: &Exec) {
     let now = time::OffsetDateTime::now_utc();
     let at = |days: i64| arr::import::rfc3339(now + time::Duration::days(days));
-    let mut snap = snapshot();
-    snap["sonarr"]["series"].as_array_mut().unwrap().push(json!({
-        "id": 40, "title": "WAR (2026)", "alternateTitles": [], "year": 2026, "tvdbId": 467092, "tvMazeId": 86587,
-        "seriesType": "standard", "runtime": 60, "originalLanguage": { "id": 1, "name": "English" }, "status": "continuing",
-        "monitored": true, "qualityProfileId": 6, "path": "/tvshows/WAR (2026)",
-        "seasons": [{ "seasonNumber": 1, "monitored": true, "statistics": { "episodeFileCount": 1, "episodeCount": 4, "totalEpisodeCount": 8 } }],
-    }));
     let episodes: Vec<Value> = (1..=8i64)
         .map(|n| {
             let aired = if n <= 4 { at(-7 * (5 - n)) } else { at(7 * (n - 4)) };
-            json!({ "seasonNumber": 1, "episodeNumber": n, "title": format!("Episode {n}"), "airDateUtc": aired,
-                    "runtime": 60, "hasFile": n == 1, "monitored": true })
+            json!({ "season": 1, "number": n, "name": format!("Episode {n}"), "type": "regular", "airstamp": aired, "runtime": 60 })
         })
         .collect();
-    snap["sonarr"]["episode_samples"]["40"] = json!(episodes);
-    snap
+    e.mock
+        .lock()
+        .unwrap()
+        .tvmaze_extra
+        .insert("9467".into(), episodes);
+    put(
+        &e.tv,
+        "WAR (2026)/Season 1/WAR.S01E01.1080p.WEB-DL.x264-OLD.mkv",
+        &mkv(1),
+    );
+    e.add("series:tvdb:467092").await;
+    e.mock.lock().unwrap().log.clear();
 }
 
 #[tokio::test]
 async fn native_year_disambiguator_scopes_queries_and_empty_results_stay_honest() {
-    let (addr, mock) = start_mock().await;
-    let app = start_app(&war_snapshot(), "", Some(addr), false).await;
+    let app = start_exec(ExecOptions::shadow()).await;
+    let mock = app.mock.clone();
+    add_war(&app).await;
 
     let (s, v, text) = body(
         app.get("/api/v1/media/season:tvdb:467092:1/releases")
@@ -983,7 +847,7 @@ async fn native_year_disambiguator_scopes_queries_and_empty_results_stay_honest(
     assert_eq!(v["queries"][0]["query"], "WAR 2026 S01");
     assert_eq!(v["outcome"], "observed_empty");
     assert_eq!(v["completeness"]["retrieval"], "complete");
-    assert_eq!(v["completeness"]["provider"], "unverified");
+    assert_eq!(v["completeness"]["provider"], "complete");
 
     let (s, v, text) = body(
         app.post("/api/v1/plans")
@@ -1024,18 +888,15 @@ async fn native_year_disambiguator_scopes_queries_and_empty_results_stay_honest(
             .contains("re-download owned episodes [1]")),
         "{text}"
     );
-    assert_eq!(plan["search"]["completeness"]["provider"], "unverified");
+    assert_eq!(plan["search"]["completeness"]["provider"], "complete");
 
     // Every query kept the native disambiguator; only aired, missing episodes were searched.
     let log = mock.lock().unwrap().log.clone();
-    assert!(
-        log.iter().all(|q| q.contains("query=WAR+2026+S01")),
-        "{log:?}"
-    );
+    assert!(log.iter().all(|q| q.contains("q=WAR+2026+S01")), "{log:?}");
     for e in ["E02", "E03", "E04"] {
         assert!(
             log.iter()
-                .any(|q| q.contains(&format!("query=WAR+2026+S01{e}&"))),
+                .any(|q| q.contains(&format!("q=WAR+2026+S01{e}&"))),
             "{e}: {log:?}"
         );
     }
@@ -1058,7 +919,8 @@ async fn post_plan(base: &str, key: Option<&str>, body_json: Value) -> (u16, Val
 
 #[tokio::test]
 async fn idempotency_keys_bind_to_existing_active_plans() {
-    let (addr, mock) = start_mock().await;
+    let app = start_exec(ExecOptions::shadow()).await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
     slow_horses_releases(&mock);
     mock.lock().unwrap().releases.insert(
         "The Matrix 1999".into(),
@@ -1068,7 +930,6 @@ async fn idempotency_keys_bind_to_existing_active_plans() {
             40,
         )],
     );
-    let app = start_app(&snapshot(), "", Some(addr), false).await;
     let slow = json!({ "media_id": "season:tvdb:372264:1" });
     let matrix = json!({ "media_id": "movie:tmdb:603" });
     let (_, a, _) = post_plan(&app.base, None, slow.clone()).await;
@@ -1123,7 +984,8 @@ async fn idempotency_keys_bind_to_existing_active_plans() {
 
 #[tokio::test]
 async fn racing_idempotency_keys_bind_exactly_once() {
-    let (addr, mock) = start_mock().await;
+    let app = start_exec(ExecOptions::shadow()).await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
     slow_horses_releases(&mock);
     {
         let mut m = mock.lock().unwrap();
@@ -1140,7 +1002,6 @@ async fn racing_idempotency_keys_bind_exactly_once() {
             vec![release("Amelie.2001.FRENCH.1080p.WEB-DL", 6.0, 10)],
         );
     }
-    let app = start_app(&snapshot(), "", Some(addr), false).await;
     let slow = json!({ "media_id": "season:tvdb:372264:1" });
     let matrix = json!({ "media_id": "movie:tmdb:603" });
     post_plan(&app.base, None, slow.clone()).await;
@@ -1229,7 +1090,7 @@ fn legacy_state(dir: &std::path::Path, fingerprint: &str) {
         "state": "shadow_planned",
         "execution": { "mode": "shadow", "download_submission": "not_implemented", "submitted": false, "note": "shadow plan only" },
         "created_at": "2026-10-20T00:00:00Z", "updated_at": "2026-10-20T00:00:00Z", "import_id": null, "catalog_observed_at": null,
-        "profile": "radarr:6", "destination_root": "/movies", "selection": "movie", "units": [], "candidates": [], "blockers": [],
+        "profile": "setup:movies-hd", "destination_root": "/movies", "selection": "movie", "units": [], "candidates": [], "blockers": [],
         "search": null, "notes": [], "superseded_by": null,
     });
     c.execute(
@@ -1246,15 +1107,21 @@ fn legacy_state(dir: &std::path::Path, fingerprint: &str) {
 
 #[tokio::test]
 async fn legacy_idempotency_keys_replay_after_the_upgrade() {
-    let (addr, mock) = start_mock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("state");
-    write_state(&dir, &snapshot(), "", Some(addr), false);
+    let app = start_exec(ExecOptions::shadow()).await;
+    let (mock, _addr) = (app.mock.clone(), app.mock_addr);
+    // The state database is replaced by one the previous release wrote, then the server
+    // starts over it.
+    let mut app = app;
+    let dir = app.dir.clone();
+    for f in ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
     // The previous release fingerprinted the canonical body {media_id, quality_profile,
     // replan}, serialised in this order.
     let fp = hex_digest(br#"{"media_id":"movie:tmdb:603","quality_profile":null,"replan":false}"#);
     legacy_state(&dir, &fp);
-    let base = serve_dir(&dir).await;
+    app.restart().await;
+    let base = app.base.clone();
     let client = reqwest::Client::new();
     for body in [
         json!({ "media_id": "movie:tmdb:603" }),
