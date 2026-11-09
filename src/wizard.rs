@@ -70,8 +70,6 @@ pub struct Options {
     pub plex_port: u16,
     /// The installer was told yes (`--error-reports`): the page starts with reports on.
     pub error_reports: bool,
-    /// Where TMDB's API is, for checking keys (overridden in tests).
-    pub tmdb_url: Url,
 }
 
 struct Wizard {
@@ -150,10 +148,7 @@ enum Phase {
         step: String,
         detail: String,
     },
-    Done {
-        /// A movie library was set up without a TMDB key, so Arr can't find new movies.
-        no_tmdb: bool,
-    },
+    Done,
     Failed {
         message: String,
     },
@@ -256,7 +251,7 @@ pub async fn run(mut opts: Options) -> Result<()> {
         })
         .await?;
     match wiz.inner.lock().unwrap().phase.clone() {
-        Phase::Done { .. } => Ok(()),
+        Phase::Done => Ok(()),
         _ => bail!("setup wasn't finished"),
     }
 }
@@ -289,7 +284,6 @@ fn router(wiz: Arc<Wizard>) -> Router {
         .route("/api/plex/install", post(install_plex))
         .route("/api/plex/libraries", post(create_libraries))
         .route("/api/reporting", post(set_reporting))
-        .route("/api/tmdb/check", post(check_tmdb))
         .route("/api/folder", post(folder))
         .route("/api/apply", post(apply))
         .route("/api/finish", post(finish))
@@ -697,19 +691,6 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
 #[derive(Deserialize)]
 struct ReportingChoice {
     enabled: bool,
-}
-
-#[derive(Deserialize)]
-struct TmdbKey {
-    key: String,
-}
-
-/// Checks a TMDB key as it's pasted, so the page can say straight away whether it works.
-async fn check_tmdb(State(wiz): St, Json(k): Json<TmdbKey>) -> Response {
-    match crate::tmdbkey::verify(&wiz.opts.tmdb_url, &k.key).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => problem(StatusCode::BAD_REQUEST, &format!("{e:#}")),
-    }
 }
 
 /// The "Send error reports" box: reporting starts the moment it's ticked, so a failure
@@ -1183,8 +1164,6 @@ struct Choices {
     movies: Option<LibraryChoice>,
     tv: Option<LibraryChoice>,
     downloads: String,
-    #[serde(default)]
-    tmdb: String,
     auto_update: bool,
     /// Send error reports (written as `[reporting] enabled`).
     #[serde(default)]
@@ -1208,7 +1187,7 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
     // Checked and claimed in one go, so two tabs can't both start setup.
     let plex = {
         let mut inner = wiz.inner.lock().unwrap();
-        if matches!(inner.phase, Phase::Working { .. } | Phase::Done { .. }) {
+        if matches!(inner.phase, Phase::Working { .. } | Phase::Done) {
             return problem(StatusCode::CONFLICT, "setup is already running");
         }
         let Some(plex) = inner.plex.clone() else {
@@ -1254,27 +1233,14 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
     if let Err(m) = check_folder(&c.downloads, true) {
         return refuse(&format!("download folder: {m}"));
     }
-    // The key only finds movies, so without a movie library it isn't asked for.
-    let tmdb = match movies {
-        Some(_) => c.tmdb.trim().to_string(),
-        None => String::new(),
-    };
-    if !tmdb.is_empty() {
-        // Checked again here, not only as it's typed: a key saved has worked once.
-        set_phase(&wiz, "Checking your TMDB key", "");
-        if let Err(e) = crate::tmdbkey::verify(&wiz.opts.tmdb_url, &tmdb).await {
-            return refuse(&format!("{e:#}"));
-        }
-    }
     set_phase(&wiz, "Saving your settings", "");
     editing.0 = None;
-    let no_tmdb = movies.is_some() && tmdb.is_empty();
     let w = wiz.clone();
     tokio::spawn(async move {
-        let result = finish_setup(&w, &plex, movies, tv, &c, &tmdb).await;
+        let result = finish_setup(&w, &plex, movies, tv, &c).await;
         let mut inner = w.inner.lock().unwrap();
         inner.phase = match result {
-            Ok(()) => Phase::Done { no_tmdb },
+            Ok(()) => Phase::Done,
             Err(e) => {
                 crate::report::error("setup", &crate::report::reportable(&e));
                 Phase::Failed {
@@ -1282,7 +1248,7 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
                 }
             }
         };
-        if matches!(inner.phase, Phase::Done { .. }) {
+        if matches!(inner.phase, Phase::Done) {
             let w = w.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(LINGER).await;
@@ -1317,7 +1283,6 @@ async fn finish_setup(
     movies: Option<Library>,
     tv: Option<Library>,
     c: &Choices,
-    tmdb: &str,
 ) -> Result<()> {
     let dir = &wiz.opts.state_dir;
     let secrets = dir.join("secrets");
@@ -1330,22 +1295,12 @@ async fn finish_setup(
         fsutil::write_new_private_file(&mcp_token, fsutil::random_hex(32)?.as_bytes())?;
     }
     fsutil::atomic_replace_private(&secrets.join("plex_token"), plex.token.expose().as_bytes())?;
-    if !tmdb.is_empty() {
-        fsutil::atomic_replace_private(&secrets.join("tmdb_credential"), tmdb.as_bytes())?;
-    }
     std::fs::create_dir_all(&c.downloads)
         .with_context(|| format!("can't create {}", c.downloads))?;
     // Under another name until everything has worked: the installers take config.toml to
     // mean "Arr is set up".
     let config = dir.join("config.toml.new");
-    let text = render_config(
-        &wiz.opts,
-        plex,
-        movies.as_ref(),
-        tv.as_ref(),
-        c,
-        !tmdb.is_empty(),
-    );
+    let text = render_config(&wiz.opts, plex, movies.as_ref(), tv.as_ref(), c);
     fsutil::atomic_replace_private(&config, text.as_bytes())?;
 
     let result = async {
@@ -1485,7 +1440,7 @@ fn progress(line: &str) -> Option<String> {
 }
 
 async fn finish(State(wiz): St) -> Response {
-    if !matches!(wiz.inner.lock().unwrap().phase, Phase::Done { .. }) {
+    if !matches!(wiz.inner.lock().unwrap().phase, Phase::Done) {
         return problem(StatusCode::CONFLICT, "setup isn't finished");
     }
     wiz.finished.notify_one();
@@ -1499,7 +1454,6 @@ fn render_config(
     movies: Option<&Library>,
     tv: Option<&Library>,
     c: &Choices,
-    tmdb: bool,
 ) -> String {
     let s = |v: &str| toml::Value::String(v.to_string()).to_string();
     let mut out = format!(
@@ -1524,13 +1478,10 @@ recent_feed = true
 enabled = true
 
 [tmdb]
-enabled = {tmdb}
+enabled = false
 "#,
         listen = s(&format!("127.0.0.1:{}", opts.port)),
     );
-    if tmdb {
-        out.push_str("credential_file = \"secrets/tmdb_credential\"\n");
-    }
     out.push_str(&format!(
         r#"
 [execution]

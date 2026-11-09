@@ -39,7 +39,6 @@ function render(s) {
     return;
   }
   if (phase === "done") {
-    $("done-movies").hidden = !s.phase.no_tmdb;
     return;
   }
   // The form is back, and Finish starts again where it stopped (the import resumes).
@@ -176,8 +175,6 @@ function libraryChanged(kind) {
     if (lib.local_path) checkFolder(`${kind}-folder`, `${kind}-hint`, false);
   }
   suggestDownloads();
-  // The TMDB key only finds movies. A key typed in stays, in case movies come back.
-  $("tmdb-box").hidden = !$("movies-lib").value;
 }
 
 function suggestDownloads() {
@@ -322,36 +319,6 @@ $("create-libs").addEventListener("click", async (ev) => {
   $("libs-warning").hidden = warnings.length === 0;
 });
 
-// The TMDB key is checked with TMDB as it's pasted, so a wrong one shows up straight away.
-const tmdbHint = $("tmdb-hint");
-const tmdbHintDefault = tmdbHint.innerHTML;
-let tmdbTimer = null;
-$("tmdb").addEventListener("input", () => {
-  clearTimeout(tmdbTimer);
-  const key = $("tmdb").value.trim();
-  tmdbHint.classList.remove("bad", "good");
-  if (!key) { tmdbHint.innerHTML = tmdbHintDefault; return; }
-  tmdbHint.textContent = "Checking the key with TMDB…";
-  tmdbTimer = setTimeout(async () => {
-    let ok = true, message = "This key works: Arr can find new movies.";
-    try { await call("POST", "/api/tmdb/check", { key }); } catch (e) { ok = false; message = e.message; }
-    if ($("tmdb").value.trim() !== key) return; // changed while TMDB answered
-    tmdbHint.textContent = message;
-    tmdbHint.classList.add(ok ? "good" : "bad");
-  }, 500);
-});
-
-// Copy buttons for the TMDB form's answers, where the browser allows it (localhost, HTTPS).
-if (navigator.clipboard && window.isSecureContext) {
-  for (const b of document.querySelectorAll("button.copy")) {
-    b.hidden = false;
-    b.addEventListener("click", async () => {
-      try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; } catch (_) { /* leave it */ }
-      setTimeout(() => { b.textContent = "Copy"; }, 1500);
-    });
-  }
-}
-
 $("form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const lib = (kind) => {
@@ -362,11 +329,9 @@ $("form").addEventListener("submit", async (ev) => {
     movies: lib("movies"),
     tv: lib("tv"),
     downloads: $("downloads").value.trim(),
-    tmdb: $("tmdb-box").hidden ? "" : $("tmdb").value.trim(),
     auto_update: $("auto-update").checked,
     reporting: $("reporting").checked,
   };
-  // From the click, not the answer, so "Checking your TMDB key" shows too.
   startProgressPolling();
   await act($("apply"), () => call("POST", "/api/apply", body));
   if (state && state.phase.state === "working") startProgressPolling();

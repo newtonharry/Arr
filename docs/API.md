@@ -145,9 +145,11 @@ response bodies or credentials.
   - The profile and root folder are chosen automatically when exactly one exists for the
     media kind; otherwise pass them. Replays and concurrent calls are serialised with every other library
     change (`PATCH`, `DELETE`), and grabs never duplicate.
-  - Movies outside the catalog use TMDB when configured: title, runtime, aliases and release
-    dates (primary release date as in-cinemas, plus the earliest digital and physical
-    releases). Without TMDB, pass explicit
+  - Movies outside the catalog use Plex's metadata service (TMDB, when a key is configured,
+    wins for language, aliases and release dates): title, runtime, aliases and release dates
+    (primary release date as in-cinemas, plus the earliest digital and physical releases; from
+    Plex, "digital" is the day Plex first showed somewhere to buy or stream it). Without Plex
+    or TMDB, pass explicit
     `metadata: {title, year, runtime_minutes?, original_language?, alternate_titles?, imdb_id?, in_cinemas?, physical_release?, digital_release?}`
     (dates `YYYY-MM-DD`). Without either, the answer is `409 metadata_unavailable`, with
     guidance.
@@ -230,11 +232,12 @@ response bodies or credentials.
   `q` is a folded title/alias search: accents and case are ignored, and an exact key match is
   listed first. Responses are `{total, items, observation: {import_id, observed_at, note}}`.
 - **`GET /api/v1/discover?kind=movie|series&q=&year=`** merges catalog hits with TVmaze (for
-  series, when enabled) and TMDB (for movies, when configured). Each result carries
+  series, when enabled) and Plex's metadata service, then TMDB as the backup (for movies, when
+  configured). Each result carries
   `media_id`, `in_catalog`, `sources` and `external_ids`. `providers[]` gives each provider's
   status: `ok`, `failed` (with `error`), `disabled`, `not_configured` or `not_imported`. When
-  TMDB is not configured the response says:
-  `"no TMDB credential configured; movie discovery is limited to the imported catalog"`.
+  neither Plex nor TMDB can answer, the `plex` provider is `not_configured` and its message says
+  the install needs to sign in to Plex.
 - **`GET /api/v1/media/{media_id}`** resolves a target. For a season or episode it returns the
   episode list with `aired` and `ownership` (`owned` / `missing` / `unknown`), plus
   `ownership_source` and `episode_list_source`.

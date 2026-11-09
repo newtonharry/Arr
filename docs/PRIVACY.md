@@ -1,6 +1,8 @@
 # Privacy and error reports
 
-Arr runs on your computer and talks to Plex, your torrent sources and TMDB. It doesn't send
+Arr runs on your computer and talks to Plex, your torrent sources and, only if you add a key, TMDB.
+Movie searches and lookups go to Plex's metadata service with your Plex sign-in; TV searches go to
+TVmaze; a movie's details go to TMDB only if you've added a TMDB key. It doesn't send
 anything about you or your library to its developer, with one optional exception: error reports.
 
 ## Error reports are off unless you turn them on

@@ -277,7 +277,7 @@ async function loadFeed() {
   feedBusy = true;
   try {
     const r = await api('/v1/feed');
-    if (r.ok) { S.feed = r.data; if (onHome()) paintHome(); }
+    if (r.ok) { S.feed = r.data; $('#tmdb-credit').hidden = !r.data.tmdb_backup; if (onHome()) paintHome(); }
     return r.ok;
   } catch { return false; } finally {
     feedBusy = false;
@@ -332,7 +332,7 @@ async function renderSearch(q, t) {
   if (!ok(m) && !ok(s)) { mount(hint('Search will work again as soon as Arr is back.', 'status')); return; }
   const movies = ok(m) ? m.value.data.results || [] : [];
   const shows = ok(s) ? s.value.data.results || [] : [];
-  const moviesOff = (S.feed && S.feed.movies_enabled === false) || (ok(m) && (m.value.data.providers || []).some((p) => p.name === 'tmdb' && p.status === 'not_configured'));
+  const moviesOff = (S.feed && S.feed.movies_enabled === false) || (ok(m) && (m.value.data.providers || []).some((p) => p.name === 'plex' && p.status === 'not_configured'));
   const rows = [];
   for (let i = 0; i < Math.max(movies.length, shows.length); i++) {
     if (movies[i]) rows.push(searchRow(movies[i], 'Movie'));
@@ -451,6 +451,8 @@ async function boot() {
     return;
   }
   route();
+  // The feed also says whether TMDB is used, which the footer credit needs on every screen.
+  if (!onHome()) loadFeed();
 }
 function go(q) {
   const url = '#/search?q=' + encodeURIComponent(q);
@@ -460,7 +462,7 @@ function go(q) {
 async function boot2() {
   try {
     const r = await api('/me');
-    if (r.ok) { $('#who').textContent = r.data.email ? 'Signed in as ' + r.data.email : 'Signed in'; $('#foot').hidden = false; route(); }
+    if (r.ok) { $('#who').textContent = r.data.email ? 'Signed in as ' + r.data.email : 'Signed in'; $('#foot').hidden = false; route(); if (!onHome()) loadFeed(); }
   } catch { if (!S.out) setTimeout(boot2, 5000); }
 }
 boot();

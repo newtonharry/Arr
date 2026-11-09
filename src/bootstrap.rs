@@ -8,7 +8,8 @@
 //!   show's `allLeaves`), bounded per batch; the cursor is durable, so a run resumes where it
 //!   stopped and reports machine-readable progress, counts and issues;
 //! - identity comes only from exact provider ids: TMDB for movies (an IMDB-only movie is
-//!   resolved through TMDB's `find` when `[tmdb]` is configured, else reported unresolved),
+//!   resolved through Plex's metadata service, then TMDB's `find` when `[tmdb]` is configured,
+//!   else reported unresolved),
 //!   TVDB for shows; titles are never matched by name;
 //! - ownership comes only from a validated local file: the Plex path must be inside the
 //!   mapped Plex root, the relative name a plain path to a video file, reached without a
@@ -501,21 +502,21 @@ async fn plan_movie(
         .filter(|t| *t > 0)
     {
         Some(t) => t,
-        None => match (item.provider_id("imdb"), &st.tmdb) {
+        None => match (item.provider_id("imdb"), &st.movies) {
             (Some(imdb), Some(t)) => match t.find_imdb(&imdb).await {
                 Ok(Some(id)) => id,
                 Ok(None) => {
                     run.issue(
                         "unresolved",
                         item,
-                        format!("TMDB knows no single movie for {imdb}"),
+                        format!("no single movie is known for {imdb}"),
                     );
                     return Ok(None);
                 }
-                Err(e) => return Err(format!("tmdb {}", e.describe())),
+                Err(e) => return Err(format!("movie metadata {}", e.describe())),
             },
             (Some(imdb), None) => {
-                run.issue("unresolved", item, format!("only an IMDB id ({imdb}); configure [tmdb] to resolve it, or add the movie by TMDB id"));
+                run.issue("unresolved", item, format!("only an IMDB id ({imdb}) and no movie metadata source (Plex sign-in or TMDB) to resolve it"));
                 return Ok(None);
             }
             (None, _) => {
@@ -551,7 +552,10 @@ async fn plan_movie(
             existing.clone()
         }
         None => {
-            let mut m = match &st.tmdb {
+            // The library import already has the title, year and length from the user's own Plex
+            // library, so Plex's metadata service is not asked about every movie; a TMDB key adds
+            // release dates, alternative titles and the original language.
+            let mut m = match st.movies.as_ref().and_then(|m| m.tmdb()) {
                 Some(t) => match t.movie(tmdb).await {
                     Ok(Some(d)) => library::new_movie(
                         tmdb,

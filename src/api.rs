@@ -12,7 +12,7 @@ use crate::ids::{MediaId, SeriesKey};
 use crate::import::{self, rfc3339};
 use crate::indexer::{Backend, Registry};
 use crate::library::{self, MonitorMode};
-use crate::metadata::{self, Tmdb, Tvmaze};
+use crate::metadata::{self, Movies, PlexMovies, Tmdb, Tvmaze};
 use crate::plan::{self, Execution, ExecutionOutcome, Plan, PlanInputs, PlanState, UnitStatus};
 use crate::plex::Plex;
 use crate::prowlarr::ProwlarrClient;
@@ -134,7 +134,8 @@ pub struct AppState {
     /// The release search backend: native indexers or Prowlarr (never both, no fallback).
     pub search: Option<Backend>,
     pub tvmaze: Option<Tvmaze>,
-    pub tmdb: Option<Tmdb>,
+    /// Movie metadata: Plex first, TMDB (when it has a key) as the backup.
+    pub movies: Option<Movies>,
     /// The download client ([qbittorrent] or [embedded]); none in shadow mode.
     pub client: Option<Arc<Client>>,
     pub plex: Option<Plex>,
@@ -262,7 +263,14 @@ impl AppState {
         Ok(AppState {
             search,
             tvmaze: cfg.tvmaze.as_ref().map(Tvmaze::new),
-            tmdb: cfg.tmdb.as_ref().and_then(Tmdb::new),
+            movies: Movies::new(
+                cfg.plex.as_ref().and_then(|p| {
+                    crate::plexsignin::client_id(&cfg.state_dir)
+                        .ok()
+                        .map(|id| PlexMovies::new(p, id))
+                }),
+                cfg.tmdb.as_ref().and_then(Tmdb::new),
+            ),
             client: match (&cfg.qbittorrent, &cfg.embedded) {
                 (Some(q), _) => Some(Arc::new(Client::Qbit(Qbit::new(q.clone())))),
                 // The engine runs only with execution enabled: in shadow mode nothing may open
@@ -364,7 +372,7 @@ impl AppState {
         Resolver {
             catalog: Some(index),
             tvmaze: self.tvmaze.as_ref(),
-            tmdb: self.tmdb.as_ref(),
+            movies: self.movies.as_ref(),
             now,
             availability_delay_days: self.availability_delay_days(),
         }
@@ -1070,7 +1078,7 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
             None => "no release search backend: add [[indexer]] entries (native) or [prowlarr]".into(),
         } },
         Cap { name: "release_decisions", implemented: true, configured: imported, tested: "unit_tests", detail: "independent evaluation of imported quality/size/seeder/language/scope/delay/revision rules".into() },
-        Cap { name: "movie_discovery", implemented: true, configured: st.tmdb.is_some(), tested: "loopback_mocks", detail: if st.tmdb.is_some() { "TMDB search and details".into() } else { crate::tmdbkey::MISSING.into() } },
+        Cap { name: "movie_discovery", implemented: true, configured: st.movies.is_some(), tested: "loopback_mocks", detail: match &st.movies { Some(m) if m.has_tmdb() => "Plex search and details, with TMDB as the backup".into(), Some(_) => "Plex search and details".into(), None => crate::tmdbkey::MISSING.into() } },
         Cap { name: "tv_discovery", implemented: true, configured: st.tvmaze.is_some(), tested: "loopback_mocks", detail: "TVmaze search and episode lists (enable [tvmaze])".into() },
         Cap { name: "plans", implemented: true, configured: imported, tested: "loopback_mocks", detail: "durable idempotent plans; executable when execution is enabled".into() },
         Cap { name: name("download_submission", "embedded_download_submission"), implemented: true, configured: exec && qb, tested, detail: if embedded { "embedded engine (no qBittorrent API): .torrent bytes or magnet metadata fetched from peers, names validated by the engine's parser before anything is written, durable record before the add, reconciliation by hash, never overwrites existing files, outbox queue limit".into() } else { "qBittorrent WebAPI 2.8.2 (4.3.9) to 2.11 (5.x): hash identity persisted before add, ambiguous-add reconciliation, category + unified-media tag ownership".into() } },
@@ -1082,7 +1090,7 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
         Cap { name: "embedded_download_engine", implemented: true, configured: exec && embedded, tested: "loopback_peers", detail: format!("{} in this process: persistent session with fast-resume under the state directory, lifetime upload/download/seeding counters persisted in SQLite (the engine's reset on every restart), share limits enforced from them, explicit listen address, DHT/LSD only when configured, UPnP never", crate::embedded::ENGINE) },
         Cap { name: "rss_sync", implemented: true, configured: exec && searchable && rss_interval.is_some(), tested: "loopback_mocks", detail: match rss_interval { Some(i) => format!("feeds of RSS-enabled indexers {} every {} min; feed windows can miss releases (gap_possible)", match &st.search { Some(Backend::Native(_)) => "read directly (TPB top-100 recent, Torznab t=search)", _ => "via Prowlarr's Torznab proxy" }, i.as_secs() / 60), None => "RSS disabled by the settings' rssSyncInterval or no settings".into() } },
         Cap { name: "explicit_requests", implemented: true, configured: exec, tested: "loopback_mocks", detail: "one-call add-and-search for movies, series, seasons and episodes (scan first), manual searches, backlog search on demand, bounded retries of unmet requests (including movies not yet released)".into() },
-        Cap { name: "metadata_refresh", implemented: true, configured: exec && st.tvmaze.is_some(), tested: "loopback_mocks", detail: "fresh TVmaze episode lists for managed series and TMDB movie release evidence (availability); never changes monitoring or ownership".into() },
+        Cap { name: "metadata_refresh", implemented: true, configured: exec && st.tvmaze.is_some(), tested: "loopback_mocks", detail: "fresh TVmaze episode lists for managed series and movie release evidence (Plex, or TMDB) (availability); never changes monitoring or ownership".into() },
         Cap { name: "library_scan", implemented: true, configured: exec && lib, tested: "loopback_mocks", detail: "per-root reconciliation; unavailable/incomplete/suspect-empty roots change nothing; lazy bounded ffprobe".into() },
         Cap { name: "plex", implemented: true, configured: exec && st.plex.is_some(), tested: "loopback_mocks", detail: "section refresh after imports (optional)".into() },
         Cap { name: "coexistence_guard", implemented: true, configured: exec && st.cfg.migration == MigrationMode::Coexistence, tested: "loopback_mocks", detail: format!("coexistence mode: imported titles acquire only after adoption (POST /library with native_handoff_confirmed); one acquisition gate for plans, grabs, RSS, searches and retries{}", if embedded { "; the embedded engine is private to this process (no shared client category)" } else { "; native qBittorrent categories refused" }) },
@@ -1242,7 +1250,7 @@ fn migration_readiness(st: &AppState, counts: &BTreeMap<String, usize>) -> Value
     if !rss_on {
         broad.configuration_blockers.push("RSS sync is disabled: new episodes and releases of adopted titles would be acquired only through explicit requests".into());
     }
-    if st.tmdb.is_none() {
+    if st.movies.is_none() {
         broad
             .configuration_blockers
             .push(crate::tmdbkey::MISSING.into());
@@ -1439,7 +1447,8 @@ async fn readiness(State(st): St) -> Response {
     checks.push(search_readiness(&st));
     checks.push(peer_discovery_readiness(&st));
     checks.push(json!({ "name": "tvmaze", "status": if st.tvmaze.is_some() { "enabled" } else { "disabled" } }));
-    checks.push(json!({ "name": "tmdb", "status": if st.tmdb.is_some() { "configured" } else { "not_configured" } }));
+    checks.push(json!({ "name": "plex_metadata", "status": if st.movies.as_ref().is_some_and(Movies::has_plex) { "configured" } else { "not_configured" } }));
+    checks.push(json!({ "name": "tmdb", "status": if st.movies.as_ref().is_some_and(Movies::has_tmdb) { "configured" } else { "not_configured" } }));
     checks.push(json!({ "name": "execution", "status": if st.cfg.execution_enabled { "enabled" } else { "disabled" } }));
     if st.cfg.execution_enabled {
         for m in [MediaKind::Movie, MediaKind::Series] {
@@ -1835,7 +1844,7 @@ struct AddBody {
     /// Search after adding (default true; false = monitor only).
     #[serde(default = "yes")]
     search: bool,
-    /// Operator-supplied movie metadata (when TMDB is not configured).
+    /// Operator-supplied movie metadata (when neither Plex nor TMDB can answer).
     #[serde(default)]
     metadata: Option<SuppliedMetadata>,
     /// Coexistence mode, native (imported) titles only: the caller confirms that native
@@ -1865,7 +1874,7 @@ fn date_field(v: &Option<String>, what: &str) -> Result<Option<String>, ApiError
     }
 }
 
-/// A new movie record from TMDB or operator metadata (never invented).
+/// A new movie record from Plex, TMDB or operator metadata (never invented).
 async fn new_movie_record(
     st: &AppState,
     l: &Loaded,
@@ -1888,8 +1897,10 @@ async fn new_movie_record(
         .settings
         .media_management(MediaKind::Movie)
         .is_none_or(|x| x.replace_illegal_characters);
-    let (title, year, runtime, lang, alts, imdb, release, source) = match (&st.tmdb, &body.metadata)
-    {
+    let (title, year, runtime, lang, alts, imdb, release, source) = match (
+        &st.movies,
+        &body.metadata,
+    ) {
         (_, Some(md)) => {
             let title = md.title.trim();
             if title.is_empty()
@@ -1927,12 +1938,12 @@ async fn new_movie_record(
             let m = t
                 .movie(tmdb)
                 .await
-                .map_err(|e| e.into_api("tmdb"))?
+                .map_err(|e| e.into_api("movie metadata"))?
                 .ok_or_else(|| {
                     ApiError::new(
                         StatusCode::NOT_FOUND,
                         ErrorCode::MetadataUnavailable,
-                        format!("TMDB has no movie {tmdb}"),
+                        format!("no movie metadata for TMDB id {tmdb}"),
                     )
                 })?;
             let alts = m
@@ -1954,7 +1965,7 @@ async fn new_movie_record(
                 alts,
                 m.imdb_id,
                 release,
-                "tmdb",
+                "metadata",
             )
         }
         (None, None) => {
@@ -2929,18 +2940,22 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
                 Err(e) => providers.push(json!({ "name": "tvmaze", "status": "failed", "error": { "code": e.code(), "message": format!("tvmaze {}", e.describe()) } })),
             },
         },
-        DiscoverKind::Movie => match &st.tmdb {
-            None => providers.push(json!({ "name": "tmdb", "status": "not_configured", "message": crate::tmdbkey::MISSING })),
-            Some(t) => match t.search(&text, q.year).await {
-                Ok(movies) => {
-                    providers.push(json!({ "name": "tmdb", "status": "ok", "results": movies.len() }));
-                    for m in movies.iter().take(25) {
-                        let in_catalog = catalog.is_some_and(|c| c.movie(m.id).is_some());
-                        add(MediaId::Movie { tmdb: m.id }, json!({ "kind": "movie", "title": m.title, "original_title": m.original_title, "year": metadata::year_of(m.release_date.as_deref()), "in_catalog": in_catalog, "external_ids": { "tmdb": m.id } }), "tmdb");
-                    }
+        DiscoverKind::Movie => match &st.movies {
+            None => providers.push(json!({ "name": "plex", "status": "not_configured", "message": crate::tmdbkey::MISSING })),
+            Some(movies) => {
+                let (found, answers) = movies.search(&text, q.year).await;
+                let source = answers.iter().rev().find(|(_, a)| a.is_ok()).map_or("plex", |(n, _)| *n);
+                for (name, answer) in answers {
+                    providers.push(match answer {
+                        Ok(n) => json!({ "name": name, "status": "ok", "results": n }),
+                        Err(e) => json!({ "name": name, "status": "failed", "error": { "code": e.code(), "message": format!("{name} {}", e.describe()) } }),
+                    });
                 }
-                Err(e) => providers.push(json!({ "name": "tmdb", "status": "failed", "error": { "code": e.code(), "message": format!("tmdb {}", e.describe()) } })),
-            },
+                for m in found.iter().take(25) {
+                    let in_catalog = catalog.is_some_and(|c| c.movie(m.id).is_some());
+                    add(MediaId::Movie { tmdb: m.id }, json!({ "kind": "movie", "title": m.title, "original_title": m.original_title, "year": metadata::year_of(m.release_date.as_deref()), "in_catalog": in_catalog, "external_ids": { "tmdb": m.id } }), source);
+                }
+            }
         },
     }
     let list: Vec<Value> = order
@@ -3764,7 +3779,7 @@ async fn setup_status(State(st): St) -> ApiResult {
                 .into(),
         );
     }
-    if st.tmdb.is_none() {
+    if st.movies.is_none() {
         next.push(format!("optional: {}", crate::tmdbkey::MISSING));
     }
     if st.tvmaze.is_none() {
@@ -3792,7 +3807,7 @@ async fn setup_status(State(st): St) -> ApiResult {
         "execution_enabled": st.cfg.execution_enabled,
         "library": st.cfg.library.as_ref().map(|l| json!({ "movies": l.movies, "tv": l.tv })),
         "plex": st.cfg.plex.as_ref().map(|p| json!({ "movie_section": p.movie_section, "tv_section": p.tv_section, "movies_path": p.movies_path, "tv_path": p.tv_path })),
-        "metadata": { "tvmaze": st.tvmaze.is_some(), "tmdb": st.tmdb.is_some() },
+        "metadata": { "tvmaze": st.tvmaze.is_some(), "plex": st.movies.as_ref().is_some_and(Movies::has_plex), "tmdb": st.movies.as_ref().is_some_and(Movies::has_tmdb) },
         "mcp": st.cfg.mcp.is_some(),
         "next_steps": next,
         "note": "connections and credentials (as file paths) live in config.toml; this endpoint manages policy only and never enables execution",
@@ -4728,7 +4743,8 @@ async fn feed(State(st): St) -> ApiResult {
 
     ok(json!({
         "generated_at": rfc3339(now),
-        "movies_enabled": st.tmdb.is_some(),
+        "movies_enabled": st.movies.is_some(),
+        "tmdb_backup": st.movies.as_ref().is_some_and(Movies::has_tmdb),
         "needs_you": needs_you,
         "on_its_way": on_its_way,
         "arrived": arrived,
@@ -4868,12 +4884,12 @@ async fn quick_add(State(st): St, ApiJson(body): ApiJson<QuickAddBody>) -> ApiRe
                 Err(e)
                     if e.status == StatusCode::CONFLICT
                         && e.code == ErrorCode::MetadataUnavailable
-                        && st.tmdb.is_none() =>
+                        && st.movies.is_none() =>
                 {
                     return ok(json!({
                         "media_id": id, "title": format!("Movie {tmdb}"), "detail": null,
                         "outcome": "movies_off", "until": null,
-                        "message": "Movie search isn't set up yet. The person who runs Arr can add a free TMDB key.",
+                        "message": "Movie search isn't set up yet. The person who runs Arr needs to sign in to Plex again.",
                     }));
                 }
                 Err(e) => return Err(e),

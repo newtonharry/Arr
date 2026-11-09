@@ -553,6 +553,25 @@ struct PlexSection {
     tv_path: Option<String>,
     #[serde(default = "d_meta_timeout")]
     timeout_secs: u64,
+    /// Where Plex's movie search lives (tests only; installers never write this).
+    #[serde(default = "d_plex_discover")]
+    discover_url: String,
+    /// Where Plex's movie details live (tests only).
+    #[serde(default = "d_plex_metadata")]
+    metadata_url: String,
+    /// Where Plex's posters live (tests only).
+    #[serde(default = "d_plex_images")]
+    image_base_url: String,
+}
+
+fn d_plex_discover() -> String {
+    "https://discover.provider.plex.tv".into()
+}
+fn d_plex_metadata() -> String {
+    "https://metadata.provider.plex.tv".into()
+}
+fn d_plex_images() -> String {
+    "https://metadata-static.plex.tv".into()
 }
 
 /// qBittorrent connection and the download directory as both sides see it.
@@ -636,6 +655,10 @@ pub struct PlexConfig {
     pub movies_path: Option<String>,
     pub tv_path: Option<String>,
     pub timeout: Duration,
+    /// Plex's own movie metadata service, read with the same token.
+    pub discover_url: Url,
+    pub metadata_url: Url,
+    pub image_base_url: Url,
 }
 
 /// What a native indexer is.
@@ -1472,6 +1495,9 @@ pub fn parse_config(
                 movies_path: plex_path(&p.movies_path, "plex.movies_path")?,
                 tv_path: plex_path(&p.tv_path, "plex.tv_path")?,
                 timeout: Duration::from_secs(within("plex.timeout_secs", p.timeout_secs, 1, 120)?),
+                discover_url: parse_base_url(&p.discover_url, "plex.discover_url")?,
+                metadata_url: parse_base_url(&p.metadata_url, "plex.metadata_url")?,
+                image_base_url: parse_base_url(&p.image_base_url, "plex.image_base_url")?,
             })
         }
     };

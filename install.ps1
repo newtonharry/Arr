@@ -9,7 +9,7 @@
 #   ARR_VERSION          a release tag such as v0.4.0 (default: the latest release)
 #   ARR_AUTO_UPDATE      1 to install new versions automatically, 0 to turn that off
 #   ARR_ERROR_REPORTS    1 to send error reports, 0 not to (docs/PRIVACY.md)
-#   ARR_TMDB_KEY         a TMDB key, so Arr can find new movies
+#   ARR_TMDB_KEY         an optional backup TMDB key (movies come from Plex)
 #   ARR_UPLOAD_LIMIT_KIB upload limit for downloads in KiB/s (0 = no limit)
 #   ARR_TORRENT_PORT     the port downloads use (default 50413)
 #   ARR_PORT             Arr's port on this computer (default 8787; first setup only, and
@@ -96,37 +96,6 @@ function Install-Arr {
 		$out = $input | Run-Arr set --config $Config @args
 		if ($LASTEXITCODE -ne 0) { throw "couldn't set $($args[0]): $(($out -join ' ') -replace '^Error: ', '')" }
 		Say $out
-	}
-
-	# Whether TMDB accepts a key, asked through arr with the key on stdin; $script:TmdbWhy says
-	# why not. (Windows PowerShell turns a native program's stderr into errors, hence Continue.)
-	function Test-TmdbKey($key) {
-		$ErrorActionPreference = 'Continue'
-		$out = $key | & $Arr tmdb-key --check 2>&1 | ForEach-Object { "$_" }
-		$script:TmdbWhy = (($out -join ' ').Trim() -replace '^Error: ', '')
-		return $LASTEXITCODE -eq 0
-	}
-	# Walks whoever is at the keyboard through getting a TMDB key (docs/TMDB.md; the setup page
-	# and Arr's answers to an assistant give the same steps). Returns it, or '' if skipped.
-	function Read-TmdbKey {
-		if (-not (Interactive)) { return '' }
-		Say 'Arr finds TV shows on its own. To find movies you don''t have yet, it needs a free key'
-		Say 'from TMDB, the movie database. It takes about five minutes:'
-		Say '  1. Create a free account: https://www.themoviedb.org/signup'
-		Say '  2. Request a key on https://www.themoviedb.org/settings/api and accept TMDB''s terms.'
-		Say '     If it asks about your app, it''s personal use: name Arr, URL'
-		Say '     https://github.com/newtonharry/Arr, summary "Personal media server".'
-		Say '  3. Copy the API Read Access Token (the long one) or the API Key.'
-		Say '  Help: https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md'
-		if (Confirm 'Open TMDB in your browser now?' 'y') { Open-Page 'https://www.themoviedb.org/signup' }
-		for ($i = 0; $i -lt 3; $i++) {
-			$key = "$(Read-Host 'Paste the TMDB key (Enter to skip)')".Trim()
-			if (-not $key) { break }
-			if (Test-TmdbKey $key) { Say 'That key works.'; return $key }
-			Say $script:TmdbWhy
-		}
-		Say 'No TMDB key for now: TV works, and running this again later asks for one.'
-		return ''
 	}
 
 	if (-not [Environment]::Is64BitOperatingSystem) { throw 'Arr needs 64-bit Windows.' }
@@ -253,13 +222,12 @@ function Install-Arr {
 				Write-Warning 'couldn''t reach Plex to check Arr''s sign-in; carrying on.'
 			}
 		}
-		# A TMDB key can be added on any later run: $env:ARR_TMDB_KEY, or asked here.
+		# Movies come from the Plex sign-in. A TMDB key is an optional backup ($env:ARR_TMDB_KEY);
+		# an existing one is kept.
 		$tmdbKey = $env:ARR_TMDB_KEY
 		$tmdbOn = (Get-Content $Config -Raw) -match '(?ms)^\[tmdb\][^\[]*?^enabled *= *true'
-		if (-not $tmdbKey -and -not $tmdbOn -and (Interactive)) {
-			Step 'Arr can''t find new movies yet'
-			$tmdbKey = Read-TmdbKey
-		}
+		if ($tmdbKey -or $tmdbOn) { Say 'Movies now come from your Plex sign-in; your TMDB key stays as a backup.' }
+		else { Say 'Movies now come from your Plex sign-in — no TMDB key needed.' }
 		# Given options change only those settings; each is checked, and a refused one stops
 		# here, before Arr is restarted. The TMDB key goes first: it's the one likely refused.
 		# If this run fails before Arr runs well again, the config and secrets go back as they are now.

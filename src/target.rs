@@ -5,7 +5,7 @@
 use crate::catalog::{AltTitle, CatalogIndex, Movie, Series};
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::{MediaId, SeriesKey};
-use crate::metadata::{self, Tmdb, Tvmaze, TvmazeShow};
+use crate::metadata::{self, Movies, Tvmaze, TvmazeShow};
 use crate::settings::MediaKind;
 use axum::http::StatusCode;
 use serde::Serialize;
@@ -141,7 +141,7 @@ impl Target {
 pub struct Resolver<'a> {
     pub catalog: Option<&'a CatalogIndex>,
     pub tvmaze: Option<&'a Tvmaze>,
-    pub tmdb: Option<&'a Tmdb>,
+    pub movies: Option<&'a Movies>,
     pub now: OffsetDateTime,
     /// Radarr `availabilityDelay` (days) for movie availability.
     pub availability_delay_days: i64,
@@ -258,29 +258,38 @@ impl Resolver<'_> {
                 self.availability_delay_days,
             ));
         }
-        let Some(client) = self.tmdb else {
+        let Some(client) = self.movies else {
             return Err(metadata_unavailable(format!(
-                "movie:tmdb:{tmdb} is not in the imported catalog and TMDB is not configured, so its title/year/runtime are unknown"
+                "movie:tmdb:{tmdb} is not in the imported catalog and no movie metadata source (Plex or TMDB) is configured, so its title/year/runtime are unknown"
             )));
         };
         let m = client
             .movie(tmdb)
             .await
-            .map_err(|e| e.into_api("tmdb"))?
-            .ok_or_else(|| metadata_unavailable(format!("TMDB has no movie {tmdb}")))?;
+            .map_err(|e| e.into_api("movie metadata"))?
+            .ok_or_else(|| metadata_unavailable(format!("no movie metadata for TMDB id {tmdb}")))?;
         Ok(MovieTarget {
             id: MediaId::Movie { tmdb },
             existing: None,
             queued: false,
             folder: None,
             availability_note: None,
-            alternate_titles: m
-                .original_title
-                .iter()
-                .filter(|t| **t != m.title)
-                .cloned()
-                .chain(m.alternative_titles.titles.iter().map(|t| t.title.clone()))
-                .collect(),
+            alternate_titles: {
+                // Plex lists the original title among the alternatives too: once is enough.
+                let mut v: Vec<String> = vec![];
+                for t in m
+                    .original_title
+                    .iter()
+                    .filter(|t| **t != m.title)
+                    .cloned()
+                    .chain(m.alternative_titles.titles.iter().map(|t| t.title.clone()))
+                {
+                    if !v.contains(&t) {
+                        v.push(t);
+                    }
+                }
+                v
+            },
             year: metadata::year_of(m.release_date.as_deref()),
             secondary_year: None,
             runtime_minutes: m.runtime.filter(|r| *r > 0),

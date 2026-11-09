@@ -51,6 +51,7 @@ cache_ttl_secs = 900
 enabled = true
 base_url = "https://api.tvmaze.com"
 
+# Optional backup for movies (movies come from the Plex sign-in): add a free TMDB key.
 [tmdb]
 enabled = true
 base_url = "https://api.themoviedb.org"

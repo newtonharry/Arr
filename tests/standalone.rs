@@ -63,6 +63,9 @@ struct World {
     plex_pages: Vec<String>,
     tmdb: HashMap<String, Value>,
     tmdb_find: HashMap<String, u32>,
+    /// IMDb guid -> TMDB id, as Plex's metadata service matches them; the guids asked, in order.
+    plex_find: HashMap<String, u32>,
+    plex_matches: Vec<String>,
     tvmaze_shows: HashMap<u32, Value>,
     tvmaze_episodes: HashMap<u32, Vec<Value>>,
     tvmaze_akas: HashMap<u32, Vec<Value>>,
@@ -272,6 +275,19 @@ async fn tmdb_find(
     .into_response()
 }
 
+async fn plex_meta_matches(State(m): State<Mock>, uri: Uri) -> Response {
+    let guid = query_param(&uri, "guid").unwrap_or_default();
+    let mut w = m.lock().unwrap();
+    w.plex_matches.push(guid.clone());
+    let items: Vec<Value> = w
+        .plex_find
+        .get(&guid)
+        .map(|id| json!({ "Guid": [{ "id": guid }, { "id": format!("tmdb://{id}") }] }))
+        .into_iter()
+        .collect();
+    axum::Json(json!({ "MediaContainer": { "Metadata": items } })).into_response()
+}
+
 async fn tmdb_search(State(m): State<Mock>, headers: HeaderMap, uri: Uri) -> Response {
     if !tmdb_ok(&headers, &uri) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -375,6 +391,12 @@ async fn start_mock() -> (SocketAddr, Mock) {
         .route("/plex/library/sections/{id}/all", get(plex_all))
         .route("/plex/library/metadata/{key}/allLeaves", get(plex_leaves))
         .route("/plex/library/sections/{id}/refresh", post(plex_refresh))
+        .route("/plexmeta/library/metadata/matches", get(plex_meta_matches))
+        // Plex finds nothing: TMDB (the backup here) answers.
+        .route(
+            "/plexmeta/library/search",
+            get(|| async { axum::Json(json!({ "MediaContainer": { "SearchResults": [] } })) }),
+        )
         .route("/tmdb/3/movie/{id}", get(tmdb_movie))
         .route("/tmdb/3/find/{imdb}", get(tmdb_find))
         .route("/tmdb/3/search/movie", get(tmdb_search))
@@ -569,6 +591,9 @@ movie_section = 1
 tv_section = 2
 movies_path = "/media_library/movies"
 tv_path = "/media_library/tvshows"
+discover_url = "http://{mock}/plexmeta"
+metadata_url = "http://{mock}/plexmeta"
+image_base_url = "http://{mock}"
 [mcp]
 enabled = true
 token_file = "secrets/mcp_token"
@@ -803,6 +828,10 @@ async fn fresh_standalone_deployment_end_to_end_with_native_indexers_only() {
             json!({ "ratingKey": "102", "type": "movie", "title": "Elsewhere", "year": 2001,
                 "Guid": [{ "id": "imdb://tt0000102" }],
                 "Media": [{ "Part": [{ "file": "/media_library/movies/Elsewhere (2001)/Elsewhere.mkv" }] }] }),
+            // Only an IMDB id that Plex's metadata service resolves (TMDB never needs asking).
+            json!({ "ratingKey": "104", "type": "movie", "title": "Via Plex", "year": 2003,
+                "Guid": [{ "id": "imdb://tt0000104" }],
+                "Media": [{ "Part": [{ "file": "/media_library/movies/Via Plex (2003)/Via.Plex.mkv" }] }] }),
             // Only an IMDB id TMDB does not know: reported unresolved, nothing invented.
             json!({ "ratingKey": "103", "type": "movie", "title": "Unknown Film", "year": 1990,
                 "Guid": [{ "id": "imdb://tt0000103" }], "Media": [] }),
@@ -839,6 +868,7 @@ async fn fresh_standalone_deployment_end_to_end_with_native_indexers_only() {
         w.tmdb
             .insert("1102".into(), tmdb_details(1102, "Elsewhere", 2001, 90));
         w.tmdb_find.insert("tt0000102".into(), 1102);
+        w.plex_find.insert("imdb://tt0000104".into(), 1104);
         let (show, eps) = tvmaze_slow_horses();
         w.tvmaze_shows.insert(9001, show);
         w.tvmaze_episodes.insert(9001, eps);
@@ -960,7 +990,12 @@ async fn fresh_standalone_deployment_end_to_end_with_native_indexers_only() {
             assert_eq!(movies["status"], "done", "{v}");
             assert_eq!(movies["counts"]["titles_created"], 1, "{v}");
             assert_eq!(movies["counts"]["unresolved"], 1, "{v}");
-            assert_eq!(movies["counts"]["missing_locally"], 1, "{v}");
+            assert_eq!(movies["counts"]["missing_locally"], 2, "{v}");
+            // Plex's metadata service is asked first for each IMDb-only movie, TMDB second.
+            let asked = mock.lock().unwrap().plex_matches.clone();
+            for g in ["imdb://tt0000102", "imdb://tt0000103", "imdb://tt0000104"] {
+                assert!(asked.iter().any(|a| a == g), "{asked:?}");
+            }
             let tv = &v["runs"][1];
             assert_eq!(tv["counts"]["episodes_owned"], 2, "{v}");
             assert_eq!(tv["counts"]["unsupported"], 1, "the special: {v}");

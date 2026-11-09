@@ -1,12 +1,13 @@
-//! Optional external metadata: TVmaze (free, no key) and TMDB (operator credential).
+//! External metadata: TVmaze (free, no key) for TV; Plex's own metadata service (with the
+//! Plex sign-in) and, optionally, TMDB (operator credential) for movies.
 //! Both are read-only GETs to the configured base URL; data is cached briefly.
 
-use crate::config::MetadataConfig;
+use crate::config::{MetadataConfig, PlexConfig, Secret};
 use crate::upstream::{self, TtlCache, UpstreamError};
 use reqwest::Url;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
@@ -472,6 +473,13 @@ pub struct TmdbMovie {
     pub release_dates: TmdbReleaseDates,
     #[serde(default)]
     pub poster_path: Option<String>,
+    /// Plex's poster address (Plex answers only; never read from TMDB).
+    #[serde(default, skip_deserializing)]
+    pub plex_thumb: Option<String>,
+    /// The only digital date is "Plex shows it for sale or streaming today", not a published
+    /// date: a refresh keeps an earlier recorded date instead of moving it forward.
+    #[serde(default, skip_deserializing)]
+    pub observed_digital: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -684,6 +692,549 @@ impl Tmdb {
     }
 }
 
+/// Most Plex search hits looked up in full (each needs a details call for its TMDB id).
+const PLEX_SEARCH_MAX: usize = 10;
+/// Details calls in flight at once for one search.
+const PLEX_LOOKUPS: usize = 4;
+
+#[derive(Deserialize)]
+struct PlexEnvelope<T> {
+    #[serde(rename = "MediaContainer")]
+    container: T,
+}
+
+#[derive(Deserialize, Default)]
+struct PlexSearchContainer {
+    #[serde(rename = "SearchResults", default)]
+    groups: Vec<PlexSearchGroup>,
+}
+
+#[derive(Deserialize)]
+struct PlexSearchGroup {
+    #[serde(rename = "SearchResult", default)]
+    hits: Vec<PlexSearchHit>,
+}
+
+#[derive(Deserialize)]
+struct PlexSearchHit {
+    #[serde(rename = "Metadata")]
+    metadata: Option<PlexMeta>,
+}
+
+#[derive(Deserialize, Default)]
+struct PlexMetaContainer {
+    #[serde(rename = "Metadata", default)]
+    items: Vec<PlexMeta>,
+}
+
+#[derive(Deserialize, Default)]
+struct PlexOffers {
+    #[serde(rename = "Availability", default)]
+    offers: Vec<serde::de::IgnoredAny>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlexGuid {
+    id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlexCountry {
+    tag: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlexMeta {
+    #[serde(default)]
+    title: String,
+    #[serde(rename = "originalTitle", default)]
+    original_title: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    year: Option<u16>,
+    #[serde(rename = "ratingKey", default)]
+    rating_key: String,
+    /// `plex://movie/<key>`.
+    #[serde(default)]
+    guid: Option<String>,
+    #[serde(rename = "originallyAvailableAt", default)]
+    originally_available_at: Option<String>,
+    /// Milliseconds.
+    #[serde(default)]
+    duration: Option<u64>,
+    #[serde(rename = "Guid", default)]
+    guids: Vec<PlexGuid>,
+    #[serde(rename = "Country", default)]
+    countries: Vec<PlexCountry>,
+    #[serde(default)]
+    thumb: Option<String>,
+}
+
+impl PlexMeta {
+    fn guid(&self, scheme: &str) -> Option<&str> {
+        self.guids
+            .iter()
+            .find_map(|g| g.id.strip_prefix(scheme)?.strip_prefix("://"))
+    }
+
+    /// The key Plex's other endpoints use for this movie.
+    fn key(&self) -> &str {
+        if self.rating_key.is_empty() {
+            self.guid
+                .as_deref()
+                .and_then(|g| g.strip_prefix("plex://movie/"))
+                .unwrap_or("")
+        } else {
+            &self.rating_key
+        }
+    }
+
+    fn tmdb_id(&self) -> Option<u32> {
+        self.guid("tmdb")?.parse().ok().filter(|id| *id > 0)
+    }
+}
+
+/// The original-language code for the first production country Plex lists. Only common
+/// countries with one dominant language are mapped; the rest are unknown, never guessed.
+fn language_of_country(country: &str) -> Option<&'static str> {
+    Some(match country {
+        "United States of America"
+        | "United Kingdom"
+        | "Canada"
+        | "Australia"
+        | "Ireland"
+        | "New Zealand" => "en",
+        "France" => "fr",
+        "Germany" | "Austria" => "de",
+        "Spain" | "Mexico" | "Argentina" => "es",
+        "Italy" => "it",
+        "Japan" => "ja",
+        "South Korea" => "ko",
+        "China" | "Taiwan" => "zh",
+        // India (Hindi, Tamil, Telugu, …) and Hong Kong (mostly Cantonese) have no single language.
+        "Denmark" => "da",
+        "Sweden" => "sv",
+        "Norway" => "no",
+        "Finland" => "fi",
+        "Netherlands" => "nl",
+        "Brazil" | "Portugal" => "pt",
+        "Russia" => "ru",
+        "Poland" => "pl",
+        "Turkey" => "tr",
+        "Iran" => "fa",
+        "Thailand" => "th",
+        "Indonesia" => "id",
+        "Israel" => "he",
+        _ => return None,
+    })
+}
+
+/// Plex's movie metadata service (the search and details Plex itself shows), read with the
+/// Plex sign-in. Movies are keyed by the TMDB id in Plex's guid list; a Plex movie without
+/// one is invisible to Arr.
+#[derive(Clone)]
+pub struct PlexMovies {
+    inner: Arc<PlexInner>,
+}
+
+struct PlexInner {
+    discover: Url,
+    metadata: Url,
+    http: reqwest::Client,
+    token: Secret,
+    client_id: String,
+    /// Plex details by Plex key.
+    metas: TtlCache<String, Option<PlexMeta>>,
+    /// Finished movies by TMDB id.
+    movies: TtlCache<u32, Option<TmdbMovie>>,
+}
+
+/// A Plex key is letters and digits only; anything else is never put in a path.
+fn plex_key(key: &str) -> Option<&str> {
+    (!key.is_empty() && key.len() <= 64 && key.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then_some(key)
+}
+
+impl PlexMovies {
+    pub fn new(cfg: &PlexConfig, client_id: String) -> Self {
+        PlexMovies {
+            inner: Arc::new(PlexInner {
+                discover: cfg.discover_url.clone(),
+                metadata: cfg.metadata_url.clone(),
+                http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
+                token: cfg.token.clone(),
+                client_id,
+                metas: TtlCache::new(METADATA_TTL, 512),
+                movies: TtlCache::new(METADATA_TTL, 512),
+            }),
+        }
+    }
+
+    async fn get<T: DeserializeOwned>(
+        &self,
+        base: &Url,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T, UpstreamError> {
+        let mut url = base.join(path).map_err(|_| UpstreamError::BadResponse {
+            reason: "invalid path".into(),
+        })?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let req = self
+            .inner
+            .http
+            .get(url)
+            .header("Accept", "application/json")
+            .header("X-Plex-Token", self.inner.token.expose())
+            .header("X-Plex-Product", "Arr")
+            .header("X-Plex-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-Plex-Client-Identifier", &self.inner.client_id);
+        let env: PlexEnvelope<T> =
+            upstream::read_json(upstream::send(req).await?, MAX_METADATA_BYTES).await?;
+        Ok(env.container)
+    }
+
+    /// The first item of a metadata answer; a 404 is "no such movie".
+    async fn first_meta(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Option<PlexMeta>, UpstreamError> {
+        match self
+            .get::<PlexMetaContainer>(&self.inner.metadata, path, query)
+            .await
+        {
+            Ok(c) => Ok(c.items.into_iter().next()),
+            Err(UpstreamError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn meta_by_key(&self, key: &str) -> Result<Option<PlexMeta>, UpstreamError> {
+        let Some(key) = plex_key(key) else {
+            return Ok(None);
+        };
+        if let Some(hit) = self.inner.metas.get(&key.to_string()) {
+            return Ok(hit);
+        }
+        let meta = self
+            .first_meta(&format!("library/metadata/{key}"), &[])
+            .await?;
+        self.inner.metas.insert(key.to_string(), meta.clone());
+        Ok(meta)
+    }
+
+    /// `guid` is `tmdb://<id>` or `imdb://tt...`.
+    async fn meta_by_guid(&self, guid: &str) -> Result<Option<PlexMeta>, UpstreamError> {
+        self.first_meta("library/metadata/matches", &[("type", "1"), ("guid", guid)])
+            .await
+    }
+
+    /// Whether Plex lists at least one place to buy, rent or stream the movie.
+    async fn offered(&self, key: &str) -> Result<bool, UpstreamError> {
+        let Some(key) = plex_key(key) else {
+            return Ok(false);
+        };
+        match self
+            .get::<PlexOffers>(
+                &self.inner.discover,
+                &format!("library/metadata/{key}/availabilities"),
+                &[],
+            )
+            .await
+        {
+            Ok(o) => Ok(!o.offers.is_empty()),
+            Err(UpstreamError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn search(&self, query: &str) -> Result<Vec<TmdbSearchResult>, UpstreamError> {
+        let limit = PLEX_SEARCH_MAX.to_string();
+        let found: PlexSearchContainer = self
+            .get(
+                &self.inner.discover,
+                "library/search",
+                &[
+                    ("query", query),
+                    ("searchTypes", "movies"),
+                    ("searchProviders", "discover"),
+                    ("includeMetadata", "1"),
+                    ("limit", &limit),
+                ],
+            )
+            .await?;
+        let keys: Vec<String> = found
+            .groups
+            .into_iter()
+            .flat_map(|g| g.hits)
+            .filter_map(|h| h.metadata)
+            .filter(|m| m.kind.as_deref().is_none_or(|k| k == "movie"))
+            .map(|m| m.key().to_string())
+            .filter(|k| plex_key(k).is_some())
+            .take(PLEX_SEARCH_MAX)
+            .collect();
+        let mut out: Vec<Option<TmdbSearchResult>> = vec![None; keys.len()];
+        let mut failure = None;
+        for chunk in keys.chunks(PLEX_LOOKUPS).enumerate() {
+            let mut set = tokio::task::JoinSet::new();
+            for (i, key) in chunk.1.iter().enumerate() {
+                let (this, key) = (self.clone(), key.clone());
+                let at = chunk.0 * PLEX_LOOKUPS + i;
+                set.spawn(async move { (at, this.meta_by_key(&key).await) });
+            }
+            while let Some(done) = set.join_next().await {
+                let Ok((at, meta)) = done else { continue };
+                match meta {
+                    Ok(Some(m)) => {
+                        out[at] = m.tmdb_id().map(|id| TmdbSearchResult {
+                            id,
+                            title: Some(m.title.clone()),
+                            original_title: m.original_title.clone(),
+                            release_date: m
+                                .originally_available_at
+                                .clone()
+                                .or(m.year.map(|y| y.to_string())),
+                            original_language: None,
+                        })
+                    }
+                    Ok(None) => {}
+                    Err(e) => failure = Some(e),
+                }
+            }
+        }
+        let results: Vec<TmdbSearchResult> = out.into_iter().flatten().collect();
+        match failure {
+            Some(e) if results.is_empty() => Err(e),
+            _ => Ok(results),
+        }
+    }
+
+    pub async fn find_imdb(&self, imdb: &str) -> Result<Option<u32>, UpstreamError> {
+        if !imdb_shape(imdb) {
+            return Ok(None);
+        }
+        Ok(self
+            .meta_by_guid(&format!("imdb://{imdb}"))
+            .await?
+            .and_then(|m| m.tmdb_id()))
+    }
+
+    /// A movie by TMDB id. `fresh` bypasses the cache (metadata refresh).
+    pub async fn movie_with(
+        &self,
+        id: u32,
+        fresh: bool,
+    ) -> Result<Option<TmdbMovie>, UpstreamError> {
+        if !fresh && let Some(hit) = self.inner.movies.get(&id) {
+            return Ok(hit);
+        }
+        let Some(meta) = self.meta_by_guid(&format!("tmdb://{id}")).await? else {
+            self.inner.movies.insert(id, None);
+            return Ok(None);
+        };
+        let key = meta.key().to_string();
+        let on_sale = self.offered(&key).await?;
+        let movie = Some(plex_movie(id, &meta, on_sale));
+        self.inner.metas.insert(key, Some(meta));
+        self.inner.movies.insert(id, movie.clone());
+        Ok(movie)
+    }
+}
+
+fn imdb_shape(imdb: &str) -> bool {
+    imdb.starts_with("tt") && imdb.len() <= 12 && imdb[2..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Plex's answer in the movie shape the rest of Arr reads. Nothing is invented: the cinema
+/// date is Plex's own, and "released digitally" is only claimed (as today) while Plex lists
+/// at least one offer.
+fn plex_movie(id: u32, m: &PlexMeta, on_sale: bool) -> TmdbMovie {
+    let today = time::OffsetDateTime::now_utc().date().to_string();
+    let original = m
+        .original_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != m.title);
+    TmdbMovie {
+        id,
+        title: m.title.clone(),
+        original_title: original.map(str::to_owned),
+        original_language: m
+            .countries
+            .first()
+            .and_then(|c| language_of_country(&c.tag))
+            .map(str::to_owned),
+        release_date: m
+            .originally_available_at
+            .clone()
+            .or(m.year.map(|y| y.to_string())),
+        runtime: m.duration.map(|d| (d / 60_000) as u32).filter(|r| *r > 0),
+        imdb_id: m.guid("imdb").map(str::to_owned),
+        status: None,
+        alternative_titles: TmdbAltTitles {
+            titles: original
+                .map(|t| TmdbAltTitle {
+                    title: t.to_string(),
+                })
+                .into_iter()
+                .collect(),
+        },
+        release_dates: TmdbReleaseDates {
+            results: if on_sale {
+                vec![TmdbCountryReleases {
+                    release_dates: vec![TmdbReleaseDate {
+                        kind: 4,
+                        release_date: Some(today),
+                    }],
+                }]
+            } else {
+                vec![]
+            },
+        },
+        poster_path: None,
+        plex_thumb: m.thumb.clone(),
+        observed_digital: on_sale,
+    }
+}
+
+/// Where movies come from: Plex's metadata service first, TMDB (with its own key) as the
+/// backup, and as the richer source for language, alternative titles and release dates when
+/// both answer.
+pub struct Movies {
+    plex: Option<PlexMovies>,
+    tmdb: Option<Tmdb>,
+}
+
+/// What each provider said to one search.
+pub type Answers = Vec<(&'static str, Result<usize, UpstreamError>)>;
+
+impl Movies {
+    /// None when neither Plex nor TMDB can answer.
+    pub fn new(plex: Option<PlexMovies>, tmdb: Option<Tmdb>) -> Option<Self> {
+        (plex.is_some() || tmdb.is_some()).then_some(Movies { plex, tmdb })
+    }
+
+    pub fn has_tmdb(&self) -> bool {
+        self.tmdb.is_some()
+    }
+
+    /// TMDB alone, for callers that must not need the network for every Plex movie.
+    pub fn tmdb(&self) -> Option<&Tmdb> {
+        self.tmdb.as_ref()
+    }
+
+    pub fn has_plex(&self) -> bool {
+        self.plex.is_some()
+    }
+
+    /// Results from Plex, or from TMDB when Plex fails or finds nothing, with what each
+    /// provider asked said.
+    pub async fn search(&self, query: &str, year: Option<u16>) -> (Vec<TmdbSearchResult>, Answers) {
+        let mut answers: Answers = vec![];
+        if let Some(p) = &self.plex {
+            // Plex searches without a year: hits from other years must not stop the TMDB fallback.
+            let in_year = |r: &TmdbSearchResult| {
+                year.is_none_or(|y| year_of(r.release_date.as_deref()) == Some(y))
+            };
+            match p
+                .search(query)
+                .await
+                .map(|r| r.into_iter().filter(in_year).collect::<Vec<_>>())
+            {
+                Ok(r) if !r.is_empty() || self.tmdb.is_none() => {
+                    answers.push(("plex", Ok(r.len())));
+                    return (r, answers);
+                }
+                Ok(_) => answers.push(("plex", Ok(0))),
+                Err(e) => answers.push(("plex", Err(e))),
+            }
+        }
+        let mut results = vec![];
+        if let Some(t) = &self.tmdb {
+            match t.search(query, year).await {
+                Ok(r) => {
+                    answers.push(("tmdb", Ok(r.len())));
+                    results = r;
+                }
+                Err(e) => answers.push(("tmdb", Err(e))),
+            }
+        }
+        (results, answers)
+    }
+
+    pub async fn find_imdb(&self, imdb: &str) -> Result<Option<u32>, UpstreamError> {
+        let mut failed = None;
+        if let Some(p) = &self.plex {
+            match p.find_imdb(imdb).await {
+                Ok(Some(id)) => return Ok(Some(id)),
+                Ok(None) => {}
+                Err(e) => failed = Some(e),
+            }
+        }
+        match &self.tmdb {
+            Some(t) => t.find_imdb(imdb).await,
+            None => failed.map_or(Ok(None), Err),
+        }
+    }
+
+    pub async fn movie(&self, id: u32) -> Result<Option<TmdbMovie>, UpstreamError> {
+        self.movie_with(id, false).await
+    }
+
+    pub async fn movie_with(
+        &self,
+        id: u32,
+        fresh: bool,
+    ) -> Result<Option<TmdbMovie>, UpstreamError> {
+        let plex = match &self.plex {
+            Some(p) => p.movie_with(id, fresh).await,
+            None => Ok(None),
+        };
+        let tmdb = match &self.tmdb {
+            Some(t) => t.movie_with(id, fresh).await,
+            None => Ok(None),
+        };
+        match (plex, tmdb) {
+            (Ok(Some(p)), Ok(Some(t))) => Ok(Some(merge(p, t))),
+            (Ok(Some(m)), _) | (_, Ok(Some(m))) => Ok(Some(m)),
+            (_, Err(e)) | (Err(e), _) => Err(e),
+            (Ok(None), Ok(None)) => Ok(None),
+        }
+    }
+}
+
+/// TMDB's richer language, alternative titles and release dates, with Plex filling what TMDB
+/// leaves out (a poster first, and "on sale today" when TMDB has no digital date).
+fn merge(plex: TmdbMovie, mut tmdb: TmdbMovie) -> TmdbMovie {
+    tmdb.plex_thumb = plex.plex_thumb;
+    tmdb.original_title = tmdb.original_title.or(plex.original_title);
+    tmdb.original_language = tmdb
+        .original_language
+        .filter(|l| !l.trim().is_empty())
+        .or(plex.original_language);
+    // TMDB sends "" for an unknown date: that must not hide Plex's real one.
+    tmdb.release_date = tmdb
+        .release_date
+        .filter(|d| provider_date(Some(d)).is_some())
+        .or(plex.release_date);
+    tmdb.runtime = tmdb.runtime.filter(|r| *r > 0).or(plex.runtime);
+    tmdb.imdb_id = tmdb.imdb_id.or(plex.imdb_id);
+    if tmdb.alternative_titles.titles.is_empty() {
+        tmdb.alternative_titles = plex.alternative_titles;
+    }
+    if plex.observed_digital && tmdb.release().digital_release.is_none() {
+        tmdb.release_dates
+            .results
+            .extend(plex.release_dates.results);
+        tmdb.observed_digital = true;
+    }
+    tmdb
+}
+
 #[cfg(test)]
 mod release_date_tests {
     use super::*;
@@ -694,6 +1245,13 @@ mod release_date_tests {
             "release_dates": { "results": [{ "release_dates": dates.iter().map(|(k, d)| serde_json::json!({ "type": k, "release_date": d })).collect::<Vec<_>>() }] },
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_blank_tmdb_date_does_not_hide_plexs() {
+        let merged = merge(movie("2024-02-27", &[]), movie("", &[]));
+        assert_eq!(merged.release_date.as_deref(), Some("2024-02-27"));
+        assert_eq!(merged.release().in_cinemas.as_deref(), Some("2024-02-27"));
     }
 
     #[test]

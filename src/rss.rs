@@ -527,7 +527,7 @@ async fn process(
         availability_delay_days: st.availability_delay_days(),
         catalog: Some(&index),
         tvmaze: None,
-        tmdb: None,
+        movies: None,
         now,
     };
     // Already grabbed (by key) items are skipped outright.
