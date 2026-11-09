@@ -274,13 +274,22 @@ impl Resolver<'_> {
             queued: false,
             folder: None,
             availability_note: None,
-            alternate_titles: m
-                .original_title
-                .iter()
-                .filter(|t| **t != m.title)
-                .cloned()
-                .chain(m.alternative_titles.titles.iter().map(|t| t.title.clone()))
-                .collect(),
+            alternate_titles: {
+                // Plex lists the original title among the alternatives too: once is enough.
+                let mut v: Vec<String> = vec![];
+                for t in m
+                    .original_title
+                    .iter()
+                    .filter(|t| **t != m.title)
+                    .cloned()
+                    .chain(m.alternative_titles.titles.iter().map(|t| t.title.clone()))
+                {
+                    if !v.contains(&t) {
+                        v.push(t);
+                    }
+                }
+                v
+            },
             year: metadata::year_of(m.release_date.as_deref()),
             secondary_year: None,
             runtime_minutes: m.runtime.filter(|r| *r > 0),
