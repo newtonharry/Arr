@@ -1,7 +1,7 @@
 // Arr web app. Preact (vendored under /app/vendor, no build step, no JSX). Server text only ever
 // reaches the page as Preact children or attributes, never as markup.
 import { h, render, Fragment } from '/app/vendor/preact.mjs';
-import { useState, useEffect, useLayoutEffect, useMemo, useRef } from '/app/vendor/hooks.mjs';
+import { useState, useEffect, useLayoutEffect, useRef } from '/app/vendor/hooks.mjs';
 
 const $ = (s) => document.querySelector(s);
 // Module state, read while rendering. Whatever changes it calls bump() to draw it again.
