@@ -721,6 +721,7 @@ const PICK_ERRORS = {
   already_queued: 'Arr is already getting that one.',
   blocklisted: "That copy failed before, so Arr won't try it again.",
   release_not_found: 'That list is out of date. Look again and pick one.',
+  quality_changed: 'That copy no longer matches the quality you chose. Look again and pick one.',
   not_managed: 'Arr is not getting this right now. Tap Get to start again.',
   not_adopted: 'Arr is not getting this right now. Tap Get to start again.',
 };

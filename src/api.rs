@@ -776,6 +776,7 @@ fn refusal_code(code: &str) -> ErrorCode {
         "category_shared" => ErrorCode::CategoryShared,
         "indexer_limit_reached" => ErrorCode::IndexerLimitReached,
         "no_peer_discovery" => ErrorCode::NoPeerDiscovery,
+        "quality_changed" => ErrorCode::QualityChanged,
         _ => ErrorCode::InvalidRequest,
     }
 }

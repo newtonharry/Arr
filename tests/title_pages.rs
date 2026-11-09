@@ -1409,3 +1409,74 @@ async fn a_download_already_underway_keeps_the_quality_it_was_grabbed_under() {
     let (_, bl, _) = e.json(e.get("/api/v1/blocklist")).await;
     assert_eq!(bl["items"], json!([]), "{bl}");
 }
+
+/// A tracked movie whose Standard copies were listed, and then its level moved to Smaller.
+async fn stale_standard_list() -> (Exec, Site, Value) {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    // Arr has the title (nothing found yet).
+    let (s, _) = site
+        .post("/quick-add", json!({ "media_id": "movie:tmdb:900001" }))
+        .await;
+    assert_eq!(s, 200);
+    leviticus(&e);
+    let (_, v) = site.get("/copies/movie:tmdb:900001").await;
+    let pick = v["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["resolution"] == "1080p")
+        .unwrap()["id"]
+        .clone();
+    // Another tab saves Smaller.
+    let (s, _) = site
+        .post(
+            "/quality",
+            json!({ "media_id": "movie:tmdb:900001", "level": "smaller" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    (e, site, pick)
+}
+
+#[tokio::test]
+async fn a_stale_pick_after_a_quality_change_is_refused() {
+    let (e, site, pick) = stale_standard_list().await;
+    let (s, v) = site
+        .post("/copies/movie:tmdb:900001/get", json!({ "id": pick }))
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("quality_changed")),
+        "{v}"
+    );
+    let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
+    assert_eq!(q["items"], json!([]), "nothing was queued: {q}");
+    // A copy the new level allows still goes through.
+    let (_, v) = site.get("/copies/movie:tmdb:900001").await;
+    let ok = v["copies"][0]["id"].clone();
+    assert_eq!(v["copies"][0]["resolution"], "720p", "{v}");
+    let (s, v) = site
+        .post("/copies/movie:tmdb:900001/get", json!({ "id": ok }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+}
+
+#[tokio::test]
+async fn a_stale_release_id_is_refused_by_the_grab_route_too() {
+    // POST /grabs is what the MCP start_download tool calls.
+    let (e, _site, pick) = stale_standard_list().await;
+    let (s, v, text) = e
+        .json(
+            e.post("/api/v1/grabs")
+                .json(&json!({ "media_id": "movie:tmdb:900001", "release_ref": pick })),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("quality_changed")),
+        "{text}"
+    );
+    let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
+    assert_eq!(q["items"], json!([]), "{q}");
+}
