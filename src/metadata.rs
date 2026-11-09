@@ -811,8 +811,8 @@ fn language_of_country(country: &str) -> Option<&'static str> {
         "Italy" => "it",
         "Japan" => "ja",
         "South Korea" => "ko",
-        "China" | "Taiwan" | "Hong Kong" => "zh",
-        "India" => "hi",
+        "China" | "Taiwan" => "zh",
+        // India (Hindi, Tamil, Telugu, …) and Hong Kong (mostly Cantonese) have no single language.
         "Denmark" => "da",
         "Sweden" => "sv",
         "Norway" => "no",
@@ -1136,7 +1136,15 @@ impl Movies {
     pub async fn search(&self, query: &str, year: Option<u16>) -> (Vec<TmdbSearchResult>, Answers) {
         let mut answers: Answers = vec![];
         if let Some(p) = &self.plex {
-            match p.search(query).await {
+            // Plex searches without a year: hits from other years must not stop the TMDB fallback.
+            let in_year = |r: &TmdbSearchResult| {
+                year.is_none_or(|y| year_of(r.release_date.as_deref()) == Some(y))
+            };
+            match p
+                .search(query)
+                .await
+                .map(|r| r.into_iter().filter(in_year).collect::<Vec<_>>())
+            {
                 Ok(r) if !r.is_empty() || self.tmdb.is_none() => {
                     answers.push(("plex", Ok(r.len())));
                     return (r, answers);
@@ -1204,8 +1212,15 @@ impl Movies {
 fn merge(plex: TmdbMovie, mut tmdb: TmdbMovie) -> TmdbMovie {
     tmdb.plex_thumb = plex.plex_thumb;
     tmdb.original_title = tmdb.original_title.or(plex.original_title);
-    tmdb.original_language = tmdb.original_language.or(plex.original_language);
-    tmdb.release_date = tmdb.release_date.or(plex.release_date);
+    tmdb.original_language = tmdb
+        .original_language
+        .filter(|l| !l.trim().is_empty())
+        .or(plex.original_language);
+    // TMDB sends "" for an unknown date: that must not hide Plex's real one.
+    tmdb.release_date = tmdb
+        .release_date
+        .filter(|d| provider_date(Some(d)).is_some())
+        .or(plex.release_date);
     tmdb.runtime = tmdb.runtime.filter(|r| *r > 0).or(plex.runtime);
     tmdb.imdb_id = tmdb.imdb_id.or(plex.imdb_id);
     if tmdb.alternative_titles.titles.is_empty() {
@@ -1230,6 +1245,13 @@ mod release_date_tests {
             "release_dates": { "results": [{ "release_dates": dates.iter().map(|(k, d)| serde_json::json!({ "type": k, "release_date": d })).collect::<Vec<_>>() }] },
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_blank_tmdb_date_does_not_hide_plexs() {
+        let merged = merge(movie("2024-02-27", &[]), movie("", &[]));
+        assert_eq!(merged.release_date.as_deref(), Some("2024-02-27"));
+        assert_eq!(merged.release().in_cinemas.as_deref(), Some("2024-02-27"));
     }
 
     #[test]

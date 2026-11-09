@@ -213,6 +213,17 @@ async fn a_tmdb_key_wins_for_language_titles_and_dates_and_backs_plex_up() {
     assert_eq!(m.digital_release.as_deref(), Some("2024-07-01"));
     let (_, feed, _) = e.json(e.get("/api/v1/feed")).await;
     assert_eq!(feed["tmdb_backup"], true);
+    // Plex only has other years for this search: TMDB is still asked.
+    let (_, d, text) = e
+        .json(e.get("/api/v1/discover?kind=movie&q=Plex&year=1950"))
+        .await;
+    let asked: Vec<&str> = d["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert!(asked.contains(&"tmdb"), "{text}");
 
     // Plex has no such movie: TMDB answers (search and details).
     let (_, v, text) = e

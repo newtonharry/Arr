@@ -451,6 +451,8 @@ async function boot() {
     return;
   }
   route();
+  // The feed also says whether TMDB is used, which the footer credit needs on every screen.
+  if (!onHome()) loadFeed();
 }
 function go(q) {
   const url = '#/search?q=' + encodeURIComponent(q);
