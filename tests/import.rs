@@ -876,3 +876,208 @@ fn rss_seed_criteria_and_client_report_their_implemented_effects() {
         serde_json::to_string(&n.report).unwrap()
     );
 }
+
+/// Re-importing a newer snapshot: new native items appear, native metadata refreshes, and the
+/// user's choices (monitoring, removal, added items) are kept.
+#[tokio::test]
+async fn a_reimport_keeps_the_users_choices_on_snapshot_items() {
+    let (addr, _mock) = start_mock().await;
+    let mut app = start_app(&snapshot(), "", Some(addr), true).await;
+    let call = |rb: reqwest::RequestBuilder| async move {
+        let r = rb.send().await.unwrap();
+        let t = r.text().await.unwrap();
+        serde_json::from_str::<Value>(&t).unwrap_or(Value::Null)
+    };
+    let movie = |v: &Value, tmdb: u64| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["tmdb_id"] == tmdb)
+            .cloned()
+    };
+    let added = call(app.post("/api/v1/library").json(&json!({ "media_id": "movie:tmdb:900001", "metadata": { "title": "Leviticus", "year": 2025, "runtime_minutes": 86 } }))).await;
+    assert_eq!(added["created"], true);
+    let patch = |app: &App, path: &str| {
+        app.client
+            .patch(format!("{}{path}", app.base))
+            .bearer_auth(TOKEN)
+    };
+    call(patch(&app, "/api/v1/library/movie:tmdb:603").json(&json!({ "monitored": false }))).await;
+    call(
+        app.client
+            .delete(format!("{}/api/v1/library/movie:tmdb:194", app.base))
+            .bearer_auth(TOKEN),
+    )
+    .await;
+    app.base = serve_dir(&app.dir).await;
+
+    let mut snap = snapshot();
+    snap["radarr"]["movie"][0]["title"] = json!("The Matrix (Remastered)");
+    snap["radarr"]["movie"][0]["monitored"] = json!(true);
+    snap["radarr"]["movie"].as_array_mut().unwrap().push(json!({ "id": 13, "title": "Dune", "originalLanguage": { "id": 1, "name": "English" }, "year": 2021, "runtime": 155, "tmdbId": 438631, "hasFile": false, "monitored": true, "qualityProfileId": 6, "path": "/movies/Dune (2021)", "isAvailable": true }));
+    write_state(&app.dir, &snap, "", Some(addr), true);
+    app.base = serve_dir(&app.dir).await;
+    let v = call(app.get("/api/v1/library/movies")).await;
+    assert!(movie(&v, 438631).is_some(), "new snapshot item seeded");
+    let matrix = movie(&v, 603).unwrap();
+    assert_eq!(matrix["title"], "The Matrix (Remastered)");
+    assert_eq!(
+        matrix["monitored"], false,
+        "user's unmonitor survives the re-import"
+    );
+    assert!(movie(&v, 194).is_none(), "removal survives the re-import");
+    assert!(
+        movie(&v, 900001).is_some(),
+        "added item survives the re-import"
+    );
+}
+
+async fn body(resp: reqwest::Response) -> (u16, Value, String) {
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(Value::Null),
+        text,
+    )
+}
+
+// The two tests below moved here from plans.rs: they are about what a Radarr/Sonarr snapshot
+// says (unsupported custom-format scoring, tag-routed indexers, per-episode ownership
+// statistics), so they stay on the legacy stack until the snapshot import is removed.
+
+#[tokio::test]
+async fn unsupported_policy_blocks_plans_fail_closed() {
+    let (addr, mock) = start_mock().await;
+    mock.lock().unwrap().releases.insert(
+        "The Matrix 1999".into(),
+        vec![release(
+            "The.Matrix.1999.1080p.WEB-DL.DDP5.1.H.264-GRP",
+            8.0,
+            40,
+        )],
+    );
+    let mut snap = snapshot();
+    snap["radarr"]["customformat"] = json!([{ "id": 1, "name": "x265", "specifications": [] }]);
+    snap["radarr"]["qualityprofile"][0]["formatItems"] =
+        json!([{ "format": 1, "name": "x265", "score": -1000 }]);
+    let app = start_app(&snap, "", Some(addr), false).await;
+
+    let (_, caps, _) = body(app.get("/api/v1/capabilities").send().await.unwrap()).await;
+    assert_eq!(
+        caps["policy_blocking_issues"][0]["code"],
+        "custom_format_scoring"
+    );
+
+    // The otherwise-perfect release is shown but not approved.
+    let (s, v, _) = body(
+        app.get("/api/v1/media/movie:tmdb:603/releases")
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["releases"][0]["decision"]["approved"], false);
+    assert_eq!(
+        v["releases"][0]["decision"]["rejections"][0]["code"],
+        "policy_unsupported"
+    );
+    assert_eq!(v["counts"]["approved"], 0);
+
+    let (s, v, _) = body(
+        app.post("/api/v1/plans")
+            .json(&json!({ "media_id": "movie:tmdb:603" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, 201);
+    assert_eq!(v["plan"]["state"], "blocked");
+    assert_eq!(v["plan"]["blockers"][0]["code"], "policy_unsupported");
+    assert!(v["plan"]["candidates"].as_array().unwrap().is_empty());
+    // TV is unaffected by a Radarr profile issue.
+    let (_, v, _) = body(
+        app.get("/api/v1/media/season:tvdb:372264:1/releases")
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(v["policy_blockers"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tag_scoped_indexer_and_ownership_unknown_block() {
+    let (addr, _mock) = start_mock().await;
+    let mut snap = snapshot();
+    snap["sonarr"]["indexer"][0]["tags"] = json!([3]);
+    let app = start_app(&snap, "", Some(addr), true).await;
+    let (_, v, _) = body(
+        app.post("/api/v1/plans")
+            .json(&json!({ "media_id": "season:tvdb:269613:5" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v["plan"]["state"], "blocked");
+    assert_eq!(v["plan"]["blockers"][0]["code"], "policy_unsupported");
+    assert!(
+        v["plan"]["blockers"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tag_routing")
+    );
+
+    // Without the tag: Fargo S04 has 3/11 files but no per-episode sample -> ownership unknown.
+    let app = start_app(&snapshot(), "", Some(addr), true).await;
+    let (_, v, text) = body(
+        app.post("/api/v1/plans")
+            .json(&json!({ "media_id": "season:tvdb:269613:4" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v["plan"]["state"], "blocked", "{text}");
+    assert_eq!(v["plan"]["blockers"][0]["code"], "ownership_unknown");
+
+    // Stats say "all 11 on disk" and TVmaze lists 11: already satisfied, no search.
+    let mut snap = snapshot();
+    snap["sonarr"]["series"][1]["seasons"][0]["statistics"] =
+        json!({ "episodeFileCount": 11, "episodeCount": 11, "totalEpisodeCount": 11 });
+    let app = start_app(&snap, "", Some(addr), true).await;
+    let (_, v, _) = body(
+        app.post("/api/v1/plans")
+            .json(&json!({ "media_id": "season:tvdb:269613:4" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v["plan"]["state"], "already_satisfied");
+    // Stats say "all 10 on disk" but TVmaze now lists 11: the extra episode's ownership is unknown.
+    snap["sonarr"]["series"][1]["seasons"][0]["statistics"] =
+        json!({ "episodeFileCount": 10, "episodeCount": 10, "totalEpisodeCount": 10 });
+    let app = start_app(&snap, "", Some(addr), true).await;
+    let (_, v, text) = body(
+        app.post("/api/v1/plans")
+            .json(&json!({ "media_id": "season:tvdb:269613:4" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v["plan"]["state"], "blocked", "{text}");
+    assert_eq!(v["plan"]["blockers"][0]["code"], "ownership_unknown");
+    assert!(
+        v["plan"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("counts 10 episodes"))
+    );
+}

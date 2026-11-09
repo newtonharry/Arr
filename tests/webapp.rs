@@ -516,7 +516,7 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     assert_eq!(item["stage"], "found", "not submitted yet");
     assert_eq!(item["paused"], false);
     e.tick().await;
-    qb::set_state(&e.qb, &hash, "downloading", 0.5);
+    e.set_state(&hash, "downloading", 0.5);
     e.tick().await;
     let v = feed().await;
     assert_eq!(v["on_its_way"].as_array().unwrap().len(), 1, "{v}");
@@ -543,7 +543,7 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     assert_eq!(s, 201, "{text}");
     let failed = first_grab(&v);
     e.tick().await;
-    qb::set_state(&e.qb, &bad_hash, "error", 0.2);
+    e.set_state(&bad_hash, "error", 0.2);
     let t0 = OffsetDateTime::now_utc();
     e.tick_at(t0).await;
     e.tick_at(t0 + std::time::Duration::from_secs(31 * 60))
@@ -559,7 +559,7 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     assert!(need["at"].is_string());
 
     // It arrived.
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     assert_eq!(e.grab_row(&matrix).state, "imported");
     let v = feed().await;
