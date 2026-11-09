@@ -254,7 +254,7 @@ secrets as environment variables so they stay out of the process list.
 
 Arr serves a small web app, made for phones: search for a movie or show and tap **Add** (a
 show gets its latest season and every new episode), then follow it on the home screen until
-it's in Plex. It also lists what's coming up, ideas from shows with new episodes this week,
+it's in Plex. It also lists what's coming up, ideas from shows with new episodes this week (with their TVmaze viewer rating),
 and your library.
 
 - **With remote access** (below): open your ngrok address, for example

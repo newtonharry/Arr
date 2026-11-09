@@ -118,6 +118,8 @@ pub struct WebShow {
     pub year: Option<u16>,
     pub network: Option<String>,
     pub summary: Option<String>,
+    /// TVmaze viewers' average rating out of 10, when it has one.
+    pub rating: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +145,10 @@ struct ScheduleShow {
     network: Option<ScheduleNetwork>,
     #[serde(default, rename = "webChannel")]
     web_channel: Option<ScheduleNetwork>,
+    /// Read loosely (`{"average": 8.1}` expected): a rating in any other shape is no rating,
+    /// never a reason to drop the day's schedule.
+    #[serde(default)]
+    rating: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +326,12 @@ impl Tvmaze {
                         year: show.show.year(),
                         network,
                         summary: show.summary.as_deref().and_then(|s| plain_summary(s, 200)),
+                        rating: show
+                            .rating
+                            .get("average")
+                            .and_then(serde_json::Value::as_f64)
+                            .filter(|r| r.is_finite() && *r > 0.0 && *r <= 10.0)
+                            .map(|r| (r * 10.0).round() / 10.0),
                     },
                 ));
             }
