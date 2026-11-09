@@ -456,7 +456,8 @@ pub(super) async fn follow(State(st): St, ApiJson(body): ApiJson<FollowBody>) ->
         _ => None,
     };
     if let Some(p) = &profile {
-        options::apply_profile(&st, id, p).await?;
+        // The library lock is already held above.
+        options::set_profile(&st, id, p).await?;
     }
     let now = OffsetDateTime::now_utc();
     let index = st.index();

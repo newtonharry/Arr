@@ -27,8 +27,19 @@ pub(super) fn level_profile(st: &AppState, id: MediaId, level: &str) -> Result<S
     Ok(profile)
 }
 
-/// Points a title already in the catalog at `profile`. Returns whether it was there.
+/// Points a title already in the catalog at `profile`, under the library lock. Returns
+/// whether it was there.
 pub(super) async fn apply_profile(
+    st: &Arc<AppState>,
+    id: MediaId,
+    profile: &str,
+) -> Result<bool, ApiError> {
+    let _guard = st.library_lock.lock().await;
+    set_profile(st, id, profile).await
+}
+
+/// The same, for a caller that already holds the library lock.
+pub(super) async fn set_profile(
     st: &Arc<AppState>,
     id: MediaId,
     profile: &str,
@@ -44,7 +55,6 @@ pub(super) async fn apply_profile(
     let Some(stored) = stored else {
         return Ok(false);
     };
-    let _guard = st.library_lock.lock().await;
     let (profile, now) = (profile.to_string(), OffsetDateTime::now_utc());
     let changed = st
         .store
@@ -252,8 +262,10 @@ pub(super) async fn copies(
     let mut skipped: BTreeMap<(u8, &'static str), usize> = BTreeMap::new();
     for c in &run.candidates {
         let d = &c.decision;
-        // A copy that would replace a file already owned is never offered.
-        if d.approved && !d.replacement {
+        // A copy that would replace a file already owned is never offered, and a season is
+        // only picked as a whole: a single episode is not a copy of the season.
+        let partial = matches!(target, Target::Season(_)) && !d.full_season;
+        if d.approved && !d.replacement && !partial {
             if copies.len() < MAX_COPIES {
                 let quality = c.parsed.quality;
                 copies.push(json!({
@@ -272,7 +284,11 @@ pub(super) async fn copies(
             .iter()
             .map(|r| skip_reason(&r.code))
             .min()
-            .unwrap_or((3, "you already have it or it's on its way"));
+            .unwrap_or(if partial {
+                (1, "not the right episodes")
+            } else {
+                (3, "you already have it or it's on its way")
+            });
         *skipped.entry(reason).or_default() += 1;
     }
     let mut skipped: Vec<((u8, &str), usize)> = skipped.into_iter().collect();

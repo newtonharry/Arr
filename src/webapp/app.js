@@ -665,11 +665,13 @@ const pickedLevel = () => (P.data && P.data.levels.length && !P.data.tracked && 
 async function setLevel(level) {
   const o = P.opt, d = P.data;
   if (o.saving || level === shownLevel()) return;
-  o.level = level; P.msg.delete('opt'); o.copies = { st: 'idle' };
+  o.level = level; o.gen = (o.gen || 0) + 1; P.msg.delete('opt'); o.copies = { st: 'idle' };
   if (!d.tracked) {
     // Nothing to save yet: Arr uses it when the person taps Get.
     say(`${LEVEL_WORDS[level]} quality. Arr will use it when you tap Get.`);
-    return paintSheet();
+    paintSheet();
+    if (o.copiesOpen) loadCopies();
+    return;
   }
   o.saving = true; paintSheet();
   const tk = P.token;
@@ -685,7 +687,10 @@ async function setLevel(level) {
   P.msg.set('opt', res); say(res.text); paintSheet();
   P.seq++;
   await loadTitle(true);
-  if (tk === P.token && !res.err) { o.level = null; paintSheet(); }
+  if (tk !== P.token) return;
+  if (!res.err) { o.level = null; paintSheet(); }
+  // An open list is looked up again for the level now in force.
+  if (o.copiesOpen) loadCopies();
 }
 const copyScope = () => (P.kind === 'movie' ? P.data.media_id : P.data.media_id.replace(/^series:/, 'season:') + ':' + (P.opt.season ?? defaultSeason()));
 function defaultSeason() {
@@ -693,7 +698,7 @@ function defaultSeason() {
   return (aired.length ? aired[aired.length - 1] : P.data.seasons[P.data.seasons.length - 1] || { number: 1 }).number;
 }
 async function loadCopies() {
-  const o = P.opt, tk = P.token, scope = copyScope();
+  const o = P.opt, tk = P.token, scope = copyScope(), gen = (o.gen = (o.gen || 0) + 1);
   o.copies = { st: 'loading', scope };
   paintSheet();
   const lv = pickedLevel();
@@ -702,7 +707,8 @@ async function loadCopies() {
     const r = await api(`/v1/copies/${enc(scope)}` + (lv ? `?level=${lv}` : ''));
     c = r.ok ? { st: 'ready', scope, data: r.data } : { st: 'error', scope };
   } catch { c = { st: 'error', scope }; }
-  if (tk !== P.token || o.copies.scope !== scope || o.copies.st !== 'loading') return;
+  // Only the newest lookup counts: an older answer is for a level or season no longer shown.
+  if (tk !== P.token || o.gen !== gen) return;
   o.copies = c; paintSheet();
   if (c.st === 'ready') say(c.data.copies.length ? plural(c.data.copies.length, 'copy', 'copies') + ' found.' : "Arr couldn't find any copies right now.");
 }
@@ -758,7 +764,7 @@ function copyRow(c) {
 }
 function copiesNode() {
   const c = P.opt.copies;
-  if (c.st === 'loading') {
+  if (c.st === 'loading' || (c.st === 'idle' && P.opt.saving)) {
     return h('div', { class: 'copies', 'aria-busy': 'true' }, h('span', { class: 'sr', role: 'status' }, 'Looking for copies'),
       h('ul', { class: 'list' }, [1, 2, 3].map(() => h('li', { class: 'item' }, h('div', { class: 'what' }, h('div', { class: 'sk', style: 'width:45%' }), h('div', { class: 'sk', style: 'width:30%;margin-top:8px' })), h('div', { class: 'sk', style: 'width:92px;height:44px;border-radius:12px' })))));
   }

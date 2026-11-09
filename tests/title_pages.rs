@@ -1315,3 +1315,97 @@ async fn the_app_reaches_the_option_routes_and_nothing_broader() {
         );
     }
 }
+
+// ------------------------------------------------------------------ review fixes
+
+#[tokio::test]
+async fn following_a_show_with_a_level_applies_it_and_returns() {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        site.post(
+            "/follow",
+            json!({ "media_id": "series:tvdb:372264", "on": true, "level": "best" }),
+        ),
+    )
+    .await
+    .expect("follow with a level must not wait on the library lock");
+    assert_eq!(r.0, 200, "{}", r.1);
+    assert_eq!(site.show("series:tvdb:372264").await["level"], "best");
+}
+
+#[tokio::test]
+async fn a_season_is_picked_as_a_whole_never_as_one_episode() {
+    let e = start_exec(managed_with_tmdb()).await;
+    let pack = "Parity.Partial.S02.1080p.WEB-DL.x264-UM";
+    let one = "Parity.Partial.S02E01.1080p.WEB-DL.x264-UM";
+    let two = "Parity.Partial.S02E02.720p.WEB-DL.x264-UM";
+    let (_, p) = e.publish(
+        pack,
+        pack,
+        vec![
+            (format!("{pack}/{pack}.E01.mkv"), mkv(1)),
+            (format!("{pack}/{pack}.E02.mkv"), mkv(1)),
+        ],
+        0.016,
+        false,
+    );
+    let (_, a) = e.publish(one, one, vec![(format!("{one}.mkv"), mkv(1))], 0.008, false);
+    let (_, b) = e.publish(two, two, vec![(format!("{two}.mkv"), mkv(1))], 0.008, false);
+    // Single episodes seed better than the pack, so they would rank first if listed.
+    let mut a = a;
+    a["seeders"] = json!(500);
+    e.search_results("Parity Partial S02", vec![a, b, p]);
+    let site = signed_in(e.state.clone()).await;
+    let (s, v) = site.get("/copies/season:tvdb:999005:2").await;
+    assert_eq!(s, 200, "{v}");
+    let copies = v["copies"].as_array().unwrap();
+    assert_eq!(copies.len(), 1, "only the full season: {v}");
+    assert_eq!(copies[0]["resolution"], "1080p");
+    assert_eq!(copies[0]["recommended"], true);
+    let skipped: u64 = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(skipped, 2, "the two single episodes are skipped: {v}");
+}
+
+#[tokio::test]
+async fn a_download_already_underway_keeps_the_quality_it_was_grabbed_under() {
+    let e = exec().await;
+    leviticus(&e);
+    let site = signed_in(e.state.clone()).await;
+    let (_, v) = site.get("/copies/movie:tmdb:900001").await;
+    let pick = v["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["resolution"] == "1080p")
+        .unwrap()["id"]
+        .clone();
+    let (s, v) = site
+        .post("/copies/movie:tmdb:900001/get", json!({ "id": pick }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let (_, q, _) = e.json(e.get("/api/v1/queue")).await;
+    let gid = q["items"][0]["id"].as_str().unwrap().to_string();
+    let hash = e.grab_row(&gid).info_hash;
+    e.tick().await;
+    // The person moves the title to Smaller while the 1080p copy downloads.
+    let (s, _) = site
+        .post(
+            "/quality",
+            json!({ "media_id": "movie:tmdb:900001", "level": "smaller" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    e.fake.lock().unwrap().complete(&hash);
+    e.tick().await;
+    let g = e.grab_row(&gid);
+    assert_eq!(g.state, "imported", "{:?} {:?}", g.failure, g.last_error);
+    let (_, bl, _) = e.json(e.get("/api/v1/blocklist")).await;
+    assert_eq!(bl["items"], json!([]), "{bl}");
+}

@@ -990,8 +990,12 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
         let advertised = grab_quality
             .map(|q| q.to_string())
             .unwrap_or_else(|| "unknown".into());
+        // A copy that is what it was grabbed as keeps the authorisation it was grabbed under:
+        // changing a title's quality level applies to later searches, never to a download
+        // already underway.
         if let Some(prof) = profile
             && prof.tier_of(eff).is_none()
+            && Some(eff) != grab_quality
         {
             return Ok(Outcome::Failed(
                 "wrong_quality",
