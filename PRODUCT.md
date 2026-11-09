@@ -55,7 +55,11 @@ Arr's interface exposes the wish and the outcome.
   is off). TV uses TVmaze (no key). TMDB's API terms apply: attribution with the TMDB logo,
   no caching TMDB data longer than 6 months, and an open question about §1.C (AI-connected
   apps) that TMDB has not answered.
-- One tap to add: Arr chooses release and quality. No release picking in the interface.
+- One tap to add: Arr chooses release and quality. No release picking in the interface (a
+  person who wants to can choose a copy under Download options, or from a Needs-you item).
+- Every add says what happened: a short "Added Title" note with Undo when Undo is safe. A
+  download that needs the person says what went wrong in one plain sentence and offers the one
+  button that helps. Downloads on their way say how long is left, when Arr can tell.
 - Existing JSON API covers search/discover, add to library, wanted, calendar, queue
   (pause/resume/cancel/retry), history, attention and library listing.
 - Shipped as a single Rust binary with embedded static assets (like the setup page); no

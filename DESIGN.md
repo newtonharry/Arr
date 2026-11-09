@@ -221,7 +221,7 @@ Title-tile gradients (eight fixed pairs, `.t0` to `.t7`: teal, coral-red, ochre,
 
 ## Layout
 
-A single centred column, `max-width: 680px`, 20px side gutters, on every viewport. Page structure: brand row, search field, banner (only when non-empty), then the feed in `main`, then a quiet footer with who is signed in and Sign out. Sections stack with 22px between them; rows in a list are 10px apart and each row is a full-width card. The ideas section is the one horizontal scroller: 132px-wide cards with proximity snap, bleeding to the page edge (`margin: 0 -20px`).
+A single centred column, `max-width: 680px`, 20px side gutters, on every viewport. Page structure: brand row, search field, banner (only when non-empty: "Can't reach Arr right now" or "Arr is still being set up"; Arr asks again every 5s on any screen and the banner goes as soon as the answer is good), then the feed in `main`, then a quiet footer with who is signed in and Sign out. Sections stack with 22px between them; rows in a list are 10px apart and each row is a full-width card. The ideas section is the one horizontal scroller: 132px-wide cards with proximity snap, bleeding to the page edge (`margin: 0 -20px`).
 
 Responsive: under 760px the tab bar is fixed to the bottom (68px plus safe-area inset, 56px tall targets, icon over 12px label) and the page pads for it. From 760px the same nav moves to the top right on the brand row as 44px pills; the current tab fills teal. Under 420px the coral button in a Needs-you row collapses to its icon. Under 360px journey labels drop to 11px. Safe-area insets are respected top and bottom.
 
@@ -246,8 +246,8 @@ Full width, 56px tall, white, 2px warm border, 18px radius, the solid 5px drop, 
 ### Item Rows
 White card, 2px warm border, 18px radius, 12px padding, 12px gap: lead tile or date chip, a text column (title, one meta line), and a trailing action when needed.
 - **Arrived:** teal border, an "In Plex" tag (teal ink, check glyph, 12px/800) above the title. There is no Watch button: people watch on their TV, so Arrived rows and the movie page just say "In Plex" and "Ready to watch".
-- **On its way:** title, status line ("42% downloaded", "Paused"), then the journey line.
-- **Needs you:** neutral border (the card stays calm), a coral-ink problem line with an alert glyph, and the coral outline button.
+- **On its way:** title, status line ("42% downloaded", "Paused"; with a rate, "42% · about 12 min left", "less than a minute left", "about 2 h left"; nothing about time when it is unknown, paused or stalled), then the journey line.
+- **Needs you:** neutral border (the card stays calm), a coral-ink problem line with an alert glyph saying in one plain sentence what went wrong, and one coral outline button under it that fixes it ("Try again", or "Choose a copy yourself", which opens the title with its copy list showing). A kind the app does not know keeps the server's own sentence and "Try again".
 - **Coming up / looking:** a sun date chip as the lead, "Out 14 Nov. Arr will get it then."
 
 ### Scores
@@ -266,6 +266,9 @@ A calm line of plain-text labels, "IMDb 7.8 · Critics 96% · Audience 87%" (14p
 
 ### Journey Line
 The signature. A 36px-tall four-stop track under any item on its way: Found, Downloading, Checking, In Plex. A 3px warm-line rail with a teal fill that scales from the left (`scaleX`, 0.9s `cubic-bezier(0.16, 1, 0.3, 1)`) as Arr works; stops are 11px circles, hollow until reached, solid teal when on; stop one is left-aligned, stop four right-aligned, two and three centred at one third and two thirds. The current stop's label is ink 800, others muted 600 at 12px. Paused turns the fill muted grey. The last stop, In Plex, is reached only when the row moves to Arrived.
+
+### Toast
+The note after Add or Get ("Added **Title**", "Following **Title**", and "Undone. ..." after Undo). Inverse of the page (ink fill with cream text; cream fill with ink text in dark mode), 14px radius, no border and no shadow, one line, with a 44px "Undo" link button when an existing route fully reverses the add (a title that was not tracked before: stop looking for it, which cancels downloads that have not finished and never touches files). No Undo when the title was already tracked or in Plex. It sits at the bottom, centred, above the tab bar on phones, over a title sheet. It is an `aria-live="polite"` region, lasts about 6s, waits while hovered or focused, is reachable by Tab (it is after the list, before the footer, and inside the sheet's focus loop), Z undoes, Escape closes it.
 
 ### Tabs
 Home / Ideas / Library, icon plus label. Phone: bottom bar, white, 2px warm top border, inactive muted 12px/800, current teal ink. Desktop: top-right pills, inactive muted with teal on hover, current filled teal with on-teal text.
@@ -288,7 +291,7 @@ The drive meter is a text line ("Movies drive: 1.2 TB free of 4 TB") over a 10px
 - **Title pages:** under the summary (four lines, then "More"), genres as small pills (999px, 2px warm border, 13px/800 muted); at the end of the page a "Cast" section of up to six names with the character in muted text, two columns on a phone. Names only, no photos.
 
 ### Empty and Sign-in
-Centred mascot (96px empty, 120px sign-in), a heading, one muted line (max 30ch) and at most one teal button. The mascot (`src/webapp/mascot.svg`) is the brand mark at 34px beside "Arr" and as the favicon.
+Centred mascot (96px empty, 120px sign-in), a heading, one muted line (max 30ch) and at most one teal button. The mascot (`src/webapp/mascot.svg`) is the brand mark at 34px beside "Arr" and as the favicon (a `<link rel="icon">` on every page, and `/favicon.ico` redirects to it for browsers that ask anyway).
 
 ### Motion
 Short and meaningful only: the journey fill (0.9s expo-out), 0.2s opacity on busy lists, 1px press. Everything is disabled under `prefers-reduced-motion`. The website's mascot bob is not in the app.
