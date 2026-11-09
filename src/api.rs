@@ -3699,6 +3699,23 @@ fn hold_item(s: &crate::catalog::Series) -> Option<Value> {
     }))
 }
 
+/// Whether a movie, episode or whole season is in the library now, by the catalog.
+fn owned_now(index: &CatalogIndex, t: MediaId) -> bool {
+    let episodes = |k: SeriesKey| index.series(k).and_then(|s| s.episodes.as_deref());
+    match t {
+        MediaId::Movie { tmdb } => index.movie(tmdb).is_some_and(|m| m.has_file),
+        MediaId::Episode(k, n, e) => episodes(k).is_some_and(|eps| {
+            eps.iter()
+                .any(|x| x.season == n && x.number == e && x.has_file)
+        }),
+        MediaId::Season(k, n) => episodes(k).is_some_and(|eps| {
+            let mut season = eps.iter().filter(|x| x.season == n).peekable();
+            season.peek().is_some() && season.all(|x| x.has_file)
+        }),
+        _ => false,
+    }
+}
+
 /// Items needing a person (or the bridge): metadata numbering holds, imports that cannot
 /// proceed, recent failures, requests that keep retrying or expired. Bounded.
 fn attention_items(grabs: &[downloads::Grab], requests: &[Value], holds: Vec<Value>) -> Vec<Value> {
@@ -3748,14 +3765,16 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
     let grabs = st
         .store
         .with(move |c| {
-            downloads::select(
+            let grabs = downloads::select(
                 c,
                 "media_id = ?1 AND (active = 1 OR updated_at >= ?2) ORDER BY created_at DESC LIMIT 50",
                 &[&parent_s, &since],
-            )
+            )?;
+            Ok((grabs, downloads::active_coverage(c)?))
         })
         .await
         .map_err(internal("grabs"))?;
+    let (grabs, active_cover) = grabs;
     let parent_s = parent.to_string();
     let requests: Vec<Value> = st
         .store
@@ -3917,7 +3936,13 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
             .flatten()
             .collect(),
     };
-    body["attention"] = json!(attention_items(&scoped, &scoped_requests, holds));
+    // Failures another download has made good stay in the history, not in attention.
+    let needs: Vec<downloads::Grab> = scoped
+        .iter()
+        .filter(|g| !downloads::made_good(g, |t| owned_now(&index, t), &active_cover))
+        .cloned()
+        .collect();
+    body["attention"] = json!(attention_items(&needs, &scoped_requests, holds));
     body["observed_at"] = json!(rfc3339(now));
     ok(body)
 }
@@ -3937,14 +3962,40 @@ async fn attention_list(
     with_holds: bool,
 ) -> Result<Vec<Value>, ApiError> {
     let since = rfc3339(now - Duration::from_secs(7 * 86_400));
+    let index = st.index();
     let grabs = st
         .store
         .with(move |c| {
-            downloads::select(
+            // Failures another download has made good are left out before the bound, so they
+            // never crowd out something that needs a person.
+            let active = downloads::active_coverage(c)?;
+            let mut kept = downloads::select(
                 c,
-                "(active = 1 AND state = 'import_blocked') OR (state = 'failed' AND updated_at >= ?1) ORDER BY updated_at DESC LIMIT 100",
-                &[&since],
-            )
+                "active = 1 AND state = 'import_blocked' ORDER BY updated_at DESC LIMIT 100",
+                &[],
+            )?;
+            const PAGE: i64 = 200;
+            let mut offset: i64 = 0;
+            while kept.len() < 100 {
+                let page = downloads::select(
+                    c,
+                    "state = 'failed' AND updated_at >= ?1 ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3",
+                    &[&since, &PAGE, &offset],
+                )?;
+                let n = page.len() as i64;
+                kept.extend(
+                    page.into_iter()
+                        .filter(|g| !downloads::made_good(g, |t| owned_now(&index, t), &active))
+                        .take(100 - kept.len()),
+                );
+                if n < PAGE {
+                    break;
+                }
+                offset += PAGE;
+            }
+            kept.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            kept.truncate(100);
+            Ok(kept)
         })
         .await
         .map_err(internal("grabs"))?;

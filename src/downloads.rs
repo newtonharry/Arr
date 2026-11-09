@@ -2750,6 +2750,34 @@ pub fn queue(
     Ok((rows, total as u64))
 }
 
+/// Targets covered by downloads that are still going (one indexed query).
+pub fn active_coverage(c: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = c.prepare(
+        "SELECT DISTINCT t.target FROM grab_targets t JOIN grabs g ON g.id = t.grab_id WHERE g.active = 1",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A failed download no longer needs anyone when every movie or episode it covered is in the
+/// library now (`owned`, from the catalog: what was actually imported, not what a download
+/// meant to bring) or covered by a download that is still going (shown on its own). Coverage
+/// is what the download covered (`grab_targets`), not the target of the plan that made it, so a
+/// different episode of the same season never counts.
+pub fn made_good(g: &Grab, owned: impl Fn(MediaId) -> bool, active: &HashSet<String>) -> bool {
+    if g.state != "failed" {
+        return false;
+    }
+    let covered: Vec<MediaId> = if g.targets.is_empty() {
+        vec![g.target]
+    } else {
+        g.targets.iter().map(|t| t.target).collect()
+    };
+    covered
+        .into_iter()
+        .all(|t| owned(t) || active.contains(&t.to_string()))
+}
+
 /// Blocked release refs/hashes for a media item (used by searches).
 pub fn blocked_for(c: &Connection, media: MediaId) -> Result<HashSet<String>> {
     let mut stmt = c.prepare("SELECT release_ref, info_hash FROM blocklist WHERE media_id = ?1")?;
@@ -2797,6 +2825,95 @@ pub fn recover(c: &Connection, now: OffsetDateTime) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What makes a failure no longer need anyone: every episode it covered is in the library
+    /// or covered by a download still going.
+    #[test]
+    fn a_failure_is_made_good_only_when_everything_it_covered_is_owned_or_coming() {
+        let ep = |n: u16| MediaId::Episode(crate::ids::SeriesKey::Tvdb(1), 1, n);
+        let season = MediaId::Season(crate::ids::SeriesKey::Tvdb(1), 1);
+        let failed = |covers: &[MediaId]| Grab {
+            id: "g".into(),
+            media_id: MediaId::Series(crate::ids::SeriesKey::Tvdb(1)),
+            target: season,
+            plan_id: None,
+            release_ref: String::new(),
+            info_hash: String::new(),
+            title: String::new(),
+            indexer_id: None,
+            size: None,
+            quality: None,
+            revision: None,
+            full_season: false,
+            category: String::new(),
+            save_path: String::new(),
+            seed_ratio: None,
+            seed_time_minutes: None,
+            remove_completed: false,
+            remove_failed: false,
+            origin: String::new(),
+            state: "failed".into(),
+            active: false,
+            attempts: 0,
+            next_attempt_at: String::new(),
+            progress: None,
+            client_state: None,
+            client_name: None,
+            last_error: None,
+            user_paused: false,
+            stalled_since: None,
+            problem_since: None,
+            absent_since: None,
+            last_progress: None,
+            failure: None,
+            retry: None,
+            cleanup: "none".into(),
+            cleanup_detail: None,
+            cleanup_at: None,
+            cleanup_files: None,
+            imported_files: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            submitted_at: None,
+            completed_at: None,
+            imported_at: None,
+            targets: covers
+                .iter()
+                .map(|&target| GrabTarget {
+                    target,
+                    replaces: false,
+                })
+                .collect(),
+        };
+        let owned = |set: &'static [u16]| move |m: MediaId| matches!(m, MediaId::Episode(_, 1, e) if set.contains(&e));
+        let none = HashSet::new();
+        let g = failed(&[ep(2), ep(3)]);
+        assert!(!made_good(&g, owned(&[]), &none), "nothing yet");
+        assert!(
+            !made_good(&g, owned(&[4]), &none),
+            "a different episode never counts"
+        );
+        // A pack meant to bring E2 and E3 brought only E3: E2 is still missing.
+        assert!(
+            !made_good(&g, owned(&[3]), &none),
+            "partial imports are not enough"
+        );
+        assert!(made_good(&g, owned(&[2, 3]), &none));
+        let coming: HashSet<String> = [ep(2).to_string()].into();
+        assert!(
+            made_good(&g, owned(&[3]), &coming),
+            "the rest is on its way"
+        );
+        // No recorded coverage: the plan target stands in.
+        let mut bare = failed(&[]);
+        bare.target = ep(5);
+        assert!(!made_good(&bare, owned(&[]), &none));
+        assert!(made_good(&bare, owned(&[5]), &none));
+        // Only failures are ever made good.
+        let mut done = failed(&[ep(2)]);
+        done.state = "imported".into();
+        assert!(!made_good(&done, owned(&[2]), &none));
+    }
 
     fn t(state: &str, ratio: f64, ratio_limit: f64, seeding: i64, time_limit: i64) -> TorrentInfo {
         serde_json::from_value(json!({
