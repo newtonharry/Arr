@@ -2405,7 +2405,7 @@ pub fn normalize(
     )?;
     for media in [MediaKind::Movie, MediaKind::Series] {
         if !settings.indexers.iter().any(|i| i.media == media) {
-            ctx.item(media.native_app(), "indexer", "usable indexers", json!(0), ItemStatus::ObservedOnly, "no indexer maps to Prowlarr: release searches for this media kind fail with no_usable_indexers");
+            ctx.item(media.label(), "indexer", "usable indexers", json!(0), ItemStatus::ObservedOnly, "no indexer maps to Prowlarr: release searches for this media kind fail with no_usable_indexers");
         }
     }
 

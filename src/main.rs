@@ -2,8 +2,6 @@ use anyhow::{Context, Result};
 use arr::{api, config, fsutil, import, library, mcp, setup, store, wizard};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 #[derive(Parser)]
 #[command(
@@ -20,15 +18,12 @@ struct Cli {
 #[allow(clippy::large_enum_variant)] // parsed once at startup; its size doesn't matter
 enum Command {
     /// Create a private state directory, API token and config template (never overwrites).
-    /// The template favours native indexers and the embedded downloader; pass
-    /// --prowlarr-url for the legacy Prowlarr-backed layout.
+    /// The template uses native indexers and the embedded downloader.
     Init {
         #[arg(long)]
         state_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: std::net::SocketAddr,
-        #[arg(long)]
-        prowlarr_url: Option<String>,
     },
     /// Create (or replace) managed settings for a standalone deployment, with an empty
     /// catalog, from an optional setup document (TOML; otherwise the current setup's, or
@@ -42,19 +37,6 @@ enum Command {
         #[arg(long)]
         settings: Option<PathBuf>,
         /// Validate and summarise without changing the settings.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Import a native Radarr/Sonarr/Prowlarr snapshot (offline; no network access).
-    Import {
-        #[arg(long)]
-        state_dir: PathBuf,
-        #[arg(long)]
-        snapshot: PathBuf,
-        /// When the snapshot was taken (RFC 3339). Defaults to the file's mtime.
-        #[arg(long)]
-        observed_at: Option<String>,
-        /// Validate and summarise without writing anything.
         #[arg(long)]
         dry_run: bool,
     },
@@ -291,14 +273,7 @@ fn fixture(
     Ok(())
 }
 
-fn init(
-    state_dir: PathBuf,
-    listen: std::net::SocketAddr,
-    prowlarr_url: Option<String>,
-) -> Result<()> {
-    if let Some(u) = &prowlarr_url {
-        config::parse_base_url(u, "--prowlarr-url")?;
-    }
+fn init(state_dir: PathBuf, listen: std::net::SocketAddr) -> Result<()> {
     // The template keeps server.allow_non_loopback off.
     if !listen.ip().is_loopback() {
         anyhow::bail!(
@@ -316,27 +291,16 @@ fn init(
     }
     let cfg = state_dir.join("config.toml");
     if !cfg.exists() {
-        fsutil::write_new_private_file(
-            &cfg,
-            config::template(&listen.to_string(), prowlarr_url.as_deref()).as_bytes(),
-        )?;
+        fsutil::write_new_private_file(&cfg, config::template(&listen.to_string()).as_bytes())?;
         created.push(cfg.display().to_string());
     }
-    let next: Vec<&str> = if prowlarr_url.is_some() {
-        vec![
-            "write the Prowlarr API key to secrets/prowlarr_api_key (chmod 600)",
-            "arr import --state-dir <STATE> --snapshot <native.json>",
-            "arr serve --config <STATE>/config.toml",
-        ]
-    } else {
-        vec![
-            "edit <STATE>/config.toml: [library], [[indexer]], [embedded] (and optionally [tmdb], [tvmaze], [plex], [mcp]); secrets only as files under <STATE>/secrets (chmod 600)",
-            "arr setup --config <STATE>/config.toml [--settings setup.toml]",
-            "arr check --config <STATE>/config.toml",
-            "arr serve --config <STATE>/config.toml",
-            "see docs/STANDALONE.md for the full recipe",
-        ]
-    };
+    let next = vec![
+        "edit <STATE>/config.toml: [library], [[indexer]], [embedded] (and optionally [tmdb], [tvmaze], [plex], [mcp]); secrets only as files under <STATE>/secrets (chmod 600)",
+        "arr setup --config <STATE>/config.toml [--settings setup.toml]",
+        "arr check --config <STATE>/config.toml",
+        "arr serve --config <STATE>/config.toml",
+        "see docs/STANDALONE.md for the full recipe",
+    ];
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -389,9 +353,8 @@ async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: boo
         let db = state_dir.join("state.sqlite");
         if db.exists() {
             let store = store::Store::open(&db)?;
-            let mode = cfg.migration;
             (
-                store.blocking(|c| library::load_index(c, mode))?,
+                store.blocking(|c| library::load_index(c))?,
                 store.blocking(|c| setup::active_grabs(c))?,
             )
         } else {
@@ -504,34 +467,7 @@ async fn run() -> Result<std::process::ExitCode> {
         .with_writer(std::io::stderr)
         .init();
     let result = match cli.command {
-        Command::Init {
-            state_dir,
-            listen,
-            prowlarr_url,
-        } => init(state_dir, listen, prowlarr_url),
-        Command::Import {
-            state_dir,
-            snapshot,
-            observed_at,
-            dry_run,
-        } => {
-            let observed_at = observed_at
-                .map(|s| {
-                    OffsetDateTime::parse(&s, &Rfc3339).context("--observed-at must be RFC 3339")
-                })
-                .transpose()?;
-            let summary = tokio::task::spawn_blocking(move || {
-                import::run_import(&import::ImportOptions {
-                    state_dir,
-                    snapshot,
-                    observed_at,
-                    dry_run,
-                })
-            })
-            .await??;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            Ok(())
-        }
+        Command::Init { state_dir, listen } => init(state_dir, listen),
         Command::Setup {
             config,
             settings,

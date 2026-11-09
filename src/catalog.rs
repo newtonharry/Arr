@@ -1,7 +1,6 @@
-//! Imported catalog observation (`catalog.json`) and in-memory lookup index.
-//!
-//! The catalog records what Radarr/Sonarr reported at snapshot time. It is evidence about
-//! ownership, not the current state of the library.
+//! The catalog types (`catalog.json` of an import, empty for managed setup) and the in-memory
+//! lookup index over the managed catalog. Fields such as `Provenance` keep the shape older
+//! releases wrote (they recorded what Radarr/Sonarr reported) so existing state stays readable.
 
 use crate::ids::{MediaId, SeriesKey};
 use crate::quality::Quality;

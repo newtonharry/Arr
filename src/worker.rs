@@ -575,7 +575,7 @@ async fn run_command(st: &AppState, cmd: &Command, now: OffsetDateTime) -> Comma
                 };
                 let kind = crate::downloads::media_kind(id);
                 let Some(section) = plex.section_for(kind) else {
-                    return Ok(CommandOutcome::Done(json!({ "skipped": format!("no Plex section configured for {}", kind.native_app()) })));
+                    return Ok(CommandOutcome::Done(json!({ "skipped": format!("no Plex section configured for {}", kind.label()) })));
                 };
                 // With the root's Plex path configured, only the item's folder is scanned.
                 let index = st.index();
@@ -643,12 +643,10 @@ fn search_targets(st: &AppState, id: MediaId, now: OffsetDateTime) -> Vec<MediaI
                 // Not acquiring here (unmonitored, observed or not adopted).
                 return vec![];
             }
-            if st.cfg.migration == crate::config::MigrationMode::Coexistence
-                && let Some(eps) = &s.episodes
-            {
+            if let Some(eps) = &s.episodes {
                 // Only adopted (monitored) units: a whole season only when every episode of
                 // it is adopted, else its adopted missing episodes one by one, so neither a
-                // season pack nor a plan covers an episode the native app still owns.
+                // season pack nor a plan covers an episode that is not monitored here.
                 let mut out = vec![];
                 for n in seasons {
                     let all = eps.iter().filter(|e| e.season == n).all(|e| e.monitored);

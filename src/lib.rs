@@ -1,9 +1,9 @@
 //! Arr: movie/TV API server.
 //!
-//! Sonarr/Radarr data enters only through the offline snapshot importer. Runtime integrations
-//! are Prowlarr (search, downloads, Torznab RSS), TVmaze/TMDB metadata, and, only with
-//! `[execution] enabled`, qBittorrent, the configured library roots and Plex. Shadow mode
-//! (the default) makes no writes outside its own private state.
+//! Runtime integrations are native indexers (or Prowlarr: search, downloads, Torznab RSS),
+//! TVmaze/TMDB metadata, Plex (library bootstrap and refreshes), and, only with
+//! `[execution] enabled`, the embedded BitTorrent engine (or qBittorrent) and the configured
+//! library roots. Shadow mode (the default) makes no writes outside its own private state.
 
 pub mod api;
 pub mod art;

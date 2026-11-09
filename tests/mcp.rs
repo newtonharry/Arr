@@ -35,15 +35,6 @@ const TOOLS: [&str; 8] = [
     "start_download",
 ];
 
-/// LEGACY stack: the tests of the Sonarr/Radarr native-handoff gate need an imported snapshot.
-fn coexistence() -> ExecOptions {
-    ExecOptions {
-        mode: "coexistence",
-        categories: Some(("um-movies", "um-tv")),
-        ..ExecOptions::legacy()
-    }
-}
-
 /// The managed stack with the dedicated download categories the MCP tests expect.
 fn managed() -> ExecOptions {
     ExecOptions {
@@ -274,7 +265,7 @@ fn property_names(schema: &Value, out: &mut BTreeSet<String>) {
 
 #[tokio::test]
 async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() {
-    let e = start_exec(coexistence()).await;
+    let e = start_exec(managed()).await;
     let token = e.dir.join("secrets/api_token");
     // The SDK negotiates; the expected versions are the SDK's own constants.
     let cases = [
@@ -626,117 +617,10 @@ async fn an_add_committed_before_its_search_failed_is_reported_as_unknown() {
 }
 
 #[tokio::test]
-async fn an_operator_adopted_scope_is_acquired_through_mcp_and_cannot_be_widened() {
-    let e = start_exec(coexistence()).await;
-    let title = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
-    let (hash, ep2) = e.publish(
-        title,
-        title,
-        vec![(format!("{title}.mkv"), mkv(2))],
-        1.5,
-        false,
-    );
-    e.search_results("Slow Horses S01E02", vec![ep2]);
-    // Out of band: the operator records the native handoff for exactly this episode.
-    let (status, _, text) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "episode:tvdb:372264:1:2", "native_handoff_confirmed": true, "search": false
-        })))
-        .await;
-    assert_eq!(status, 201, "{text}");
-    let token = e.dir.join("secrets/api_token");
-    let s = launch(Launch::new(&e.base, &token)).await;
-
-    // The conversational add needs no confirmation for the adopted scope, and acquires it.
-    let r = s
-        .call(
-            "add_media",
-            json!({ "media_id": "episode:tvdb:372264:1:2" }),
-        )
-        .await;
-    let v = ok(&r);
-    assert_eq!(v["created"], false, "{v}");
-    assert_eq!(v["adoption"]["handoff"], "on_record", "{v}");
-    assert_eq!(v["automatic"]["status"], "download_queued", "{v}");
-    assert_eq!(
-        v["plan"]["execution"]["grabs"].as_array().map(Vec::len),
-        Some(1),
-        "{v}"
-    );
-    e.tick().await;
-    assert_eq!(adds(&e), 1);
-    assert_eq!(category_of(&e, &hash), "um-tv");
-    // Anything wider is still Sonarr's.
-    for wider in ["episode:tvdb:372264:1:4", "season:tvdb:372264:1"] {
-        let r = s.call("add_media", json!({ "media_id": wider })).await;
-        let (code, v) = failed(&r);
-        assert_eq!(
-            (code, v["outcome"].as_str()),
-            ("native_handoff_required", Some("not_applied")),
-            "{wider}: {v}"
-        );
-    }
-    let r = s.call("requests", json!({})).await;
-    let v = ok(&r);
-    let items = v["queue"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1, "{v}");
-    assert_eq!(items[0]["target"], "episode:tvdb:372264:1:2");
-
-    // A confirmed season covers its episodes whatever their current monitoring.
-    let (status, _, text) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "season:tvdb:372264:1", "native_handoff_confirmed": true, "search": false
-        })))
-        .await;
-    assert_eq!(status, 201, "{text}");
-    let (status, _, text) = e
-        .json(
-            e.patch("/api/v1/library/episode:tvdb:372264:1:5")
-                .json(&json!({ "monitored": false })),
-        )
-        .await;
-    assert_eq!(status, 200, "{text}");
-    let r = s
-        .call(
-            "add_media",
-            json!({ "media_id": "episode:tvdb:372264:1:5" }),
-        )
-        .await;
-    ok(&r);
-    // The confirmed scopes are visible for reconciliation with the native ledger.
-    let (_, o, _) = e.json(e.get("/api/v1/ownership?state=adopted")).await;
-    let item = o["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|i| i["media_id"] == "series:tvdb:372264")
-        .unwrap_or_else(|| panic!("{o}"));
-    let mut scopes: Vec<&str> = item["handoffs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["scope"].as_str().unwrap())
-        .collect();
-    scopes.sort();
-    assert_eq!(
-        scopes,
-        ["episode:tvdb:372264:1:2", "season:tvdb:372264:1"],
-        "{item}"
-    );
-    s.finish().await;
-}
-
-#[tokio::test]
 async fn an_automatic_add_without_a_release_reads_as_waiting_and_a_real_shadow_plan_stays_shadow() {
-    // Execution enabled, an operator-adopted episode, and an indexer with nothing for it.
-    let e = start_exec(coexistence()).await;
+    // Execution enabled, a monitored episode, and an indexer with nothing for it.
+    let e = start_exec(managed()).await;
     let episode = json!({ "media_id": "episode:tvdb:372264:1:2" });
-    let (status, _, text) = e
-        .json(e.post("/api/v1/library").json(&json!({
-            "media_id": "episode:tvdb:372264:1:2", "native_handoff_confirmed": true, "search": false
-        })))
-        .await;
-    assert_eq!(status, 201, "{text}");
     let token = e.dir.join("secrets/api_token");
     let s = launch(Launch::new(&e.base, &token)).await;
     let r = s.call("add_media", episode.clone()).await;
@@ -745,28 +629,16 @@ async fn an_automatic_add_without_a_release_reads_as_waiting_and_a_real_shadow_p
     let keys: BTreeSet<&str> = adoption.keys().map(String::as_str).collect();
     assert_eq!(
         keys,
-        BTreeSet::from([
-            "acquisition",
-            "handoff",
-            "mode",
-            "native_app",
-            "operator_note"
-        ]),
+        BTreeSet::from(["acquisition", "mode", "native_app", "operator_note"]),
         "{v}"
     );
     assert_eq!(
         (
             &adoption["acquisition"],
             &adoption["mode"],
-            &adoption["native_app"],
-            &adoption["handoff"]
+            &adoption["native_app"]
         ),
-        (
-            &json!("adopted"),
-            &json!("coexistence"),
-            &json!("Sonarr"),
-            &json!("on_record")
-        )
+        (&json!("adopted"), &json!("coexistence"), &json!(null))
     );
     assert_eq!(v["plan"]["state"], "blocked", "{v}");
     let ex = &v["plan"]["execution"];
@@ -813,10 +685,9 @@ async fn an_automatic_add_without_a_release_reads_as_waiting_and_a_real_shadow_p
     assert_eq!(v["adoption"]["native_handoff_confirmed"], false, "{v}");
 
     // Execution disabled: the shadow plan is reported as one.
-    let (addr, _mock) = start_mock().await;
-    let app = start_app(&snapshot(), "", Some(addr), false).await;
-    let token = app.dir.join("secrets/api_token");
-    let s = launch(Launch::new(&app.base, &token)).await;
+    let shadow = start_exec(ExecOptions::shadow()).await;
+    let token = shadow.dir.join("secrets/api_token");
+    let s = launch(Launch::new(&shadow.base, &token)).await;
     let r = s
         .call("add_media", json!({ "media_id": "movie:tmdb:603" }))
         .await;
@@ -829,13 +700,13 @@ async fn an_automatic_add_without_a_release_reads_as_waiting_and_a_real_shadow_p
     );
     assert_eq!(ex["note"], "shadow plan only: [execution] enabled = false");
     assert_eq!(v["automatic"]["status"], "execution_disabled", "{v}");
-    assert!(v["adoption"].get("handoff").is_none(), "legacy mode: {v}");
+    assert!(v["adoption"].get("handoff").is_none(), "{v}");
     s.finish().await;
 }
 
 #[tokio::test]
-async fn an_unadopted_native_title_is_refused_with_the_core_error_and_nothing_happens() {
-    let e = start_exec(coexistence()).await;
+async fn a_title_that_is_not_monitored_is_refused_with_the_core_error_and_nothing_happens() {
+    let e = start_exec(managed()).await;
     let (_, matrix) = e.publish(
         "The.Matrix.1999.1080p.WEB-DL.x264-UM",
         "The.Matrix.1999.1080p.WEB-DL.x264-UM",
@@ -847,27 +718,7 @@ async fn an_unadopted_native_title_is_refused_with_the_core_error_and_nothing_ha
     let token = e.dir.join("secrets/api_token");
     let s = launch(Launch::new(&e.base, &token)).await;
 
-    for id in [
-        "movie:tmdb:603",
-        "season:tvdb:372264:1",
-        "episode:tvdb:372264:1:2",
-    ] {
-        let r = s.call("add_media", json!({ "media_id": id })).await;
-        let (code, v) = failed(&r);
-        assert_eq!(
-            (code, v["http_status"].as_u64()),
-            ("native_handoff_required", Some(409)),
-            "{id}: {v}"
-        );
-        assert_eq!(v["outcome"], "not_applied");
-        assert!(
-            v["routing"]
-                .as_str()
-                .unwrap()
-                .contains("does not fall back")
-        );
-    }
-    // The assistant cannot confirm the handoff itself.
+    // The assistant cannot send the retired hand-over flag.
     let r = s
         .call(
             "add_media",
@@ -886,7 +737,15 @@ async fn an_unadopted_native_title_is_refused_with_the_core_error_and_nothing_ha
             .unwrap()
             .contains("native_handoff_confirmed")
     );
-    // Releases can be listed (a read), but downloading one is refused by the core.
+    // Releases can be listed (a read), but downloading one for a title Arr is not getting
+    // (stopped) is refused by the core.
+    let (st, _, text) = e
+        .json(
+            e.patch("/api/v1/library/movie:tmdb:603")
+                .json(&json!({ "monitored": false })),
+        )
+        .await;
+    assert_eq!(st, 200, "{text}");
     let r = s
         .call("release_choices", json!({ "media_id": "movie:tmdb:603" }))
         .await;
@@ -921,14 +780,6 @@ async fn an_unadopted_native_title_is_refused_with_the_core_error_and_nothing_ha
     );
     let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
     assert_eq!(q["items"], json!([]));
-    let (_, r, _) = e.json(e.get("/api/v1/requests")).await;
-    assert_eq!(r["items"], json!([]));
-    let (_, o, _) = e.json(e.get("/api/v1/ownership")).await;
-    assert_eq!(o["counts"]["adopted"], Value::Null, "{o}");
-    let r = s
-        .call("media_status", json!({ "media_id": "movie:tmdb:603" }))
-        .await;
-    assert_eq!(ok(&r)["acquisition"], "observed");
     s.finish().await;
 }
 
@@ -1375,7 +1226,7 @@ async fn the_token_never_leaves_through_stdout_stderr_or_results() {
 async fn stop_ends_the_search_for_a_wanted_movie_and_says_what_happened() {
     let e = start_exec(ExecOptions {
         tmdb: true,
-        ..coexistence()
+        ..managed()
     })
     .await;
     let token = e.dir.join("secrets/api_token");

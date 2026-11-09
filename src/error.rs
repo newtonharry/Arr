@@ -48,14 +48,8 @@ pub enum ErrorCode {
     NotManaged,
     ActiveDownloads,
     WrongPayload,
-    /// Coexistence mode: the target is acquired natively until it is adopted here.
+    /// The target is not adopted and monitored here, so nothing is acquired for it.
     NotAdopted,
-    /// Coexistence mode: adopting a native title needs `native_handoff_confirmed`.
-    NativeHandoffRequired,
-    /// Coexistence mode: the qBittorrent category is also a native client category.
-    CategoryShared,
-    /// Coexistence mode: an imported title this server cannot acquire stays native.
-    UnsupportedScope,
     /// A native indexer's configured grab limit is reached for its window.
     IndexerLimitReached,
     /// The embedded engine could find no peer for the payload (no tracker it may use, DHT
@@ -115,9 +109,6 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::ActiveDownloads,
     ErrorCode::WrongPayload,
     ErrorCode::NotAdopted,
-    ErrorCode::NativeHandoffRequired,
-    ErrorCode::CategoryShared,
-    ErrorCode::UnsupportedScope,
     ErrorCode::IndexerLimitReached,
     ErrorCode::NoPeerDiscovery,
     ErrorCode::QualityChanged,

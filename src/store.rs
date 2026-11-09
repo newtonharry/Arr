@@ -446,8 +446,9 @@ impl Store {
         // Latest metadata numbering hold (JSON) while a refresh finds conflicts with the
         // imported numbering; cleared by a refresh without conflicts.
         ensure_column(&conn, "media", "metadata_hold", "TEXT")?;
-        // Native handoffs the operator confirmed (coexistence mode), per catalog title:
-        // scope "" is the whole title, "S" a season, "S:E" an episode. A release removes them.
+        // Native handoffs an older release recorded, per catalog title (scope "" is the whole
+        // title, "S" a season, "S:E" an episode). Kept so a rollback finds them; nothing
+        // writes them now, and a release still removes them.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS handoffs (
                 media_id TEXT NOT NULL,

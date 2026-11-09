@@ -14,10 +14,11 @@ pub enum MediaKind {
 }
 
 impl MediaKind {
-    pub fn native_app(self) -> &'static str {
+    /// The plural name used in messages and report rows.
+    pub fn label(self) -> &'static str {
         match self {
-            MediaKind::Movie => "radarr",
-            MediaKind::Series => "sonarr",
+            MediaKind::Movie => "movies",
+            MediaKind::Series => "shows",
         }
     }
 }

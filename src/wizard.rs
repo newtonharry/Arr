@@ -1524,7 +1524,8 @@ enabled = false
 enabled = true
 download_cleanup = true
 
-# Sonarr/Radarr can keep running: Arr only acquires what you add to Arr.
+# Still written so this config also works with the previous release (auto-update rollback),
+# which requires it when downloading is on. "coexistence" is the only mode.
 [migration]
 mode = "coexistence"
 

@@ -3,12 +3,13 @@
 //! - Managed (the default): the real default layout, with managed setup, a native Torznab
 //!   indexer on a loopback mock, the in-memory download client (`arr::client::fake`, behind
 //!   the `test-client` feature) and the Plex/TVmaze/TMDB mocks.
-//! - LEGACY-ONLY: a synthetic Sonarr/Radarr snapshot import (`snapshot`, `write_state`,
-//!   `start_app`), `[prowlarr]` and the qBittorrent mock (`qb`). Kept for the suites that test
-//!   those integrations until they are deleted; new tests use the managed stack.
+//! - Legacy: the same managed setup and library, but with `[prowlarr]` search and the
+//!   qBittorrent mock (`qb`) as the download client. Kept only for the suites that test those
+//!   two integrations (links, execution, sandbox) until they go; new tests use the managed
+//!   stack.
 #![allow(dead_code)]
 
-use arr::{api, config, fsutil, import};
+use arr::{api, config, fsutil};
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
@@ -33,198 +34,8 @@ pub const TOKEN: &str = "test-token-0123456789abcdef0123456789";
 pub const TMDB_V3_KEY: &str = "FAKE-TEST-TMDB-V3-KEY-0001";
 pub const TMDB_V4_TOKEN: &str = "eyJGAKE-TEST-TMDB-V4-TOKEN-0001";
 
-// ------------------------------------------------------------------ snapshot (LEGACY-ONLY)
-
-fn quality(id: i64, name: &str) -> Value {
-    json!({ "id": id, "name": name, "source": "unknown", "resolution": 0 })
-}
-
-fn item(id: i64, name: &str, allowed: bool) -> Value {
-    json!({ "quality": quality(id, name), "items": [], "allowed": allowed })
-}
-
-fn group(id: i64, name: &str, members: Vec<Value>, allowed: bool) -> Value {
-    json!({ "id": id, "name": name, "items": members, "allowed": allowed })
-}
-
-/// Radarr profile 6 "HD - 720p/1080p" in native order (ascending preference).
-fn radarr_profile() -> Value {
-    json!({
-        "id": 6, "name": "HD - 720p/1080p", "upgradeAllowed": false, "cutoff": 6,
-        "minFormatScore": 0, "cutoffFormatScore": 0, "minUpgradeFormatScore": 1, "formatItems": [],
-        "language": { "id": 1, "name": "English" },
-        "items": [
-            item(0, "Unknown", false), item(24, "WORKPRINT", false), item(25, "CAM", false), item(26, "TELESYNC", false),
-            item(27, "TELECINE", false), item(29, "REGIONAL", false), item(28, "DVDSCR", false), item(1, "SDTV", false),
-            item(2, "DVD", false), item(23, "DVD-R", false),
-            group(1000, "WEB 480p", vec![item(8, "WEBDL-480p", false), item(12, "WEBRip-480p", false)], false),
-            item(20, "Bluray-480p", false), item(21, "Bluray-576p", false), item(4, "HDTV-720p", true),
-            group(1001, "WEB 720p", vec![item(5, "WEBDL-720p", true), item(14, "WEBRip-720p", true)], true),
-            item(6, "Bluray-720p", true), item(9, "HDTV-1080p", true),
-            group(1002, "WEB 1080p", vec![item(3, "WEBDL-1080p", true), item(15, "WEBRip-1080p", true)], true),
-            item(7, "Bluray-1080p", false), item(30, "Remux-1080p", false), item(16, "HDTV-2160p", false),
-            group(1003, "WEB 2160p", vec![item(18, "WEBDL-2160p", false), item(17, "WEBRip-2160p", false)], false),
-            item(19, "Bluray-2160p", false), item(31, "Remux-2160p", false), item(22, "BR-DISK", false), item(10, "Raw-HD", false),
-        ],
-    })
-}
-
-fn sonarr_profile() -> Value {
-    json!({
-        "id": 6, "name": "HD - 720p/1080p", "upgradeAllowed": false, "cutoff": 4,
-        "minFormatScore": 0, "cutoffFormatScore": 0, "minUpgradeFormatScore": 1, "formatItems": [],
-        "items": [
-            item(0, "Unknown", false), item(1, "SDTV", false),
-            group(1000, "WEB 480p", vec![item(12, "WEBRip-480p", false), item(8, "WEBDL-480p", false)], false),
-            item(2, "DVD", false), item(13, "Bluray-480p", false), item(22, "Bluray-576p", false),
-            item(4, "HDTV-720p", true), item(9, "HDTV-1080p", true), item(10, "Raw-HD", false),
-            group(1001, "WEB 720p", vec![item(14, "WEBRip-720p", true), item(5, "WEBDL-720p", true)], true),
-            item(6, "Bluray-720p", true),
-            group(1002, "WEB 1080p", vec![item(15, "WEBRip-1080p", true), item(3, "WEBDL-1080p", true)], true),
-            item(7, "Bluray-1080p", false), item(20, "Bluray-1080p Remux", false), item(16, "HDTV-2160p", false),
-            group(1003, "WEB 2160p", vec![item(17, "WEBRip-2160p", false), item(18, "WEBDL-2160p", false)], false),
-            item(19, "Bluray-2160p", false), item(21, "Bluray-2160p Remux", false),
-        ],
-    })
-}
-
-fn defs(rows: &[(i64, &str, f64, Option<f64>)]) -> Value {
-    Value::Array(
-        rows.iter()
-            .enumerate()
-            .map(|(i, (id, name, min, max))| json!({ "quality": quality(*id, name), "title": name, "weight": i + 1, "minSize": min, "maxSize": max, "preferredSize": 95, "id": i + 1 }))
-            .collect(),
-    )
-}
-
-fn radarr_defs() -> Value {
-    let capped = [
-        (0, "Unknown"),
-        (24, "WORKPRINT"),
-        (25, "CAM"),
-        (26, "TELESYNC"),
-        (27, "TELECINE"),
-        (29, "REGIONAL"),
-        (28, "DVDSCR"),
-        (1, "SDTV"),
-        (2, "DVD"),
-        (23, "DVD-R"),
-        (8, "WEBDL-480p"),
-        (12, "WEBRip-480p"),
-        (20, "Bluray-480p"),
-        (21, "Bluray-576p"),
-        (4, "HDTV-720p"),
-        (5, "WEBDL-720p"),
-        (14, "WEBRip-720p"),
-        (6, "Bluray-720p"),
-        (9, "HDTV-1080p"),
-        (3, "WEBDL-1080p"),
-        (15, "WEBRip-1080p"),
-    ];
-    let open = [
-        (7, "Bluray-1080p"),
-        (30, "Remux-1080p"),
-        (16, "HDTV-2160p"),
-        (18, "WEBDL-2160p"),
-        (17, "WEBRip-2160p"),
-        (19, "Bluray-2160p"),
-        (31, "Remux-2160p"),
-        (22, "BR-DISK"),
-        (10, "Raw-HD"),
-    ];
-    let rows: Vec<(i64, &str, f64, Option<f64>)> = capped
-        .iter()
-        .map(|(i, n)| (*i, *n, 0.0, Some(100.0)))
-        .chain(open.iter().map(|(i, n)| (*i, *n, 0.0, None)))
-        .collect();
-    defs(&rows)
-}
-
-fn sonarr_defs() -> Value {
-    defs(&[
-        (0, "Unknown", 1.0, Some(199.9)),
-        (1, "SDTV", 2.0, Some(100.0)),
-        (12, "WEBRip-480p", 2.0, Some(100.0)),
-        (8, "WEBDL-480p", 2.0, Some(100.0)),
-        (2, "DVD", 2.0, Some(100.0)),
-        (13, "Bluray-480p", 2.0, Some(100.0)),
-        (22, "Bluray-576p", 2.0, Some(100.0)),
-        (4, "HDTV-720p", 3.0, Some(125.0)),
-        (9, "HDTV-1080p", 4.0, Some(125.0)),
-        (10, "Raw-HD", 4.0, None),
-        (14, "WEBRip-720p", 3.0, Some(130.0)),
-        (5, "WEBDL-720p", 3.0, Some(130.0)),
-        (6, "Bluray-720p", 4.0, Some(130.0)),
-        (15, "WEBRip-1080p", 4.0, Some(130.0)),
-        (3, "WEBDL-1080p", 4.0, Some(130.0)),
-        (7, "Bluray-1080p", 4.0, Some(155.0)),
-        (20, "Bluray-1080p Remux", 35.0, None),
-        (16, "HDTV-2160p", 35.0, Some(199.9)),
-        (17, "WEBRip-2160p", 35.0, None),
-        (18, "WEBDL-2160p", 35.0, None),
-        (19, "Bluray-2160p", 35.0, None),
-        (21, "Bluray-2160p Remux", 35.0, None),
-    ])
-}
-
-fn field(name: &str, value: Value, privacy: &str) -> Value {
-    json!({ "name": name, "value": value, "privacy": privacy, "type": if privacy == "password" { "password" } else { "textbox" } })
-}
-
-fn indexer(categories: Value) -> Value {
-    json!({
-        "id": 1, "name": "The Pirate Bay (Prowlarr)", "protocol": "torrent", "priority": 25,
-        "enableRss": true, "enableAutomaticSearch": true, "enableInteractiveSearch": true,
-        "implementation": "Torznab", "configContract": "TorznabSettings", "tags": [], "downloadClientId": 0,
-        "fields": [
-            field("baseUrl", json!("http://prowlarr:9696/1/"), "normal"),
-            field("apiPath", json!("/api"), "normal"),
-            field("apiKey", json!(FAKE_APIKEY), "apiKey"),
-            field("categories", categories, "normal"),
-            field("multiLanguages", json!([]), "normal"),
-            field("minimumSeeders", json!(1), "normal"),
-            field("seedCriteria.seedRatio", json!(2), "normal"),
-            field("requiredFlags", json!([]), "normal"),
-        ],
-    })
-}
-
-fn download_client(category_field: &str, category: &str) -> Value {
-    json!({
-        "id": 1, "name": "qBittorrent", "enable": true, "protocol": "torrent", "priority": 1,
-        "implementation": "QBittorrent", "tags": [], "removeCompletedDownloads": true, "removeFailedDownloads": true,
-        "fields": [
-            field("host", json!("qbittorrent"), "normal"), field("port", json!(8080), "normal"), field("useSsl", json!(false), "normal"),
-            field("username", json!(FAKE_USER), "userName"), field("password", json!(FAKE_PASSWORD), "password"),
-            field(category_field, json!(category), "normal"), field("initialState", json!(0), "normal"),
-        ],
-    })
-}
-
-fn delay() -> Value {
-    json!([{ "id": 1, "enableUsenet": true, "enableTorrent": true, "preferredProtocol": "usenet", "usenetDelay": 0, "torrentDelay": 0,
-             "bypassIfHighestQuality": true, "bypassIfAboveCustomFormatScore": false, "minimumCustomFormatScore": 0, "order": 2147483647, "tags": [] }])
-}
-
-fn english() -> Value {
-    json!({ "id": 1, "name": "English" })
-}
-
-fn episode(season: i64, n: i64, has_file: bool, aired: &str) -> Value {
-    json!({ "seasonNumber": season, "episodeNumber": n, "title": format!("Episode {n}"), "airDateUtc": aired, "runtime": 50,
-            "hasFile": has_file, "monitored": true })
-}
-
-/// Native media management as both apps export it (rename off, hardlinks, no extras).
-fn media_management() -> Value {
-    json!({ "downloadPropersAndRepacks": "preferAndUpgrade", "copyUsingHardlinks": true, "minimumFreeSpaceWhenImporting": 100,
-            "skipFreeSpaceCheckWhenImporting": false, "importExtraFiles": false, "setPermissionsLinux": false, "useScriptImport": false,
-            "recycleBin": "", "fileDate": "none", "enableMediaInfo": true, "id": 1 })
-}
-
-/// Synthetic snapshot: real native shapes, fictional/fake values.
-/// A native-owned file named with the canonical franchise prefix in front of a longer
-/// metadata alias (synthetic stand-in for a real library case).
+/// A library file named with the canonical franchise prefix in front of a longer metadata
+/// alias (synthetic stand-in for a real library case).
 pub const FRANCHISE_FILE: &str =
     "Nebula.The.Legend.of.Arin.The.Last.Keeper.2026.1080p.WEBRip.AAC2.0.x264-GROUP.mp4";
 pub const FRANCHISE_FOLDER: &str = "Nebula Arin - The Last Keeper (2026)";
@@ -234,99 +45,6 @@ pub const FRANCHISE_ALIASES: [&str; 4] = [
     "Arin – Der letzte Hüter",
     "Арин: Последний хранитель",
 ];
-
-pub fn with_franchise_movie(mut v: Value) -> Value {
-    let aliases: Vec<Value> = FRANCHISE_ALIASES
-        .iter()
-        .map(|t| json!({ "title": t }))
-        .collect();
-    v["radarr"]["movie"].as_array_mut().unwrap().push(json!({
-        "id": 13, "title": "Nebula Arin: The Last Keeper", "originalTitle": "Nebula Arin: The Last Keeper",
-        "originalLanguage": english(), "alternateTitles": aliases, "year": 2026, "runtime": 110, "tmdbId": 990001,
-        "hasFile": true, "monitored": true, "qualityProfileId": 6, "path": format!("/movies/{FRANCHISE_FOLDER}"),
-        "status": "released", "isAvailable": true,
-        "movieFile": { "relativePath": FRANCHISE_FILE, "size": 1, "quality": { "quality": quality(15, "WEBRip-1080p") } },
-    }));
-    v
-}
-
-pub fn snapshot() -> Value {
-    json!({
-        "radarr": {
-            "health": [{ "source": "UpdateCheck", "type": "warning", "message": "update available" }],
-            "indexer": [indexer(json!([2000, 2040, 2045]))],
-            "downloadclient": [download_client("movieCategory", "radarr")],
-            "qualityprofile": [radarr_profile()],
-            "qualitydefinition": radarr_defs(),
-            "rootfolder": [{ "path": "/movies", "accessible": true, "freeSpace": 1000, "id": 1 }],
-            "config/downloadclient": { "enableCompletedDownloadHandling": true, "autoRedownloadFailed": true, "id": 1 },
-            "config/indexer": { "minimumAge": 0, "maximumSize": 0, "retention": 0, "rssSyncInterval": 30, "preferIndexerFlags": false,
-                                "availabilityDelay": 0, "allowHardcodedSubs": false, "whitelistedHardcodedSubs": "", "id": 1 },
-            "config/mediamanagement": media_management(),
-            "config/naming": { "renameMovies": false, "replaceIllegalCharacters": true, "colonReplacementFormat": "smart",
-                               "standardMovieFormat": "{Movie Title} ({Release Year}) {Quality Full}", "movieFolderFormat": "{Movie Title} ({Release Year})", "id": 1 },
-            "delayprofile": delay(),
-            "customformat": [], "tag": [], "remotepathmapping": [],
-            "movie": [
-                { "id": 10, "title": "The Matrix", "originalTitle": "The Matrix", "originalLanguage": english(), "alternateTitles": [],
-                  "year": 1999, "runtime": 136, "imdbId": "tt0133093", "tmdbId": 603, "hasFile": false, "monitored": true,
-                  "qualityProfileId": 6, "path": "/movies/The Matrix (1999)", "status": "released", "isAvailable": true },
-                { "id": 11, "title": "The Matrix Reloaded", "originalLanguage": english(), "year": 2003, "runtime": 138, "tmdbId": 604,
-                  "hasFile": true, "monitored": true, "qualityProfileId": 6, "path": "/movies/The Matrix Reloaded (2003)", "status": "released",
-                  "isAvailable": true, "movieFile": { "quality": { "quality": quality(3, "WEBDL-1080p") } } },
-                { "id": 12, "title": "Amélie", "originalTitle": "Le Fabuleux Destin d'Amélie Poulain", "originalLanguage": { "id": 2, "name": "French" },
-                  "alternateTitles": [{ "title": "Amelie from Montmartre" }], "year": 2001, "runtime": 122, "tmdbId": 194,
-                  "hasFile": false, "monitored": true, "qualityProfileId": 6, "rootFolderPath": "/movies", "isAvailable": true },
-            ],
-        },
-        "sonarr": {
-            "health": [],
-            "indexer": [indexer(json!([5000, 5040, 5045]))],
-            "downloadclient": [download_client("tvCategory", "tv-sonarr")],
-            "qualityprofile": [sonarr_profile()],
-            "qualitydefinition": sonarr_defs(),
-            "languageprofile": [{ "id": 1, "name": "Deprecated", "upgradeAllowed": true, "cutoff": english(), "languages": [{ "language": english(), "allowed": true }] }],
-            "rootfolder": [{ "path": "/tvshows", "accessible": true, "freeSpace": 1000, "id": 1 }],
-            "config/downloadclient": { "enableCompletedDownloadHandling": true, "id": 1 },
-            "config/indexer": { "minimumAge": 0, "retention": 0, "maximumSize": 0, "rssSyncInterval": 30, "id": 1 },
-            "config/mediamanagement": media_management(),
-            "config/naming": { "renameEpisodes": false, "replaceIllegalCharacters": true, "colonReplacementFormat": 4,
-                               "seriesFolderFormat": "{Series Title}", "seasonFolderFormat": "Season {season}", "id": 1 },
-            "delayprofile": delay(),
-            "customformat": [], "tag": [], "remotepathmapping": [],
-            "series": [
-                { "id": 20, "title": "Slow Horses", "alternateTitles": [], "year": 2022, "tvdbId": 372264, "tvMazeId": 9001, "imdbId": "tt5875444",
-                  "seriesType": "standard", "runtime": 50, "originalLanguage": english(), "status": "continuing", "monitored": true,
-                  "qualityProfileId": 6, "languageProfileId": 1, "path": "/tvshows/Slow Horses",
-                  "seasons": [
-                      { "seasonNumber": 1, "monitored": true, "statistics": { "episodeFileCount": 2, "episodeCount": 6, "totalEpisodeCount": 6 } },
-                      { "seasonNumber": 2, "monitored": true, "statistics": { "episodeFileCount": 0, "episodeCount": 6, "totalEpisodeCount": 6 } },
-                  ] },
-                { "id": 21, "title": "Fargo", "alternateTitles": [], "year": 2014, "tvdbId": 269613, "tvMazeId": 9002,
-                  "seriesType": "standard", "runtime": 60, "originalLanguage": english(), "status": "continuing", "monitored": true,
-                  "qualityProfileId": 6, "path": "/tvshows/Fargo",
-                  "seasons": [
-                      { "seasonNumber": 4, "monitored": true, "statistics": { "episodeFileCount": 3, "episodeCount": 11, "totalEpisodeCount": 11 } },
-                      { "seasonNumber": 5, "monitored": true, "statistics": { "episodeFileCount": 0, "episodeCount": 10, "totalEpisodeCount": 10 } },
-                  ] },
-            ],
-            "episode_samples": {
-                "20": [
-                    episode(1, 1, true, "2022-04-01T02:00:00Z"), episode(1, 2, false, "2022-04-01T02:00:00Z"),
-                    episode(1, 3, true, "2022-04-08T02:00:00Z"), episode(1, 4, false, "2022-04-15T02:00:00Z"),
-                    episode(1, 5, false, "2022-04-22T02:00:00Z"), episode(1, 6, false, "2022-04-29T02:00:00Z"),
-                ],
-            },
-        },
-        "prowlarr": {
-            "health": [],
-            "indexer": [{ "id": 1, "name": "The Pirate Bay", "enable": true, "protocol": "torrent", "privacy": "public", "priority": 25,
-                          "definitionName": "thepiratebay", "tags": [],
-                          "fields": [field("baseUrl", json!("https://thepiratebay.org/"), "normal"), field("cookie", json!(FAKE_COOKIE), "normal")] }],
-            "applications": [{ "name": "Sonarr", "fields": [field("apiKey", json!(FAKE_APIKEY), "apiKey")] }],
-        },
-    })
-}
 
 // ------------------------------------------------------------------ mock upstreams
 
@@ -1277,77 +995,46 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
     (addr, state)
 }
 
-// ------------------------------------------------------------------ app harness (LEGACY-ONLY)
-
-pub struct App {
-    pub base: String,
-    pub dir: PathBuf,
-    pub client: reqwest::Client,
-    _tmp: Option<tempfile::TempDir>,
-}
-
-impl App {
-    pub fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        self.client
-            .get(format!("{}{path}", self.base))
-            .bearer_auth(TOKEN)
-    }
-
-    pub fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        self.client
-            .post(format!("{}{path}", self.base))
-            .bearer_auth(TOKEN)
-    }
-}
-
-pub fn write_state(
+/// Config, secrets and managed settings (written offline, as `arr setup` does) for a server
+/// with `[prowlarr]` search against the mock, then `extra_config` (whole sections, including
+/// the download client). For the real-client sandbox, which starts its own server.
+pub fn write_prowlarr_state(
     dir: &Path,
-    snapshot: &Value,
     extra_config: &str,
-    mock: Option<SocketAddr>,
-    tvmaze: bool,
+    mock: SocketAddr,
+    categories: (&'static str, &'static str),
 ) {
     fsutil::ensure_private_dir(dir).unwrap();
     fsutil::ensure_private_dir(&dir.join("secrets")).unwrap();
-    let write = |p: PathBuf, b: &[u8]| {
+    for (name, value) in [("api_token", TOKEN), ("prowlarr_api_key", PROWLARR_KEY)] {
+        let p = dir.join("secrets").join(name);
         if !p.exists() {
-            fsutil::write_new_private_file(&p, b).unwrap();
+            fsutil::write_new_private_file(&p, value.as_bytes()).unwrap();
         }
-    };
-    write(dir.join("secrets/api_token"), TOKEN.as_bytes());
-    write(
-        dir.join("secrets/prowlarr_api_key"),
-        PROWLARR_KEY.as_bytes(),
+    }
+    let cfg = format!(
+        "[server]\napi_token_file = \"secrets/api_token\"\nrequest_timeout_secs = 30\nmax_body_bytes = 4096\n\
+         [prowlarr]\nbase_url = \"http://{mock}/prowlarr\"\napi_key_file = \"secrets/prowlarr_api_key\"\ntimeout_secs = 2\npage_size = 100\nmax_pages = 2\nmax_response_bytes = 1048576\n\
+         [migration]\nmode = \"coexistence\"\n{extra_config}"
     );
-    let mut cfg = "[server]\napi_token_file = \"secrets/api_token\"\nrequest_timeout_secs = 30\nmax_body_bytes = 4096\n".to_string();
-    if let Some(addr) = mock {
-        cfg.push_str(&format!(
-            "[prowlarr]\nbase_url = \"http://{addr}/prowlarr\"\napi_key_file = \"secrets/prowlarr_api_key\"\ntimeout_secs = 2\npage_size = 100\nmax_pages = 2\nmax_response_bytes = 1048576\n"
-        ));
-        if tvmaze {
-            cfg.push_str(&format!(
-                "[tvmaze]\nenabled = true\nbase_url = \"http://{addr}/tvmaze\"\nimage_base_url = \"http://{addr}\"\ntimeout_secs = 2\n"
-            ));
-        }
-    }
-    cfg.push_str(extra_config);
-    // Existing suites model the legacy behaviour (imported titles acquire); coexistence tests
-    // opt in with their own [migration] section.
-    if !extra_config.contains("[migration]") {
-        cfg.push_str("[migration]\nmode = \"legacy\"\n");
-    }
     let cfg_path = dir.join("config.toml");
     let _ = std::fs::remove_file(&cfg_path);
     fsutil::write_new_private_file(&cfg_path, cfg.as_bytes()).unwrap();
-    let snap = dir.join("native.json");
-    let _ = std::fs::remove_file(&snap);
-    fsutil::write_new_private_file(&snap, &serde_json::to_vec(snapshot).unwrap()).unwrap();
-    import::run_import(&import::ImportOptions {
-        state_dir: dir.to_path_buf(),
-        snapshot: snap,
-        observed_at: Some(time::macros::datetime!(2026-10-01 12:00 UTC)),
-        dry_run: false,
-    })
+    let rt = config::load(&cfg_path).unwrap();
+    let doc: arr::setup::SetupDoc = serde_json::from_value(setup_document(&ExecOptions {
+        stack: Stack::Legacy,
+        categories: Some(categories),
+        ..Default::default()
+    }))
+    .unwrap();
+    let prepared =
+        arr::setup::prepare(&doc, &rt, time::OffsetDateTime::now_utc()).expect("managed setup");
+    arr::import::write_and_activate(
+        dir,
+        arr::setup::SOURCE_FILE,
+        &prepared.source,
+        &prepared.normalized,
+    )
     .unwrap();
 }
 
@@ -1359,24 +1046,6 @@ pub async fn serve_dir(dir: &Path) -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, api::router(state)).await.unwrap() });
     format!("http://{addr}")
-}
-
-pub async fn start_app(
-    snapshot: &Value,
-    extra_config: &str,
-    mock: Option<SocketAddr>,
-    tvmaze: bool,
-) -> App {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("state");
-    write_state(&dir, snapshot, extra_config, mock, tvmaze);
-    let base = serve_dir(&dir).await;
-    App {
-        base,
-        dir,
-        client: reqwest::Client::new(),
-        _tmp: Some(tmp),
-    }
 }
 
 pub fn assert_no_leaks(body: &str) {
@@ -1488,10 +1157,10 @@ pub enum Stack {
     /// a native Torznab indexer, the in-memory download client standing in for the embedded
     /// engine, `[migration] mode = "coexistence"`, and the Plex/TVmaze/TMDB mocks.
     Managed,
-    /// LEGACY ONLY. A synthetic Sonarr/Radarr snapshot import, `[prowlarr]`, the qBittorrent
-    /// mock and `[migration] mode = "legacy"`. Kept for the suites that test those
-    /// integrations (import, coexistence, migration_review, links, execution, sandbox) until
-    /// they are deleted with them; nothing new belongs here.
+    /// LEGACY ONLY. The managed setup and library of `Managed`, but with `[prowlarr]` search
+    /// (indexer id 1) and the qBittorrent mock as the download client (categories `radarr` /
+    /// `tv-sonarr`). Kept for the suites that test those two integrations (links, execution,
+    /// sandbox) until they are deleted; nothing new belongs here.
     Legacy,
 }
 
@@ -1504,8 +1173,8 @@ pub struct ExecOptions {
     pub extra: String,
     /// Configure [tmdb] against the mock (v3 key).
     pub tmdb: bool,
-    /// Download categories: `[qbittorrent]` movie/TV categories (legacy; default the imported
-    /// native ones) or the managed setup's `[download]` (default `um-movies` / `um-tv`).
+    /// Download categories of the setup's `[download]` (default `um-movies` / `um-tv`; the
+    /// legacy stack's are `radarr` / `tv-sonarr`).
     pub categories: Option<(&'static str, &'static str)>,
     /// `[automation] stall_timeout_minutes` (default: the configuration's default).
     pub stall_timeout_minutes: Option<u64>,
@@ -1535,10 +1204,6 @@ pub struct ExecOptions {
     pub movies_extra: String,
     /// LEGACY: qBittorrent WebAPI version of the mock.
     pub api: &'static str,
-    /// LEGACY: the Sonarr/Radarr/Prowlarr snapshot to import.
-    pub snapshot: Value,
-    /// LEGACY: `[migration] mode` (`legacy` by default for the legacy suites).
-    pub mode: &'static str,
 }
 
 impl Default for ExecOptions {
@@ -1566,8 +1231,6 @@ impl Default for ExecOptions {
             tv_extra: String::new(),
             movies_extra: String::new(),
             api: QB_API_4_3_9,
-            snapshot: snapshot(),
-            mode: "legacy",
         }
     }
 }
@@ -1581,7 +1244,7 @@ impl ExecOptions {
         }
     }
 
-    /// The legacy stack (snapshot import, Prowlarr, qBittorrent mock).
+    /// The legacy stack (Prowlarr search, qBittorrent mock).
     pub fn legacy() -> Self {
         ExecOptions {
             stack: Stack::Legacy,
@@ -1734,87 +1397,8 @@ impl Exec {
     }
 }
 
-async fn start_legacy(o: ExecOptions) -> Exec {
-    let (mock_addr, mock) = start_mock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
-    let dir = root.join("state");
-    let downloads = root.join("downloads");
-    let movies = root.join("library/movies");
-    let tv = root.join("library/tv");
-    for d in [&downloads, &movies, &tv] {
-        std::fs::create_dir_all(d).unwrap();
-    }
-    let (qb_addr, qb) = qb::start(o.api, downloads.clone()).await;
-    fsutil::ensure_private_dir(&dir).unwrap();
-    fsutil::ensure_private_dir(&dir.join("secrets")).unwrap();
-    fsutil::write_new_private_file(&dir.join(QB_USER_FILE), FAKE_USER.as_bytes()).unwrap();
-    fsutil::write_new_private_file(&dir.join("secrets/qb_pass"), FAKE_PASSWORD.as_bytes()).unwrap();
-    fsutil::write_new_private_file(&dir.join("secrets/plex_token"), PLEX_TOKEN.as_bytes()).unwrap();
-    fsutil::write_new_private_file(&dir.join("secrets/tmdb"), TMDB_V3_KEY.as_bytes()).unwrap();
-    let tmdb = if o.tmdb {
-        format!(
-            "[tmdb]\nenabled = true\nbase_url = \"http://{mock_addr}/tmdb\"\nimage_base_url = \"http://{mock_addr}\"\ncredential_file = \"secrets/tmdb\"\n"
-        )
-    } else {
-        String::new()
-    };
-    let extra = format!(
-        "[execution]\nenabled = true\ndownload_cleanup = {cleanup}\n\
-         [qbittorrent]\nbase_url = \"http://{qb_addr}/\"\nusername_file = '{QB_USER_FILE}'\npassword_file = \"secrets/qb_pass\"\nsave_path = \"/downloads\"\nlocal_path = '{dl}'\ntimeout_secs = 5\n{cats}\
-         [migration]\nmode = '{mode}'\n\
-         [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = {sample}\nprobe_timeout_secs = 30\n\
-         [automation]\npoll_seconds = 3600\n{stall}\
-         [plex]\nbase_url = \"http://{mock_addr}/plex\"\ntoken_file = \"secrets/plex_token\"\nmovie_section = 1\ntv_section = 2\n\
-         discover_url = \"http://{mock_addr}/plexmeta\"\nmetadata_url = \"http://{mock_addr}/plexmeta\"\nimage_base_url = \"http://{mock_addr}\"\n{tmdb}{extra}",
-        cleanup = o.cleanup,
-        dl = downloads.display(),
-        movies = movies.display(),
-        tv = tv.display(),
-        sample = o.sample_detection,
-        extra = o.extra,
-        tmdb = tmdb,
-        mode = o.mode,
-        stall = o
-            .stall_timeout_minutes
-            .map(|m| format!("stall_timeout_minutes = {m}\n"))
-            .unwrap_or_default(),
-        cats = o
-            .categories
-            .map(|(m, t)| format!("movie_category = '{m}'\ntv_category = '{t}'\n"))
-            .unwrap_or_default(),
-    );
-    write_state(&dir, &o.snapshot, &extra, Some(mock_addr), o.tvmaze);
-    let cfg = config::load(&dir.join("config.toml")).unwrap();
-    let state = Arc::new(api::AppState::new(cfg).unwrap());
-    arr::worker::recover(&state, time::OffsetDateTime::now_utc()).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let s2 = state.clone();
-    tokio::spawn(async move { axum::serve(listener, api::router(s2)).await.unwrap() });
-    Exec {
-        base: format!("http://{addr}"),
-        client: reqwest::Client::new(),
-        state,
-        dir,
-        downloads,
-        movies,
-        tv,
-        qb,
-        qb_addr,
-        fake: arr::client::fake::handle("legacy-unused"),
-        stack: Stack::Legacy,
-        mock,
-        mock_addr,
-        _tmp: tmp,
-    }
-}
-
 pub async fn start_exec(o: ExecOptions) -> Exec {
-    match o.stack {
-        Stack::Managed => start_managed(o).await,
-        Stack::Legacy => start_legacy(o).await,
-    }
+    start_managed(o).await
 }
 
 // ------------------------------------------------------------------ managed stack
@@ -1823,7 +1407,10 @@ pub async fn start_exec(o: ExecOptions) -> Exec {
 /// categories, and size limits that bound a release's size per minute of runtime the way the
 /// legacy snapshot's quality definitions did (so claimed sizes in the suites stay valid).
 fn setup_document(o: &ExecOptions) -> Value {
-    let (movies, tv) = o.categories.unwrap_or(("um-movies", "um-tv"));
+    let (movies, tv) = o.categories.unwrap_or(match o.stack {
+        Stack::Managed => ("um-movies", "um-tv"),
+        Stack::Legacy => ("radarr", "tv-sonarr"),
+    });
     let mut doc = format!(
         "[download]\nmovie_category = \"{movies}\"\ntv_category = \"{tv}\"\n{}\
          [tv]\n{}[movies]\n{}",
@@ -1881,11 +1468,13 @@ fn setup_document(o: &ExecOptions) -> Value {
 fn managed_config(
     o: &ExecOptions,
     mock: SocketAddr,
+    qb_addr: SocketAddr,
     fake_id: &str,
     downloads: &Path,
     movies: &Path,
     tv: &Path,
 ) -> String {
+    let legacy = o.stack == Stack::Legacy;
     let tmdb = if o.tmdb {
         format!(
             "[tmdb]\nenabled = true\nbase_url = \"http://{mock}/tmdb\"\nimage_base_url = \"http://{mock}\"\ncredential_file = \"secrets/tmdb\"\n"
@@ -1908,7 +1497,11 @@ fn managed_config(
     } else {
         String::new()
     };
-    let indexer = if o.indexer {
+    let indexer = if o.indexer && legacy {
+        format!(
+            "[prowlarr]\nbase_url = \"http://{mock}/prowlarr\"\napi_key_file = \"secrets/prowlarr_api_key\"\ntimeout_secs = 2\npage_size = 100\nmax_pages = 2\nmax_response_bytes = 1048576\n"
+        )
+    } else if o.indexer {
         format!(
             "[[indexer]]\nid = 1\nname = \"The Pirate Bay\"\nkind = \"torznab\"\nbase_url = \"http://{}/tz/\"\napi_key_file = \"secrets/tz_key\"\nmin_interval_ms = 0\ncache_ttl_secs = {}\ntimeout_secs = 2\npage_size = {}\nmax_pages = 2\n",
             o.indexer_addr.unwrap_or(mock),
@@ -1918,7 +1511,14 @@ fn managed_config(
     } else {
         String::new()
     };
-    let execution = if o.execution {
+    let execution = if o.execution && legacy {
+        format!(
+            "[execution]\nenabled = true\ndownload_cleanup = {cleanup}\n\
+             [qbittorrent]\nbase_url = \"http://{qb_addr}/\"\nusername_file = '{QB_USER_FILE}'\npassword_file = \"secrets/qb_pass\"\nsave_path = \"/downloads\"\nlocal_path = '{dl}'\ntimeout_secs = 5\n",
+            cleanup = o.cleanup,
+            dl = downloads.display(),
+        )
+    } else if o.execution {
         format!(
             "[execution]\nenabled = true\ndownload_cleanup = {cleanup}\n\
              [embedded]\ndownload_dir = '{dl}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ndht = true\nlocal_discovery = false\n\
@@ -1976,7 +1576,22 @@ async fn start_managed(o: ExecOptions) -> Exec {
         fsutil::write_new_private_file(&dir.join("secrets").join(name), value.as_bytes()).unwrap();
     }
     let fake_id = format!("exec-{}", root.display());
-    let cfg_text = managed_config(&o, mock_addr, &fake_id, &downloads, &movies, &tv);
+    let (qb_addr, qb) = if o.stack == Stack::Legacy {
+        qb::start(o.api, downloads.clone()).await
+    } else {
+        (
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Arc::new(Mutex::new(qb::QbState::default())),
+        )
+    };
+    for (name, value) in [
+        (QB_USER_FILE.trim_start_matches("secrets/"), FAKE_USER),
+        ("qb_pass", FAKE_PASSWORD),
+        ("prowlarr_api_key", PROWLARR_KEY),
+    ] {
+        fsutil::write_new_private_file(&dir.join("secrets").join(name), value.as_bytes()).unwrap();
+    }
+    let cfg_text = managed_config(&o, mock_addr, qb_addr, &fake_id, &downloads, &movies, &tv);
     fsutil::write_new_private_file(&dir.join("config.toml"), cfg_text.as_bytes()).unwrap();
     let cfg = config::load(&dir.join("config.toml")).unwrap();
     let state = Arc::new(api::AppState::new(cfg).unwrap());
@@ -1984,10 +1599,6 @@ async fn start_managed(o: ExecOptions) -> Exec {
     let addr = listener.local_addr().unwrap();
     let s2 = state.clone();
     tokio::spawn(async move { axum::serve(listener, api::router(s2)).await.unwrap() });
-    let (qb_addr, qb) = (
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        Arc::new(Mutex::new(qb::QbState::default())),
-    );
     let e = Exec {
         base: format!("http://{addr}"),
         client: reqwest::Client::new(),
@@ -1999,7 +1610,7 @@ async fn start_managed(o: ExecOptions) -> Exec {
         qb,
         qb_addr,
         fake: arr::client::fake::handle(&fake_id),
-        stack: Stack::Managed,
+        stack: o.stack,
         mock,
         mock_addr,
         _tmp: tmp,
