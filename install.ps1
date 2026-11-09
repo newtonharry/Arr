@@ -388,10 +388,12 @@ function Install-Arr {
 	Say 'Arr is running. Open it at:'
 	Say "  this computer: http://localhost:$Port"
 	if ($PublicUrl) { Say "  any device:    $PublicUrl   (sign in with Google)" }
-	# A first install has nobody signed in yet: a link that works once, for 15 minutes. It goes
-	# to the screen only, never to a log. (With remote access it would name the public address,
-	# which may not be reachable yet, so it names this computer.)
-	if ($firstInstall) {
+	# A first install has nobody signed in yet: a link that works once, for 15 minutes. Anyone
+	# who has it can sign in, so it is made only when a person is at the console (not ARR_YES,
+	# not redirected) and goes to the host, never into output that could be captured. (With
+	# remote access it would name the public address, which may not be reachable yet, so it
+	# names this computer.)
+	if ($firstInstall -and (Interactive) -and -not [Console]::IsOutputRedirected) {
 		$link = & { $ErrorActionPreference = 'Continue'; & $Arr app-link --config $Config 2>$null | Select-Object -First 1 }
 		if ($link) {
 			Say ''

@@ -32,6 +32,7 @@ cat install.out
 grep -q "doesn't reach Arr yet" install.out || fail "no public-check failure"
 grep -q '^Arr is running\. Open it at:' install.out || fail "the install doesn't say where to open Arr"
 grep -q '^  any device:    https://arr-ci-test.ngrok-free.app   (sign in with Google)$' install.out || fail "the install doesn't show the public address"
+grep -q 'app/link' install.out && fail "a non-interactive install printed a sign-in link"
 grep -q 'journalctl -u arr-tunnel' install.out || fail "the failure doesn't point at the tunnel's log"
 
 config=$(sudo cat "$state/config.toml")
@@ -69,6 +70,7 @@ arr_pid() { systemctl show -p MainPID --value arr; }
 # Remote access is set up (with the made-up ngrok account), so a rerun that otherwise works
 # ends at the public check: it must fail there, after Arr is running, and nowhere else.
 ends_at_public_check() { # ends_at_public_check OUTPUT_FILE WHAT
+	! grep -q 'app/link' "$1" || { cat "$1"; fail "$2 printed a sign-in link without a person at the terminal"; }
 	grep -q '^Arr is running\. Open it at:' "$1" && grep -q '^  this computer: http://localhost:8787$' "$1" &&
 		grep -q '^  any device:    https://arr-ci-test.ngrok-free.app   (sign in with Google)$' "$1" &&
 		grep -q "doesn't reach Arr yet" "$1" ||

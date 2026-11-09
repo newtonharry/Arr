@@ -65,6 +65,7 @@ arr_pid() { launchctl list io.github.newtonharry.arr | sed -n 's/.*"PID" = \([0-
 # Remote access is set up (with the made-up ngrok account), so a rerun that otherwise works
 # ends at the public check: it must fail there, after Arr is running, and nowhere else.
 ends_at_public_check() { # ends_at_public_check OUTPUT_FILE WHAT
+	! grep -q 'app/link' "$1" || { cat "$1"; fail "$2 printed a sign-in link without a person at the terminal"; }
 	grep -q '^Arr is running\. Open it at:' "$1" && grep -q '^  this computer: http://localhost:8787$' "$1" &&
 		grep -q '^  any device:    https://arr-ci-test.ngrok-free.app   (sign in with Google)$' "$1" &&
 		grep -q "doesn't reach Arr yet" "$1" ||

@@ -594,6 +594,68 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         .unwrap();
     assert!(status.success());
 
+    // The service the installer starts takes over the page's address. "Open Arr" posts the
+    // minted link to it from the page (a same-origin fetch, so its Origin is the page's);
+    // that signs in once, and the same link fails the second time.
+    // (Without downloading, so the test doesn't start a torrent engine.)
+    let written = std::fs::read_to_string(state_dir.join("config.toml")).unwrap();
+    arr::fsutil::atomic_replace_private(
+        &state_dir.join("serve.toml"),
+        written
+            .replace(
+                "[execution]\nenabled = true",
+                "[execution]\nenabled = false",
+            )
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut serve = tokio::process::Command::new(BIN)
+        .arg("serve")
+        .arg("--config")
+        .arg(state_dir.join("serve.toml"))
+        .env("ARR_SENTRY_DSN", "http://key@127.0.0.1:9/1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !matches!(
+            http.get(format!("{base}/api/v1/health")).send().await,
+            Ok(r) if r.status().is_success()
+        ) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("arr serve didn't come up");
+    let redeem = || {
+        http.post(format!("{base}/app/link"))
+            .header("origin", &base)
+            .form(&[("t", token)])
+            .send()
+    };
+    let r = redeem().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/");
+    let cookie = r.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let me = http
+        .get(format!("{base}/app/api/me"))
+        .header("x-arr-app", "1")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+    assert_eq!(redeem().await.unwrap().status(), StatusCode::GONE);
+    let _ = serve.kill().await;
+
     // What the installer picks up.
     let config = std::fs::read_to_string(state_dir.join("config.toml")).unwrap();
     for want in [

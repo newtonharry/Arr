@@ -1489,15 +1489,18 @@ echo
 echo "Arr is running. Open it at:"
 echo "  this computer: http://localhost:$PORT"
 [ -z "$PUBLIC_URL" ] || echo "  any device:    $PUBLIC_URL   (sign in with Google)"
-# A first install has nobody signed in yet: a link that works once, for 15 minutes. It goes to
-# the screen only, never to a log. (With remote access it would name the public address, which
-# may not be reachable yet, so it names this computer.)
-if [ "$FIRST_INSTALL" = 1 ]; then
+# A first install has nobody signed in yet: a link that works once, for 15 minutes. Anyone
+# who has it can sign in, so it is made only when a person is at the terminal (not --yes, not a
+# pipe or a log), and goes to the terminal itself. (With remote access it would name the public
+# address, which may not be reachable yet, so it names this computer.)
+if [ "$FIRST_INSTALL" = 1 ] && interactive && [ -t 1 ]; then
 	link=$(as_run "$ARR" app-link --config "$CONFIG" 2>/dev/null | sed "s#^https://[^/]*#http://localhost:$PORT#") || link=""
 	if [ -n "$link" ]; then
-		echo
-		echo "To sign in on this computer, open this link. It works once, within 15 minutes:"
-		echo "  $link"
+		{
+			echo
+			echo "To sign in on this computer, open this link. It works once, within 15 minutes:"
+			echo "  $link"
+		} >/dev/tty
 	fi
 fi
 cat <<EOF

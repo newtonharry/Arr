@@ -400,13 +400,44 @@ async function prepareOpen() {
   look();
 }
 
-$("open-arr").addEventListener("click", () => {
+// Opens Arr signed in. The link is spent here, by a POST to the app (as its own page, so
+// the browser stores the session for this address), and the new tab then goes to the app's
+// front page: no token ever sits in a tab's address or history.
+$("open-arr").addEventListener("click", async () => {
   if (!appLink) return;
-  // A new tab with no opener or referrer; the link works once.
-  window.open(appLink, "_blank", "noopener,noreferrer");
+  const button = $("open-arr"), status = $("open-status");
+  // Opened now, while the click still counts, so the browser doesn't block it.
+  const tab = window.open("", "_blank");
+  if (tab) { try { tab.opener = null; } catch (_) { /* fine */ } }
+  const token = new URL(appLink).searchParams.get("t");
   appLink = null;
-  $("open-arr").disabled = true;
-  $("open-status").textContent = "Opened in a new tab.";
+  button.disabled = true;
+  status.textContent = "Signing in…";
+  let ok = false;
+  try {
+    const r = await fetch("/app/link", {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ t: token }),
+    });
+    ok = r.type === "opaqueredirect" || r.status === 303;
+  } catch (_) { /* Arr isn't answering */ }
+  if (ok) {
+    if (tab) tab.location.href = `${location.origin}/`;
+    else window.open(`${location.origin}/`, "_blank");
+    status.textContent = "Opened in a new tab.";
+    return;
+  }
+  if (tab) tab.close();
+  // Expired or already used: a new one, if this page can still ask for it.
+  try {
+    appLink = (await call("POST", "/api/app-link")).url;
+    status.textContent = "That sign-in didn't work. Click Open Arr to try again.";
+    button.disabled = false;
+  } catch (_) {
+    status.textContent = `That sign-in link has expired. Open ${location.origin} and use the new link the installer printed in the terminal, or run "arr app-link" there.`;
+  }
 });
 
 for (const b of document.querySelectorAll("button.copy")) {
