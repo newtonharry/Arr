@@ -156,8 +156,8 @@ async fn the_show_page_of_a_catalog_show_says_what_is_in_plex() {
         ["in_plex", "wanted", "in_plex", "wanted", "wanted", "wanted"]
     );
     assert_eq!(eps["episodes"][1]["media_id"], "episode:tvdb:372264:1:2");
-    assert_eq!(eps["episodes"][1]["air_date"], "2022-04-01");
-    assert_eq!(eps["episodes"][1]["title"], "Episode 2");
+    assert_eq!(eps["episodes"][1]["air_date"], "2025-02-02");
+    assert_eq!(eps["episodes"][1]["title"], "Ep 2");
     let (s, v) = site.get("/show/series:tvdb:372264/season/9").await;
     assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
 }
@@ -465,7 +465,7 @@ async fn stopping_a_season_cancels_its_download_and_leaves_the_library_alone() {
         .unwrap()
         .to_string();
     e.tick().await;
-    qb::complete(&e.qb, &hash4);
+    e.fake.lock().unwrap().complete(&hash4);
     e.tick().await;
     assert_eq!(e.grab_row(&g4).state, "imported");
     let library = e.tv.join(format!("Slow Horses/Season 1/{done}.mkv"));
@@ -506,7 +506,7 @@ async fn stopping_a_season_cancels_its_download_and_leaves_the_library_alone() {
     );
     assert_eq!(e.grab_row(&g2).state, "cancelled");
     assert!(
-        !e.qb.lock().unwrap().torrents.contains_key(&hash2),
+        !e.fake.lock().unwrap().torrents.contains_key(&hash2),
         "the unfinished download is removed from the client"
     );
     // The library is untouched: the imported file is still there and still counted.
@@ -522,11 +522,22 @@ async fn stopping_a_season_cancels_its_download_and_leaves_the_library_alone() {
     assert_eq!(season(&page, 1)["state"], "partly");
     assert_eq!(season(&page, 1)["in_plex"], 3);
     assert_eq!(season(&page, 1)["wanted"], 0);
-    // The automatic search no longer wants anything of it.
+    // The automatic search no longer wants anything of season 1 (other seasons may stay wanted).
     let (_, w, _) = e
         .json(e.get("/api/v1/wanted?media_id=series:tvdb:372264"))
         .await;
-    assert_eq!(w["items"].as_array().unwrap().len(), 0, "{w}");
+    let of_season_1 = w["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| {
+            i["target"]
+                .as_str()
+                .unwrap()
+                .starts_with("episode:tvdb:372264:1:")
+        })
+        .count();
+    assert_eq!(of_season_1, 0, "{w}");
 }
 
 #[tokio::test]
@@ -611,7 +622,7 @@ async fn the_movie_page_follows_the_movie_through_its_states() {
     site.post("/quick-add", json!({ "media_id": "movie:tmdb:603" }))
         .await;
     e.tick().await;
-    qb::set_state(&e.qb, &hash, "downloading", 0.62);
+    e.fake.lock().unwrap().set_state(&hash, "downloading", 0.62);
     e.tick().await;
     let (_, v) = site.get("/movie/movie:tmdb:603").await;
     assert_eq!(v["state"], "on_its_way", "{v}");
@@ -692,9 +703,8 @@ async fn the_app_reaches_the_page_routes_and_nothing_broader() {
 
 // ------------------------------------------------------------------ review fixes
 
-fn coexistence() -> ExecOptions {
+fn managed_with_tmdb() -> ExecOptions {
     ExecOptions {
-        mode: "coexistence",
         categories: Some(("um-movies", "um-tv")),
         tmdb: true,
         ..Default::default()
@@ -711,7 +721,7 @@ async fn run_command(e: &Exec, body: Value) {
 }
 
 fn client_adds(e: &Exec) -> usize {
-    e.qb.lock().unwrap().add_fields.len()
+    e.fake.lock().unwrap().add_fields.len()
 }
 
 #[tokio::test]
@@ -759,7 +769,7 @@ async fn switching_following_off_stops_late_episodes_but_a_chosen_season_keeps_t
 
 #[tokio::test]
 async fn a_stopped_episode_is_not_grabbed_by_its_seasons_request() {
-    let e = start_exec(coexistence()).await;
+    let e = start_exec(managed_with_tmdb()).await;
     let site = signed_in(e.state.clone()).await;
     let (_, v) = site
         .post("/quick-add", json!({ "media_id": "season:tvdb:999005:2" }))
@@ -798,7 +808,7 @@ async fn a_stopped_episode_is_not_grabbed_by_its_seasons_request() {
 
 #[tokio::test]
 async fn a_download_enqueued_after_a_stop_is_refused() {
-    let e = start_exec(coexistence()).await;
+    let e = start_exec(managed_with_tmdb()).await;
     let site = signed_in(e.state.clone()).await;
     let t = "Leviticus.2025.1080p.WEB-DL.DDP5.1.H.264-GRP";
     let (hash, rel) = e.publish(t, t, vec![(format!("{t}.mkv"), mkv(2))], 4.0, false);
@@ -891,7 +901,7 @@ async fn a_download_that_has_all_its_data_is_left_to_finish_by_stop() {
     );
     assert_eq!(e.grab_row(&id).state, "completed");
     assert!(
-        e.qb.lock().unwrap().torrents.contains_key(&hash),
+        e.fake.lock().unwrap().torrents.contains_key(&hash),
         "its data is not removed"
     );
 }
