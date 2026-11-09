@@ -1175,6 +1175,17 @@ async fn posters_come_only_from_the_configured_image_hosts() {
         site.art("series:tvmaze:9002", Some(&cookie)).await.status(),
         404
     );
+    // The configured host, with another address hidden in its path: joining that path must
+    // not move the fetch to the other host.
+    let mock = e.mock_addr;
+    e.mock.lock().unwrap().tvmaze_images.insert(
+        9003,
+        json!({ "medium": format!("http://{mock}/http://localhost:{port}/uploads/9003.jpg") }),
+    );
+    assert_eq!(
+        site.art("series:tvmaze:9003", Some(&cookie)).await.status(),
+        404
+    );
     assert!(image_fetches(&e).is_empty());
 }
 

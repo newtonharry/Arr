@@ -80,6 +80,8 @@ impl Art {
 
     /// The poster of a media id, if there is one.
     pub async fn poster(&self, st: &AppState, id: &MediaId) -> Option<Poster> {
+        // Every upstream call (the TVDB lookup included) runs under one permit, taken when needed.
+        let mut permit = None;
         let source = match id {
             MediaId::Movie { tmdb } => {
                 st.tmdb.as_ref()?;
@@ -96,7 +98,10 @@ impl Art {
                             .and_then(|s| s.tvmaze_id);
                         match known {
                             Some(id) => id,
-                            None => tv.by_tvdb(tvdb).await.ok()??.id,
+                            None => {
+                                permit = Some(self.permits.acquire().await.ok()?);
+                                tv.by_tvdb(tvdb).await.ok()??.id
+                            }
                         }
                     }
                 })
@@ -106,7 +111,10 @@ impl Art {
         if let Some(hit) = self.cached(&key) {
             return hit;
         }
-        let _permit = self.permits.acquire().await.ok()?;
+        if permit.is_none() {
+            permit = Some(self.permits.acquire().await.ok()?);
+        }
+        let _permit = permit;
         // Another request may have fetched it while this one waited.
         if let Some(hit) = self.cached(&key) {
             return hit;
@@ -186,7 +194,7 @@ impl Art {
                 });
                 Ok(path.and_then(|p| {
                     let base = &st.cfg.tmdb.as_ref()?.image_base_url;
-                    base.join(&format!("t/p/w342{p}")).ok()
+                    on_base(base, &format!("t/p/w342{p}"))
                 }))
             }
             Source::Show(id) => {
@@ -199,9 +207,16 @@ impl Art {
                     let base = &st.cfg.tvmaze.as_ref()?.image_base_url;
                     // Only the path is used: the address is always the configured host's.
                     (u.host_str() == base.host_str()).then_some(())?;
-                    base.join(u.path().trim_start_matches('/')).ok()
+                    on_base(base, u.path().trim_start_matches('/'))
                 }))
             }
         }
     }
+}
+
+/// `rel` joined onto `base`, only if the result stays on `base`'s origin (a path such as
+/// `http://elsewhere/x` would otherwise replace the host).
+fn on_base(base: &Url, rel: &str) -> Option<Url> {
+    let u = base.join(rel).ok()?;
+    (u.origin() == base.origin()).then_some(u)
 }
