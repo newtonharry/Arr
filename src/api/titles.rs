@@ -566,12 +566,9 @@ pub(super) async fn stop(State(st): St, ApiJson(body): ApiJson<StopBody>) -> Api
         if !targets.iter().all(|t| within(scope, *t)) {
             continue;
         }
-        // One that already has all its data is being added to Plex: let it finish.
-        if !matches!(g.state.as_str(), "queued" | "unconfirmed" | "downloading") {
-            finishing += 1;
-            continue;
-        }
-        downloads::cancel(
+        // One that already has all its data is being added to Plex: it is left to finish.
+        // That is decided under the grab lock, inside the cancel.
+        let r = downloads::cancel(
             &st,
             &g.id,
             CancelOptions {
@@ -579,11 +576,20 @@ pub(super) async fn stop(State(st): St, ApiJson(body): ApiJson<StopBody>) -> Api
                 removal: Removal::TorrentAndData,
                 ignore_seed_criteria: true,
                 research: false,
+                only_unfinished: true,
             },
         )
-        .await
-        .map_err(|e| action_error(e, st.cfg.download_backend().unwrap_or("download_client")))?;
-        cancelled += 1;
+        .await;
+        match r {
+            Ok(_) => cancelled += 1,
+            Err(downloads::ActionError::Conflict("finishing", _)) => finishing += 1,
+            Err(e) => {
+                return Err(action_error(
+                    e,
+                    st.cfg.download_backend().unwrap_or("download_client"),
+                ));
+            }
+        }
     }
     ok(
         json!({ "media_id": scope, "stopped": true, "cancelled": cancelled, "finishing": finishing }),

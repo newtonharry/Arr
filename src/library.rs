@@ -622,7 +622,7 @@ pub fn add_series(
             )?;
             let all = monitor == MonitorMode::All;
             tx.execute(
-                "UPDATE seasons SET monitored = ?2 WHERE series_id = ?1",
+                "UPDATE seasons SET monitored = ?2, by_follow = 0 WHERE series_id = ?1",
                 params![id, monitor != MonitorMode::None],
             )?;
             match monitor {
@@ -796,7 +796,7 @@ pub fn set_monitored(
             let sid = MediaId::Series(k).to_string();
             let n = tx.execute(
                 "INSERT INTO seasons (series_id, season, monitored) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM media WHERE id = ?1 AND managed = 1)
-                 ON CONFLICT (series_id, season) DO UPDATE SET monitored = excluded.monitored",
+                 ON CONFLICT (series_id, season) DO UPDATE SET monitored = excluded.monitored, by_follow = 0",
                 params![sid, s, monitored],
             )?;
             tx.execute(
@@ -909,13 +909,19 @@ pub fn set_following(
     };
     if changed > 0 {
         // Turning on: a season with something still to air also takes episodes added to it
-        // later. Turning off leaves every season flag alone (a season someone chose keeps
-        // matching season packs).
+        // later; if that is what switched the season on, it is remembered (`by_follow`).
+        // Turning off switches those seasons off again, and leaves every season someone
+        // chose (Get season, an import) as it is, so it keeps taking late episodes.
         if on {
             tx.execute(
-                "INSERT INTO seasons (series_id, season, monitored) SELECT DISTINCT series_id, season, 1 FROM episodes WHERE series_id = ?1 AND season > 0 AND (air_date_utc IS NULL OR air_date_utc > ?2)
-                 ON CONFLICT (series_id, season) DO UPDATE SET monitored = 1",
+                "INSERT INTO seasons (series_id, season, monitored, by_follow) SELECT DISTINCT series_id, season, 1, 1 FROM episodes WHERE series_id = ?1 AND season > 0 AND (air_date_utc IS NULL OR air_date_utc > ?2)
+                 ON CONFLICT (series_id, season) DO UPDATE SET by_follow = CASE WHEN seasons.monitored = 1 THEN seasons.by_follow ELSE 1 END, monitored = 1",
                 params![sid, now_s],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE seasons SET monitored = 0, by_follow = 0 WHERE series_id = ?1 AND by_follow = 1",
+                params![sid],
             )?;
         }
         tx.execute(

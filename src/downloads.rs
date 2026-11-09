@@ -2007,11 +2007,21 @@ pub struct CancelOptions {
     pub removal: Removal,
     pub ignore_seed_criteria: bool,
     pub research: bool,
+    /// Cancel only while the download is still being fetched (queued, unconfirmed or
+    /// downloading); one that has all its data is left to import (`Conflict("finishing")`).
+    /// Decided under the grab lock, so the worker cannot complete it in between.
+    pub only_unfinished: bool,
 }
 
 pub async fn cancel(st: &AppState, id: &str, o: CancelOptions) -> Result<Grab, ActionError> {
     let _guard = st.worker.grabs.lock().await;
     let g = load(st, id).await?;
+    if o.only_unfinished && !matches!(g.state.as_str(), "queued" | "unconfirmed" | "downloading") {
+        return Err(ActionError::Conflict(
+            "finishing",
+            format!("the download is {}; it is left to finish", g.state),
+        ));
+    }
     if !g.active && !matches!(g.state.as_str(), "imported" | "failed" | "cancelled") {
         return Err(ActionError::Conflict(
             "grab_state",

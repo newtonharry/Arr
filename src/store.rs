@@ -427,6 +427,8 @@ impl Store {
         }
         // Columns added within schema 3 after its first build (idempotent).
         ensure_column(&conn, "media", "monitor_new", "INTEGER NOT NULL DEFAULT 1")?;
+        // A season whose flag was set only because new episodes are followed (not chosen).
+        ensure_column(&conn, "seasons", "by_follow", "INTEGER NOT NULL DEFAULT 0")?;
         // When this server took over acquisition of an item (POST /library, or creation
         // through the API). NULL for items an import seeded.
         ensure_column(&conn, "media", "adopted_at", "TEXT")?;

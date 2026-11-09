@@ -3509,6 +3509,7 @@ async fn queue_cancel(
             removal: b.remove.unwrap_or(Removal::Keep),
             ignore_seed_criteria: b.ignore_seed_criteria,
             research: b.research,
+            only_unfinished: false,
         },
     )
     .await

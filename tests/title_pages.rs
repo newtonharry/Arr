@@ -689,3 +689,209 @@ async fn the_app_reaches_the_page_routes_and_nothing_broader() {
         .unwrap();
     assert_eq!(r.status(), 401);
 }
+
+// ------------------------------------------------------------------ review fixes
+
+fn coexistence() -> ExecOptions {
+    ExecOptions {
+        mode: "coexistence",
+        categories: Some(("um-movies", "um-tv")),
+        tmdb: true,
+        ..Default::default()
+    }
+}
+
+async fn run_command(e: &Exec, body: Value) {
+    let (s, v, text) = e.json(e.post("/api/v1/commands").json(&body)).await;
+    assert!(s == 202 || s == 200, "{text}");
+    let id = v["id"].as_str().unwrap().to_string();
+    e.tick().await;
+    let (_, v, _) = e.json(e.get(&format!("/api/v1/commands/{id}"))).await;
+    assert_eq!(v["command"]["state"], "completed", "{v}");
+}
+
+fn client_adds(e: &Exec) -> usize {
+    e.qb.lock().unwrap().add_fields.len()
+}
+
+#[tokio::test]
+async fn switching_following_off_stops_late_episodes_but_a_chosen_season_keeps_taking_them() {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    site.post(
+        "/follow",
+        json!({ "media_id": "series:tvdb:999005", "on": true }),
+    )
+    .await;
+    site.post("/quick-add", json!({ "media_id": "season:tvdb:999005:2" }))
+        .await;
+    let (_, v) = site
+        .post(
+            "/follow",
+            json!({ "media_id": "series:tvdb:999005", "on": false }),
+        )
+        .await;
+    assert_eq!(v["following"], false);
+    // The provider now lists a coming episode of season 1 and a late one of season 2.
+    e.mock.lock().unwrap().tvmaze_extra.insert(
+        "9005".into(),
+        vec![
+            json!({ "season": 1, "number": 4, "name": "Ep 4", "type": "regular", "airstamp": "2099-02-01T02:00:00+00:00", "runtime": 1 }),
+            json!({ "season": 2, "number": 3, "name": "Ep 3", "type": "regular", "airstamp": "2025-06-15T02:00:00+00:00", "runtime": 1 }),
+        ],
+    );
+    run_command(
+        &e,
+        json!({ "name": "refresh_metadata", "media_id": "series:tvdb:999005" }),
+    )
+    .await;
+    assert_eq!(
+        monitored(&e, "parity", 1).await,
+        0,
+        "following is off: nothing new in season 1"
+    );
+    assert_eq!(
+        monitored(&e, "parity", 2).await,
+        3,
+        "a season someone chose takes its late episode"
+    );
+}
+
+#[tokio::test]
+async fn a_stopped_episode_is_not_grabbed_by_its_seasons_request() {
+    let e = start_exec(coexistence()).await;
+    let site = signed_in(e.state.clone()).await;
+    let (_, v) = site
+        .post("/quick-add", json!({ "media_id": "season:tvdb:999005:2" }))
+        .await;
+    assert_eq!(v["outcome"], "looking", "{v}");
+    let (_, reqs, _) = e.json(e.get("/api/v1/requests")).await;
+    assert_eq!(reqs["items"][0]["state"], "active", "{reqs}");
+    let (s, v) = site
+        .post("/stop", json!({ "media_id": "episode:tvdb:999005:2:1" }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    // A copy of just that episode turns up for the season's search and its own.
+    let t = "Parity.Partial.S02E01.1080p.WEB-DL.x264-UM";
+    let (_, r) = e.publish(t, t, vec![(format!("{t}.mkv"), mkv(1))], 1.0, false);
+    e.search_results("Parity Partial S02", vec![r.clone()]);
+    e.search_results("Parity Partial S02E01", vec![r]);
+    let now = time::OffsetDateTime::now_utc();
+    for days in [1, 3] {
+        e.tick_at(now + time::Duration::days(days)).await;
+    }
+    let searched = e.mock.lock().unwrap().log.iter().any(|q| q.contains("S02"));
+    assert!(searched, "the retry did search for the season");
+    let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
+    assert_eq!(q["items"], json!([]), "{q}");
+    assert_eq!(client_adds(&e), 0);
+    // Asking for the episode itself works again.
+    let (s, _) = site
+        .post(
+            "/quick-add",
+            json!({ "media_id": "episode:tvdb:999005:2:1" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(monitored(&e, "parity", 2).await, 2);
+}
+
+#[tokio::test]
+async fn a_download_enqueued_after_a_stop_is_refused() {
+    let e = start_exec(coexistence()).await;
+    let site = signed_in(e.state.clone()).await;
+    let t = "Leviticus.2025.1080p.WEB-DL.DDP5.1.H.264-GRP";
+    let (hash, rel) = e.publish(t, t, vec![(format!("{t}.mkv"), mkv(2))], 4.0, false);
+    e.search_results("Leviticus 2025", vec![rel]);
+    let add = json!({ "media_id": "movie:tmdb:900001", "search": false });
+    let (s, _, text) = e.json(e.post("/api/v1/library").json(&add)).await;
+    assert_eq!(s, 201, "{text}");
+    let (_, v, text) = e
+        .json(e.get("/api/v1/media/movie:tmdb:900001/releases"))
+        .await;
+    let release_ref = v["releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["decision"]["approved"] == true)
+        .unwrap_or_else(|| panic!("an approved release: {text}"))["release_ref"]
+        .clone();
+    let grab = json!({ "media_id": "movie:tmdb:900001", "release_ref": release_ref });
+    // The grab passes its checks, then its torrent fetch is held open.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    e.mock.lock().unwrap().download_gate = Some(gate.clone());
+    let pending = tokio::spawn(e.post("/api/v1/grabs").json(&grab).send());
+    for _ in 0..1000 {
+        if e.mock.lock().unwrap().downloads.contains(&hash) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        e.mock.lock().unwrap().downloads.contains(&hash),
+        "the fetch started"
+    );
+    let (s, v) = site
+        .post("/stop", json!({ "media_id": "movie:tmdb:900001" }))
+        .await;
+    assert_eq!(
+        (s, v["cancelled"].clone()),
+        (200, json!(0)),
+        "nothing recorded yet: {v}"
+    );
+    gate.notify_one();
+    let r = pending.await.unwrap().unwrap();
+    let status = r.status().as_u16();
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (409, Some("not_adopted")),
+        "{v}"
+    );
+    e.tick().await;
+    assert_eq!(client_adds(&e), 0);
+    let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
+    assert_eq!(q["items"], json!([]), "{q}");
+}
+
+#[tokio::test]
+async fn a_download_that_has_all_its_data_is_left_to_finish_by_stop() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = signed_in(e.state.clone()).await;
+    let t = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(t, t, vec![(format!("{t}.mkv"), mkv(1))], 1.5, false);
+    e.search_results("Slow Horses S01E02", vec![r]);
+    let (_, v, _) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "episode:tvdb:372264:1:2", "execute": true })),
+        )
+        .await;
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    // The worker has just moved it on: all its data is there and it is about to import.
+    let g = id.clone();
+    e.state
+        .store
+        .blocking(move |c| {
+            Ok(c.execute("UPDATE grabs SET state = 'completed' WHERE id = ?1", [&g])?)
+        })
+        .unwrap();
+    let (s, v) = site
+        .post("/stop", json!({ "media_id": "season:tvdb:372264:1" }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["cancelled"].clone(), v["finishing"].clone()),
+        (json!(0), json!(1)),
+        "{v}"
+    );
+    assert_eq!(e.grab_row(&id).state, "completed");
+    assert!(
+        e.qb.lock().unwrap().torrents.contains_key(&hash),
+        "its data is not removed"
+    );
+}

@@ -186,6 +186,7 @@ body.sheet-open{overflow:hidden}
 .stretch::after{content:"";position:absolute;inset:0;border-radius:18px}
 .stretch:focus-visible{outline:none}
 .stretch:focus-visible::after{outline:3px solid var(--ring);outline-offset:3px}
+.item,.idea{position:relative}
 .item:has(.stretch){cursor:pointer}
 .idea{position:relative}
 .item .btn,.item .link,.idea .btn{position:relative;z-index:1}

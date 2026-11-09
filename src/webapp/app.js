@@ -400,9 +400,11 @@ function renderLibrary(t) {
 
 // ---------- title pages (a show or a movie, as a sheet over the current screen) ----------
 const sheet = $('#sheet'), panel = $('#panel');
-const P = { id: '', kind: '', token: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false };
+const P = { id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false };
 let bgHash = '', sheetFills = [];
 const sheetOpen = () => !sheet.hidden;
+// Everything behind the sheet: out of reach of the keyboard and of assistive tech while it is open.
+const behind = () => [$('.skip'), top, view, $('#foot')];
 const enc = encodeURIComponent;
 const pct = (p) => Math.round(p * 100);
 const fmtDate = (s) => {
@@ -445,7 +447,7 @@ function openTitle(t) {
     P.scrollY = window.scrollY;
     sheet.hidden = false;
     document.body.classList.add('sheet-open');
-    for (const el of [top, view, $('#foot')]) el.inert = true;
+    for (const el of behind()) el.inert = true;
   }
   clearTimeout(P.pollT); clearTimeout(P.askT);
   Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false });
@@ -460,7 +462,7 @@ function closeSheet() {
   P.token++;
   sheet.hidden = true;
   document.body.classList.remove('sheet-open');
-  for (const el of [top, view, $('#foot')]) el.inert = false;
+  for (const el of behind()) el.inert = false;
   panel.replaceChildren();
   document.title = pageName(parseHash(bgHash).path) + ' · Arr';
   window.scrollTo(0, P.scrollY);
@@ -479,36 +481,47 @@ document.addEventListener('keydown', (e) => {
   if (P.ask) { P.ask = ''; paintSheet(); } else dismiss();
 });
 sheet.addEventListener('click', (e) => { if (e.target === sheet) dismiss(); });
+// Tab and Shift-Tab stay inside the sheet.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Tab' || !sheetOpen()) return;
+  const f = [...panel.querySelectorAll('a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])')].filter((x) => !x.hidden && x.getClientRects().length);
+  const a = document.activeElement;
+  if (!f.length) { e.preventDefault(); panel.focus(); return; }
+  if (!panel.contains(a)) { e.preventDefault(); f[0].focus(); }
+  else if (e.shiftKey && a === f[0]) { e.preventDefault(); f[f.length - 1].focus(); }
+  else if (!e.shiftKey && a === f[f.length - 1]) { e.preventDefault(); f[0].focus(); }
+});
 
 function errText(r) {
   if (P.kind === 'movie') return r && r.status === 404 ? (S.feed && S.feed.movies_enabled === false ? "Movie details need movie search, which isn't set up yet." : "Arr doesn't have details for this movie right now.") : "Couldn't load this movie just now.";
   return r && r.status === 404 ? "Arr doesn't have an episode list for this show right now." : "Couldn't load this show just now.";
 }
+// Reads are numbered: a newer read, or the start of an action, makes an older answer stale.
 async function loadTitle(quiet) {
-  const tk = P.token;
+  const tk = P.token, sq = ++P.seq, stale = () => tk !== P.token || sq !== P.seq;
   try {
     const r = await api(`/v1/${P.kind}/${enc(P.id)}`);
-    if (tk !== P.token) return;
+    if (stale()) return;
     if (!r.ok) { if (!P.data) P.err = errText(r); paintSheet(); return; }
     P.data = r.data; P.err = '';
     document.title = `${r.data.title} · Arr`;
-    if (P.kind === 'show') await Promise.all([...P.open].map((n) => loadSeason(n, tk)));
+    if (P.kind === 'show') await Promise.all([...P.open].map((n) => loadSeason(n, tk, sq)));
   } catch {
-    if (tk !== P.token) return;
+    if (stale()) return;
     if (!P.data) P.err = "Couldn't reach Arr just now.";
   }
-  if (tk !== P.token) return;
+  if (stale()) return;
   paintSheet();
   schedulePoll();
 }
-async function loadSeason(n, tk) {
+async function loadSeason(n, tk, sq) {
   const cur = P.seasons.get(n) || {};
   try {
     const r = await api(`/v1/show/${enc(P.id)}/season/${n}`);
-    if (tk !== P.token) return;
+    if (tk !== P.token || sq !== P.seq) return;
     P.seasons.set(n, r.ok ? { eps: r.data.episodes } : { ...cur, loading: false, err: "Couldn't load the episodes." });
   } catch {
-    if (tk === P.token) P.seasons.set(n, { ...cur, loading: false, err: "Couldn't load the episodes." });
+    if (tk === P.token && sq === P.seq) P.seasons.set(n, { ...cur, loading: false, err: "Couldn't load the episodes." });
   }
 }
 function schedulePoll() {
@@ -517,7 +530,10 @@ function schedulePoll() {
   const moving = P.kind === 'movie' ? P.data.state === 'on_its_way' : P.data.seasons.some((s) => s.state === 'on_its_way');
   if (!moving) return;
   const tk = P.token;
-  P.pollT = setTimeout(() => { if (tk === P.token) loadTitle(true); }, 5000);
+  P.pollT = setTimeout(() => {
+    if (tk !== P.token) return;
+    if (P.busy.size || P.followBusy) schedulePoll(); else loadTitle(true);
+  }, 5000);
 }
 
 function paintSheet() {
@@ -590,6 +606,7 @@ function actionNode(key, kind, label, noun, scope) {
 }
 async function act(key, kind, scope) {
   const tk = P.token;
+  P.seq++; // an older read must not overwrite what this changes
   P.busy.add(key); P.ask = ''; P.msg.delete(key); paintSheet();
   let res;
   try {
@@ -607,6 +624,7 @@ async function act(key, kind, scope) {
 async function toggleFollow() {
   if (P.followBusy) return;
   const want = !P.data.following, tk = P.token;
+  P.seq++;
   P.followBusy = true; P.data.following = want; P.msg.delete('follow'); paintSheet();
   let bad = false;
   try {
@@ -649,7 +667,7 @@ function toggleSeason(n) {
   if (!(P.seasons.get(n) || {}).eps) {
     P.seasons.set(n, { loading: true });
     const tk = P.token;
-    loadSeason(n, tk).then(() => { if (tk === P.token) paintSheet(); });
+    loadSeason(n, tk, P.seq).then(() => { if (tk === P.token) paintSheet(); });
   }
   paintSheet();
 }
@@ -661,7 +679,7 @@ function episodesNode(n) {
   }
   if (st.err) {
     return h('div', { class: 'eps-err' }, hint(st.err, 'status'),
-      h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'eretry:' + n, onclick: () => { P.seasons.set(n, { loading: true }); paintSheet(); const tk = P.token; loadSeason(n, tk).then(() => { if (tk === P.token) paintSheet(); }); } }, ic('retry'), 'Try again'));
+      h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'eretry:' + n, onclick: () => { P.seasons.set(n, { loading: true }); paintSheet(); const tk = P.token; loadSeason(n, tk, P.seq).then(() => { if (tk === P.token) paintSheet(); }); } }, ic('retry'), 'Try again'));
   }
   return h('div', { class: 'eps', 'aria-busy': 'true' }, [1, 2, 3].map(() => h('div', { class: 'ep' }, h('div', { class: 'sk', style: 'width:28px' }), h('div', { class: 'what' }, h('div', { class: 'sk', style: 'width:55%' })))));
 }
