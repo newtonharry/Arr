@@ -22,7 +22,6 @@ let token = 0, pollT = 0, retryT = 0, feedBusy = false, searchSeq = 0, searchAbo
 // ---------- drawing ----------
 let rerender = () => {}, pendingFk = null;
 const I = { genre: '', own: false }; // Ideas: the genre picked, and whether shows already here are listed
-const T = { text: '', undo: null, id: 0 }; // the toast
 let toastT = 0;
 const later = [];
 // Focus that a redraw takes away (a button swapped for another) goes to the element with the same data-fk.
@@ -243,9 +242,9 @@ async function addOne(it) {
   } catch { next = { msg: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   A.set(it.id, next); bump(); say(next.msg);
   if (next.err) return;
-  // Undo only for a title this tap started: the button said Add, so it was not tracked before.
+  // Undo only for a title that was not in the catalog at all before this tap.
   const o = got.outcome;
-  toastAdded(it.title, o, got.detail, () => undoAdd(it, got));
+  toastAdded(it.title, o, got.detail, it.fresh ? () => undoAdd(it, got) : null);
   loadFeed();
 }
 async function undoAdd(it, got) {
@@ -284,19 +283,8 @@ function stretch(text, id) {
 }
 const Title = ({ title, id }) => h('h3', { title }, stretch(title, id));
 
-// A small message at the bottom with one optional action; it goes away by itself.
-function toast(text, undo) {
-  const id = ++T.id;
-  Object.assign(T, { text, undo });
-  clearTimeout(toastT);
-  toastT = setTimeout(() => { if (T.id === id) { T.text = ''; T.undo = null; bump(); } }, 7000);
-  say(text);
-}
-function Toast() {
-  return h('div', { class: 'toast', hidden: !T.text },
-    h('span', null, T.text),
-    T.undo && h('button', { type: 'button', class: 'link', onClick: T.undo }, 'Undo'));
-}
+// A short note on the shared toast, with an optional Undo that says in a sentence what it did.
+function toast(text, undo) { showToast({ before: text, title: '', after: '' }, undo); }
 const owned = (x) => (x.owned ?? x.in_library) === true;
 // "Not interested": the idea goes at once; the server remembers it for everyone using this Arr.
 async function hideIdea(x) {
@@ -305,8 +293,9 @@ async function hideIdea(x) {
   S.ideas = { ...S.ideas, items: list.filter((i) => i !== x) };
   const back = () => { S.ideas = { ...S.ideas, items: S.ideas.items.some((i) => i.media_id === x.media_id) ? S.ideas.items : [...S.ideas.items.slice(0, at), x, ...S.ideas.items.slice(at)] }; };
   toast('Hidden', async () => {
-    T.text = ''; T.undo = null; back(); bump();
+    back(); bump();
     try { await api('/v1/ideas/hide/' + encodeURIComponent(x.media_id), { method: 'DELETE' }); } catch { /* shown again for now; hidden again on the next load */ }
+    return 'It is back in Ideas.';
   });
   let ok = false;
   try { ok = (await api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } })).ok; } catch { /* below */ }
@@ -607,7 +596,8 @@ function SearchRow({ x, label }) {
       h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), haveBadge(x, label)),
       chooseLink({ media_id: x.media_id, title: x.title, in_library: (x.in_catalog && x.monitored) || !!x.library_state }));
   }
-  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add' };
+  // fresh: Arr had never heard of it (not in the catalog, no file), so Undo can put things back.
+  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add' , fresh: !x.in_catalog && !x.has_file && !x.library_state };
   return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
@@ -762,13 +752,17 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Tab' || !P.shown) return;
   const panel = $('#confirm') || $('#panel'); // an open question holds the focus until it is answered
-  // The toast, when there is one, is part of the loop so its Undo can be reached (not while a question is open).
-  const f = [...panel.querySelectorAll('a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])'), ...(panel.id === 'confirm' ? [] : document.querySelectorAll('#toast button'))].filter((x) => !x.hidden && x.getClientRects().length);
+  // The toast, when there is one, is part of the loop. It comes before the sheet in the page, so it
+  // is first here too and the loop runs in the order the browser would tab (not while a question is open).
+  const f = [...(panel.id === 'confirm' ? [] : document.querySelectorAll('#toast button')), ...panel.querySelectorAll('a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])')].filter((x) => !x.hidden && x.getClientRects().length);
   const a = document.activeElement;
   if (!f.length) { e.preventDefault(); panel.focus(); return; }
-  if (!panel.contains(a) && !inToast(a)) { e.preventDefault(); f[0].focus(); }
-  else if (e.shiftKey && a === f[0]) { e.preventDefault(); f[f.length - 1].focus(); }
-  else if (!e.shiftKey && a === f[f.length - 1]) { e.preventDefault(); f[0].focus(); }
+  const i = f.indexOf(a), last = f.length - 1;
+  // The browser steps inside the panel (radio groups and all); the edges and the toast are ours.
+  if (i < 0) { e.preventDefault(); f[0].focus(); }
+  else if (e.shiftKey && i === 0) { e.preventDefault(); f[last].focus(); }
+  else if (!e.shiftKey && i === last) { e.preventDefault(); f[0].focus(); }
+  else if (inToast(a)) { e.preventDefault(); f[i + (e.shiftKey ? -1 : 1)].focus(); }
 });
 
 function errText(r) {
@@ -901,8 +895,8 @@ function stateOf(scope) {
   if (e) return (((P.seasons.get(Number(e[1])) || {}).eps || []).find((x) => x.media_id === scope) || {}).state || null;
   return null;
 }
-// Undo for a Get on the page: only a movie, season or episode that was not wanted before (state
-// 'none'), so stopping it puts things back as they were.
+// Undo for a Get on the page: only when Arr did not track the title at all before (the page said
+// tracked: false), so stopping it puts things back as they were. Unsure means no Undo.
 function undoGet(scope, tk) {
   return async () => {
     const m = await stopTitle(scope);
@@ -911,7 +905,7 @@ function undoGet(scope, tk) {
   };
 }
 async function act(key, kind, scope) {
-  const tk = P.token, title = P.data ? P.data.title : '', was = kind === 'get' ? stateOf(scope) : null;
+  const tk = P.token, title = P.data ? P.data.title : '', was = kind === 'get' && P.data && P.data.tracked === false ? stateOf(scope) : null;
   P.seq++; // an older read must not overwrite what this changes
   P.busy.add(key); P.ask = ''; P.msg.delete(key); bump();
   let res, got = null;
@@ -934,7 +928,7 @@ async function act(key, kind, scope) {
 }
 async function toggleFollow() {
   if (P.followBusy) return;
-  const want = !P.data.following, tk = P.token;
+  const want = !P.data.following, tk = P.token, fresh = P.data.tracked === false;
   P.seq++;
   P.followBusy = true; P.data.following = want; P.msg.delete('follow'); bump();
   let bad = false;
@@ -954,7 +948,7 @@ async function toggleFollow() {
   say(want ? 'Arr will get new episodes as they air.' : 'Arr will not look for new episodes.');
   if (want) {
     const id = P.data.media_id;
-    showToast({ before: 'Following ', title: P.data.title, after: '' }, async () => {
+    showToast({ before: 'Following ', title: P.data.title, after: '' }, !fresh ? null : async () => {
       const m = await unfollowTitle(id);
       if (m && tk === P.token && P.shown) loadTitle(true);
       return m;
@@ -1092,7 +1086,7 @@ async function pickCopy(c) {
   if (o.picking) return;
   const tk = P.token;
   o.picking = c.id; P.msg.delete('copy'); P.seq++; bump();
-  const scope = o.copies.data.media_id, was = stateOf(scope), title = P.data.title;
+  const scope = o.copies.data.media_id, was = P.data.tracked === false ? stateOf(scope) : null, title = P.data.title;
   let res;
   try {
     const r = await api(`/v1/copies/${enc(scope)}/get`, { method: 'POST', body: { id: c.id, ...(pickedLevel() ? { level: pickedLevel() } : {}) } });
@@ -1430,7 +1424,6 @@ function App() {
     h(Toast),
     h(Footer),
     h(Sheet),
-    h(Toast),
     h('div', { id: 'live', class: 'sr', 'aria-live': 'polite' }, S.live || null));
 }
 

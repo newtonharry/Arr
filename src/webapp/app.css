@@ -260,8 +260,6 @@ h2 .link .ic{width:16px;height:16px;stroke-width:3}
 .link.quiet{display:block;padding:0;min-height:44px;font-size:13px;color:var(--muted);font-weight:700;text-align:left}
 .idea .link.quiet{min-height:36px;text-align:center;width:100%}
 .what .link.quiet{min-height:40px}
-.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(var(--tab-h) + env(safe-area-inset-bottom) + 12px);z-index:40;display:flex;align-items:center;gap:6px;width:max-content;max-width:calc(100vw - 32px);padding:4px 6px 4px 16px;border-radius:14px;background:var(--ink);color:var(--bg);font-weight:700}
-.toast .link{color:inherit}
 /* search before typing */
 .recent{list-style:none;padding:0;display:grid;gap:8px}
 .recent li{display:flex;align-items:center;background:var(--card);border:2px solid var(--line);border-radius:14px}
