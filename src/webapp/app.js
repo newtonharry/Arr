@@ -462,7 +462,7 @@ function go(q) {
 async function boot2() {
   try {
     const r = await api('/me');
-    if (r.ok) { $('#who').textContent = r.data.email ? 'Signed in as ' + r.data.email : 'Signed in'; $('#foot').hidden = false; route(); }
+    if (r.ok) { $('#who').textContent = r.data.email ? 'Signed in as ' + r.data.email : 'Signed in'; $('#foot').hidden = false; route(); if (!onHome()) loadFeed(); }
   } catch { if (!S.out) setTimeout(boot2, 5000); }
 }
 boot();
