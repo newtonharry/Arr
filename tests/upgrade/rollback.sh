@@ -54,9 +54,16 @@ trap 'stop; [ -z "$mockpid" ] || kill "$mockpid" 2>/dev/null || true; rm -rf "$w
 
 # --- the previous release, checksum verified
 mkdir "$work/release"
-# GitHub's release downloads sometimes answer 504 for a moment: retry rather than fail the run.
-curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 "$base/$asset" -o "$work/release/$asset" || fail "cannot download $base/$asset"
-curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 "$base/$asset.sha256" -o "$work/release/$asset.sha256" || fail "cannot download $base/$asset.sha256"
+# GitHub's anonymous release downloads can answer 504 for long stretches (an overloaded web
+# tier). With a token (CI sets GH_TOKEN) and the default base, download signed in through gh,
+# which isn't affected; otherwise curl with retries.
+if [ -z "${ARR_OLD_BASE:-}" ] && [ -n "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+	gh release download --repo newtonharry/Arr --dir "$work/release" --pattern "$asset" --pattern "$asset.sha256" ||
+		fail "cannot download the latest release's $asset with gh"
+else
+	curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 "$base/$asset" -o "$work/release/$asset" || fail "cannot download $base/$asset"
+	curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 "$base/$asset.sha256" -o "$work/release/$asset.sha256" || fail "cannot download $base/$asset.sha256"
+fi
 want=$(cut -d' ' -f1 "$work/release/$asset.sha256")
 have=$(sha256sum "$work/release/$asset" | cut -d' ' -f1)
 [ -n "$want" ] && [ "$want" = "$have" ] || fail "checksum mismatch for $asset ($want vs $have)"
