@@ -499,17 +499,19 @@ function errText(r) {
 // Reads are numbered: a newer read, or the start of an action, makes an older answer stale.
 async function loadTitle(quiet) {
   const tk = P.token, sq = ++P.seq, stale = () => tk !== P.token || sq !== P.seq;
+  // Expanded seasons reload on their own, so a failed title read can't leave one loading forever.
+  const seasons = P.kind === 'show' ? Promise.all([...P.open].map((n) => loadSeason(n, tk, sq))) : null;
   try {
     const r = await api(`/v1/${P.kind}/${enc(P.id)}`);
     if (stale()) return;
-    if (!r.ok) { if (!P.data) P.err = errText(r); paintSheet(); return; }
+    if (!r.ok) { if (!P.data) P.err = errText(r); await seasons; if (!stale()) paintSheet(); return; }
     P.data = r.data; P.err = '';
     document.title = `${r.data.title} · Arr`;
-    if (P.kind === 'show') await Promise.all([...P.open].map((n) => loadSeason(n, tk, sq)));
   } catch {
     if (stale()) return;
     if (!P.data) P.err = "Couldn't reach Arr just now.";
   }
+  await seasons;
   if (stale()) return;
   paintSheet();
   schedulePoll();
