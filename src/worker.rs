@@ -923,16 +923,16 @@ pub async fn refresh_metadata(
     Ok(json!({ "series": series, "movies": movies }))
 }
 
-/// Movie release evidence, status and runtime from TMDB (fresh), when configured. Without
-/// TMDB, availability still advances with the clock from the recorded release dates.
+/// Movie release evidence, status and runtime from Plex or TMDB (fresh), when configured.
+/// Without either, availability still advances with the clock from the recorded release dates.
 async fn refresh_movies(
     st: &AppState,
     only: Option<MediaId>,
     now: OffsetDateTime,
 ) -> Result<Value> {
-    let Some(tmdb) = st.tmdb.as_ref() else {
+    let Some(tmdb) = st.movies.as_ref() else {
         return Ok(
-            json!({ "skipped": "TMDB is not configured; availability follows the recorded release dates" }),
+            json!({ "skipped": "no movie metadata source (Plex or TMDB) is configured; availability follows the recorded release dates" }),
         );
     };
     let only_s = only.map(|m| m.to_string());
@@ -952,11 +952,13 @@ async fn refresh_movies(
         let fetched = match tmdb.movie_with(tmdb_id, true).await {
             Ok(Some(m)) => m,
             Ok(None) => {
-                results.push(json!({ "movie": id, "error": "not found on TMDB" }));
+                results.push(json!({ "movie": id, "error": "no movie metadata found" }));
                 continue;
             }
             Err(e) => {
-                results.push(json!({ "movie": id, "error": format!("tmdb {}", e.describe()) }));
+                results.push(
+                    json!({ "movie": id, "error": format!("movie metadata {}", e.describe()) }),
+                );
                 if matches!(
                     e,
                     crate::upstream::UpstreamError::Timeout
@@ -972,10 +974,14 @@ async fn refresh_movies(
             continue;
         };
         let release = fetched.release();
-        // Only evidence TMDB actually states replaces what is recorded.
+        // Only evidence the provider actually states replaces what is recorded. "On sale today"
+        // (Plex) is an observation, so it never moves an earlier recorded date forward.
         movie.in_cinemas = release.in_cinemas.or(movie.in_cinemas);
         movie.physical_release = release.physical_release.or(movie.physical_release);
-        movie.digital_release = release.digital_release.or(movie.digital_release);
+        movie.digital_release = match (release.digital_release, movie.digital_release) {
+            (Some(new), Some(old)) if fetched.observed_digital => Some(new.min(old)),
+            (new, old) => new.or(old),
+        };
         movie.status = fetched.status.clone().or(movie.status);
         movie.runtime_minutes = fetched.runtime.filter(|r| *r > 0).or(movie.runtime_minutes);
         let (id2, now_s, json_s) = (id.clone(), ts(now), serde_json::to_string(&movie)?);

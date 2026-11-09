@@ -1,9 +1,12 @@
-# Getting a TMDB key
+# A TMDB key (optional)
 
-Arr finds TV shows through TVmaze, which needs no key. To find **movies you don't own yet**,
-it needs a free key from [TMDB](https://www.themoviedb.org) (The Movie Database), which tells
-Arr each movie's exact title, year, other titles, runtime and release dates. Without a key,
-everything else works: your Plex library, TV shows, and the movies you already have.
+Arr finds movies through your Plex sign-in, so you don't need a TMDB key. TV shows come from
+TVmaze, which needs no key either.
+
+A free key from [TMDB](https://www.themoviedb.org) (The Movie Database) is an optional backup.
+With one, Arr asks TMDB whenever Plex can't answer, and when both answer it prefers TMDB's
+original language, other titles and release dates. If you already added a key, it stays and
+keeps working as the backup.
 
 It takes about five minutes, on a computer rather than a phone (TMDB's form isn't made for
 phones).
@@ -25,10 +28,7 @@ Arr checks every key with TMDB before saving it, so a mistyped key is caught str
 
 ## Adding it to Arr
 
-- **During setup:** paste it into the TMDB box on the setup page, or answer the installer's
-  question in a terminal install.
-- **Later**, after Arr is set up: run the install command again. If movie search is still off,
-  it asks for the key. To give it straight away:
+- **With the installer:** run the install command again with the key:
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --tmdb-key YOUR_KEY
@@ -37,19 +37,19 @@ Arr checks every key with TMDB before saving it, so a mistyped key is caught str
   On Windows, run `$env:ARR_TMDB_KEY = 'YOUR_KEY'` in PowerShell, then the install line.
 - **By hand:** `arr set --config <state folder>/config.toml tmdb-key`, then paste the key when
   it asks (or pipe it in: `printf %s YOUR_KEY | arr set --config ... tmdb-key`). It checks the
-  key, saves it and turns movie search on. Then
+  key, saves it and turns the backup on. Then
   [restart Arr](../README.md#restarting-arr).
 
 ## For AI agents installing Arr
 
-Ask the user for the key (it needs their TMDB login, so they create it themselves, following
-the steps above), then pass it with `--tmdb-key` (or `ARR_TMDB_KEY`). If TMDB doesn't accept
-the key, the installer stops with an `error:` line, and a re-run of an existing install stops
-before changing anything (at a terminal, `install.sh` warns and carries on without the key).
-`arr tmdb-key --check` (key on stdin) checks a key without saving it.
+Don't ask the user for a TMDB key: movies work without one. If the user already has a key and
+wants it used as the backup, pass it with `--tmdb-key` (or `ARR_TMDB_KEY`). If TMDB doesn't
+accept the key, the installer stops with an `error:` line, and a re-run of an existing install
+stops before changing anything. `arr tmdb-key --check` (key on stdin) checks a key without
+saving it.
 
-When movie search isn't set up, Arr's answers to your assistant say so and point here, so the
-assistant can walk the user through these steps.
+If movie search is reported as not set up, the install isn't connected to Plex: run the install
+command again to sign in to Plex.
 
 ## If TMDB doesn't accept the key
 

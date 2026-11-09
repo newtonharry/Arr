@@ -75,7 +75,7 @@ arr init --state-dir "$STATE"  # API token + standalone config template (never o
    curl -s -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{}' $API/setup/plex/bootstrap
    ```
    (or `arr bootstrap --config "$STATE/config.toml"` before `serve`). Owned movies
-   (TMDB id; IMDB-only items are resolved through TMDB when configured, otherwise reported
+   (TMDB id; IMDB-only items are resolved through Plex's metadata service, then TMDB when configured, otherwise reported
    unresolved) and owned episodes (TVDB id plus Plex's exact season/episode numbers) become
    catalog entries that are owned and **not monitored**. Ownership needs a validated local
    file: inside the mapped root, a plain relative video path, no symbolic links, present.

@@ -121,9 +121,6 @@ enum Command {
         /// Start with error reports ticked (the installer's --error-reports).
         #[arg(long)]
         error_reports: bool,
-        /// Tests: where TMDB's API is, for checking keys.
-        #[arg(long, hide = true, default_value = arr::tmdbkey::API_URL)]
-        tmdb_url: reqwest::Url,
     },
     /// Install Plex Media Server from Plex's package source, and make a media folder Plex and
     /// you can both use (Movies, TV Shows). Needs administrator rights; the setup page runs it
@@ -653,7 +650,7 @@ async fn run() -> Result<std::process::ExitCode> {
                     "search_backend": state.cfg.search_backend(),
                     "native_indexers": state.cfg.indexers.iter().map(|i| serde_json::json!({ "id": i.id, "name": i.name, "kind": i.kind })).collect::<Vec<_>>(),
                     "tvmaze_enabled": state.tvmaze.is_some(),
-                    "tmdb_configured": state.tmdb.is_some(),
+                    "tmdb_configured": state.movies.as_ref().is_some_and(arr::metadata::Movies::has_tmdb),
                     "execution_enabled": state.cfg.execution_enabled,
                     "qbittorrent_configured": state.cfg.qbittorrent.is_some(),
                     "download_backend": state.cfg.download_backend(),
@@ -746,7 +743,6 @@ async fn run() -> Result<std::process::ExitCode> {
             plex_installer,
             plex_port,
             error_reports,
-            tmdb_url,
         } => {
             wizard::run(wizard::Options {
                 state_dir,
@@ -763,7 +759,6 @@ async fn run() -> Result<std::process::ExitCode> {
                 plex_installer,
                 plex_port,
                 error_reports,
-                tmdb_url,
             })
             .await
         }

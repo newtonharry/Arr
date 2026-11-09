@@ -219,6 +219,9 @@ pub async fn identity(http: &reqwest::Client, base: &Url) -> Result<Identity, Up
 /// A Plex server's libraries, read with `token`.
 pub async fn sections(base_url: Url, token: Secret) -> Result<Vec<Section>, UpstreamError> {
     Plex::new(PlexConfig {
+        discover_url: base_url.clone(),
+        metadata_url: base_url.clone(),
+        image_base_url: base_url.clone(),
         base_url,
         token,
         movie_section: None,

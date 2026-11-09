@@ -374,15 +374,16 @@ async fn catalog_lookup_discovery_and_capabilities() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|p| p["name"] == "tmdb")
+        .find(|p| p["name"] == "plex")
         .unwrap();
     assert_eq!(tmdb["status"], "not_configured");
-    // The assistant is told how the user gets a key, so it can walk them through it.
+    // The assistant is told to have the user sign in to Plex, and not to ask for a TMDB key.
     let message = tmdb["message"].as_str().unwrap();
     assert!(
-        message.contains("docs/TMDB.md") && message.contains("--tmdb-key"),
+        message.contains("sign in to Plex") && message.contains("do not ask"),
         "{message}"
     );
+    assert!(!message.contains("--tmdb-key"), "{message}");
 
     let (_, v, _) = body(app.get("/api/v1/capabilities").send().await.unwrap()).await;
     let state = |n: &str| {
@@ -886,6 +887,35 @@ async fn search_results_are_cached_and_deterministic() {
     assert_eq!(
         a["counts"]["unique"].as_u64().unwrap() as usize,
         matrix_releases().len()
+    );
+}
+
+#[tokio::test]
+async fn movies_are_off_only_without_plex_and_tmdb() {
+    let app = start_app(&snapshot(), "", None, false).await;
+    let (s, v, text) = body(
+        app.post("/api/v1/quick-add")
+            .json(&json!({ "media_id": "movie:tmdb:12345" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, 200, "{text}");
+    assert_eq!(v["outcome"], "movies_off");
+    assert_eq!(
+        v["message"],
+        "Movie search isn't set up yet. The person who runs Arr needs to sign in to Plex again."
+    );
+    let (_, f, _) = body(app.get("/api/v1/feed").send().await.unwrap()).await;
+    assert_eq!(
+        (&f["movies_enabled"], &f["tmdb_backup"]),
+        (&json!(false), &json!(false))
+    );
+    let (_, v, _) = body(app.get("/api/v1/readiness").send().await.unwrap()).await;
+    assert!(
+        v.to_string().contains("Movie search isn't set up"),
+        "readiness says movies are off: {v}"
     );
 }
 

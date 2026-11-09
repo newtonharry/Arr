@@ -159,7 +159,7 @@ impl Movie {
             }
             None if self.is_available == Some(true) => Availability::Available,
             None => Availability::Unknown(
-                "no release date is known (physical/digital release or in-cinemas); configure [tmdb] or supply metadata release dates".into(),
+                "no release date is known (physical/digital release or in-cinemas); Arr checks again when its movie metadata refreshes, or supply metadata release dates".into(),
             ),
         }
     }

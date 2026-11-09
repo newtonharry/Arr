@@ -1,5 +1,5 @@
-//! Checking TMDB keys, so Arr can find movies you don't own yet. `arr set tmdb-key` (and the
-//! older `arr tmdb-key`) saves one; the setup page and installers check one first.
+//! Checking TMDB keys, the optional backup for movie details (Plex's metadata service is used
+//! first). `arr set tmdb-key` (and the older `arr tmdb-key`) saves one and checks it.
 
 use crate::{
     config::{MetadataConfig, Secret},
@@ -17,7 +17,7 @@ const CHECK_MOVIE: u32 = 603;
 /// Where TMDB's API lives (overridden in tests).
 pub const API_URL: &str = "https://api.themoviedb.org/";
 /// What Arr tells an assistant, and whoever runs it, when movie search isn't set up.
-pub const MISSING: &str = "Movie search isn't set up: Arr needs a free TMDB key to find movies the user doesn't own yet (TV works without one). Ask the user to get one at https://www.themoviedb.org/settings/api (steps: https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md), then run the Arr install command again with --tmdb-key KEY (on Windows, $env:ARR_TMDB_KEY = 'KEY' before the install line).";
+pub const MISSING: &str = "Movie search isn't set up: Arr reads movie details through the user's Plex sign-in, and this install isn't connected to Plex. Tell the user to run the Arr install command again to sign in to Plex (TV works without it). A TMDB key is only an optional backup; do not ask for one.";
 
 /// The key without spaces around it, or why it can't be one.
 pub fn shape(key: &str) -> Result<&str> {

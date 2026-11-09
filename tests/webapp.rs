@@ -777,22 +777,20 @@ async fn quick_add_gets_a_movie_or_a_show() {
 }
 
 #[tokio::test]
-async fn quick_add_says_so_when_movie_search_is_off() {
+async fn quick_add_finds_movies_through_plex_alone() {
     let e = start_exec(ExecOptions::default()).await;
     let (s, v, text) = e
         .json(
             e.post("/api/v1/quick-add")
-                .json(&json!({ "media_id": "movie:tmdb:12345" })),
+                .json(&json!({ "media_id": "movie:tmdb:910001" })),
         )
         .await;
     assert_eq!(s, 200, "{text}");
-    assert_eq!(v["outcome"], "movies_off");
-    assert_eq!(
-        v["message"],
-        "Movie search isn't set up yet. The person who runs Arr can add a free TMDB key."
-    );
+    assert_eq!(v["title"], "Plex Released Movie", "{v}");
+    assert_ne!(v["outcome"], "movies_off");
     let (_, f, _) = e.json(e.get("/api/v1/feed")).await;
-    assert_eq!(f["movies_enabled"], false);
+    assert_eq!(f["movies_enabled"], true);
+    assert_eq!(f["tmdb_backup"], false);
 }
 
 // ------------------------------------------------------------------ Google sign-in for the app
@@ -1190,7 +1188,7 @@ async fn posters_come_only_from_the_configured_image_hosts() {
 }
 
 #[tokio::test]
-async fn movie_posters_need_tmdb() {
+async fn movie_posters_need_plex_or_tmdb_to_know_the_movie() {
     let e = start_exec(ExecOptions::default()).await;
     let site = serve(e.state.clone()).await;
     let cookie = site.sign_in(&e).await;
@@ -1199,4 +1197,35 @@ async fn movie_posters_need_tmdb() {
         404
     );
     assert!(image_fetches(&e).is_empty());
+}
+
+#[tokio::test]
+async fn movie_posters_come_from_plex_on_its_image_host_only() {
+    // No TMDB key at all.
+    let e = start_exec(ExecOptions::default()).await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let r = site.art("movie:tmdb:910001", Some(&cookie)).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(&r.bytes().await.unwrap()[..3], &[0xff, 0xd8, 0xff]);
+    assert_eq!(image_fetches(&e), ["/uploads/rel0001.jpg"]);
+    // A poster address on another host is never fetched.
+    assert_eq!(
+        site.art("movie:tmdb:910003", Some(&cookie)).await.status(),
+        404
+    );
+    assert_eq!(image_fetches(&e).len(), 1);
+}
+
+#[tokio::test]
+async fn a_movie_plex_has_no_poster_for_falls_back_to_tmdb() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    // Plex doesn't know this one; TMDB's poster is used.
+    assert_eq!(
+        site.art("movie:tmdb:900001", Some(&cookie)).await.status(),
+        200
+    );
+    assert_eq!(image_fetches(&e), ["/t/p/w342/leviticus.jpg"]);
 }

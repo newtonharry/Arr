@@ -374,6 +374,12 @@ pub struct MockState {
     pub image_log: Vec<String>,
     /// TVmaze `image` values overriding the built-in ones, per show id.
     pub tvmaze_images: HashMap<u32, Value>,
+    /// Plex's metadata service answers HTTP 500.
+    pub plex_meta_fail: bool,
+    /// Each Plex metadata request: its path and query, and whether Arr's headers were right.
+    pub plex_meta_log: Vec<(String, bool)>,
+    /// Plex keys that have offers now, on top of the built-in ones.
+    pub plex_extra_offers: Vec<String>,
 }
 
 pub type Mock = Arc<Mutex<MockState>>;
@@ -675,6 +681,190 @@ async fn tmdb_details(
     }
 }
 
+// ------------------------------------------------------------------ Plex metadata service
+
+/// A Plex movie: `(key, tmdb id, title, original title, year, premiere, country, offers)`.
+/// Released with offers; unreleased with none; foreign with an original title; no TMDB guid.
+pub const PLEX_RELEASED: u32 = 910001;
+pub const PLEX_UNRELEASED: u32 = 910002;
+pub const PLEX_FOREIGN: u32 = 910003;
+
+fn plex_fixtures() -> Vec<Value> {
+    let movie = |key: &str,
+                 imdb: &str,
+                 tmdb: Option<u32>,
+                 title: &str,
+                 original: Option<&str>,
+                 date: &str,
+                 country: &str| {
+        let mut guids = vec![json!({ "id": format!("imdb://{imdb}") })];
+        if let Some(t) = tmdb {
+            guids.push(json!({ "id": format!("tmdb://{t}") }));
+        }
+        let mut v = json!({
+            "ratingKey": key, "guid": format!("plex://movie/{key}"), "type": "movie", "title": title,
+            "year": date[..4].parse::<u16>().unwrap(), "originallyAvailableAt": date, "duration": 6_000_000,
+            "Guid": guids, "Country": [{ "tag": country }],
+            // The host is the mock's (127.0.0.1), except the foreign movie's: not Plex's image host.
+            "thumb": if key == "for0001" { format!("https://elsewhere.example/uploads/{key}.jpg") } else { format!("http://127.0.0.1/uploads/{key}.jpg") },
+        });
+        if let Some(o) = original {
+            v["originalTitle"] = json!(o);
+        }
+        v
+    };
+    vec![
+        movie(
+            "rel0001",
+            "tt9100001",
+            Some(PLEX_RELEASED),
+            "Plex Released Movie",
+            None,
+            "2024-05-01",
+            "United States of America",
+        ),
+        movie(
+            "fut0001",
+            "tt9100002",
+            Some(PLEX_UNRELEASED),
+            "Plex Future Movie",
+            None,
+            "2099-01-01",
+            "United Kingdom",
+        ),
+        movie(
+            "for0001",
+            "tt9100003",
+            Some(PLEX_FOREIGN),
+            "Plex Foreign Movie",
+            Some("Le Film Etranger"),
+            "2001-04-25",
+            "France",
+        ),
+        movie(
+            "nog0001",
+            "tt9100004",
+            None,
+            "Plex Unmatched Movie",
+            None,
+            "2020-02-02",
+            "Canada",
+        ),
+    ]
+}
+
+/// Records the request; false when Arr's Plex headers are missing or wrong.
+fn plex_meta_seen(m: &Mock, headers: &HeaderMap, uri: &Uri) -> bool {
+    let header = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
+    let good = header("x-plex-token") == Some(PLEX_TOKEN)
+        && header("x-plex-product") == Some("Arr")
+        && header("x-plex-client-identifier").is_some_and(|c| !c.is_empty())
+        && header("accept") == Some("application/json");
+    let mut s = m.lock().unwrap();
+    s.plex_meta_log.push((uri.to_string(), good));
+    good && !s.plex_meta_fail
+}
+
+fn plex_denied(m: &Mock) -> Response {
+    if m.lock().unwrap().plex_meta_fail {
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+async fn plex_search(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !plex_meta_seen(&m, &headers, &uri) {
+        return plex_denied(&m);
+    }
+    let query = q.get("query").map(|s| s.to_lowercase()).unwrap_or_default();
+    let hits: Vec<Value> = plex_fixtures()
+        .into_iter()
+        .filter(|f| {
+            f["title"]
+                .as_str()
+                .is_some_and(|t| t.to_lowercase().contains(&query))
+        })
+        .map(|f| {
+            // Search hits carry no external ids.
+            let mut hit = f.clone();
+            hit.as_object_mut().unwrap().remove("Guid");
+            json!({ "Metadata": hit })
+        })
+        .collect();
+    axum::Json(json!({ "MediaContainer": { "SearchResults": [{ "SearchResult": hits }] } }))
+        .into_response()
+}
+
+async fn plex_matches(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !plex_meta_seen(&m, &headers, &uri) {
+        return plex_denied(&m);
+    }
+    let guid = q.get("guid").cloned().unwrap_or_default();
+    let found: Vec<Value> = plex_fixtures()
+        .into_iter()
+        .filter(|f| {
+            f["Guid"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|g| g["id"] == guid.as_str())
+        })
+        .collect();
+    axum::Json(json!({ "MediaContainer": { "Metadata": found } })).into_response()
+}
+
+async fn plex_details(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    uri: Uri,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Response {
+    if !plex_meta_seen(&m, &headers, &uri) {
+        return plex_denied(&m);
+    }
+    match plex_fixtures()
+        .into_iter()
+        .find(|f| f["ratingKey"] == key.as_str())
+    {
+        Some(f) => axum::Json(json!({ "MediaContainer": { "Metadata": [f] } })).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn plex_offers(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    uri: Uri,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Response {
+    if !plex_meta_seen(&m, &headers, &uri) {
+        return plex_denied(&m);
+    }
+    let offers = match key.as_str() {
+        "rel0001" => vec![
+            json!({ "platform": "netflix", "offerType": "subscription" }),
+            json!({ "platform": "apple", "offerType": "buy" }),
+        ],
+        "for0001" => vec![json!({ "platform": "apple", "offerType": "rent" })],
+        _ if m.lock().unwrap().plex_extra_offers.contains(&key) => {
+            vec![json!({ "platform": "apple", "offerType": "buy" })]
+        }
+        _ => vec![],
+    };
+    axum::Json(json!({ "MediaContainer": { "Availability": offers } })).into_response()
+}
+
 /// A tiny JPEG (the header bytes are all the app checks).
 const TINY_JPEG: &[u8] = &[
     0xff, 0xd8, 0xff, 0xe0, 0, 16, b'J', b'F', b'I', b'F', 0, 1, 0xff, 0xd9,
@@ -818,6 +1008,9 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         download_gate: None,
         image_log: vec![],
         tvmaze_images: HashMap::new(),
+        plex_meta_fail: false,
+        plex_meta_log: vec![],
+        plex_extra_offers: vec![],
     }));
     let app = Router::new()
         .route("/prowlarr/api/v1/search", get(prowlarr_search))
@@ -828,6 +1021,13 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         .route("/tvmaze/schedule/web", get(tvmaze_schedule))
         .route("/tmdb/3/search/movie", get(tmdb_search))
         .route("/tmdb/3/movie/{id}", get(tmdb_details))
+        .route("/plexmeta/library/search", get(plex_search))
+        .route("/plexmeta/library/metadata/matches", get(plex_matches))
+        .route("/plexmeta/library/metadata/{key}", get(plex_details))
+        .route(
+            "/plexmeta/library/metadata/{key}/availabilities",
+            get(plex_offers),
+        )
         .route("/t/p/w342/{file}", get(image_host))
         .route("/uploads/{file}", get(image_host))
         .route("/prowlarr/{id}/download", get(prowlarr_download))
@@ -1241,7 +1441,8 @@ pub async fn start_exec(o: ExecOptions) -> Exec {
          [migration]\nmode = '{mode}'\n\
          [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = {sample}\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 3600\n{stall}\
-         [plex]\nbase_url = \"http://{mock_addr}/plex\"\ntoken_file = \"secrets/plex_token\"\nmovie_section = 1\ntv_section = 2\n{tmdb}{extra}",
+         [plex]\nbase_url = \"http://{mock_addr}/plex\"\ntoken_file = \"secrets/plex_token\"\nmovie_section = 1\ntv_section = 2\n\
+         discover_url = \"http://{mock_addr}/plexmeta\"\nmetadata_url = \"http://{mock_addr}/plexmeta\"\nimage_base_url = \"http://{mock_addr}\"\n{tmdb}{extra}",
         cleanup = o.cleanup,
         dl = downloads.display(),
         movies = movies.display(),

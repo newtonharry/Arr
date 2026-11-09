@@ -1,4 +1,4 @@
-//! Posters for the web app: fetched from TMDB or TVmaze by the server, kept in a private
+//! Posters for the web app: fetched from Plex, TMDB or TVmaze by the server, kept in a private
 //! folder, and served from `/app/art/{media_id}`. Browsers never contact those sites.
 
 use crate::api::AppState;
@@ -84,7 +84,7 @@ impl Art {
         let mut permit = None;
         let source = match id {
             MediaId::Movie { tmdb } => {
-                st.tmdb.as_ref()?;
+                st.movies.as_ref()?;
                 Source::Movie(*tmdb)
             }
             _ => {
@@ -183,8 +183,17 @@ impl Art {
     async fn image_url(&self, st: &AppState, source: &Source) -> Result<Option<Url>, ()> {
         match source {
             Source::Movie(id) => {
-                let tmdb = st.tmdb.as_ref().ok_or(())?;
-                let movie = tmdb.movie(*id).await.map_err(|_| ())?;
+                let movies = st.movies.as_ref().ok_or(())?;
+                let movie = movies.movie(*id).await.map_err(|_| ())?;
+                // Plex's poster first (on Plex's image host only), then TMDB's.
+                if let Some(thumb) = movie.as_ref().and_then(|m| m.plex_thumb.as_deref())
+                    && let Ok(given) = Url::parse(thumb)
+                    && let Some(base) = st.cfg.plex.as_ref().map(|p| &p.image_base_url)
+                    && given.host_str() == base.host_str()
+                    && let Some(url) = on_base(base, given.path().trim_start_matches('/'))
+                {
+                    return Ok(Some(url));
+                }
                 let path = movie.and_then(|m| m.poster_path).filter(|p| {
                     p.starts_with('/')
                         && p.len() < 100

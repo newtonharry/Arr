@@ -69,14 +69,6 @@ button:disabled { opacity: .55; cursor: default; }
 .hint { font-size: 14px; margin: 4px 0 0; min-height: 1em; }
 .hint.bad { color: var(--bad); }
 .hint.good { color: var(--ok); font-weight: 600; }
-.tmdb { margin-top: 20px; padding-top: 8px; border-top: 1px solid var(--line); }
-.tmdb h3 { margin: 8px 0 4px; font-size: 17px; }
-.tmdb .steps { padding-left: 22px; }
-.tmdb .steps li { margin: 6px 0; }
-.answers { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 8px 0; font-size: 14px; }
-.answers dt { color: var(--muted); }
-.answers dd { margin: 0; overflow-wrap: anywhere; }
-button.copy { padding: 2px 8px; margin: 0 0 0 6px; font-size: 13px; font-weight: 500; }
 .ok { color: var(--ok); font-weight: 600; margin: 0; }
 .library + .library { margin-top: 20px; padding-top: 8px; border-top: 1px solid var(--line); }
 details { margin-top: 16px; }

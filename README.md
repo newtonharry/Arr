@@ -164,16 +164,14 @@ the [`uninstall.ps1`](uninstall.ps1) line. This deletes Arr's config, secrets an
 your movie and TV files. Then run the install command again; setup reads your Plex library
 again, so Arr still knows what you own.
 
-### A TMDB key, to find new movies
+### Movies come from Plex; a TMDB key is an optional backup
 
-Arr finds TV shows on its own, but to find movies you don't own yet it needs a free key from
-TMDB, the movie database. The setup page and the terminal install both walk you through
-getting one (about five minutes) and check it with TMDB before saving it; you can also skip
-it. [docs/TMDB.md](docs/TMDB.md) has the steps.
+Arr finds movies through your Plex sign-in, so there is nothing extra to set up. If you want a
+second source, give Arr a free key from TMDB, the movie database. Arr then uses it whenever
+Plex can't answer, and prefers its original languages, other titles and release dates. If you
+had a key before, it stays as that backup. [docs/TMDB.md](docs/TMDB.md) has the steps.
 
-Skipped it? Run the install command again: seeing that Arr can't find new movies yet, it walks
-you through it, checks the key, saves it and restarts Arr. Your settings stay as they are. To
-give the key straight away:
+To add a key later:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --tmdb-key YOUR_KEY
@@ -217,16 +215,14 @@ README and ask it to install Arr. It needs three things from you:
   folders.
 - **A Plex token**, only if the script can't read it from Plex's settings. In Plex Web, open
   any movie, choose ⋯ > Get Info > View XML, and copy the value after `X-Plex-Token=`.
-- **A TMDB key** (optional, free). Without one, Arr can't find movies you don't already own;
-  TV works without it. It needs your TMDB login, so you create it yourself:
-  [docs/TMDB.md](docs/TMDB.md) has the five-minute steps to follow, or to hand to you. The
-  installer checks the key and stops with an `error:` line if TMDB refuses it.
+- **Nothing else for movies:** they come from the Plex sign-in. A TMDB key is only an optional
+  backup (see [docs/TMDB.md](docs/TMDB.md)); don't ask the user for one.
 
 The agent then runs:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --yes \
-  --tmdb-key "$TMDB_KEY"            # add --plex-token "$PLEX_TOKEN" if asked for one
+curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --yes
+                                    # add --plex-token "$PLEX_TOKEN" if asked for one
 ```
 
 `--yes` accepts every default and never waits for input. A failed run ends with one `error:`
@@ -391,6 +387,6 @@ right to.
 
 ## Credits
 
-Movie details come from [TMDB](https://www.themoviedb.org) and TV details from
-[TVmaze](https://www.tvmaze.com). Arr uses TMDB and the TMDB APIs but is not endorsed,
-certified or otherwise approved by TMDB.
+Movie details come from Plex's metadata service and, if you add a key, from
+[TMDB](https://www.themoviedb.org); TV details come from [TVmaze](https://www.tvmaze.com).
+Arr uses TMDB and the TMDB APIs but is not endorsed, certified or otherwise approved by TMDB.

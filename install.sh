@@ -68,7 +68,7 @@ are; a setting you give is applied, or refused before anything changes.
   --movie-section N      Plex movie library number (default: the first one; first setup only)
   --tv-section N         Plex TV library number (default: the first one; first setup only)
   --downloads DIR        where torrents download before import (first setup only)
-  --tmdb-key KEY         TMDB API key or read token, to find movies you don't own yet
+  --tmdb-key KEY         optional backup: a TMDB API key or read token (movies come from Plex)
   --port N               API port (default: 8787; first setup only)
   --torrent-port N       BitTorrent port (default: 50413)
   --upload-limit-kib N   upload limit in KiB/s for all torrents (default: 0 = none)
@@ -203,48 +203,12 @@ open_page() {
 	"$@" >/dev/null 2>&1 </dev/null &
 }
 
-# A TMDB key lets Arr find movies you don't own yet (docs/TMDB.md). The setup page and Arr's
-# answers to an assistant give the same steps.
-tmdb_steps() {
-	say "Arr finds TV shows on its own. To find movies you don't have yet, it needs a free key"
-	say "from TMDB, the movie database. It takes about five minutes, on a computer:"
-	say "  1. Create a free account: https://www.themoviedb.org/signup"
-	say "  2. Request a key on https://www.themoviedb.org/settings/api and accept TMDB's terms."
-	say "     If it asks about your app, it's personal use: name Arr, URL"
-	say "     https://github.com/newtonharry/Arr, summary \"Personal media server\"."
-	say "  3. Copy the API Read Access Token (the long one) or the API Key."
-	say "  Help: https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md"
-}
 # tmdb_key_ok KEY: whether TMDB accepts it (asked through arr; the key goes on stdin). If not,
 # TMDB_WHY says why.
 tmdb_key_ok() {
 	TMDB_WHY=$(printf '%s' "$1" | "$ARR" tmdb-key --check 2>&1 >/dev/null) && return 0
 	TMDB_WHY=${TMDB_WHY#Error: }
 	return 1
-}
-# ask_tmdb_key: walks whoever is at the terminal through getting a key, then checks it.
-# Sets TMDB_KEY, empty if they skip it.
-ask_tmdb_key() {
-	TMDB_KEY=""
-	interactive || return 0
-	say ""
-	tmdb_steps
-	if [ -z "${SSH_CONNECTION:-}" ] && confirm "Open TMDB in your browser now?" y; then
-		open_page https://www.themoviedb.org/signup
-	fi
-	tries=0
-	while [ "$tries" -lt 3 ]; do
-		key=$(ask "Paste the TMDB key (Enter to skip)" "")
-		[ -n "$key" ] || break
-		if tmdb_key_ok "$key"; then
-			TMDB_KEY=$key
-			say "That key works."
-			return 0
-		fi
-		say "$TMDB_WHY"
-		tries=$((tries + 1))
-	done
-	say "No TMDB key for now: TV works, and running this again later asks for one."
 }
 confirm() { # confirm "Question" y|n
 	a=$(ask "$1 (y/n)" "$2")
@@ -727,8 +691,6 @@ done
 if [ -n "$TMDB_KEY" ]; then
 	# Nothing is written yet, so a key TMDB refuses stops here with the reason.
 	tmdb_key_ok "$TMDB_KEY" || die "$TMDB_WHY (the key from --tmdb-key or ARR_TMDB_KEY; see docs/TMDB.md)"
-else
-	ask_tmdb_key
 fi
 
 if [ "$DOWNLOADING" = 1 ] && ! confirm "Let Arr download and import what you ask for?" y; then
@@ -981,12 +943,14 @@ if [ -f "$CONFIG" ]; then
 	elif grep -q '^\[plex\]' "$CONFIG"; then
 		plex_signin
 	fi
-	# A TMDB key can be added on any later run: --tmdb-key, ARR_TMDB_KEY, or asked here.
-	if [ -z "$TMDB_KEY" ] && interactive && [ "$(conf tmdb enabled)" != true ]; then
-		step "Arr can't find new movies yet"
-		ask_tmdb_key
-	fi
+	# Movies come from the Plex sign-in. A TMDB key is an optional backup, added with
+	# --tmdb-key or ARR_TMDB_KEY; an existing one is kept.
 	[ -z "$TMDB_KEY" ] || set_secret tmdb-key "$TMDB_KEY"
+	if [ -n "$TMDB_KEY" ] || [ "$(conf tmdb enabled)" = true ]; then
+		say "Movies now come from your Plex sign-in; your TMDB key stays as a backup."
+	else
+		say "Movies now come from your Plex sign-in — no TMDB key needed."
+	fi
 	[ "$DOWNLOADING" = 1 ] || set_conf downloading off
 	[ "$UPLOAD_SET" = 0 ] || set_conf upload-limit-kib "$UPLOAD_LIMIT_KIB"
 	[ "$TORRENT_PORT_SET" = 0 ] || set_conf torrent-port "$TORRENT_PORT"
