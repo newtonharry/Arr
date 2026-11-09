@@ -13,7 +13,7 @@ async fn an_empty_metadata_response_cannot_resolve_a_known_numbering_conflict() 
     let e = start_exec(ExecOptions {
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (status, _, body) = e
@@ -87,7 +87,7 @@ async fn episode_status_uses_actual_coverage_not_the_original_season_request() {
     let e = start_exec(ExecOptions {
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     for number in [2, 4] {
@@ -128,7 +128,7 @@ async fn season_status_includes_pending_individual_episode_requests() {
     let e = start_exec(ExecOptions {
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (status, _, body) = e
@@ -180,7 +180,7 @@ async fn season_status_includes_individual_grabs_with_either_series_namespace() 
     let e = start_exec(ExecOptions {
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let title = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
@@ -225,7 +225,7 @@ async fn metadata_must_not_append_known_episodes_renumbered_as_a_new_season() {
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
         snapshot: snap,
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (status, _, body) = e
@@ -286,7 +286,7 @@ async fn confirmed_scope_replays_without_handoff_but_never_expands_via_sibling_o
     let e = start_exec(ExecOptions {
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let target = "episode:tvdb:372264:1:2";
@@ -353,7 +353,7 @@ async fn unmonitored_registration_cannot_stand_in_for_a_confirmed_native_handoff
     let e = start_exec(ExecOptions {
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     for registration in [
@@ -394,7 +394,7 @@ async fn a_single_known_episode_does_not_authorize_its_seasons_future_episodes()
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
         snapshot,
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (status, _, body) = e
@@ -438,7 +438,7 @@ async fn an_explicit_whole_title_handoff_survives_disabled_monitoring_and_reacti
         mode: "coexistence",
         categories: Some(("um-review-movies", "um-review-tv")),
         snapshot,
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (status, _, body) = e
@@ -473,4 +473,36 @@ async fn an_explicit_whole_title_handoff_survives_disabled_monitoring_and_reacti
         status, 201,
         "the same confirmed scope, including its canonical alias, can be reactivated: {body}"
     );
+}
+
+#[tokio::test]
+async fn imported_minimum_availability_gates_acquisition() {
+    let mut snap = snapshot();
+    // The imported Matrix record says: released mode, digital release in 2099.
+    snap["radarr"]["movie"][0]["minimumAvailability"] = json!("released");
+    snap["radarr"]["movie"][0]["digitalRelease"] = json!("2099-01-01T00:00:00Z");
+    snap["radarr"]["movie"][0]["isAvailable"] = json!(false);
+    // Amélie uses a mode this build does not implement.
+    snap["radarr"]["movie"][2]["minimumAvailability"] = json!("inCinemas");
+    let e = start_exec(ExecOptions {
+        snapshot: snap,
+        ..ExecOptions::legacy()
+    })
+    .await;
+    let (_, v, text) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "movie:tmdb:603" })),
+        )
+        .await;
+    assert_eq!(v["plan"]["blockers"][0]["code"], "not_available", "{text}");
+    assert!(text.contains("2099-01-01"));
+    let (_, v, text) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "movie:tmdb:194" })),
+        )
+        .await;
+    assert!(text.contains("not implemented"), "{text}");
+    let _ = v;
 }

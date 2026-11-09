@@ -9,26 +9,6 @@ use common::*;
 use serde_json::{Value, json};
 use std::path::Path;
 
-async fn call(app: &App, rb: reqwest::RequestBuilder) -> (u16, Value, String) {
-    let _ = app;
-    let r = rb.send().await.unwrap();
-    let s = r.status().as_u16();
-    let t = r.text().await.unwrap();
-    (s, serde_json::from_str(&t).unwrap_or(Value::Null), t)
-}
-
-fn patch(app: &App, path: &str) -> reqwest::RequestBuilder {
-    app.client
-        .patch(format!("{}{path}", app.base))
-        .bearer_auth(TOKEN)
-}
-
-fn del(app: &App, path: &str) -> reqwest::RequestBuilder {
-    app.client
-        .delete(format!("{}{path}", app.base))
-        .bearer_auth(TOKEN)
-}
-
 fn movie(v: &Value, tmdb: u64) -> Option<&Value> {
     v["items"]
         .as_array()
@@ -38,17 +18,20 @@ fn movie(v: &Value, tmdb: u64) -> Option<&Value> {
 }
 
 #[tokio::test]
-async fn catalog_changes_persist_across_restart_and_reimport() {
-    let (addr, _mock) = start_mock().await;
-    let mut app = start_app(&snapshot(), "", Some(addr), true).await;
+async fn catalog_changes_persist_across_restart() {
+    let mut e = start_exec(ExecOptions {
+        plex: false,
+        ..Default::default()
+    })
+    .await;
 
     // Without TMDB, a movie outside the catalog needs explicit metadata.
-    let (s, v, _) = call(
-        &app,
-        app.post("/api/v1/library")
-            .json(&json!({ "media_id": "movie:tmdb:900001" })),
-    )
-    .await;
+    let (s, v, _) = e
+        .json(
+            e.post("/api/v1/library")
+                .json(&json!({ "media_id": "movie:tmdb:900001" })),
+        )
+        .await;
     assert_eq!(
         (s, v["error"]["code"].as_str()),
         (409, Some("metadata_unavailable"))
@@ -59,62 +42,67 @@ async fn catalog_changes_persist_across_restart_and_reimport() {
             .unwrap()
             .contains("supply metadata")
     );
-    let (s, v, _) = call(
-        &app,
-        app.post("/api/v1/library").json(
+    let (s, v, _) = e
+        .json(e.post("/api/v1/library").json(
             &json!({ "media_id": "movie:tmdb:900001", "metadata": { "title": "Leviticus" } }),
-        ),
-    )
-    .await;
+        ))
+        .await;
     assert_eq!(
         (s, v["error"]["code"].as_str()),
         (400, Some("invalid_body")),
         "year required"
     );
-    let (s, v, text) = call(&app, app.post("/api/v1/library").json(&json!({ "media_id": "movie:tmdb:900001", "metadata": { "title": "Leviticus", "year": 2025, "runtime_minutes": 86 } }))).await;
+    let (s, v, text) = e.json(e.post("/api/v1/library").json(&json!({ "media_id": "movie:tmdb:900001", "metadata": { "title": "Leviticus", "year": 2025, "runtime_minutes": 86 } }))).await;
     assert_eq!(s, 201, "{text}");
     assert_eq!(v["created"], true);
-    let (_, v, _) = call(&app, app.get("/api/v1/library/movies?q=leviticus")).await;
+    let (_, v, _) = e.json(e.get("/api/v1/library/movies?q=leviticus")).await;
     let m = movie(&v, 900001).unwrap();
     assert_eq!(
-        m["quality_profile"], "radarr:6",
+        m["quality_profile"], "setup:movies-hd",
         "the only movie profile is chosen"
     );
-    assert_eq!(m["root_folder"], "/movies", "the only movie root is chosen");
+    assert_eq!(
+        m["root_folder"],
+        e.movies.to_str().unwrap(),
+        "the only movie root is chosen"
+    );
     assert_eq!(m["folder"], "Leviticus (2025)");
     assert_eq!(m["provenance"]["source_app"], "unified-media");
     assert_eq!(m["monitored"], true);
     // Adding again re-manages without duplicating.
-    let (s, v, _) = call(&app, app.post("/api/v1/library").json(&json!({ "media_id": "movie:tmdb:900001", "metadata": { "title": "Leviticus", "year": 2025 } }))).await;
+    let (s, v, _) = e.json(e.post("/api/v1/library").json(&json!({ "media_id": "movie:tmdb:900001", "metadata": { "title": "Leviticus", "year": 2025 } }))).await;
     assert_eq!((s, v["created"].as_bool()), (201, Some(false)));
 
     // A series from TVmaze with future-only monitoring (all its episodes have aired).
-    let (s, v, text) = call(
-        &app,
-        app.post("/api/v1/library")
-            .json(&json!({ "media_id": "series:tvdb:999001", "monitor": "future" })),
-    )
-    .await;
+    let (s, v, text) = e
+        .json(
+            e.post("/api/v1/library")
+                .json(&json!({ "media_id": "series:tvdb:999001", "monitor": "future" })),
+        )
+        .await;
     assert_eq!(s, 201, "{text}");
     assert_eq!(v["media_id"], "series:tvdb:999001");
-    let (_, v, _) = call(&app, app.get("/api/v1/wanted?media_id=series:tvdb:999001")).await;
+    let (_, v, _) = e
+        .json(e.get("/api/v1/wanted?media_id=series:tvdb:999001"))
+        .await;
     assert_eq!(
         v["total"], 0,
         "future-only: aired episodes are not monitored"
     );
-    let (s, _, _) = call(
-        &app,
-        patch(&app, "/api/v1/library/season:tvdb:999001:1").json(&json!({ "monitored": true })),
-    )
-    .await;
+    let (s, _, _) = e
+        .json(
+            e.patch("/api/v1/library/season:tvdb:999001:1")
+                .json(&json!({ "monitored": true })),
+        )
+        .await;
     assert_eq!(s, 200);
-    let (_, v, _) = call(&app, app.get("/api/v1/wanted?media_id=series:tvdb:999001")).await;
+    let (_, v, _) = e
+        .json(e.get("/api/v1/wanted?media_id=series:tvdb:999001"))
+        .await;
     assert_eq!(v["total"], 8);
-    let (_, v, _) = call(
-        &app,
-        app.get("/api/v1/calendar?start=2025-02-01T00:00:00Z&end=2025-02-04T00:00:00Z"),
-    )
-    .await;
+    let (_, v, _) = e
+        .json(e.get("/api/v1/calendar?start=2025-02-01T00:00:00Z&end=2025-02-04T00:00:00Z"))
+        .await;
     assert_eq!(
         v["items"]
             .as_array()
@@ -125,53 +113,33 @@ async fn catalog_changes_persist_across_restart_and_reimport() {
         3
     );
 
-    // User choices on snapshot items.
-    let (s, _, _) = call(
-        &app,
-        patch(&app, "/api/v1/library/movie:tmdb:603").json(&json!({ "monitored": false })),
-    )
-    .await;
+    // User choices.
+    let (s, _, _) = e
+        .json(
+            e.patch("/api/v1/library/movie:tmdb:603")
+                .json(&json!({ "monitored": false })),
+        )
+        .await;
     assert_eq!(s, 200);
-    let (s, v, _) = call(
-        &app,
-        patch(&app, "/api/v1/library/movie:tmdb:424242").json(&json!({ "monitored": false })),
-    )
-    .await;
+    let (s, v, _) = e
+        .json(
+            e.patch("/api/v1/library/movie:tmdb:424242")
+                .json(&json!({ "monitored": false })),
+        )
+        .await;
     assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_managed")));
-    let (s, _, _) = call(&app, del(&app, "/api/v1/library/movie:tmdb:194")).await;
+    let (s, _, _) = e.json(e.delete("/api/v1/library/movie:tmdb:194")).await;
     assert_eq!(s, 200);
-    let (_, v, _) = call(&app, app.get("/api/v1/library/movies")).await;
+    let (_, v, _) = e.json(e.get("/api/v1/library/movies")).await;
     assert!(movie(&v, 194).is_none(), "removed items are hidden");
     assert_eq!(movie(&v, 603).unwrap()["monitored"], false);
 
     // Restart: everything persists.
-    app.base = serve_dir(&app.dir).await;
-    let (_, v, _) = call(&app, app.get("/api/v1/library/movies")).await;
+    e.restart().await;
+    let (_, v, _) = e.json(e.get("/api/v1/library/movies")).await;
     assert!(movie(&v, 900001).is_some());
     assert_eq!(movie(&v, 603).unwrap()["monitored"], false);
     assert!(movie(&v, 194).is_none());
-
-    // Re-import a newer snapshot: new native items appear, native metadata refreshes,
-    // user choices (monitoring, removal, added items) are kept.
-    let mut snap = snapshot();
-    snap["radarr"]["movie"][0]["title"] = json!("The Matrix (Remastered)");
-    snap["radarr"]["movie"][0]["monitored"] = json!(true);
-    snap["radarr"]["movie"].as_array_mut().unwrap().push(json!({ "id": 13, "title": "Dune", "originalLanguage": { "id": 1, "name": "English" }, "year": 2021, "runtime": 155, "tmdbId": 438631, "hasFile": false, "monitored": true, "qualityProfileId": 6, "path": "/movies/Dune (2021)", "isAvailable": true }));
-    write_state(&app.dir, &snap, "", Some(addr), true);
-    app.base = serve_dir(&app.dir).await;
-    let (_, v, _) = call(&app, app.get("/api/v1/library/movies")).await;
-    assert!(movie(&v, 438631).is_some(), "new snapshot item seeded");
-    let matrix = movie(&v, 603).unwrap();
-    assert_eq!(matrix["title"], "The Matrix (Remastered)");
-    assert_eq!(
-        matrix["monitored"], false,
-        "user's unmonitor survives the re-import"
-    );
-    assert!(movie(&v, 194).is_none(), "removal survives the re-import");
-    assert!(
-        movie(&v, 900001).is_some(),
-        "added item survives the re-import"
-    );
 }
 
 fn write_media(root: &Path, rel: &str, bytes: &[u8]) {
@@ -218,6 +186,11 @@ fn owned(e: &Exec, id: &str) -> bool {
 async fn scans_reconcile_healthy_roots_and_change_nothing_on_unhealthy_ones() {
     let e = start_exec(ExecOptions::default()).await;
     // Empty roots while owned items are recorded: suspect, nothing changes.
+    for root in [&e.movies, &e.tv] {
+        for entry in std::fs::read_dir(root).unwrap().flatten() {
+            std::fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
     let r = rescan(&e).await;
     assert_eq!(r[0]["status"], "empty_suspect", "{r}");
     assert!(owned(&e, "movie:tmdb:604") && owned(&e, "episode:tvdb:372264:1:3"));
@@ -259,7 +232,7 @@ async fn scans_reconcile_healthy_roots_and_change_nothing_on_unhealthy_ones() {
     assert!(owned(&e, "episode:tvdb:372264:1:1"));
     assert!(
         !owned(&e, "episode:tvdb:372264:1:3"),
-        "a healthy scan retires the snapshot's claim"
+        "a healthy scan retires the claim of a file that is gone"
     );
     let index = e.state.index();
     let reloaded = index.movie(604).unwrap().file.clone().unwrap();
@@ -306,24 +279,24 @@ async fn scans_reconcile_healthy_roots_and_change_nothing_on_unhealthy_ones() {
 
 #[tokio::test]
 async fn scheduled_mass_missing_is_held_back_but_explicit_rescan_applies() {
-    let mut snap = snapshot();
-    let eps: Vec<Value> = (1..=12).map(|n| json!({ "seasonNumber": 1, "episodeNumber": n, "airDateUtc": "2020-01-01T02:00:00Z", "runtime": 30, "hasFile": true, "monitored": true,
-        "episodeFile": { "relativePath": format!("Season 1/Scan.Show.S01E{n:02}.720p.HDTV.x264-GRP.mkv"), "size": 1 } })).collect();
-    snap["sonarr"]["series"].as_array_mut().unwrap().push(json!({ "id": 50, "title": "Scan Show", "alternateTitles": [], "year": 2020, "tvdbId": 999200, "seriesType": "standard", "runtime": 30,
-        "originalLanguage": { "id": 1, "name": "English" }, "monitored": true, "qualityProfileId": 6, "path": "/tvshows/Scan Show",
-        "seasons": [{ "seasonNumber": 1, "monitored": true, "statistics": { "episodeFileCount": 12, "episodeCount": 12, "totalEpisodeCount": 12 } }] }));
-    snap["sonarr"]["episode_samples"]["50"] = json!(eps);
-    let e = start_exec(ExecOptions {
-        snapshot: snap,
-        ..Default::default()
-    })
-    .await;
+    let e = start_exec(ExecOptions::default()).await;
+    // "Scan Show" (TVDB 999200): twelve episodes, all on disk and owned.
+    for n in 1..=12 {
+        write_media(
+            &e.tv,
+            &format!("Scan Show/Season 1/Scan.Show.S01E{n:02}.720p.HDTV.x264-GRP.mkv"),
+            &mkv(1),
+        );
+    }
+    e.add("series:tvdb:999200").await;
+    assert!(owned(&e, "episode:tvdb:999200:1:7"));
     // Only one file is actually present (as if a disk were half unmounted).
-    write_media(
-        &e.tv,
-        "Scan Show/Season 1/Scan.Show.S01E01.720p.HDTV.x264-GRP.mkv",
-        &mkv(1),
-    );
+    for n in 2..=12 {
+        std::fs::remove_file(e.tv.join(format!(
+            "Scan Show/Season 1/Scan.Show.S01E{n:02}.720p.HDTV.x264-GRP.mkv"
+        )))
+        .unwrap();
+    }
     let report = arr::scan::scan(&e.state, time::OffsetDateTime::now_utc(), false)
         .await
         .unwrap();
@@ -340,10 +313,15 @@ async fn scheduled_mass_missing_is_held_back_but_explicit_rescan_applies() {
 
 #[tokio::test]
 async fn scan_keeps_a_franchise_prefixed_alias_file_and_never_attributes_wrong_names() {
-    let e = start_exec(ExecOptions {
-        snapshot: with_franchise_movie(snapshot()),
-        ..Default::default()
-    })
+    let e = start_exec(ExecOptions::default()).await;
+    e.add_movie(
+        990001,
+        "Nebula Arin: The Last Keeper",
+        2026,
+        110,
+        "English",
+        &FRANCHISE_ALIASES,
+    )
     .await;
     write_media(
         &e.movies,
@@ -466,7 +444,7 @@ async fn first_episode_of_a_new_series_grabs_only_that_episode_even_when_added_c
         assert!(!episode(&e, 999005, s, n).monitored, "S{s}E{n}");
     }
     e.tick().await;
-    let q = e.qb.lock().unwrap();
+    let q = e.fake.lock().unwrap();
     assert_eq!(q.add_fields.len(), 1, "one grab: no E02, no season pack");
     assert!(q.torrents.contains_key(&e1_hash));
 }
@@ -515,14 +493,21 @@ async fn next_missing_episode_of_a_partly_owned_series_keeps_adjacent_choices() 
     assert!(!episode(&e, 372264, 1, 4).monitored, "E4 stays unmonitored");
     assert!(episode(&e, 372264, 1, 5).monitored);
     assert!(episode(&e, 372264, 1, 1).has_file && episode(&e, 372264, 1, 3).has_file);
-    {
-        let index = e.state.index();
-        let s = index.series(arr::ids::SeriesKey::Tvdb(372264)).unwrap();
-        assert!(s.seasons.iter().any(|x| x.number == 2 && !x.monitored));
-    }
+    let season2: bool = e
+        .state
+        .store
+        .blocking(|c| {
+            Ok(c.query_row(
+                "SELECT monitored FROM seasons WHERE series_id = 'series:tvdb:372264' AND season = 2",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(!season2, "season 2 stays unmonitored");
     e.tick().await;
     {
-        let q = e.qb.lock().unwrap();
+        let q = e.fake.lock().unwrap();
         assert_eq!(q.add_fields.len(), 1, "only E02: no E04, no season pack");
         assert!(q.torrents.contains_key(&e2_hash));
     }
@@ -539,7 +524,7 @@ async fn next_missing_episode_of_a_partly_owned_series_keeps_adjacent_choices() 
         "{text}"
     );
     e.tick().await;
-    assert_eq!(e.qb.lock().unwrap().add_fields.len(), 1);
+    assert_eq!(e.fake.lock().unwrap().add_fields.len(), 1);
     let (_, r, text) = e.json(e.get("/api/v1/requests")).await;
     assert!(
         r["items"]
@@ -591,7 +576,7 @@ async fn previewing_a_movie_without_an_approved_release_changes_nothing_with_exe
         e.tick_at(t0 + std::time::Duration::from_secs(hours * 3600))
             .await;
     }
-    assert!(e.qb.lock().unwrap().add_fields.is_empty());
+    assert!(e.fake.lock().unwrap().add_fields.is_empty());
     let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
     assert_eq!(q["items"], json!([]));
     let (_, r, _) = e.json(e.get("/api/v1/requests")).await;

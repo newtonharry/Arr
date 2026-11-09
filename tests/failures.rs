@@ -36,7 +36,7 @@ async fn client_errors_and_external_removal_are_classified_after_grace() {
     let t0 = OffsetDateTime::now_utc();
     // Persistent client error: failed and blocklisted after the grace period.
     let (id, hash) = downloading_episode(&e, 2, "ERR").await;
-    qb::set_state(&e.qb, &hash, "error", 0.2);
+    e.set_state(&hash, "error", 0.2);
     e.tick_at(t0).await;
     assert_eq!(e.grab_row(&id).state, "downloading", "within grace");
     let (_, v, _) = e.json(e.get(&format!("/api/v1/queue/{id}"))).await;
@@ -51,7 +51,8 @@ async fn client_errors_and_external_removal_are_classified_after_grace() {
     assert_eq!(v["items"].as_array().unwrap().len(), 1);
     // The incomplete torrent was stopped.
     assert!(
-        e.qb.lock()
+        e.fake
+            .lock()
             .unwrap()
             .log
             .iter()
@@ -60,7 +61,7 @@ async fn client_errors_and_external_removal_are_classified_after_grace() {
 
     // Removed from the client by someone else: failed (not blocklisted) after the grace period.
     let (id, hash) = downloading_episode(&e, 4, "GONE").await;
-    e.qb.lock().unwrap().torrents.remove(&hash);
+    e.fake.lock().unwrap().torrents.remove(&hash);
     e.tick_at(t0 + Duration::from_secs(32 * 60)).await;
     assert_eq!(e.grab_row(&id).state, "downloading");
     e.tick_at(t0 + Duration::from_secs(43 * 60)).await;
@@ -74,7 +75,8 @@ async fn client_errors_and_external_removal_are_classified_after_grace() {
 
     // Category changed by the user: released (no longer managed), nothing touched.
     let (id, hash) = downloading_episode(&e, 5, "MINE").await;
-    e.qb.lock()
+    e.fake
+        .lock()
         .unwrap()
         .torrents
         .get_mut(&hash)
@@ -83,7 +85,7 @@ async fn client_errors_and_external_removal_are_classified_after_grace() {
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!((g.state.as_str(), g.active), ("released", false));
-    assert!(e.qb.lock().unwrap().torrents.contains_key(&hash));
+    assert!(e.fake.lock().unwrap().torrents.contains_key(&hash));
 }
 
 #[tokio::test]
@@ -104,16 +106,16 @@ async fn a_download_without_progress_fails_at_the_stall_timeout_whatever_its_lab
     // Downloading with peers connected but nothing arriving. qBittorrent labels a forced
     // download `forcedDL` whatever its speed, the embedded engine `downloading` while any
     // peer is connected: neither is a stalled label, and neither is progress.
-    qb::set_state(&e.qb, &hash, "forcedDL", 0.2);
+    e.set_state(&hash, "forcedDL", 0.2);
     e.tick_at(at(0)).await;
     assert_eq!(clock(&e), None, "progress since the first observation");
     e.tick_at(at(1)).await;
     assert!(clock(&e).is_some(), "no progress while downloading");
-    qb::set_state(&e.qb, &hash, "downloading", 0.2);
+    e.set_state(&hash, "downloading", 0.2);
     e.tick_at(at(20)).await;
     still(&e, "19 of 30 min");
     // Progress resets the clock.
-    qb::set_state(&e.qb, &hash, "downloading", 0.21);
+    e.set_state(&hash, "downloading", 0.21);
     e.tick_at(at(25)).await;
     assert_eq!(clock(&e), None);
     e.tick_at(at(26)).await;
@@ -131,21 +133,21 @@ async fn a_download_without_progress_fails_at_the_stall_timeout_whatever_its_lab
     assert!(clock(&e).is_some());
     // Checking, moving or queued in the client: not downloading, the clock resets.
     for (i, label) in ["checkingDL", "moving", "queuedDL"].into_iter().enumerate() {
-        qb::set_state(&e.qb, &hash, label, 0.21);
+        e.set_state(&hash, label, 0.21);
         e.tick_at(at(200 + 60 * i as u64)).await;
         still(&e, label);
         assert_eq!(clock(&e), None, "{label}");
     }
-    qb::set_state(&e.qb, &hash, "downloading", 0.21);
+    e.set_state(&hash, "downloading", 0.21);
     e.tick_at(at(400)).await;
     e.tick_at(at(420)).await;
     still(&e, "20 min observed");
     // Two hours without an answer from the client do not count: 20 min observed before,
     // 9 after is still within the timeout.
-    e.qb.lock().unwrap().down = true;
+    e.fake.lock().unwrap().down = true;
     e.tick_at(at(480)).await;
     e.tick_at(at(540)).await;
-    e.qb.lock().unwrap().down = false;
+    e.fake.lock().unwrap().down = false;
     e.tick_at(at(540)).await;
     still(&e, "the outage is not time without progress");
     e.tick_at(at(549)).await;
@@ -169,13 +171,14 @@ async fn a_download_without_progress_fails_at_the_stall_timeout_whatever_its_lab
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["reason"], "stalled");
     // The incomplete torrent was stopped (once by the user earlier, once at the failure).
-    let pauses =
-        e.qb.lock()
-            .unwrap()
-            .log
-            .iter()
-            .filter(|l| *l == &format!("pause {hash}"))
-            .count();
+    let pauses = e
+        .fake
+        .lock()
+        .unwrap()
+        .log
+        .iter()
+        .filter(|l| *l == &format!("pause {hash}"))
+        .count();
     assert_eq!(pauses, 2);
 }
 
@@ -188,8 +191,8 @@ async fn client_outage_changes_nothing() {
     let clock = e.grab_row(&id).stalled_since;
     assert!(clock.is_some());
     let progress = e.grab_row(&id).progress.unwrap();
-    qb::set_state(&e.qb, &hash, "stalledDL", progress);
-    e.qb.lock().unwrap().down = true;
+    e.set_state(&hash, "stalledDL", progress);
+    e.fake.lock().unwrap().down = true;
     let t0 = OffsetDateTime::now_utc();
     for h in [1u64, 5, 14, 30] {
         e.tick_at(t0 + Duration::from_secs(h * 3600)).await;
@@ -217,7 +220,7 @@ async fn client_outage_changes_nothing() {
     );
     // Answers again after 30 h, still without progress: those hours were not observed, so
     // they are not time without progress (the 12 h timeout is far from reached).
-    e.qb.lock().unwrap().down = false;
+    e.fake.lock().unwrap().down = false;
     e.tick_at(t0 + Duration::from_secs(30 * 3600)).await;
     let g = e.grab_row(&id);
     assert_eq!(g.state, "downloading", "{:?}", g.last_error);
@@ -237,11 +240,11 @@ async fn cancel_blocklists_on_request_and_holds_automatic_searches() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["grab"]["state"], "cancelled");
     assert!(
-        e.qb.lock().unwrap().torrents.contains_key(&hash),
+        e.fake.lock().unwrap().torrents.contains_key(&hash),
         "kept by default"
     );
     assert_eq!(
-        e.qb.lock().unwrap().torrents[&hash].state,
+        e.fake.lock().unwrap().torrents[&hash].state,
         "pausedDL",
         "incomplete torrent stopped"
     );
@@ -333,7 +336,7 @@ async fn explicit_requests_retry_with_backoff_until_satisfied() {
         next.as_str() > arr::import::rfc3339(t0 + Duration::from_secs(61 * 60 + 110 * 60)).as_str(),
         "doubling backoff: {next}"
     );
-    // A Prowlarr outage defers without counting an attempt.
+    // An indexer outage defers without counting an attempt.
     e.mock.lock().unwrap().mode = Mode::Status(503);
     e.tick_at(t0 + Duration::from_secs(4 * 3600)).await;
     let (_, v, _) = e.json(e.get("/api/v1/requests")).await;

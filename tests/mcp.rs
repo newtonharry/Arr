@@ -38,7 +38,7 @@ fn coexistence() -> ExecOptions {
     ExecOptions {
         mode: "coexistence",
         categories: Some(("um-movies", "um-tv")),
-        ..Default::default()
+        ..ExecOptions::legacy()
     }
 }
 

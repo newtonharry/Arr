@@ -103,7 +103,7 @@ fn session_cookie(r: &reqwest::Response) -> String {
 async fn exec() -> Exec {
     start_exec(ExecOptions {
         tmdb: true,
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await
 }
@@ -645,7 +645,7 @@ async fn ideas_say_when_they_are_unavailable_or_off() {
     );
     let off = start_exec(ExecOptions {
         tvmaze: false,
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (s, v, _) = off.json(off.get("/api/v1/ideas")).await;
@@ -778,7 +778,7 @@ async fn quick_add_gets_a_movie_or_a_show() {
 
 #[tokio::test]
 async fn quick_add_finds_movies_through_plex_alone() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (s, v, text) = e
         .json(
             e.post("/api/v1/quick-add")
@@ -1189,7 +1189,7 @@ async fn posters_come_only_from_the_configured_image_hosts() {
 
 #[tokio::test]
 async fn movie_posters_need_plex_or_tmdb_to_know_the_movie() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let site = serve(e.state.clone()).await;
     let cookie = site.sign_in(&e).await;
     assert_eq!(
@@ -1202,7 +1202,7 @@ async fn movie_posters_need_plex_or_tmdb_to_know_the_movie() {
 #[tokio::test]
 async fn movie_posters_come_from_plex_on_its_image_host_only() {
     // No TMDB key at all.
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let site = serve(e.state.clone()).await;
     let cookie = site.sign_in(&e).await;
     let r = site.art("movie:tmdb:910001", Some(&cookie)).await;

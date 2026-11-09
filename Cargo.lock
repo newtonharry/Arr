@@ -111,6 +111,7 @@ name = "arr"
 version = "0.10.0"
 dependencies = [
  "anyhow",
+ "arr",
  "axum",
  "base64",
  "clap",

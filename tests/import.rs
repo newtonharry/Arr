@@ -876,3 +876,59 @@ fn rss_seed_criteria_and_client_report_their_implemented_effects() {
         serde_json::to_string(&n.report).unwrap()
     );
 }
+
+/// Re-importing a newer snapshot: new native items appear, native metadata refreshes, and the
+/// user's choices (monitoring, removal, added items) are kept.
+#[tokio::test]
+async fn a_reimport_keeps_the_users_choices_on_snapshot_items() {
+    let (addr, _mock) = start_mock().await;
+    let mut app = start_app(&snapshot(), "", Some(addr), true).await;
+    let call = |rb: reqwest::RequestBuilder| async move {
+        let r = rb.send().await.unwrap();
+        let t = r.text().await.unwrap();
+        serde_json::from_str::<Value>(&t).unwrap_or(Value::Null)
+    };
+    let movie = |v: &Value, tmdb: u64| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["tmdb_id"] == tmdb)
+            .cloned()
+    };
+    let added = call(app.post("/api/v1/library").json(&json!({ "media_id": "movie:tmdb:900001", "metadata": { "title": "Leviticus", "year": 2025, "runtime_minutes": 86 } }))).await;
+    assert_eq!(added["created"], true);
+    let patch = |app: &App, path: &str| {
+        app.client
+            .patch(format!("{}{path}", app.base))
+            .bearer_auth(TOKEN)
+    };
+    call(patch(&app, "/api/v1/library/movie:tmdb:603").json(&json!({ "monitored": false }))).await;
+    call(
+        app.client
+            .delete(format!("{}/api/v1/library/movie:tmdb:194", app.base))
+            .bearer_auth(TOKEN),
+    )
+    .await;
+    app.base = serve_dir(&app.dir).await;
+
+    let mut snap = snapshot();
+    snap["radarr"]["movie"][0]["title"] = json!("The Matrix (Remastered)");
+    snap["radarr"]["movie"][0]["monitored"] = json!(true);
+    snap["radarr"]["movie"].as_array_mut().unwrap().push(json!({ "id": 13, "title": "Dune", "originalLanguage": { "id": 1, "name": "English" }, "year": 2021, "runtime": 155, "tmdbId": 438631, "hasFile": false, "monitored": true, "qualityProfileId": 6, "path": "/movies/Dune (2021)", "isAvailable": true }));
+    write_state(&app.dir, &snap, "", Some(addr), true);
+    app.base = serve_dir(&app.dir).await;
+    let v = call(app.get("/api/v1/library/movies")).await;
+    assert!(movie(&v, 438631).is_some(), "new snapshot item seeded");
+    let matrix = movie(&v, 603).unwrap();
+    assert_eq!(matrix["title"], "The Matrix (Remastered)");
+    assert_eq!(
+        matrix["monitored"], false,
+        "user's unmonitor survives the re-import"
+    );
+    assert!(movie(&v, 194).is_none(), "removal survives the re-import");
+    assert!(
+        movie(&v, 900001).is_some(),
+        "added item survives the re-import"
+    );
+}

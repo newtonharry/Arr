@@ -14,10 +14,7 @@ fn item(e: &Exec, title: &str, files: Vec<(String, Vec<u8>)>, gib: f64, cats: &[
     FeedItem {
         title: title.into(),
         guid: format!("guid-{hash}"),
-        url: format!(
-            "http://{}/prowlarr/1/download?apikey={PROWLARR_KEY}&link={hash}",
-            e.mock_addr
-        ),
+        url: format!("http://{}/tz/dl/{hash}", e.mock_addr),
         size: (gib * 1024.0 * 1024.0 * 1024.0) as i64,
         seeders: 20,
         info_hash: Some(hash),
@@ -55,7 +52,7 @@ fn searches(e: &Exec) -> usize {
         .unwrap()
         .log
         .iter()
-        .filter(|q| q.contains("type=search"))
+        .filter(|q| q.contains("t=search"))
         .count()
 }
 
@@ -142,7 +139,7 @@ async fn feed_grabs_only_tracked_monitored_wanted_items_and_replays_are_idempote
     let r = rss_sync(&e).await;
     assert_eq!(r["grabbed"], 2, "{r}");
     assert_eq!(r["retrieval"], "complete");
-    assert_eq!(r["provider_completeness"], "unverified");
+    assert_eq!(r["provider_completeness"], "complete_window");
     assert_eq!(searches(&e), before, "RSS never runs searches");
     {
         let feed_log = e.mock.lock().unwrap().feed_log.clone();
@@ -204,7 +201,7 @@ async fn feed_grabs_only_tracked_monitored_wanted_items_and_replays_are_idempote
         "TV numbering in a movie category"
     );
     e.tick().await;
-    assert_eq!(e.qb.lock().unwrap().add_fields.len(), 2);
+    assert_eq!(e.fake.lock().unwrap().add_fields.len(), 2);
 
     // Replay of the same feed, and again after a restart: no duplicate grabs.
     let r = rss_sync(&e).await;
@@ -214,7 +211,7 @@ async fn feed_grabs_only_tracked_monitored_wanted_items_and_replays_are_idempote
     let r = rss_sync(&e).await;
     assert_eq!(r["grabbed"], 0);
     e.tick().await;
-    assert_eq!(e.qb.lock().unwrap().add_fields.len(), 2);
+    assert_eq!(e.fake.lock().unwrap().add_fields.len(), 2);
     let (_, v, _) = e.json(e.get("/api/v1/rss")).await;
     let ix = &v["indexers"][0];
     assert_eq!(ix["last_status"], "ok");
@@ -222,35 +219,30 @@ async fn feed_grabs_only_tracked_monitored_wanted_items_and_replays_are_idempote
     assert_eq!(ix["gap_possible"], false);
 }
 
-/// A series with `seasons` x 50 old missing episodes plus one episode that aired yesterday.
-fn backlog_snapshot(seasons: u16) -> Value {
-    let mut s = snapshot();
-    s["sonarr"]["series"].as_array_mut().unwrap().push(json!({
-        "id": 40, "title": "Backlog Show", "alternateTitles": [], "year": 2010, "tvdbId": 999100, "seriesType": "standard", "runtime": 45,
-        "originalLanguage": { "id": 1, "name": "English" }, "status": "continuing", "monitored": true, "qualityProfileId": 6, "path": "/tvshows/Backlog Show",
-        "seasons": (1..=seasons + 1).map(|n| json!({ "seasonNumber": n, "monitored": true, "statistics": { "episodeFileCount": 0, "episodeCount": 50, "totalEpisodeCount": 50 } })).collect::<Vec<_>>(),
-    }));
+/// Backlog Show (TVDB 999100): `seasons` x 50 old missing episodes plus one episode that
+/// aired yesterday, all from TVmaze.
+async fn backlog(e: &Exec, seasons: u16) {
     let yesterday =
         arr::import::rfc3339(time::OffsetDateTime::now_utc() - Duration::from_secs(86_400));
     let mut eps: Vec<Value> = vec![];
     for season in 1..=seasons {
         for n in 1..=50 {
-            eps.push(json!({ "seasonNumber": season, "episodeNumber": n, "airDateUtc": "2012-01-01T02:00:00Z", "runtime": 45, "hasFile": false, "monitored": true }));
+            eps.push(json!({ "season": season, "number": n, "name": format!("Ep {n}"), "type": "regular", "airstamp": "2012-01-01T02:00:00+00:00", "runtime": 45 }));
         }
     }
-    eps.push(json!({ "seasonNumber": seasons + 1, "episodeNumber": 1, "airDateUtc": yesterday, "runtime": 45, "hasFile": false, "monitored": true }));
-    s["sonarr"]["episode_samples"]["40"] = json!(eps);
-    s
+    eps.push(json!({ "season": seasons + 1, "number": 1, "name": "Ep 1", "type": "regular", "airstamp": yesterday, "runtime": 45 }));
+    e.mock
+        .lock()
+        .unwrap()
+        .tvmaze_extra
+        .insert("9100".into(), eps);
+    e.add("series:tvdb:999100").await;
 }
 
 #[tokio::test]
 async fn new_episode_is_grabbed_while_a_large_backlog_is_never_bulk_searched() {
-    let e = start_exec(ExecOptions {
-        snapshot: backlog_snapshot(30),
-        extra: "[automation]\n".replace("[automation]\n", ""),
-        ..Default::default()
-    })
-    .await;
+    let e = start_exec(ExecOptions::default()).await;
+    backlog(&e, 30).await;
     let (_, v, _) = e
         .json(e.get("/api/v1/wanted?media_id=series:tvdb:999100&limit=1"))
         .await;
@@ -323,18 +315,8 @@ async fn new_episode_is_grabbed_while_a_large_backlog_is_never_bulk_searched() {
 
 #[tokio::test]
 async fn explicit_season_search_still_finds_packs() {
-    let mut snap = snapshot();
     // Season 2 of Slow Horses: all aired and missing, with an episode list.
-    let eps: Vec<Value> = (1..=6).map(|n| json!({ "seasonNumber": 2, "episodeNumber": n, "airDateUtc": "2023-01-01T02:00:00Z", "runtime": 50, "hasFile": false, "monitored": true })).collect();
-    snap["sonarr"]["episode_samples"]["20"]
-        .as_array_mut()
-        .unwrap()
-        .extend(eps);
-    let e = start_exec(ExecOptions {
-        snapshot: snap,
-        ..Default::default()
-    })
-    .await;
+    let e = start_exec(ExecOptions::default()).await;
     let name = "Slow.Horses.S02.1080p.WEB-DL.x264-PACK";
     let files: Vec<(String, Vec<u8>)> = (1..=6)
         .map(|n| {
@@ -366,11 +348,14 @@ async fn explicit_season_search_still_finds_packs() {
 #[tokio::test]
 async fn newly_aired_metadata_becomes_matchable() {
     let e = start_exec(ExecOptions::default()).await;
-    // Fargo has no per-episode data in the snapshot: RSS cannot map it yet.
+    // TVmaze does not list Slow Horses S01E07 yet: RSS cannot map it.
     let it = item(
         &e,
-        "Fargo.S05E01.1080p.WEB-DL.x264-RSS",
-        vec![("Fargo.S05E01.1080p.WEB-DL.x264-RSS.mkv".into(), mkv(2))],
+        "Slow.Horses.S01E07.1080p.WEB-DL.x264-RSS",
+        vec![(
+            "Slow.Horses.S01E07.1080p.WEB-DL.x264-RSS.mkv".into(),
+            mkv(2),
+        )],
         2.0,
         &[5040],
     );
@@ -378,30 +363,29 @@ async fn newly_aired_metadata_becomes_matchable() {
     let r = rss_sync(&e).await;
     assert_eq!(r["grabbed"], 0);
     let (_, v, _) = e.json(e.get("/api/v1/rss")).await;
-    assert!(
-        v["recent"][0]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("episode list")
+    assert_eq!(v["recent"][0]["detail"], "unknown_episode", "{v}");
+    // The episode appears in TVmaze; a metadata refresh adds it, and it is missing.
+    e.mock.lock().unwrap().tvmaze_extra.insert(
+        "9001".into(),
+        vec![json!({ "season": 1, "number": 7, "name": "Ep 7", "type": "regular", "airstamp": "2025-02-20T02:00:00+00:00", "runtime": 60 })],
     );
-    // Metadata refresh (TVmaze) adds the episodes; season 5 had 0 files, so they are missing.
     let (s, v, _) = e
         .json(
             e.post("/api/v1/commands")
-                .json(&json!({ "name": "refresh_metadata", "media_id": "series:tvdb:269613" })),
+                .json(&json!({ "name": "refresh_metadata", "media_id": "series:tvdb:372264" })),
         )
         .await;
     assert_eq!(s, 202, "{v}");
     e.tick().await;
     let (_, v, _) = e
-        .json(e.get("/api/v1/calendar?start=2025-02-01T00:00:00Z&end=2025-02-03T00:00:00Z"))
+        .json(e.get("/api/v1/calendar?start=2025-02-19T00:00:00Z&end=2025-02-21T00:00:00Z"))
         .await;
     assert!(
         v["items"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|i| i["target"] == "episode:tvdb:269613:5:1" && i["status"] == "missing"),
+            .any(|i| i["target"] == "episode:tvdb:372264:1:7" && i["status"] == "missing"),
         "{v}"
     );
     let r = rss_sync(&e).await;
@@ -562,7 +546,7 @@ async fn a_new_series_added_for_one_episode_is_matched_by_rss_for_that_episode_o
     }
     e.tick().await;
     {
-        let q = e.qb.lock().unwrap();
+        let q = e.fake.lock().unwrap();
         assert_eq!(q.add_fields.len(), 1);
         assert!(q.torrents.contains_key(&wanted_hash));
     }
@@ -571,7 +555,7 @@ async fn a_new_series_added_for_one_episode_is_matched_by_rss_for_that_episode_o
     e.tick_at(t0 + Duration::from_secs(2 * 3600)).await;
     let (_, r, _) = e.json(e.get("/api/v1/requests")).await;
     assert_eq!(r["items"][0]["state"], "satisfied", "{r}");
-    assert_eq!(e.qb.lock().unwrap().add_fields.len(), 1);
+    assert_eq!(e.fake.lock().unwrap().add_fields.len(), 1);
 
     // Metadata refresh keeps the scope: new episodes of the season and a new season are not
     // monitored, so they do not match either.
@@ -607,7 +591,7 @@ async fn a_new_series_added_for_one_episode_is_matched_by_rss_for_that_episode_o
     }
     e.tick().await;
     assert_eq!(
-        e.qb.lock().unwrap().add_fields.len(),
+        e.fake.lock().unwrap().add_fields.len(),
         1,
         "still one download"
     );
@@ -643,7 +627,18 @@ async fn an_episode_added_to_an_unmonitored_season_is_matched_alone_by_rss() {
     let scope = |e: &Exec| {
         let index = e.state.index();
         let s = index.series(arr::ids::SeriesKey::Tvdb(372264)).unwrap();
-        let seasons: Vec<(u16, bool)> = s.seasons.iter().map(|x| (x.number, x.monitored)).collect();
+        let seasons: Vec<(u16, bool)> = e
+            .state
+            .store
+            .blocking(|c| {
+                let mut st = c.prepare(
+                    "SELECT season, monitored FROM seasons WHERE series_id = 'series:tvdb:372264' ORDER BY season",
+                )?;
+                Ok(st
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
         assert_eq!(
             seasons,
             [(1, false), (2, false)],
@@ -689,12 +684,12 @@ async fn an_episode_added_to_an_unmonitored_season_is_matched_alone_by_rss() {
     assert_eq!(status(&v, wanted).0, "grabbed");
     for t in others {
         let (s, d) = status(&v, t);
-        assert_eq!(s, "ignored", "{t}: {d}");
-        assert!(d.contains("is not monitored"), "{t}: {d}");
+        assert_eq!(s, "rejected", "{t}: {d}");
+        assert!(d.contains("not_monitored"), "{t}: {d}");
     }
     e.tick().await;
     {
-        let q = e.qb.lock().unwrap();
+        let q = e.fake.lock().unwrap();
         assert_eq!(q.add_fields.len(), 1);
         assert!(q.torrents.contains_key(&wanted_hash));
     }
@@ -742,10 +737,11 @@ async fn an_episode_added_to_an_unmonitored_season_is_matched_alone_by_rss() {
     let r = rss_sync(&e).await;
     assert_eq!(r["grabbed"], 0, "{r}");
     let (_, v, _) = e.json(e.get("/api/v1/rss")).await;
-    assert_eq!(status(&v, late).0, "ignored");
+    assert_eq!(status(&v, late).0, "rejected");
+    assert!(status(&v, late).1.contains("not_monitored"));
     e.tick().await;
     assert_eq!(
-        e.qb.lock().unwrap().add_fields.len(),
+        e.fake.lock().unwrap().add_fields.len(),
         1,
         "still one download"
     );

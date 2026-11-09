@@ -1081,7 +1081,7 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
             (ratio.filter(|r| *r >= 0.0), time.filter(|t| *t >= 0))
         })
         .unwrap_or((None, None));
-    let save_path = st.client.as_ref().expect("checked").save_path().to_string();
+    let save_path = st.client.as_ref().expect("checked").save_path();
     let now = OffsetDateTime::now_utc();
     let id = format!(
         "grb_{}",
@@ -1228,7 +1228,7 @@ fn payload_contradiction(st: &AppState, media: MediaId, payload: &Payload) -> Op
 /// How messages name the configured download client.
 fn client_name(st: &AppState) -> &'static str {
     match st.client.as_deref() {
-        Some(Client::Embedded(_)) => "the embedded engine",
+        Some(c) if c.embedded_semantics() => "the embedded engine",
         _ => "qBittorrent",
     }
 }
