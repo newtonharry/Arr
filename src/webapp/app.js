@@ -150,7 +150,7 @@ function retryControl(it) {
   track(id, btn, () => {
     const st = A.get(id) || {}, off = st.busy || st.state;
     btn.setAttribute('aria-disabled', off ? 'true' : 'false');
-    btn.replaceChildren(ic('retry'), st.busy ? 'Trying…' : st.state ? 'Trying again' : 'Try again');
+    btn.replaceChildren(ic('retry'), h('span', { class: 'lbl' }, st.busy ? 'Trying…' : st.state ? 'Trying again' : 'Try again'));
     btn.setAttribute('aria-label', `Try again, ${it.title}`);
     msg.textContent = st.msg || ''; if (st.err) msg.dataset.err = ''; else delete msg.dataset.err;
   });
@@ -174,15 +174,15 @@ function retryControl(it) {
 // ---------- rows ----------
 function needRow(it) {
   const [btn, msg] = retryControl(it);
-  return h('li', { class: 'item need top-align' }, tile(it.title),
+  return h('li', { class: 'item need' }, tile(it.title),
     h('div', { class: 'what' }, h('h3', { title: it.title }, it.title),
       meta(it) && h('p', { class: 'meta' }, meta(it)),
-      h('p', { class: 'problem' }, ic('alert'), h('span', null, it.problem)), btn, msg));
+      h('p', { class: 'problem' }, ic('alert'), h('span', null, it.problem)), msg), btn);
 }
 function arrivedRow(it) {
   return h('li', { class: 'item arrived' }, tile(it.title),
     h('div', { class: 'what' }, h('span', { class: 'tag' }, ic('check'), 'In Plex'),
-      h('h3', { title: it.title }, it.title), h('p', { class: 'meta' }, joinDot(it.detail, 'Ready to watch', ago(it.at)))),
+      h('h3', { title: it.title }, it.title), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))),
     plexLink(it.title));
 }
 const STAGES = ['Found', 'Downloading', 'Checking', 'In Plex'];
