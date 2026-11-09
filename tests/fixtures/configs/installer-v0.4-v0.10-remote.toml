@@ -1,0 +1,68 @@
+# Arr configuration, written by install.sh. Secrets live in secrets/ (mode 600).
+# More options: https://github.com/newtonharry/Arr/blob/main/config/standalone.example.toml
+
+[server]
+listen = "127.0.0.1:8787"
+api_token_file = "secrets/api_token"
+
+[state]
+dir = "."
+
+[[indexer]]
+id = 1
+name = "The Pirate Bay"
+kind = "thepiratebay"
+base_url = "https://apibay.org/"
+recent_feed = true
+
+[tvmaze]
+enabled = true
+
+[tmdb]
+enabled = true
+credential_file = "secrets/tmdb_credential"
+
+[execution]
+enabled = true
+download_cleanup = true
+
+# Sonarr/Radarr can keep running: Arr only acquires what you add to Arr.
+[migration]
+mode = "coexistence"
+
+[embedded]
+download_dir = "@ROOT@/downloads"
+listen = "0.0.0.0:51413"
+trackers = true
+dht = true
+max_active_downloads = 3
+
+[library]
+ffprobe = "@ROOT@/bin/ffprobe"
+movies = "@ROOT@/media/movies"
+tv = "@ROOT@/media/tv"
+
+[plex]
+base_url = "http://127.0.0.1:32400"
+token_file = "secrets/plex_token"
+movie_section = 1
+movies_path = "/data/movies"
+tv_section = 2
+tv_path = "/data/tv"
+
+# MCP for AI assistants on this machine (Claude Desktop, Claude Code, ...); see docs/MCP.md.
+[mcp]
+allowed_hosts = ["arr-example.ngrok-free.app", "localhost", "127.0.0.1"]
+enabled = true
+token_file = "secrets/mcp_token"
+
+# Error reports with names, paths, addresses and tokens removed; see docs/PRIVACY.md.
+[reporting]
+enabled = true
+
+# Google sign-in for ChatGPT and other remote MCP clients (docs/REMOTE.md).
+[mcp.oauth]
+public_url = "https://arr-example.ngrok-free.app"
+google_client_id = "000000000000-example.apps.googleusercontent.com"
+google_client_secret_file = "secrets/google_client_secret"
+allowed_emails = ["someone@example.com"]

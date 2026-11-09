@@ -1,0 +1,682 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "setup:movies-hd",
+      "media": "movie",
+      "name": "HD 720p/1080p (movies)",
+      "upgrade_allowed": false,
+      "tiers": [
+        {
+          "name": "HDTV-720p",
+          "qualities": [
+            "hdtv_720p"
+          ]
+        },
+        {
+          "name": "WEB 720p",
+          "qualities": [
+            "webdl_720p",
+            "webrip_720p"
+          ]
+        },
+        {
+          "name": "Bluray-720p",
+          "qualities": [
+            "bluray_720p"
+          ]
+        },
+        {
+          "name": "HDTV-1080p",
+          "qualities": [
+            "hdtv_1080p"
+          ]
+        },
+        {
+          "name": "WEB 1080p",
+          "qualities": [
+            "webdl_1080p",
+            "webrip_1080p"
+          ]
+        },
+        {
+          "name": "Bluray-1080p",
+          "qualities": [
+            "bluray_1080p"
+          ]
+        }
+      ],
+      "cutoff_tier": null,
+      "language": {
+        "requirement": {
+          "mode": "original"
+        },
+        "unmarked": "assume_original",
+        "source": "setup default (movies: original language)"
+      }
+    },
+    {
+      "id": "setup:tv-hd",
+      "media": "series",
+      "name": "HD 720p/1080p (TV)",
+      "upgrade_allowed": false,
+      "tiers": [
+        {
+          "name": "HDTV-720p",
+          "qualities": [
+            "hdtv_720p"
+          ]
+        },
+        {
+          "name": "WEB 720p",
+          "qualities": [
+            "webdl_720p",
+            "webrip_720p"
+          ]
+        },
+        {
+          "name": "Bluray-720p",
+          "qualities": [
+            "bluray_720p"
+          ]
+        },
+        {
+          "name": "HDTV-1080p",
+          "qualities": [
+            "hdtv_1080p"
+          ]
+        },
+        {
+          "name": "WEB 1080p",
+          "qualities": [
+            "webdl_1080p",
+            "webrip_1080p"
+          ]
+        },
+        {
+          "name": "Bluray-1080p",
+          "qualities": [
+            "bluray_1080p"
+          ]
+        }
+      ],
+      "cutoff_tier": null,
+      "language": {
+        "requirement": {
+          "mode": "any"
+        },
+        "unmarked": "accept",
+        "source": "setup default (series: any language)"
+      }
+    }
+  ],
+  "size_limits": [
+    {
+      "media": "movie",
+      "quality": "workprint",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "cam",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "telesync",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "telecine",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "regional",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "dvdscr",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "sdtv",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "dvd",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "dvdr",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "webdl_480p",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "webrip_480p",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "bluray_480p",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "bluray_576p",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "hdtv_720p",
+      "min_mib_per_minute": 3.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "webdl_720p",
+      "min_mib_per_minute": 3.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "webrip_720p",
+      "min_mib_per_minute": 3.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "bluray_720p",
+      "min_mib_per_minute": 3.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "hdtv_1080p",
+      "min_mib_per_minute": 4.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "webdl_1080p",
+      "min_mib_per_minute": 4.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "webrip_1080p",
+      "min_mib_per_minute": 4.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "bluray_1080p",
+      "min_mib_per_minute": 4.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "remux_1080p",
+      "min_mib_per_minute": 50.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "hdtv_2160p",
+      "min_mib_per_minute": 10.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "webdl_2160p",
+      "min_mib_per_minute": 10.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "webrip_2160p",
+      "min_mib_per_minute": 10.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "bluray_2160p",
+      "min_mib_per_minute": 10.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "remux_2160p",
+      "min_mib_per_minute": 50.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "brdisk",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "movie",
+      "quality": "rawhd",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "workprint",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "cam",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "telesync",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "telecine",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "regional",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "dvdscr",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "sdtv",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "dvd",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "dvdr",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "webdl_480p",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "webrip_480p",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "bluray_480p",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "bluray_576p",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "hdtv_720p",
+      "min_mib_per_minute": 3.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "webdl_720p",
+      "min_mib_per_minute": 3.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "webrip_720p",
+      "min_mib_per_minute": 3.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "bluray_720p",
+      "min_mib_per_minute": 3.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "hdtv_1080p",
+      "min_mib_per_minute": 4.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "webdl_1080p",
+      "min_mib_per_minute": 4.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "webrip_1080p",
+      "min_mib_per_minute": 4.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "bluray_1080p",
+      "min_mib_per_minute": 4.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "remux_1080p",
+      "min_mib_per_minute": 50.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "hdtv_2160p",
+      "min_mib_per_minute": 10.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "webdl_2160p",
+      "min_mib_per_minute": 10.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "webrip_2160p",
+      "min_mib_per_minute": 10.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "bluray_2160p",
+      "min_mib_per_minute": 10.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "remux_2160p",
+      "min_mib_per_minute": 50.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "brdisk",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    },
+    {
+      "media": "series",
+      "quality": "rawhd",
+      "min_mib_per_minute": 1.0,
+      "max_mib_per_minute": null,
+      "preferred_mib_per_minute": null
+    }
+  ],
+  "indexers": [
+    {
+      "media": "movie",
+      "prowlarr_indexer_id": 1,
+      "name": "The Pirate Bay",
+      "native": {
+        "app": "setup",
+        "id": 1,
+        "name": "The Pirate Bay"
+      },
+      "protocol": "torrent",
+      "categories": [
+        2000
+      ],
+      "priority": 25,
+      "minimum_seeders": 1,
+      "enable_automatic_search": true,
+      "enable_interactive_search": true,
+      "enable_rss": true,
+      "seed_ratio": 1.0,
+      "seed_time_minutes": 4320,
+      "season_pack_seed_time_minutes": 4320,
+      "unsupported": []
+    },
+    {
+      "media": "series",
+      "prowlarr_indexer_id": 1,
+      "name": "The Pirate Bay",
+      "native": {
+        "app": "setup",
+        "id": 1,
+        "name": "The Pirate Bay"
+      },
+      "protocol": "torrent",
+      "categories": [
+        5000
+      ],
+      "priority": 25,
+      "minimum_seeders": 1,
+      "enable_automatic_search": true,
+      "enable_interactive_search": true,
+      "enable_rss": true,
+      "seed_ratio": 1.0,
+      "seed_time_minutes": 4320,
+      "season_pack_seed_time_minutes": 4320,
+      "unsupported": []
+    }
+  ],
+  "release_policies": [
+    {
+      "media": "movie",
+      "maximum_size_mb": 0,
+      "allow_hardcoded_subs": false,
+      "prefer_propers_and_repacks": true,
+      "torrent_enabled": true,
+      "torrent_delay_minutes": 0,
+      "bypass_delay_if_highest_quality": true,
+      "revision_upgrades": false,
+      "redownload_failed": true,
+      "redownload_failed_interactive": false,
+      "rss_sync_interval_minutes": 15,
+      "availability_delay_days": 0
+    },
+    {
+      "media": "series",
+      "maximum_size_mb": 0,
+      "allow_hardcoded_subs": false,
+      "prefer_propers_and_repacks": true,
+      "torrent_enabled": true,
+      "torrent_delay_minutes": 0,
+      "bypass_delay_if_highest_quality": true,
+      "revision_upgrades": false,
+      "redownload_failed": true,
+      "redownload_failed_interactive": false,
+      "rss_sync_interval_minutes": 15,
+      "availability_delay_days": 0
+    }
+  ],
+  "download_clients": [
+    {
+      "media": "movie",
+      "native": {
+        "app": "setup",
+        "id": 0,
+        "name": "managed download policy"
+      },
+      "implementation": "managed",
+      "protocol": "torrent",
+      "enabled": true,
+      "priority": 1,
+      "host": null,
+      "port": null,
+      "use_ssl": null,
+      "url_base": null,
+      "category": "um-movies",
+      "post_import_category": null,
+      "initial_state": 0,
+      "sequential_order": false,
+      "first_and_last": false,
+      "content_layout": 0,
+      "remove_completed_downloads": true,
+      "remove_failed_downloads": true,
+      "credential_fields_in_snapshot": [],
+      "execution": "server_config"
+    },
+    {
+      "media": "series",
+      "native": {
+        "app": "setup",
+        "id": 0,
+        "name": "managed download policy"
+      },
+      "implementation": "managed",
+      "protocol": "torrent",
+      "enabled": true,
+      "priority": 1,
+      "host": null,
+      "port": null,
+      "use_ssl": null,
+      "url_base": null,
+      "category": "um-tv",
+      "post_import_category": null,
+      "initial_state": 0,
+      "sequential_order": false,
+      "first_and_last": false,
+      "content_layout": 0,
+      "remove_completed_downloads": true,
+      "remove_failed_downloads": true,
+      "credential_fields_in_snapshot": [],
+      "execution": "server_config"
+    }
+  ],
+  "root_folders": [
+    {
+      "media": "movie",
+      "path": "/srv/arr-fixture/media/movies",
+      "accessible_at_snapshot": null,
+      "free_space_bytes_at_snapshot": null
+    },
+    {
+      "media": "series",
+      "path": "/srv/arr-fixture/media/tv",
+      "accessible_at_snapshot": null,
+      "free_space_bytes_at_snapshot": null
+    }
+  ],
+  "blocking_issues": [],
+  "media_management": [
+    {
+      "media": "movie",
+      "copy_using_hardlinks": true,
+      "minimum_free_space_mb": 100,
+      "replace_illegal_characters": true
+    },
+    {
+      "media": "series",
+      "copy_using_hardlinks": true,
+      "minimum_free_space_mb": 100,
+      "replace_illegal_characters": true
+    }
+  ]
+}

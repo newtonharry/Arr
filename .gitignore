@@ -4,6 +4,7 @@
 *.log
 .env
 *.sqlite*
+!/tests/fixtures/state-*/state.sqlite
 /config/local*
 !config/local.example.toml
 /.impeccable/mocks/

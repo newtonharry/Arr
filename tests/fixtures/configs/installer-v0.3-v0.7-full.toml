@@ -1,0 +1,57 @@
+# Arr configuration, written by install.sh. Secrets live in secrets/ (mode 600).
+# All options: https://github.com/newtonharry/Arr/blob/main/config/standalone.example.toml
+
+[server]
+listen = "127.0.0.1:8787"
+api_token_file = "secrets/api_token"
+
+[state]
+dir = "."
+
+[[indexer]]
+id = 1
+name = "The Pirate Bay"
+kind = "thepiratebay"
+base_url = "https://apibay.org/"
+recent_feed = true
+
+[tvmaze]
+enabled = true
+
+[tmdb]
+enabled = true
+credential_file = "secrets/tmdb_credential"
+
+[execution]
+enabled = true
+download_cleanup = true
+
+# Sonarr/Radarr can keep running: Arr only acquires what you add to Arr.
+[migration]
+mode = "coexistence"
+
+[embedded]
+download_dir = "@ROOT@/downloads"
+listen = "0.0.0.0:51413"
+trackers = true
+dht = true
+max_active_downloads = 3
+upload_limit_bytes_per_sec = 1048576
+
+[library]
+ffprobe = "@ROOT@/bin/ffprobe"
+movies = "@ROOT@/media/movies"
+tv = "@ROOT@/media/tv"
+
+[plex]
+base_url = "http://127.0.0.1:32400"
+token_file = "secrets/plex_token"
+movie_section = 1
+movies_path = "/data/movies"
+tv_section = 2
+tv_path = "/data/tv"
+
+# MCP for AI assistants on this machine (Claude Desktop, Claude Code, ...); see docs/MCP.md.
+[mcp]
+enabled = true
+token_file = "secrets/mcp_token"

@@ -1,0 +1,15 @@
+{
+  "import_id": "imp-433458ad4f62827b-s1",
+  "schema_version": 1,
+  "snapshot_sha256": "5f8c839af68a26a8751881dd880d0deef23a4a7ba9341713fc9483d4dd8cb71b",
+  "snapshot_bytes": 1300,
+  "imported_at": "2026-11-09T02:50:47Z",
+  "observed_at": "2026-11-09T02:50:47Z",
+  "files": {
+    "catalog.json": "2f261d8e7ff6607011f105b752e06a9671b5e42e5e272a4b72d216a3d923f2a3",
+    "migration-report.json": "a3471fe3139a1068cc6b43d10e4daaabce54d120d87f28cb3bacb7dfc7a4ab62",
+    "migration-report.md": "0b7b8166f9629fc74fe01ee78964a6e45a6e777a5b301db083360de2cea98392",
+    "settings.json": "932a942ae94d254b0db692ece2d914b0e2075e1e9fcbc130f02749c8fad367b2",
+    "source-setup.json": "5f8c839af68a26a8751881dd880d0deef23a4a7ba9341713fc9483d4dd8cb71b"
+  }
+}
