@@ -1965,14 +1965,7 @@ impl Exec {
 
     /// Adds `media_id` through the API without searching (monitored, as a user would).
     pub async fn add(&self, media_id: &str) -> Value {
-        let (s, v, text) = self
-            .json(
-                self.post("/api/v1/library")
-                    .json(&json!({ "media_id": media_id, "search": false })),
-            )
-            .await;
-        assert_eq!(s, 201, "adding {media_id}: {text}");
-        v
+        add_title(&self.base, &self.client, media_id).await
     }
 
     /// Adds a movie from operator-supplied metadata (released long ago, no TMDB needed).
@@ -1985,58 +1978,22 @@ impl Exec {
         language: &str,
         alternates: &[&str],
     ) {
-        let (s, _, text) = self
-            .json(self.post("/api/v1/library").json(&json!({
-                "media_id": format!("movie:tmdb:{tmdb}"), "search": false,
-                "metadata": { "title": title, "year": year, "runtime_minutes": runtime,
-                    "original_language": language, "alternate_titles": alternates,
-                    "digital_release": format!("{year}-06-01") },
-            })))
-            .await;
-        assert_eq!(s, 201, "adding {title}: {text}");
+        add_movie_to(
+            &self.base,
+            &self.client,
+            tmdb,
+            title,
+            year,
+            runtime,
+            language,
+            alternates,
+        )
+        .await
     }
 
-    /// The managed counterpart of the legacy `snapshot()`: The Matrix (603, missing), The
-    /// Matrix Reloaded (604, on disk), Amélie (194, French, missing), Slow Horses (TVDB
-    /// 372264: S01E01 and S01E03 on disk) and Fargo (TVDB 269613: S04E01-E03 on disk), all
-    /// added and monitored.
+    /// The managed counterpart of the legacy `snapshot()` (see `seed_standard_library`).
     pub async fn seed_library(&self, tvmaze: bool) {
-        put(
-            &self.movies,
-            "The Matrix Reloaded (2003)/The.Matrix.Reloaded.2003.1080p.WEB-DL.x264-OLD.mkv",
-            &mkv(1),
-        );
-        self.add_movie(603, "The Matrix", 1999, 136, "English", &[])
-            .await;
-        self.add_movie(604, "The Matrix Reloaded", 2003, 138, "English", &[])
-            .await;
-        self.add_movie(
-            194,
-            "Amélie",
-            2001,
-            122,
-            "French",
-            &["Amelie from Montmartre"],
-        )
-        .await;
-        if tvmaze {
-            for n in [1, 3] {
-                put(
-                    &self.tv,
-                    &format!("Slow Horses/Season 1/Slow.Horses.S01E0{n}.1080p.WEB-DL.x264-OLD.mkv"),
-                    &mkv(1),
-                );
-            }
-            for n in 1..=3 {
-                put(
-                    &self.tv,
-                    &format!("Fargo/Season 4/Fargo.S04E0{n}.1080p.WEB-DL.x264-OLD.mkv"),
-                    &mkv(1),
-                );
-            }
-            self.add("series:tvdb:372264").await;
-            self.add("series:tvdb:269613").await;
-        }
+        seed_standard_library(&self.base, &self.client, &self.movies, &self.tv, tvmaze).await;
         // Nothing the seeding asked is a test's business.
         let mut m = self.mock.lock().unwrap();
         m.log.clear();
@@ -2044,6 +2001,158 @@ impl Exec {
         m.schedule_dates.clear();
         m.image_log.clear();
     }
+}
+
+async fn post_ok(base: &str, client: &reqwest::Client, path: &str, body: Value) -> Value {
+    let r = client
+        .post(format!("{base}{path}"))
+        .bearer_auth(TOKEN)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let text = r.text().await.unwrap();
+    assert!(
+        status == 200 || status == 201,
+        "POST {path}: {status} {text}"
+    );
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// Adds `media_id` (no search) to the server at `base`.
+pub async fn add_title(base: &str, client: &reqwest::Client, media_id: &str) -> Value {
+    post_ok(
+        base,
+        client,
+        "/api/v1/library",
+        json!({ "media_id": media_id, "search": false }),
+    )
+    .await
+}
+
+/// Adds a movie from operator-supplied metadata (no search).
+#[allow(clippy::too_many_arguments)]
+pub async fn add_movie_to(
+    base: &str,
+    client: &reqwest::Client,
+    tmdb: u32,
+    title: &str,
+    year: u16,
+    runtime: u32,
+    language: &str,
+    alternates: &[&str],
+) {
+    post_ok(
+        base,
+        client,
+        "/api/v1/library",
+        json!({
+            "media_id": format!("movie:tmdb:{tmdb}"), "search": false,
+            "metadata": { "title": title, "year": year, "runtime_minutes": runtime,
+                "original_language": language, "alternate_titles": alternates,
+                "digital_release": format!("{year}-06-01") },
+        }),
+    )
+    .await;
+}
+
+/// The managed setup of the harness (`POST /api/v1/setup`), for tests that start their own
+/// server over `write_managed_config`.
+pub async fn setup_managed(base: &str, client: &reqwest::Client) {
+    let v = post_ok(
+        base,
+        client,
+        "/api/v1/setup",
+        json!({ "document": setup_document(&ExecOptions::default()) }),
+    )
+    .await;
+    assert_eq!(v["status"], "created", "{v}");
+}
+
+/// The managed counterpart of the legacy `snapshot()`: The Matrix (603, missing), The Matrix
+/// Reloaded (604, on disk), Amélie (194, French, missing), Slow Horses (TVDB 372264: S01E01
+/// and S01E03 on disk) and Fargo (TVDB 269613: S04E01-E03 on disk), all added and monitored.
+pub async fn seed_standard_library(
+    base: &str,
+    client: &reqwest::Client,
+    movies: &Path,
+    tv: &Path,
+    tvmaze: bool,
+) {
+    put(
+        movies,
+        "The Matrix Reloaded (2003)/The.Matrix.Reloaded.2003.1080p.WEB-DL.x264-OLD.mkv",
+        &mkv(1),
+    );
+    add_movie_to(base, client, 603, "The Matrix", 1999, 136, "English", &[]).await;
+    add_movie_to(
+        base,
+        client,
+        604,
+        "The Matrix Reloaded",
+        2003,
+        138,
+        "English",
+        &[],
+    )
+    .await;
+    add_movie_to(
+        base,
+        client,
+        194,
+        "Amélie",
+        2001,
+        122,
+        "French",
+        &["Amelie from Montmartre"],
+    )
+    .await;
+    if tvmaze {
+        for n in [1, 3] {
+            put(
+                tv,
+                &format!("Slow Horses/Season 1/Slow.Horses.S01E0{n}.1080p.WEB-DL.x264-OLD.mkv"),
+                &mkv(1),
+            );
+        }
+        for n in 1..=3 {
+            put(
+                tv,
+                &format!("Fargo/Season 4/Fargo.S04E0{n}.1080p.WEB-DL.x264-OLD.mkv"),
+                &mkv(1),
+            );
+        }
+        add_title(base, client, "series:tvdb:372264").await;
+        add_title(base, client, "series:tvdb:269613").await;
+    }
+}
+
+/// Config and secrets of the managed stack for tests that run their own server or engine:
+/// `[server]`, the native Torznab `[[indexer]]` (id 1) on the mock, `[tvmaze]` when asked,
+/// then `extra` (whole sections). The state is not set up (`setup_managed` does that).
+pub fn write_managed_config(dir: &Path, mock: SocketAddr, tvmaze: bool, extra: &str) {
+    fsutil::ensure_private_dir(dir).unwrap();
+    fsutil::ensure_private_dir(&dir.join("secrets")).unwrap();
+    for (name, value) in [("api_token", TOKEN), ("tz_key", TZ_KEY)] {
+        let p = dir.join("secrets").join(name);
+        if !p.exists() {
+            fsutil::write_new_private_file(&p, value.as_bytes()).unwrap();
+        }
+    }
+    let mut cfg = format!(
+        "[server]\napi_token_file = \"secrets/api_token\"\nrequest_timeout_secs = 30\n\
+         [[indexer]]\nid = 1\nname = \"The Pirate Bay\"\nkind = \"torznab\"\nbase_url = \"http://{mock}/tz/\"\napi_key_file = \"secrets/tz_key\"\nmin_interval_ms = 0\ncache_ttl_secs = 0\ntimeout_secs = 2\npage_size = 100\nmax_pages = 2\n"
+    );
+    if tvmaze {
+        cfg.push_str(&format!(
+            "[tvmaze]\nenabled = true\nbase_url = \"http://{mock}/tvmaze\"\nimage_base_url = \"http://{mock}\"\ntimeout_secs = 2\n"
+        ));
+    }
+    cfg.push_str(extra);
+    let cfg_path = dir.join("config.toml");
+    let _ = std::fs::remove_file(&cfg_path);
+    fsutil::write_new_private_file(&cfg_path, cfg.as_bytes()).unwrap();
 }
 
 /// ffprobe accepts the file (the library copy is real, readable media).

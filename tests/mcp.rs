@@ -34,6 +34,7 @@ const TOOLS: [&str; 7] = [
     "start_download",
 ];
 
+/// LEGACY stack: the tests of the Sonarr/Radarr native-handoff gate need an imported snapshot.
 fn coexistence() -> ExecOptions {
     ExecOptions {
         mode: "coexistence",
@@ -42,8 +43,26 @@ fn coexistence() -> ExecOptions {
     }
 }
 
+/// The managed stack with the dedicated download categories the MCP tests expect.
+fn managed() -> ExecOptions {
+    ExecOptions {
+        categories: Some(("um-movies", "um-tv")),
+        ..Default::default()
+    }
+}
+
+fn category_of(e: &Exec, hash: &str) -> String {
+    match e.stack {
+        Stack::Managed => e.fake.lock().unwrap().torrents[hash].category.clone(),
+        Stack::Legacy => e.qb.lock().unwrap().torrents[hash].category.clone(),
+    }
+}
+
 fn adds(e: &Exec) -> usize {
-    e.qb.lock().unwrap().add_fields.len()
+    match e.stack {
+        Stack::Managed => e.fake.lock().unwrap().add_fields.len(),
+        Stack::Legacy => e.qb.lock().unwrap().add_fields.len(),
+    }
 }
 
 /// Counts every connection made to it: the proxy every child is pointed at.
@@ -413,7 +432,7 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
 async fn a_new_title_is_found_added_and_tracked_and_repeating_creates_no_duplicate() {
     let e = start_exec(ExecOptions {
         tmdb: true,
-        ..coexistence()
+        ..managed()
     })
     .await;
     let title = "Leviticus.2025.1080p.WEB-DL.DDP5.1.H.264-GRP";
@@ -461,7 +480,7 @@ async fn a_new_title_is_found_added_and_tracked_and_repeating_creates_no_duplica
     );
     e.tick().await;
     assert_eq!(adds(&e), 1);
-    assert_eq!(e.qb.lock().unwrap().torrents[&hash].category, "um-movies");
+    assert_eq!(category_of(&e, &hash), "um-movies");
 
     let r = s
         .call("media_status", json!({ "media_id": "movie:tmdb:900001" }))
@@ -548,7 +567,7 @@ async fn a_new_title_is_found_added_and_tracked_and_repeating_creates_no_duplica
 async fn an_add_committed_before_its_search_failed_is_reported_as_unknown() {
     let e = start_exec(ExecOptions {
         tmdb: true,
-        ..coexistence()
+        ..managed()
     })
     .await;
     e.mock
@@ -642,7 +661,7 @@ async fn an_operator_adopted_scope_is_acquired_through_mcp_and_cannot_be_widened
     );
     e.tick().await;
     assert_eq!(adds(&e), 1);
-    assert_eq!(e.qb.lock().unwrap().torrents[&hash].category, "um-tv");
+    assert_eq!(category_of(&e, &hash), "um-tv");
     // Anything wider is still Sonarr's.
     for wider in ["episode:tvdb:372264:1:4", "season:tvdb:372264:1"] {
         let r = s.call("add_media", json!({ "media_id": wider })).await;

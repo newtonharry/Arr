@@ -103,7 +103,7 @@ fn session_cookie(r: &reqwest::Response) -> String {
 async fn exec() -> Exec {
     start_exec(ExecOptions {
         tmdb: true,
-        ..ExecOptions::legacy()
+        ..Default::default()
     })
     .await
 }
@@ -436,7 +436,7 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     assert_eq!(item["stage"], "found", "not submitted yet");
     assert_eq!(item["paused"], false);
     e.tick().await;
-    qb::set_state(&e.qb, &hash, "downloading", 0.5);
+    e.set_state(&hash, "downloading", 0.5);
     e.tick().await;
     let v = feed().await;
     assert_eq!(v["on_its_way"].as_array().unwrap().len(), 1, "{v}");
@@ -463,7 +463,7 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     assert_eq!(s, 201, "{text}");
     let failed = first_grab(&v);
     e.tick().await;
-    qb::set_state(&e.qb, &bad_hash, "error", 0.2);
+    e.set_state(&bad_hash, "error", 0.2);
     let t0 = OffsetDateTime::now_utc();
     e.tick_at(t0).await;
     e.tick_at(t0 + std::time::Duration::from_secs(31 * 60))
@@ -479,7 +479,7 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     assert!(need["at"].is_string());
 
     // It arrived.
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     assert_eq!(e.grab_row(&matrix).state, "imported");
     let v = feed().await;
@@ -645,7 +645,7 @@ async fn ideas_say_when_they_are_unavailable_or_off() {
     );
     let off = start_exec(ExecOptions {
         tvmaze: false,
-        ..ExecOptions::legacy()
+        ..Default::default()
     })
     .await;
     let (s, v, _) = off.json(off.get("/api/v1/ideas")).await;
@@ -778,7 +778,7 @@ async fn quick_add_gets_a_movie_or_a_show() {
 
 #[tokio::test]
 async fn quick_add_finds_movies_through_plex_alone() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     let (s, v, text) = e
         .json(
             e.post("/api/v1/quick-add")
@@ -1189,7 +1189,7 @@ async fn posters_come_only_from_the_configured_image_hosts() {
 
 #[tokio::test]
 async fn movie_posters_need_plex_or_tmdb_to_know_the_movie() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     let site = serve(e.state.clone()).await;
     let cookie = site.sign_in(&e).await;
     assert_eq!(
@@ -1202,7 +1202,7 @@ async fn movie_posters_need_plex_or_tmdb_to_know_the_movie() {
 #[tokio::test]
 async fn movie_posters_come_from_plex_on_its_image_host_only() {
     // No TMDB key at all.
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     let site = serve(e.state.clone()).await;
     let cookie = site.sign_in(&e).await;
     let r = site.art("movie:tmdb:910001", Some(&cookie)).await;

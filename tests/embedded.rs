@@ -233,6 +233,7 @@ async fn start(o: Opts) -> Emb {
     } else {
         String::new()
     };
+
     let limit = o
         .download_limit
         .map(|l| format!("download_limit_bytes_per_sec = {l}\n"))
@@ -254,8 +255,12 @@ async fn start(o: Opts) -> Emb {
             .map(|m| format!("stall_timeout_minutes = {m}\n"))
             .unwrap_or_default(),
     );
-    write_state(&dir, &snapshot(), &extra, Some(mock_addr), true);
+    write_managed_config(&dir, mock_addr, true, &extra);
     let (state, base, server) = serve(&dir).await;
+    let client = reqwest::Client::new();
+    setup_managed(&base, &client).await;
+    seed_standard_library(&base, &client, &movies, &tv, true).await;
+    mock.lock().unwrap().log.clear();
     Emb {
         base,
         client: reqwest::Client::new(),
@@ -475,7 +480,10 @@ async fn a_new_movie_arrives_over_bittorrent_imports_and_seeds_to_ratio_two_acro
         .unwrap_or_else(|| panic!("{text}"))
         .to_string();
     let g = e.grab(&id);
-    assert_eq!((g.category.as_str(), g.seed_ratio), ("radarr", Some(2.0)));
+    assert_eq!(
+        (g.category.as_str(), g.seed_ratio),
+        ("um-movies", Some(2.0))
+    );
     assert_eq!(g.save_path, arr::paths::client_form(&e.downloads));
 
     // Real bytes from the controlled peer, every piece checked, then the normal import.
@@ -872,7 +880,7 @@ async fn a_state_is_bound_to_its_first_download_backend() {
         tmp.path().join("dl").display()
     );
     let (addr, _mock) = start_mock().await;
-    write_state(&dir, &snapshot(), &embedded, Some(addr), false);
+    write_managed_config(&dir, addr, false, &embedded);
     let state = api::AppState::new(config::load(&dir.join("config.toml")).unwrap()).unwrap();
     assert!(
         !state.client.as_ref().unwrap().embedded().unwrap().started(),
@@ -884,7 +892,7 @@ async fn a_state_is_bound_to_its_first_download_backend() {
         "{lib}[qbittorrent]\nbase_url = \"http://127.0.0.1:9/\"\nsave_path = \"/downloads\"\nlocal_path = '{}'\n",
         tmp.path().join("qb").display()
     );
-    write_state(&dir, &snapshot(), &qbit, Some(addr), false);
+    write_managed_config(&dir, addr, false, &qbit);
     let err = api::AppState::new(config::load(&dir.join("config.toml")).unwrap())
         .err()
         .unwrap();
@@ -925,7 +933,13 @@ async fn the_server_process_killed_mid_download_resumes_and_imports() {
         seeder.addr(),
         movies.display()
     );
-    write_state(&dir, &snapshot(), &extra, Some(mock_addr), false);
+    write_managed_config(&dir, mock_addr, false, &extra);
+    {
+        let (state, base, server) = serve(&dir).await;
+        setup_managed(&base, &reqwest::Client::new()).await;
+        server.abort();
+        drop(state);
+    }
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

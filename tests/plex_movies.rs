@@ -30,7 +30,7 @@ async fn add(e: &Exec, tmdb: u32) -> Value {
 
 #[tokio::test]
 async fn plex_alone_finds_movies_without_a_tmdb_key() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     assert!(e.state.cfg.tmdb.is_none());
 
     let (s, v, text) = e.json(e.get("/api/v1/discover?kind=movie&q=Plex")).await;
@@ -105,7 +105,7 @@ async fn plex_alone_finds_movies_without_a_tmdb_key() {
 
 #[tokio::test]
 async fn a_plex_movie_maps_to_the_movie_record() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     add(&e, PLEX_FOREIGN).await;
     let index = e.state.index();
     let m = index.movie(PLEX_FOREIGN).expect("added");
@@ -136,7 +136,7 @@ async fn a_plex_movie_maps_to_the_movie_record() {
 
 #[tokio::test]
 async fn released_plex_movies_are_looked_for_and_unreleased_ones_wait() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     let v = add(&e, PLEX_RELEASED).await;
     assert_eq!(v["outcome"], "looking", "{v}");
     assert_eq!(v["title"], "Plex Released Movie");
@@ -157,7 +157,7 @@ async fn released_plex_movies_are_looked_for_and_unreleased_ones_wait() {
 
 #[tokio::test]
 async fn an_unreleased_movie_is_rechecked_by_the_metadata_refresh() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     add(&e, PLEX_UNRELEASED).await;
     let now = time::OffsetDateTime::now_utc();
     let delay = e.state.availability_delay_days();
@@ -194,7 +194,7 @@ async fn an_unreleased_movie_is_rechecked_by_the_metadata_refresh() {
 async fn a_tmdb_key_wins_for_language_titles_and_dates_and_backs_plex_up() {
     let e = start_exec(ExecOptions {
         tmdb: true,
-        ..ExecOptions::legacy()
+        ..Default::default()
     })
     .await;
     let mut tmdb = tmdb_movie_with(PLEX_RELEASED, "Plex Released Movie", 2024, "2024-07-01");
@@ -261,7 +261,7 @@ async fn a_tmdb_key_wins_for_language_titles_and_dates_and_backs_plex_up() {
 
 #[tokio::test]
 async fn plex_failing_without_a_backup_is_a_clear_error() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     e.mock.lock().unwrap().plex_meta_fail = true;
     let (s, v, text) = e.json(e.get("/api/v1/discover?kind=movie&q=Plex")).await;
     assert_eq!(s, 200, "{text}");
@@ -271,7 +271,7 @@ async fn plex_failing_without_a_backup_is_a_clear_error() {
 
 #[tokio::test]
 async fn an_imdb_only_movie_is_resolved_through_plex() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions::default()).await;
     let movies = e.state.movies.as_ref().unwrap();
     assert_eq!(
         movies.find_imdb("tt9100001").await.unwrap(),
