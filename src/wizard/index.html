@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Set up Arr</title>
 <link rel="stylesheet" href="/app.css">
+<script src="/qrcodegen.js" defer></script>
 <script src="/app.js" defer></script>
 </head>
 <body>
@@ -101,9 +102,24 @@
   </section>
 
   <section id="done" class="card" hidden>
-    <h2>Arr is set up</h2>
-    <p>Arr knows what's already in your Plex libraries. The installer is finishing up in the terminal, starting Arr in the background.</p>
-    <p>You can close this tab.</p>
+    <h2>Your Arr app is ready</h2>
+    <p>Arr is set up and knows what's already in your Plex libraries. The installer is finishing up in the terminal, starting Arr in the background.</p>
+    <div id="open-box">
+      <button type="button" id="open-arr" class="primary" disabled>Open Arr</button>
+      <span id="open-status" class="muted" role="status">Starting Arr…</span>
+    </div>
+    <p id="open-elsewhere" class="hint" hidden>This page isn't on the computer that runs Arr, so open the address below there.</p>
+    <h3>On this computer</h3>
+    <div class="addr"><code id="app-local"></code><button type="button" class="copy" data-from="app-local">Copy</button><span class="copied" role="status"></span></div>
+    <div id="remote-yes" hidden>
+      <h3>On your phone or any device</h3>
+      <div class="addr"><code id="app-public"></code><button type="button" class="copy" data-from="app-public">Copy</button><span class="copied" role="status"></span></div>
+      <p class="hint">Sign in with Google. Scan this with your phone's camera:</p>
+      <div id="app-qr"></div>
+    </div>
+    <p id="remote-no" class="hint">Arr works on this computer for now. To use it on your phone, run the installer again with remote access (<code>--remote</code>); <a href="https://github.com/newtonharry/Arr/blob/main/docs/REMOTE.md" target="_blank" rel="noopener noreferrer">how it works</a>.</p>
+    <p id="bookmark-hint" class="hint"></p>
+    <p class="hint">You can close this tab when you've opened Arr.</p>
   </section>
 </main>
 </body>

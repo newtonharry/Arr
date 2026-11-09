@@ -351,7 +351,11 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     std::fs::create_dir_all(&tv).unwrap();
     let state_dir = tmp.path().join("state");
     let (mock, world) = start_mock(&movies, &tv).await;
-    let (mut child, link, port) = start_wizard(&state_dir, mock, &[]).await;
+    let extra = [
+        "--public-url".to_string(),
+        "https://arr-test.ngrok-free.app/".to_string(),
+    ];
+    let (mut child, link, port) = start_wizard(&state_dir, mock, &extra).await;
     let base = format!("http://127.0.0.1:{port}");
     let code = link.split("code=").nth(1).unwrap();
 
@@ -498,6 +502,16 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     }
     let (_, v) = page.get("/api/state").await;
     assert_eq!(v["phase"]["state"], "editing", "{v}");
+    // The Done screen's addresses: this computer's, and the public one the installer is
+    // about to set up (without a trailing slash).
+    assert_eq!(v["app"]["url"], format!("http://localhost:{port}"), "{v}");
+    assert_eq!(
+        v["app"]["public_url"], "https://arr-test.ngrok-free.app",
+        "{v}"
+    );
+    // Until setup has finished there is no app to sign in to.
+    let (s, _) = page.post("/api/app-link", json!({})).await;
+    assert_eq!(s, StatusCode::CONFLICT);
 
     let finished = || async {
         let mut last = Value::Null;
@@ -544,6 +558,34 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     assert!(last.get("no_tmdb").is_none(), "{last}");
     let (s, _) = page.post("/api/apply", choices("1:0")).await;
     assert_eq!(s, StatusCode::CONFLICT);
+    // "Open Arr": a one-time link for the config just written, made on request. Its token
+    // is kept (hashed) for the service to consume; each request makes a new one.
+    let (s, v) = page.post("/api/app-link", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let link = v["url"].as_str().unwrap();
+    let prefix = format!("http://localhost:{port}/app/link?t=");
+    let token = link
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("{link}"));
+    let (_, v2) = page.post("/api/app-link", json!({})).await;
+    assert_ne!(v2["url"].as_str().unwrap(), link);
+    let db = rusqlite::Connection::open(state_dir.join("web.sqlite")).unwrap();
+    let live = |t: &str| -> i64 {
+        db.query_row(
+            "SELECT COUNT(*) FROM links WHERE hash = ?1",
+            [hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                t.as_bytes(),
+            ))],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(live(token), 1, "the link wasn't saved for the service");
+    assert!(
+        !std::fs::read_to_string(state_dir.join("config.toml"))
+            .unwrap()
+            .contains(token)
+    );
     let (s, _) = page.post("/api/finish", json!({})).await;
     assert_eq!(s, StatusCode::OK);
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())

@@ -128,6 +128,32 @@ async fn pages_and_assets_carry_the_security_headers() {
         ("/app/app.css", "text/css", "no-cache"),
         ("/app/mascot.svg", "image/svg+xml", "no-cache"),
         ("/app/tmdb.svg", "image/svg+xml", "no-cache"),
+        ("/app/qrcodegen.js", "text/javascript", "no-cache"),
+        (
+            "/app/manifest.webmanifest",
+            "application/manifest+json",
+            "no-cache",
+        ),
+        (
+            "/app/icons/apple-touch-icon.png",
+            "image/png",
+            "public, max-age=604800, immutable",
+        ),
+        (
+            "/app/icons/icon-192.png",
+            "image/png",
+            "public, max-age=604800, immutable",
+        ),
+        (
+            "/app/icons/icon-512.png",
+            "image/png",
+            "public, max-age=604800, immutable",
+        ),
+        (
+            "/app/icons/icon-maskable-512.png",
+            "image/png",
+            "public, max-age=604800, immutable",
+        ),
         (
             "/app/fonts/nunito-latin.woff2",
             "font/woff2",
@@ -164,6 +190,58 @@ async fn pages_and_assets_carry_the_security_headers() {
         .unwrap();
     assert!(html.contains("/app/app.js") && html.contains("/app/app.css"));
     assert!(!html.contains("<style") && !html.contains("onclick"));
+    // It can be put on a home screen: a manifest, a touch icon and a theme colour.
+    for want in [
+        "rel=\"manifest\" href=\"/app/manifest.webmanifest\"",
+        "rel=\"apple-touch-icon\" href=\"/app/icons/apple-touch-icon.png\"",
+        "name=\"theme-color\"",
+        "src=\"/app/qrcodegen.js\"",
+    ] {
+        assert!(html.contains(want), "index.html lacks {want}");
+    }
+    let manifest: Value = site
+        .plain(Method::GET, "/app/manifest.webmanifest")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for (key, want) in [
+        ("name", "Arr"),
+        ("short_name", "Arr"),
+        ("start_url", "/"),
+        ("scope", "/"),
+        ("display", "standalone"),
+        ("background_color", "#fff8ef"),
+        ("theme_color", "#1c8576"),
+    ] {
+        assert_eq!(manifest[key], want, "{key}");
+    }
+    // Every icon the manifest names is served, as the PNG of the size it says.
+    let icons = manifest["icons"].as_array().unwrap();
+    assert!(icons.iter().any(|i| i["purpose"] == "maskable"));
+    for i in icons {
+        let bytes = site
+            .plain(Method::GET, i["src"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let side: u32 = i["sizes"]
+            .as_str()
+            .unwrap()
+            .split('x')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{i}");
+        let dim = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!((dim(16), dim(20)), (side, side), "{i}");
+    }
     // The API keeps answering where it always did.
     let (s, v) = site.json(site.plain(Method::GET, "/api/v1/health")).await;
     assert_eq!((s, v["status"].as_str()), (200, Some("ok")), "{v}");
@@ -278,6 +356,8 @@ async fn a_link_signs_in_once_and_expires() {
         .json(site.app(Method::GET, "/app/api/me", Some(&cookie)))
         .await;
     assert_eq!((s, &v["email"]), (200, &Value::Null), "{v}");
+    // No remote access: the app is told there is no public address.
+    assert!(v["public_url"].is_null(), "{v}");
     let (s, v) = site
         .json(site.app(Method::GET, "/app/api/v1/feed", Some(&cookie)))
         .await;
@@ -989,6 +1069,12 @@ async fn google_sign_in_gives_the_app_a_session_for_an_allowed_account() {
     let cookie = set.split(';').next().unwrap().to_string();
     let (s, v) = env.me(&cookie).await;
     assert_eq!((s, v["email"].as_str()), (200, Some(OWNER)), "{v}");
+    // With remote access, the app is told the public address (for "Use Arr on your phone").
+    assert_eq!(
+        v["public_url"].as_str(),
+        Some(env.base.trim_end_matches('/')),
+        "{v}"
+    );
     // The proxy reaches the API with its token (the catalog is simply not imported here).
     let r = env
         .http

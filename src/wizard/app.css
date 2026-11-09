@@ -85,3 +85,12 @@ a { color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 .small { font-size: 13px; }
+h3 { font-size: 15px; margin: 20px 0 6px; }
+.addr { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.addr code { flex: 1 1 220px; overflow-wrap: anywhere; user-select: all; font-size: 15px; }
+.addr button { margin: 0; }
+.copied { color: var(--ok); font-weight: 600; font-size: 14px; }
+.copied:empty { display: none; }
+#open-box { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 16px; }
+#open-box button { margin: 0; padding: 12px 22px; font-size: 17px; }
+#app-qr svg { display: block; width: 200px; height: 200px; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
