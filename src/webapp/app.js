@@ -65,7 +65,8 @@ async function api(path, { method = 'GET', body, signal } = {}) {
 
 // ---------- small helpers ----------
 const plexUrl = (t) => 'https://app.plex.tv/desktop/#!/search?query=' + encodeURIComponent(t);
-function tile(title) {
+// The title tile is the placeholder; a poster, when there is one, fades in over it.
+function tile(title, mediaId) {
   const words = String(title).split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w));
   const sig = words.filter((w) => !/^(the|a|an)$/i.test(w));
   const use = sig.length ? sig : words;
@@ -73,7 +74,14 @@ function tile(title) {
   const s = use.length > 1 ? (ch(use[0])[0] || '') + (ch(use[1])[0] || '') : ch(use[0]).slice(0, 2).join('');
   let n = 0;
   for (const c of String(title)) n = (n * 31 + c.codePointAt(0)) >>> 0;
-  return h('span', { class: 'tile t' + (n % 8), 'aria-hidden': 'true' }, (s || '?').toUpperCase());
+  const t = h('span', { class: 'tile t' + (n % 8), 'aria-hidden': 'true' }, (s || '?').toUpperCase());
+  if (mediaId) {
+    const img = h('img', { src: '/app/art/' + encodeURIComponent(mediaId), alt: '', loading: 'lazy', decoding: 'async' });
+    img.addEventListener('load', () => img.classList.add('on'));
+    img.addEventListener('error', () => img.remove());
+    t.append(img);
+  }
+  return t;
 }
 function parseDate(s) {
   if (/^\d{4}-\d\d-\d\d$/.test(s)) { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); }
@@ -174,13 +182,13 @@ function retryControl(it) {
 // ---------- rows ----------
 function needRow(it) {
   const [btn, msg] = retryControl(it);
-  return h('li', { class: 'item need' }, tile(it.title),
+  return h('li', { class: 'item need' }, tile(it.title, it.media_id),
     h('div', { class: 'what' }, h('h3', { title: it.title }, it.title),
       meta(it) && h('p', { class: 'meta' }, meta(it)),
       h('p', { class: 'problem' }, ic('alert'), h('span', null, it.problem)), msg), btn);
 }
 function arrivedRow(it) {
-  return h('li', { class: 'item arrived' }, tile(it.title),
+  return h('li', { class: 'item arrived' }, tile(it.title, it.media_id),
     h('div', { class: 'what' }, h('span', { class: 'tag' }, ic('check'), 'In Plex'),
       h('h3', { title: it.title }, it.title), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))),
     plexLink(it.title));
@@ -194,7 +202,7 @@ function wayRow(it) {
   fill.style.setProperty('--f', fills.get(it.grab_id) ?? 0);
   pendingFills.push([fill, target, it.grab_id]);
   const status = it.paused ? 'Paused' : stage === 0 ? 'Found, getting ready' : stage === 1 ? (p == null ? 'Downloading' : `${Math.round(p * 100)}% downloaded`) : 'Checking the file';
-  return h('li', { class: 'item' }, tile(it.title),
+  return h('li', { class: 'item' }, tile(it.title, it.media_id),
     h('div', { class: 'what' }, h('h3', { title: it.title }, it.title),
       h('p', { class: 'meta status' }, it.paused && ic('pause'), joinDot(meta(it), status)),
       h('ol', { class: 'journey' + (it.paused ? ' paused' : ''), 'aria-label': 'Progress' }, fill,
@@ -203,7 +211,7 @@ function wayRow(it) {
 let pendingFills = [];
 function lookRow(it) {
   const until = it.until ? parseDate(it.until) : null;
-  return h('li', { class: 'item' }, until ? chip(until, 'month') : tile(it.title),
+  return h('li', { class: 'item' }, until ? chip(until, 'month') : tile(it.title, it.media_id),
     h('div', { class: 'what' }, h('h3', { title: it.title }, it.title),
       h('p', { class: 'meta' }, joinDot(meta(it), until ? `Out ${fmtDay(until)}. Arr will get it then.` : 'Arr is looking for a copy'))));
 }
@@ -216,12 +224,12 @@ function ideaItem(x) {
 }
 function ideaCard(x) {
   const [btn] = addControl(ideaItem(x), false);
-  return h('li', { class: 'idea' }, tile(x.title), h('h3', { title: x.title }, x.title),
+  return h('li', { class: 'idea' }, tile(x.title, x.media_id), h('h3', { title: x.title }, x.title),
     h('p', { class: 'meta' }, x.network || x.year || ''), btn);
 }
 function ideaRow(x) {
   const [btn, msg] = addControl(ideaItem(x));
-  return h('li', { class: 'item top-align' }, tile(x.title),
+  return h('li', { class: 'item top-align' }, tile(x.title, x.media_id),
     h('div', { class: 'what' }, h('h3', { title: x.title }, x.title),
       h('p', { class: 'meta' }, joinDot(x.year, x.network)), x.summary && h('p', { class: 'clamp' }, x.summary), msg), btn);
 }
@@ -340,7 +348,7 @@ async function renderSearch(q, t) {
 function searchRow(x, label) {
   const base = x.has_file ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add';
   const [btn, msg] = addControl({ id: x.media_id, title: x.title, base });
-  return h('li', { class: 'item top-align' }, tile(x.title),
+  return h('li', { class: 'item top-align' }, tile(x.title, x.media_id),
     h('div', { class: 'what' }, h('h3', { title: x.title }, x.title), h('p', { class: 'meta' }, joinDot(x.year, label)), msg), btn);
 }
 
@@ -356,7 +364,8 @@ function renderLibrary(t) {
   };
   const rowFor = (x) => {
     const mv = S.kind === 'movies', title = x.title || 'Untitled';
-    return h('li', { class: 'item' }, tile(title), h('div', { class: 'what' }, h('h3', { title }, title),
+    const mid = mv ? (x.tmdb_id && `movie:tmdb:${x.tmdb_id}`) : x.tvdb_id ? `series:tvdb:${x.tvdb_id}` : x.tvmaze_id ? `series:tvmaze:${x.tvmaze_id}` : null;
+    return h('li', { class: 'item' }, tile(title, mid), h('div', { class: 'what' }, h('h3', { title }, title),
       h('p', { class: 'meta' }, joinDot(x.year, mv ? 'Movie' : 'Show', mv && x.has_file === false && 'Not in Plex yet'))),
       !(mv && x.has_file === false) && plexLink(title));
   };

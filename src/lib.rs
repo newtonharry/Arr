@@ -6,6 +6,7 @@
 //! (the default) makes no writes outside its own private state.
 
 pub mod api;
+pub mod art;
 pub mod bootstrap;
 pub mod catalog;
 pub mod client;

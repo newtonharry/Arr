@@ -370,6 +370,10 @@ pub struct MockState {
     pub schedule_fail: bool,
     /// When set, each download fetch is recorded, then answered only once notified.
     pub download_gate: Option<Arc<tokio::sync::Notify>>,
+    /// Poster requests received by the TMDB and TVmaze image hosts (paths).
+    pub image_log: Vec<String>,
+    /// TVmaze `image` values overriding the built-in ones, per show id.
+    pub tvmaze_images: HashMap<u32, Value>,
 }
 
 pub type Mock = Arc<Mutex<MockState>>;
@@ -525,12 +529,27 @@ async fn tvmaze_lookup(Query(q): Query<HashMap<String, String>>) -> Response {
     }
 }
 
-async fn tvmaze_show_by_id(axum::extract::Path(id): axum::extract::Path<String>) -> Response {
+async fn tvmaze_show_by_id(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
     match shows()
         .into_iter()
         .find(|s| s["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id.as_str()))
     {
-        Some(s) => axum::Json(s).into_response(),
+        Some(mut s) => {
+            let n = s["id"].as_u64().unwrap_or(0) as u32;
+            let host = headers["host"].to_str().unwrap_or_default().to_string();
+            s["image"] = m
+                .lock()
+                .unwrap()
+                .tvmaze_images
+                .get(&n)
+                .cloned()
+                .unwrap_or(json!({ "medium": format!("http://{host}/uploads/{n}.jpg") }));
+            axum::Json(s).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -606,6 +625,7 @@ fn tmdb_authorized(headers: &HeaderMap, q: &HashMap<String, String>) -> bool {
 
 fn tmdb_movie() -> Value {
     json!({ "id": 900001, "title": "Leviticus", "original_title": "Leviticus", "original_language": "en",
+            "poster_path": "/leviticus.jpg",
             "release_date": "2025-06-01", "runtime": 86, "imdb_id": "tt9000001", "status": "Released",
             "alternative_titles": { "titles": [{ "iso_3166_1": "US", "title": "Leviticus (Synthetic)" }] },
             "release_dates": { "results": [{ "iso_3166_1": "US", "release_dates": [
@@ -653,6 +673,16 @@ async fn tmdb_details(
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
+}
+
+/// A tiny JPEG (the header bytes are all the app checks).
+const TINY_JPEG: &[u8] = &[
+    0xff, 0xd8, 0xff, 0xe0, 0, 16, b'J', b'F', b'I', b'F', 0, 1, 0xff, 0xd9,
+];
+
+async fn image_host(State(m): State<Mock>, uri: Uri) -> Response {
+    m.lock().unwrap().image_log.push(uri.path().to_string());
+    ([("content-type", "image/jpeg")], TINY_JPEG).into_response()
 }
 
 async fn prowlarr_download(
@@ -786,6 +816,8 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         schedule_dates: vec![],
         schedule_fail: false,
         download_gate: None,
+        image_log: vec![],
+        tvmaze_images: HashMap::new(),
     }));
     let app = Router::new()
         .route("/prowlarr/api/v1/search", get(prowlarr_search))
@@ -796,6 +828,8 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         .route("/tvmaze/schedule/web", get(tvmaze_schedule))
         .route("/tmdb/3/search/movie", get(tmdb_search))
         .route("/tmdb/3/movie/{id}", get(tmdb_details))
+        .route("/t/p/w342/{file}", get(image_host))
+        .route("/uploads/{file}", get(image_host))
         .route("/prowlarr/{id}/download", get(prowlarr_download))
         .route("/prowlarr/{id}/api", get(prowlarr_feed))
         .route(
@@ -858,7 +892,7 @@ pub fn write_state(
         ));
         if tvmaze {
             cfg.push_str(&format!(
-                "[tvmaze]\nenabled = true\nbase_url = \"http://{addr}/tvmaze\"\ntimeout_secs = 2\n"
+                "[tvmaze]\nenabled = true\nbase_url = \"http://{addr}/tvmaze\"\nimage_base_url = \"http://{addr}\"\ntimeout_secs = 2\n"
             ));
         }
     }
@@ -1196,7 +1230,7 @@ pub async fn start_exec(o: ExecOptions) -> Exec {
     fsutil::write_new_private_file(&dir.join("secrets/tmdb"), TMDB_V3_KEY.as_bytes()).unwrap();
     let tmdb = if o.tmdb {
         format!(
-            "[tmdb]\nenabled = true\nbase_url = \"http://{mock_addr}/tmdb\"\ncredential_file = \"secrets/tmdb\"\n"
+            "[tmdb]\nenabled = true\nbase_url = \"http://{mock_addr}/tmdb\"\nimage_base_url = \"http://{mock_addr}\"\ncredential_file = \"secrets/tmdb\"\n"
         )
     } else {
         String::new()

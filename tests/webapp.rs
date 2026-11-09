@@ -127,6 +127,7 @@ async fn pages_and_assets_carry_the_security_headers() {
         ("/app/app.js", "text/javascript", "no-cache"),
         ("/app/app.css", "text/css", "no-cache"),
         ("/app/mascot.svg", "image/svg+xml", "no-cache"),
+        ("/app/tmdb.svg", "image/svg+xml", "no-cache"),
         (
             "/app/fonts/nunito-latin.woff2",
             "font/woff2",
@@ -1054,4 +1055,148 @@ async fn the_google_callback_only_completes_in_the_browser_that_started_it() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403);
+}
+
+// ------------------------------------------------------------------ posters
+
+impl Site {
+    async fn art(&self, id: &str, cookie: Option<&str>) -> reqwest::Response {
+        let rb = self.plain(Method::GET, &format!("/app/art/{}", id.replace(':', "%3A")));
+        match cookie {
+            Some(c) => rb.header("cookie", c),
+            None => rb,
+        }
+        .send()
+        .await
+        .unwrap()
+    }
+}
+
+fn image_fetches(e: &Exec) -> Vec<String> {
+    e.mock.lock().unwrap().image_log.clone()
+}
+
+#[tokio::test]
+async fn posters_are_fetched_once_and_served_from_the_cache() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    // A session is required, and only real media ids are accepted.
+    assert_eq!(site.art("movie:tmdb:900001", None).await.status(), 401);
+    let cookie = site.sign_in(&e).await;
+    assert_eq!(
+        site.art("movie:imdb:tt1", Some(&cookie)).await.status(),
+        400
+    );
+    assert_eq!(site.art("nonsense", Some(&cookie)).await.status(), 400);
+    assert!(image_fetches(&e).is_empty());
+
+    // A movie poster comes from the TMDB image host, then from disk.
+    for _ in 0..2 {
+        let r = site.art("movie:tmdb:900001", Some(&cookie)).await;
+        assert_eq!(r.status(), 200);
+        let h = r.headers();
+        assert_eq!(h["content-type"], "image/jpeg");
+        assert_eq!(h["cache-control"], "private, max-age=604800");
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(&r.bytes().await.unwrap()[..3], &[0xff, 0xd8, 0xff]);
+    }
+    assert_eq!(image_fetches(&e), ["/t/p/w342/leviticus.jpg"]);
+
+    // A show's poster, and its seasons and episodes, share one fetch (TVDB id 372264 is
+    // TVmaze 9001; the show is also reachable by its TVmaze id).
+    for id in [
+        "series:tvmaze:9001",
+        "series:tvdb:372264",
+        "series:tvmaze:9001",
+        "season:tvdb:372264:1",
+        "episode:tvmaze:9001:1:2",
+    ] {
+        let r = site.art(id, Some(&cookie)).await;
+        assert_eq!(r.status(), 200, "{id}");
+        assert_eq!(r.headers()["content-type"], "image/jpeg");
+    }
+    let fetches = image_fetches(&e);
+    assert_eq!(fetches.len(), 2, "{fetches:?}");
+    assert_eq!(fetches[1], "/uploads/9001.jpg");
+    assert!(e.state.cfg.state_dir.join("art/show-9001").exists());
+    // A TVDB id the catalog doesn't know is looked up at TVmaze.
+    assert_eq!(
+        site.art("series:tvdb:999001", Some(&cookie)).await.status(),
+        200
+    );
+    assert_eq!(image_fetches(&e).len(), 3);
+}
+
+#[tokio::test]
+async fn a_missing_poster_is_a_quiet_404_and_is_remembered() {
+    let e = exec().await;
+    e.mock.lock().unwrap().tmdb_movies.insert(
+        "900002".into(),
+        tmdb_movie_with(900002, "No Poster", 2025, "2025-08-15"),
+    );
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    for _ in 0..2 {
+        let r = site.art("movie:tmdb:900002", Some(&cookie)).await;
+        assert_eq!(r.status(), 404);
+        assert!(r.bytes().await.unwrap().is_empty());
+    }
+    assert!(e.state.cfg.state_dir.join("art/movie-900002.none").exists());
+    // A show TVmaze doesn't know, and one TVmaze has no picture for, are the same.
+    assert_eq!(
+        site.art("series:tvmaze:4242", Some(&cookie)).await.status(),
+        404
+    );
+    e.mock
+        .lock()
+        .unwrap()
+        .tvmaze_images
+        .insert(9002, json!(null));
+    assert_eq!(
+        site.art("series:tvmaze:9002", Some(&cookie)).await.status(),
+        404
+    );
+    assert!(e.state.cfg.state_dir.join("art/show-9002.none").exists());
+    assert!(image_fetches(&e).is_empty());
+}
+
+#[tokio::test]
+async fn posters_come_only_from_the_configured_image_hosts() {
+    let e = exec().await;
+    let port = e.mock_addr.port();
+    // Same machine, different host name: not the configured image host.
+    e.mock.lock().unwrap().tvmaze_images.insert(
+        9002,
+        json!({ "medium": format!("http://localhost:{port}/uploads/9002.jpg") }),
+    );
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    assert_eq!(
+        site.art("series:tvmaze:9002", Some(&cookie)).await.status(),
+        404
+    );
+    // The configured host, with another address hidden in its path: joining that path must
+    // not move the fetch to the other host.
+    let mock = e.mock_addr;
+    e.mock.lock().unwrap().tvmaze_images.insert(
+        9003,
+        json!({ "medium": format!("http://{mock}/http://localhost:{port}/uploads/9003.jpg") }),
+    );
+    assert_eq!(
+        site.art("series:tvmaze:9003", Some(&cookie)).await.status(),
+        404
+    );
+    assert!(image_fetches(&e).is_empty());
+}
+
+#[tokio::test]
+async fn movie_posters_need_tmdb() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    assert_eq!(
+        site.art("movie:tmdb:900001", Some(&cookie)).await.status(),
+        404
+    );
+    assert!(image_fetches(&e).is_empty());
 }

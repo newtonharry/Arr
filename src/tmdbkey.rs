@@ -37,6 +37,7 @@ pub fn shape(key: &str) -> Result<&str> {
 pub async fn verify(base_url: &Url, key: &str) -> Result<()> {
     let cfg = MetadataConfig {
         base_url: base_url.clone(),
+        image_base_url: base_url.clone(),
         timeout: Duration::from_secs(20),
         credential: Some(Secret::new(shape(key)?.to_string())),
     };
