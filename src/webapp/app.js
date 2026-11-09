@@ -800,6 +800,67 @@ function renderPath(path, q, hash) {
   else renderHome(t);
 }
 
+// ---- Use Arr on your phone: the address, a QR code and how to put Arr on the home screen
+const REMOTE_DOCS = 'https://github.com/newtonharry/Arr/blob/main/docs/REMOTE.md';
+let publicUrl = null;
+
+function showFoot(me) {
+  $('#who').textContent = me.email ? 'Signed in as ' + me.email : 'Signed in';
+  publicUrl = me.public_url || null;
+  $('#foot').hidden = false;
+}
+
+// The code is always dark on white, whatever the theme: phones scan it that way.
+function qrSvg(text) {
+  const q = qrcodegen.QrCode.encodeText(text, qrcodegen.QrCode.Ecc.MEDIUM), pad = 3;
+  const s = document.createElementNS(NS, 'svg'), bg = document.createElementNS(NS, 'rect'), p = document.createElementNS(NS, 'path');
+  let d = '';
+  for (let y = 0; y < q.size; y++) for (let x = 0; x < q.size; x++) if (q.getModule(x, y)) d += `M${x + pad},${y + pad}h1v1h-1z`;
+  s.setAttribute('viewBox', `0 0 ${q.size + pad * 2} ${q.size + pad * 2}`);
+  s.setAttribute('class', 'qr'); s.setAttribute('role', 'img'); s.setAttribute('aria-label', 'QR code for ' + text);
+  s.setAttribute('shape-rendering', 'crispEdges');
+  bg.setAttribute('width', '100%'); bg.setAttribute('height', '100%'); bg.setAttribute('fill', '#fff');
+  p.setAttribute('d', d); p.setAttribute('fill', '#000');
+  s.append(bg, p);
+  return s;
+}
+
+async function copyText(node, text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch { /* not allowed here: select it instead */ }
+  const r = document.createRange(); r.selectNodeContents(node);
+  const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  try { return document.execCommand('copy'); } catch { return false; }
+}
+
+function paintPhone() {
+  const box = $('#phone');
+  const code = h('code', null, publicUrl);
+  const msg = h('span', { class: 'msg', role: 'status' });
+  const copy = h('button', { type: 'button', class: 'btn ghost' }, 'Copy');
+  copy.addEventListener('click', async () => { msg.textContent = (await copyText(code, publicUrl)) ? 'Copied' : 'Press Ctrl+C to copy'; });
+  const how = h('div', { class: 'how' },
+    h('p', null, h('b', null, 'iPhone: '), 'open the address in Safari, tap Share, then Add to Home Screen.'),
+    h('p', null, h('b', null, 'Android: '), 'open the address in Chrome, tap the menu (three dots), then Add to Home screen or Install app.'));
+  box.replaceChildren(publicUrl
+    ? h('div', { class: 'stack' },
+      h('p', null, 'Open this address on your phone and sign in with Google:'),
+      h('div', { class: 'addr' }, code, copy, msg),
+      qrSvg(publicUrl),
+      how)
+    : h('div', { class: 'stack' },
+      h('p', null, 'Arr works on this computer for now. To use it on your phone, turn on remote access: run the installer again with ',
+        h('code', null, '--remote'), ' (', h('a', { href: REMOTE_DOCS, target: '_blank', rel: 'noopener noreferrer' }, 'how it works'), ').'),
+      h('p', null, 'Once that is done, this page shows an address and a QR code to scan.')));
+}
+
+$('#phone-btn').addEventListener('click', () => {
+  const btn = $('#phone-btn'), open = $('#phone').hidden;
+  if (open) paintPhone();
+  $('#phone').hidden = !open;
+  btn.setAttribute('aria-expanded', String(open));
+  if (open) $('#phone').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+});
+
 async function boot() {
   $('#search-ico').append(ic('search'));
   tabs.append(...TABS.map(([p, l, i]) => h('a', { href: '#' + p }, ic(i), l)));
@@ -823,7 +884,7 @@ async function boot() {
   window.addEventListener('hashchange', route);
   try {
     const r = await api('/me');
-    if (r.ok) { $('#who').textContent = r.data.email ? 'Signed in as ' + r.data.email : 'Signed in'; $('#foot').hidden = false; }
+    if (r.ok) showFoot(r.data);
   } catch {
     if (S.out) return;
     mount(hint('Your list will show up here as soon as Arr is back.'));
@@ -842,7 +903,7 @@ function go(q) {
 async function boot2() {
   try {
     const r = await api('/me');
-    if (r.ok) { $('#who').textContent = r.data.email ? 'Signed in as ' + r.data.email : 'Signed in'; $('#foot').hidden = false; route(); if (!onHome()) loadFeed(); }
+    if (r.ok) { showFoot(r.data); route(); if (!onHome()) loadFeed(); }
   } catch { if (!S.out) setTimeout(boot2, 5000); }
 }
 boot();

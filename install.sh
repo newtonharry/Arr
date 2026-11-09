@@ -42,6 +42,7 @@ ALLOW_EMAILS="${ARR_ALLOW_EMAILS:-}"
 AUTO_UPDATE="${ARR_AUTO_UPDATE:-}"
 ERROR_REPORTS="${ARR_ERROR_REPORTS:-}"
 SETUP=1
+FIRST_INSTALL=0
 TERMINAL=0
 SERVICE=1
 DOWNLOADING=1
@@ -845,6 +846,8 @@ browser_setup() {
 		--torrent-port "$TORRENT_PORT" --upload-limit-kib "$UPLOAD_LIMIT_KIB" --ffprobe "$FFPROBE"
 	[ "$bind" != 127.0.0.1 ] || set -- "$@" --open
 	[ "$ERROR_REPORTS" != 1 ] || set -- "$@" --error-reports
+	# Remote access given up front: the page can show its address (it's set up after this).
+	[ -z "$NGROK_DOMAIN" ] || set -- "$@" --public-url "https://$(norm_domain "$NGROK_DOMAIN")"
 	# Arr runs as RUN_AS, so the page checks folders as that user too, and its files are theirs.
 	if [ "$(id -u)" = 0 ] && [ "$RUN_AS" != root ]; then
 		chown -R "$RUN_AS" "$STATE_DIR"
@@ -956,6 +959,7 @@ if [ -f "$CONFIG" ]; then
 	[ "$TORRENT_PORT_SET" = 0 ] || set_conf torrent-port "$TORRENT_PORT"
 	case "$ERROR_REPORTS" in 1) set_conf error-reports on ;; 0) set_conf error-reports off ;; esac
 else
+	FIRST_INSTALL=1
 	[ ! -f "$CONFIG.failed" ] || say "Setting Arr up from the start ($CONFIG.failed holds the last attempt, which failed)."
 	if [ "$TERMINAL" != 1 ] && interactive && [ "$DOWNLOADING" = 1 ] && [ "$PLEX_URL_SET" = 0 ] &&
 		[ -z "$PLEX_TOKEN$MOVIES$TV$MOVIE_SECTION$TV_SECTION$DOWNLOADS$TMDB_KEY" ]; then
@@ -1481,9 +1485,27 @@ if grep -q '^\[plex\]' "$CONFIG"; then
 	say "Done. Titles you already have are marked owned, and nothing was downloaded."
 fi
 
+echo
+echo "Arr is running. Open it at:"
+echo "  this computer: http://localhost:$PORT"
+[ -z "$PUBLIC_URL" ] || echo "  any device:    $PUBLIC_URL   (sign in with Google)"
+# A first install has nobody signed in yet: a link that works once, for 15 minutes. Anyone
+# who has it can sign in, so it is made only when a person is at the terminal (not --yes, not a
+# pipe or a log), and goes to the terminal itself. (With remote access it would name the public
+# address, which may not be reachable yet, so it names this computer.)
+if [ "$FIRST_INSTALL" = 1 ] && interactive && [ -t 1 ]; then
+	link=$(as_run "$ARR" app-link --config "$CONFIG" 2>/dev/null | sed "s#^https://[^/]*#http://localhost:$PORT#") || link=""
+	if [ -n "$link" ]; then
+		{
+			echo
+			echo "To sign in on this computer, open this link. It works once, within 15 minutes:"
+			echo "  $link"
+		} >/dev/tty
+	fi
+fi
 cat <<EOF
 
-Arr is running at $API
+Arr API: $API
   API token:   $STATE_DIR/secrets/api_token
   Config:      $CONFIG
   Logs:        $logs

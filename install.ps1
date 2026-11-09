@@ -239,9 +239,13 @@ function Install-Arr {
 	} else {
 		Step 'Setting up Arr in your web browser'
 		if (Test-Path "$Config.failed") { Say "(config.toml.failed in $StateDir is the last setup attempt that failed; this starts over)" }
+		$firstInstall = $true
 		$reports = @(if ($env:ARR_ERROR_REPORTS -eq '1') { '--error-reports' })
+		# Remote access given up front: the page can show its address (it's set up after this).
+		$wizardDomain = ($env:ARR_NGROK_DOMAIN -replace '^https?://', '' -replace '/.*$', '').ToLowerInvariant()
+		$publicArgs = @(if ($wizardDomain -match '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { '--public-url'; "https://$wizardDomain" })
 		& $Arr wizard --state-dir $StateDir --port $Port --torrent-port $TorrentPort `
-			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open @reports
+			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open @reports @publicArgs
 		if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Config)) { throw "setup wasn't finished; run this again to start over" }
 	}
 	# The setup page asked about automatic updates (maybe on a run that stopped before here);
@@ -381,7 +385,25 @@ function Install-Arr {
 	$mcp = @{ mcpServers = @{ arr = @{ command = $Arr; args = @('mcp', '--api-url', "$api/", '--token-file', (Join-Path $StateDir 'secrets\api_token')) } } } |
 		ConvertTo-Json -Depth 5
 	Say ''
-	Say "Arr is running at $api"
+	Say 'Arr is running. Open it at:'
+	Say "  this computer: http://localhost:$Port"
+	if ($PublicUrl) { Say "  any device:    $PublicUrl   (sign in with Google)" }
+	# A first install has nobody signed in yet: a link that works once, for 15 minutes. Anyone
+	# who has it can sign in, so it is made only when a person is at the console (not ARR_YES,
+	# not redirected) and goes straight to the console with [Console]::WriteLine: Write-Host output can still be
+	# captured by stream redirection (*> file), the console can't. (With
+	# remote access it would name the public address, which may not be reachable yet, so it
+	# names this computer.)
+	if ($firstInstall -and (Interactive) -and -not [Console]::IsOutputRedirected) {
+		$link = & { $ErrorActionPreference = 'Continue'; & $Arr app-link --config $Config 2>$null | Select-Object -First 1 }
+		if ($link) {
+			[Console]::WriteLine('')
+			[Console]::WriteLine('To sign in on this computer, open this link. It works once, within 15 minutes:')
+			[Console]::WriteLine("  " + ($link -replace '^https://[^/]*', "http://localhost:$Port"))
+		}
+	}
+	Say ''
+	Say "Arr API: $api"
 	Say "  API token:   $(Join-Path $StateDir 'secrets\api_token')"
 	Say "  Config:      $Config"
 	Say "  Logs:        $(Join-Path $StateDir 'arr.log')"

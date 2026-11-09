@@ -101,6 +101,13 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 .more{display:grid;justify-items:center;gap:6px;margin-top:14px;color:var(--muted)}
 .busy{opacity:.55;transition:opacity .2s}
 .foot{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:14px;padding-bottom:24px}
+.phone{flex-basis:100%;background:var(--card);border:2px solid var(--line);border-radius:18px;padding:16px;color:var(--ink);font-size:15px}
+.phone .stack>*+*{margin-top:12px}
+.phone code{font:600 14px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere;user-select:all}
+.phone .addr{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
+.phone .addr code{flex:1 1 200px}
+.phone .qr{display:block;width:min(100%,220px);height:auto;border-radius:12px;border:2px solid var(--line)}
+.phone .how p{color:var(--muted)}.phone .how p+p{margin-top:6px}.phone .how b{color:var(--ink)}
 .credit{flex-basis:100%;font-size:13px;line-height:1.5}
 .credit img{height:11px;width:auto;vertical-align:-1px;margin:0 2px}
 .credit a{color:inherit}

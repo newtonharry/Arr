@@ -121,6 +121,9 @@ enum Command {
         /// Start with error reports ticked (the installer's --error-reports).
         #[arg(long)]
         error_reports: bool,
+        /// The public https address the installer is setting up next, shown when setup is done.
+        #[arg(long)]
+        public_url: Option<String>,
     },
     /// Install Plex Media Server from Plex's package source, and make a media folder Plex and
     /// you can both use (Movies, TV Shows). Needs administrator rights; the setup page runs it
@@ -743,6 +746,7 @@ async fn run() -> Result<std::process::ExitCode> {
             plex_installer,
             plex_port,
             error_reports,
+            public_url,
         } => {
             wizard::run(wizard::Options {
                 state_dir,
@@ -759,6 +763,7 @@ async fn run() -> Result<std::process::ExitCode> {
                 plex_installer,
                 plex_port,
                 error_reports,
+                public_url,
             })
             .await
         }
