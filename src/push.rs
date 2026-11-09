@@ -411,8 +411,10 @@ pub fn items_from_feed(feed: &Value) -> Vec<Item> {
         let (Some(what), Some(key)) = (describe(i), i["key"].as_str()) else {
             continue;
         };
+        // The time the item entered the list is part of the key: a retry that fails again is new.
+        let at = i["at"].as_str().unwrap_or_default();
         out.push(Item {
-            key: format!("needs:{key}"),
+            key: format!("needs:{key}:{at}"),
             body: format!("{what} needs you"),
             url: route_of(i["media_id"].as_str().unwrap_or_default()),
         });
@@ -600,7 +602,9 @@ impl Push {
         let authorization = self.vapid.authorization(&url, now() + 12 * 3600)?;
         let mut client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(15));
+            .timeout(Duration::from_secs(15))
+            // A proxy would resolve the name itself and bypass the checked address below.
+            .no_proxy();
         // Resolve once, check every address, and connect to what was checked.
         if let Some(url::Host::Domain(d)) = url.host() {
             let port = url.port_or_known_default().unwrap_or(443);
@@ -610,8 +614,10 @@ impl Push {
             }
             client = client.resolve(d, addrs[0]);
         }
+        // Errors never carry the endpoint: its path is the device's subscription token.
         let resp = client
-            .build()?
+            .build()
+            .map_err(reqwest::Error::without_url)?
             .post(url)
             .header("TTL", TTL)
             .header("Content-Encoding", "aes128gcm")
@@ -620,7 +626,8 @@ impl Push {
             .header("Authorization", authorization)
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         Ok(resp.status().as_u16())
     }
 }
@@ -815,6 +822,20 @@ mod tests {
         assert_eq!(items[2].url, "/#/show/series:tvdb:372264");
         assert_eq!(route_of("garbage"), "/");
         assert!(items_from_feed(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_needs_you_item_that_comes_back_is_announced_again() {
+        let item = |at: &str| {
+            json!({ "needs_you": [{ "key": "download_failed:g1", "media_id": "movie:tmdb:603",
+                "title": "The Matrix", "detail": null, "at": at }] })
+        };
+        let first = items_from_feed(&item("2026-01-01T00:00:00Z"));
+        let seen: HashSet<String> = first.iter().map(|i| i.key.clone()).collect();
+        let same = items_from_feed(&item("2026-01-01T00:00:00Z"));
+        assert!(fresh(&seen, true, &same).is_empty(), "unchanged");
+        let retried = items_from_feed(&item("2026-01-02T00:00:00Z"));
+        assert_eq!(fresh(&seen, true, &retried).len(), 1, "failed again");
     }
 
     #[test]
