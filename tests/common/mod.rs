@@ -983,7 +983,8 @@ fn torznab_item(r: &Value, host: &str) -> String {
         })
         .unwrap_or_else(|| "Mon, 26 Oct 2026 08:00:00 +0000".into());
     let size = r["size"].as_i64().unwrap_or(0);
-    let seeders = r["seeders"].as_i64().unwrap_or(0);
+    let seeders_known = r["seeders"].as_i64();
+    let seeders = seeders_known.unwrap_or(0);
     let leechers = r["leechers"].as_i64().unwrap_or(0);
     let cats: String = r["categories"]
         .as_array()
@@ -993,7 +994,7 @@ fn torznab_item(r: &Value, host: &str) -> String {
         .map(|c| format!("<torznab:attr name=\"category\" value=\"{c}\" />"))
         .collect();
     format!(
-        "<item><title>{}</title><guid isPermaLink=\"false\">{}</guid><prowlarrindexer id=\"{}\">{}</prowlarrindexer>{}<pubDate>{date}</pubDate><size>{size}</size>{}{cats}<torznab:attr name=\"seeders\" value=\"{seeders}\" /><torznab:attr name=\"peers\" value=\"{}\" />{}{}</item>\n",
+        "<item><title>{}</title><guid isPermaLink=\"false\">{}</guid><prowlarrindexer id=\"{}\">{}</prowlarrindexer>{}<pubDate>{date}</pubDate><size>{size}</size>{}{cats}{}{}{}{}</item>\n",
         esc(r["title"].as_str().unwrap_or("")),
         esc(r["guid"].as_str().unwrap_or("")),
         r["indexerId"].as_i64().unwrap_or(1),
@@ -1007,7 +1008,15 @@ fn torznab_item(r: &Value, host: &str) -> String {
                 esc(l)
             ))
             .unwrap_or_default(),
-        seeders + leechers,
+        seeders_known
+            .map(|n| format!("<torznab:attr name=\"seeders\" value=\"{n}\" />"))
+            .unwrap_or_default(),
+        seeders_known
+            .map(|_| format!(
+                "<torznab:attr name=\"peers\" value=\"{}\" />",
+                seeders + leechers
+            ))
+            .unwrap_or_default(),
         r["infoHash"]
             .as_str()
             .map(|h| format!("<torznab:attr name=\"infohash\" value=\"{h}\" />"))
@@ -1494,6 +1503,22 @@ pub struct ExecOptions {
     pub library: bool,
     /// Managed: configure `[plex]` against the mock (the default stack has it).
     pub plex: bool,
+    /// Managed: execution enabled (the embedded engine's stand-in, the worker's writes).
+    /// False is the shadow-mode stack: planning only, no download client.
+    pub execution: bool,
+    /// Managed: configure the native Torznab indexer (false: no search backend at all).
+    pub indexer: bool,
+    /// Managed: where the Torznab indexer is (default: the mock), its result cache (seconds)
+    /// and page size.
+    pub indexer_addr: Option<SocketAddr>,
+    pub indexer_cache_secs: u64,
+    pub page_size: u32,
+    /// Managed: run the managed setup (false: a server with nothing set up yet).
+    pub setup: bool,
+    /// Managed: extra keys for the `[server]` section.
+    pub server_extra: String,
+    /// Managed: `[[profiles]]` entries for the setup document (replacing the default one).
+    pub profiles: String,
     /// Managed: extra keys for the setup document's `[download]`, `[tv]` and `[movies]` tables.
     pub download_extra: String,
     pub tv_extra: String,
@@ -1519,6 +1544,14 @@ impl Default for ExecOptions {
             stall_timeout_minutes: None,
             library: true,
             plex: true,
+            execution: true,
+            indexer: true,
+            indexer_addr: None,
+            indexer_cache_secs: 0,
+            page_size: 100,
+            setup: true,
+            server_extra: String::new(),
+            profiles: String::new(),
             download_extra: String::new(),
             tv_extra: String::new(),
             movies_extra: String::new(),
@@ -1530,6 +1563,14 @@ impl Default for ExecOptions {
 }
 
 impl ExecOptions {
+    /// The managed stack in shadow mode: execution off, so plans are never executed.
+    pub fn shadow() -> Self {
+        ExecOptions {
+            execution: false,
+            ..Default::default()
+        }
+    }
+
     /// The legacy stack (snapshot import, Prowlarr, qBittorrent mock).
     pub fn legacy() -> Self {
         ExecOptions {
@@ -1775,10 +1816,21 @@ fn setup_document(o: &ExecOptions) -> Value {
     let (movies, tv) = o.categories.unwrap_or(("um-movies", "um-tv"));
     let mut doc = format!(
         "[download]\nmovie_category = \"{movies}\"\ntv_category = \"{tv}\"\n{}\
-         [tv]\n{}[movies]\n{}\
-         [[indexers]]\nid = 1\nseed_ratio = 2.0\nseed_time_minutes = -1\n",
+         [tv]\n{}[movies]\n{}",
         o.download_extra, o.tv_extra, o.movies_extra
     );
+    if o.profiles.is_empty() {
+        // The legacy snapshot's "HD - 720p/1080p" profiles: no Bluray-1080p; movies want
+        // English, unmarked releases are taken as the original language.
+        let tiers = "tiers = [[\"hdtv_720p\"], [\"webdl_720p\", \"webrip_720p\"], [\"bluray_720p\"], [\"hdtv_1080p\"], [\"webdl_1080p\", \"webrip_1080p\"]]\n";
+        doc.push_str(&format!(
+            "[[profiles]]\nid = \"movies-hd\"\nmedia = \"movie\"\n{tiers}language = [\"english\"]\nunmarked = \"assume_original\"\n[[profiles]]\nid = \"tv-hd\"\nmedia = \"series\"\n{tiers}"
+        ));
+    }
+    doc.push_str(&o.profiles);
+    if o.indexer {
+        doc.push_str("[[indexers]]\nid = 1\nseed_ratio = 2.0\nseed_time_minutes = -1\n");
+    }
     for q in [
         "hdtv_720p",
         "webdl_720p",
@@ -1846,20 +1898,40 @@ fn managed_config(
     } else {
         String::new()
     };
+    let indexer = if o.indexer {
+        format!(
+            "[[indexer]]\nid = 1\nname = \"The Pirate Bay\"\nkind = \"torznab\"\nbase_url = \"http://{}/tz/\"\napi_key_file = \"secrets/tz_key\"\nmin_interval_ms = 0\ncache_ttl_secs = {}\ntimeout_secs = 2\npage_size = {}\nmax_pages = 2\n",
+            o.indexer_addr.unwrap_or(mock),
+            o.indexer_cache_secs,
+            o.page_size
+        )
+    } else {
+        String::new()
+    };
+    let execution = if o.execution {
+        format!(
+            "[execution]\nenabled = true\ndownload_cleanup = {cleanup}\n\
+             [embedded]\ndownload_dir = '{dl}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ndht = true\nlocal_discovery = false\n\
+             [test_client]\nid = '{fake_id}'\n",
+            cleanup = o.cleanup,
+            dl = downloads.display(),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "[server]\napi_token_file = \"secrets/api_token\"\nrequest_timeout_secs = 30\n\
-         [[indexer]]\nid = 1\nname = \"The Pirate Bay\"\nkind = \"torznab\"\nbase_url = \"http://{mock}/tz/\"\napi_key_file = \"secrets/tz_key\"\nmin_interval_ms = 0\ncache_ttl_secs = 0\ntimeout_secs = 2\npage_size = 100\nmax_pages = 2\n\
-         {tvmaze}{tmdb}\
-         [execution]\nenabled = true\ndownload_cleanup = {cleanup}\n\
-         [embedded]\ndownload_dir = '{dl}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ndht = true\nlocal_discovery = false\n\
-         [test_client]\nid = '{fake_id}'\n\
+        "[server]\napi_token_file = \"secrets/api_token\"\n{timeout}{server}\
+         {indexer}{tvmaze}{tmdb}{execution}\
          [migration]\nmode = \"coexistence\"\n\
          [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = {sample}\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 3600\n{stall}\
          {plex}{extra}",
-        plex = plex,
-        cleanup = o.cleanup,
-        dl = downloads.display(),
+        timeout = if o.server_extra.contains("request_timeout_secs") {
+            ""
+        } else {
+            "request_timeout_secs = 30\n"
+        },
+        server = o.server_extra,
         movies = movies.display(),
         tv = tv.display(),
         sample = o.sample_detection,
@@ -1922,6 +1994,9 @@ async fn start_managed(o: ExecOptions) -> Exec {
         mock_addr,
         _tmp: tmp,
     };
+    if !o.setup {
+        return e;
+    }
     let (s, v, text) = e
         .json(
             e.post("/api/v1/setup")
@@ -2050,7 +2125,7 @@ pub async fn add_movie_to(
         json!({
             "media_id": format!("movie:tmdb:{tmdb}"), "search": false,
             "metadata": { "title": title, "year": year, "runtime_minutes": runtime,
-                "original_language": language, "alternate_titles": alternates,
+                "original_language": language.to_lowercase(), "alternate_titles": alternates,
                 "digital_release": format!("{year}-06-01") },
         }),
     )
@@ -2105,7 +2180,10 @@ pub async fn seed_standard_library(
         2001,
         122,
         "French",
-        &["Amelie from Montmartre"],
+        &[
+            "Amelie from Montmartre",
+            "Le Fabuleux Destin d'Amélie Poulain",
+        ],
     )
     .await;
     if tvmaze {
