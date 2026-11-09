@@ -44,6 +44,21 @@ function Get-Download($url, $out) {
 		}
 	}
 }
+# Arr's own release files: when GitHub's download page won't answer and the default GitHub
+# address is in use ($fallback), the same file comes through GitHub's API, which stays up.
+# Once that happens, the later files go straight there.
+function Get-ArrAsset($url, $out, $name, $repo, $release, $fallback) {
+	if (-not $script:ViaApi) {
+		try { Get-Download $url $out; return }
+		catch { if (-not $fallback) { throw } }
+		Write-Output "GitHub's download page didn't answer; trying GitHub's API instead"
+		$script:ViaApi = $true
+	}
+	$rel = Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$repo/releases/$release" -Headers @{ Accept = 'application/vnd.github+json' }
+	$asset = @($rel.assets | Where-Object { $_.name -eq $name })[0]
+	if (-not $asset) { throw "GitHub's API doesn't list $name in release $release" }
+	Invoke-WebRequest -UseBasicParsing $asset.url -Headers @{ Accept = 'application/octet-stream' } -OutFile $out
+}
 
 function Install-Arr {
 	$ErrorActionPreference = 'Stop'
@@ -60,6 +75,8 @@ function Install-Arr {
 	$Target = 'x86_64-pc-windows-msvc'
 	$Version = if ($env:ARR_VERSION) { $env:ARR_VERSION } else { 'latest' }
 	$DownloadBase = $env:ARR_DOWNLOAD_BASE
+	$ApiFallback = -not $DownloadBase # only GitHub's own address falls back to its API
+	$ApiRelease = if ($Version -eq 'latest') { 'latest' } else { "tags/$Version" }
 	if (-not $DownloadBase) {
 		$DownloadBase = if ($Version -eq 'latest') { "https://github.com/$Repo/releases/latest/download" }
 		else { "https://github.com/$Repo/releases/download/$Version" }
@@ -143,8 +160,8 @@ function Install-Arr {
 	$tmp = Join-Path ([IO.Path]::GetTempPath()) ('arr-' + [guid]::NewGuid().ToString('N'))
 	New-Item -ItemType Directory $tmp | Out-Null
 	try {
-		Get-Download "$DownloadBase/$asset" "$tmp\$asset"
-		Get-Download "$DownloadBase/$asset.sha256" "$tmp\$asset.sha256"
+		Get-ArrAsset "$DownloadBase/$asset" "$tmp\$asset" $asset $Repo $ApiRelease $ApiFallback
+		Get-ArrAsset "$DownloadBase/$asset.sha256" "$tmp\$asset.sha256" "$asset.sha256" $Repo $ApiRelease $ApiFallback
 		$want = ((Get-Content "$tmp\$asset.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
 		$got = (Get-FileHash "$tmp\$asset" -Algorithm SHA256).Hash.ToLower()
 		if ($got -ne $want) { throw "checksum mismatch for $asset; nothing was installed" }
@@ -819,6 +836,21 @@ function Get-Download($url, $out) {
 		}
 	}
 }
+# Arr's own release files: when GitHub's download page won't answer and the default GitHub
+# address is in use ($fallback), the same file comes through GitHub's API, which stays up.
+# Once that happens, the later files go straight there.
+function Get-ArrAsset($url, $out, $name, $repo, $release, $fallback) {
+	if (-not $script:ViaApi) {
+		try { Get-Download $url $out; return }
+		catch { if (-not $fallback) { throw } }
+		Write-Output "GitHub's download page didn't answer; trying GitHub's API instead"
+		$script:ViaApi = $true
+	}
+	$rel = Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$repo/releases/$release" -Headers @{ Accept = 'application/vnd.github+json' }
+	$asset = @($rel.assets | Where-Object { $_.name -eq $name })[0]
+	if (-not $asset) { throw "GitHub's API doesn't list $name in release $release" }
+	Invoke-WebRequest -UseBasicParsing $asset.url -Headers @{ Accept = 'application/octet-stream' } -OutFile $out
+}
 $arr = Join-Path $BinDir 'arr.exe'
 $api = "http://127.0.0.1:$Port"
 function Restart-Arr {
@@ -842,11 +874,20 @@ catch { Log 'another update is running'; exit 0 }
 $tmp = $null
 try {
 	$releases = if ($env:ARR_RELEASES_URL) { $env:ARR_RELEASES_URL } else { "https://github.com/$Repo/releases" }
-	$req = [Net.HttpWebRequest]::Create("$releases/latest")
-	$req.AllowAutoRedirect = $false
-	$resp = $req.GetResponse()
-	$latest = ([string]$resp.Headers['Location']) -replace '.*/tag/', ''
-	$resp.Close()
+	$ApiFallback = -not $env:ARR_RELEASES_URL # only GitHub's own address falls back to its API
+	$latest = ''
+	try {
+		$req = [Net.HttpWebRequest]::Create("$releases/latest")
+		$req.AllowAutoRedirect = $false
+		$resp = $req.GetResponse()
+		$latest = ([string]$resp.Headers['Location']) -replace '.*/tag/', ''
+		$resp.Close()
+	} catch {}
+	if ($latest -notmatch '^v\d+\.\d+\.\d+$' -and $ApiFallback) {
+		Log "GitHub's download page didn't answer; trying GitHub's API instead"
+		$script:ViaApi = $true
+		try { $latest = [string](Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ Accept = 'application/vnd.github+json' }).tag_name } catch {}
+	}
 	if ($latest -notmatch '^v\d+\.\d+\.\d+$') { Log "couldn't find the latest release"; exit 1 }
 	$current = 'v' + ((& $arr --version) -split ' ')[1]
 	if ([version]$latest.TrimStart('v') -le [version]$current.TrimStart('v')) { Log "up to date ($current)"; exit 0 }
@@ -854,8 +895,8 @@ try {
 	$tmp = Join-Path ([IO.Path]::GetTempPath()) ('arr-update-' + [guid]::NewGuid().ToString('N'))
 	New-Item -ItemType Directory $tmp | Out-Null
 	$asset = "arr-$Target.zip"
-	Get-Download "$releases/download/$latest/$asset" "$tmp\$asset"
-	Get-Download "$releases/download/$latest/$asset.sha256" "$tmp\$asset.sha256"
+	Get-ArrAsset "$releases/download/$latest/$asset" "$tmp\$asset" $asset $Repo "tags/$latest" $ApiFallback
+	Get-ArrAsset "$releases/download/$latest/$asset.sha256" "$tmp\$asset.sha256" "$asset.sha256" $Repo "tags/$latest" $ApiFallback
 	$want = ((Get-Content "$tmp\$asset.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
 	if ((Get-FileHash "$tmp\$asset" -Algorithm SHA256).Hash.ToLower() -ne $want) { Log 'checksum mismatch; not updating'; exit 1 }
 	Expand-Archive "$tmp\$asset" -DestinationPath $tmp -Force
