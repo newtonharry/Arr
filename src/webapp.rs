@@ -564,10 +564,16 @@ fn allowed(method: &Method, path: &str) -> bool {
     match *method {
         Method::GET => matches!(
             parts.as_slice(),
-            ["feed"] | ["ideas"] | ["discover"] | ["library", "movies" | "series"]
+            ["feed"]
+                | ["ideas"]
+                | ["discover"]
+                | ["library", "movies" | "series"]
+                | ["show", _]
+                | ["show", _, "season", _]
+                | ["movie", _]
         ),
         Method::POST => match parts.as_slice() {
-            ["quick-add"] => true,
+            ["quick-add" | "follow" | "stop"] => true,
             ["queue", id, "retry"] => !id.is_empty(),
             _ => false,
         },

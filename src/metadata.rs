@@ -44,6 +44,19 @@ pub struct TvmazeShow {
     pub externals: TvmazeExternals,
     #[serde(default)]
     pub image: Option<TvmazeImage>,
+    /// HTML; read it with `plain_summary`.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub network: Option<TvmazeNetwork>,
+    #[serde(default, rename = "webChannel")]
+    pub web_channel: Option<TvmazeNetwork>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TvmazeNetwork {
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +71,14 @@ impl TvmazeShow {
             .as_deref()
             .and_then(|d| d.get(..4))
             .and_then(|y| y.parse().ok())
+    }
+
+    /// The network or streaming service that shows it.
+    pub fn network_name(&self) -> Option<String> {
+        [&self.network, &self.web_channel]
+            .into_iter()
+            .flatten()
+            .find_map(|n| n.name.clone().filter(|n| !n.trim().is_empty()))
     }
 }
 
@@ -130,8 +151,8 @@ struct ScheduleNetwork {
     name: Option<String>,
 }
 
-/// Plain text of a TVmaze summary (HTML), at most 200 characters.
-fn plain_summary(html: &str) -> Option<String> {
+/// Plain text of a TVmaze summary (HTML), at most `max` characters.
+pub fn plain_summary(html: &str, max: usize) -> Option<String> {
     let mut text = String::new();
     let mut tag = String::new();
     let mut in_tag = false;
@@ -163,10 +184,10 @@ fn plain_summary(html: &str) -> Option<String> {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if text.is_empty() {
         None
-    } else if text.chars().count() <= 200 {
+    } else if text.chars().count() <= max {
         Some(text)
     } else {
-        let cut: String = text.chars().take(199).collect();
+        let cut: String = text.chars().take(max - 1).collect();
         Some(format!("{}\u{2026}", cut.trim_end()))
     }
 }
@@ -298,7 +319,7 @@ impl Tvmaze {
                         name: show.show.name.trim().to_string(),
                         year: show.show.year(),
                         network,
-                        summary: show.summary.as_deref().and_then(plain_summary),
+                        summary: show.summary.as_deref().and_then(|s| plain_summary(s, 200)),
                     },
                 ));
             }
@@ -473,6 +494,9 @@ pub struct TmdbMovie {
     pub release_dates: TmdbReleaseDates,
     #[serde(default)]
     pub poster_path: Option<String>,
+    /// A plain-text summary (TMDB's overview, or Plex's summary).
+    #[serde(default)]
+    pub overview: Option<String>,
     /// Plex's poster address (Plex answers only; never read from TMDB).
     #[serde(default, skip_deserializing)]
     pub plex_thumb: Option<String>,
@@ -769,6 +793,8 @@ struct PlexMeta {
     countries: Vec<PlexCountry>,
     #[serde(default)]
     thumb: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 impl PlexMeta {
@@ -1096,6 +1122,7 @@ fn plex_movie(id: u32, m: &PlexMeta, on_sale: bool) -> TmdbMovie {
             },
         },
         poster_path: None,
+        overview: m.summary.clone().filter(|t| !t.trim().is_empty()),
         plex_thumb: m.thumb.clone(),
         observed_digital: on_sale,
     }
@@ -1211,6 +1238,9 @@ impl Movies {
 /// leaves out (a poster first, and "on sale today" when TMDB has no digital date).
 fn merge(plex: TmdbMovie, mut tmdb: TmdbMovie) -> TmdbMovie {
     tmdb.plex_thumb = plex.plex_thumb;
+    tmdb.overview = plex
+        .overview
+        .or(tmdb.overview.filter(|t| !t.trim().is_empty()));
     tmdb.original_title = tmdb.original_title.or(plex.original_title);
     tmdb.original_language = tmdb
         .original_language

@@ -2052,6 +2052,7 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
         [
             "search_titles",
             "add_media",
+            "stop",
             "media_status",
             "requests",
             "library",
@@ -2137,7 +2138,7 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
         )
         .await
         .expect("discover");
-    assert_eq!(client.list_all_tools().await.unwrap().len(), 7);
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 8);
     let _ = client.cancel().await;
     // Authentication comes before initialisation; the API token is not an MCP token.
     assert!(

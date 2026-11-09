@@ -622,7 +622,7 @@ pub fn add_series(
             )?;
             let all = monitor == MonitorMode::All;
             tx.execute(
-                "UPDATE seasons SET monitored = ?2 WHERE series_id = ?1",
+                "UPDATE seasons SET monitored = ?2, by_follow = 0 WHERE series_id = ?1",
                 params![id, monitor != MonitorMode::None],
             )?;
             match monitor {
@@ -796,7 +796,7 @@ pub fn set_monitored(
             let sid = MediaId::Series(k).to_string();
             let n = tx.execute(
                 "INSERT INTO seasons (series_id, season, monitored) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM media WHERE id = ?1 AND managed = 1)
-                 ON CONFLICT (series_id, season) DO UPDATE SET monitored = excluded.monitored",
+                 ON CONFLICT (series_id, season) DO UPDATE SET monitored = excluded.monitored, by_follow = 0",
                 params![sid, s, monitored],
             )?;
             tx.execute(
@@ -867,6 +867,81 @@ pub fn adopt_scope(c: &mut Connection, scope: MediaId, now: OffsetDateTime) -> R
         params![sid, now_str],
     )?;
     set_monitored(c, scope, true, now)
+}
+
+/// Whether Arr follows a managed series' new episodes: it acquires the series and a
+/// season that appears later is monitored too.
+pub fn following(c: &Connection, id: MediaId) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT monitored AND monitor_new FROM media WHERE id = ?1 AND managed = 1",
+        [id.to_string()],
+        |r| r.get(0),
+    )
+    .optional()?
+    .unwrap_or(false))
+}
+
+/// Turns "get new episodes as they air" on or off for a managed series. Episodes that have
+/// already aired, and every season someone chose, keep their monitoring; only what has not
+/// aired yet (and any season that appears later) follows the switch. Returns false when the
+/// series is not managed.
+pub fn set_following(
+    c: &mut Connection,
+    id: MediaId,
+    on: bool,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let MediaId::Series(_) = id else {
+        bail!("{id} is not a series");
+    };
+    let tx = c.transaction()?;
+    let (sid, now_s) = (id.to_string(), now_s(now));
+    let changed = if on {
+        tx.execute(
+            "UPDATE media SET monitored = 1, monitor_new = 1, updated_at = ?2, adopted_at = COALESCE(adopted_at, ?2) WHERE id = ?1 AND managed = 1",
+            params![sid, now_s],
+        )?
+    } else {
+        tx.execute(
+            "UPDATE media SET monitor_new = 0, updated_at = ?2 WHERE id = ?1 AND managed = 1",
+            params![sid, now_s],
+        )?
+    };
+    if changed > 0 {
+        // Turning on: a season with something still to air also takes episodes added to it
+        // later; if that is what switched the season on, it is remembered (`by_follow`).
+        // Turning off switches those seasons off again, and leaves every season someone
+        // chose (Get season, an import) as it is, so it keeps taking late episodes.
+        if on {
+            tx.execute(
+                "INSERT INTO seasons (series_id, season, monitored, by_follow) SELECT DISTINCT series_id, season, 1, 1 FROM episodes WHERE series_id = ?1 AND season > 0 AND (air_date_utc IS NULL OR air_date_utc > ?2)
+                 ON CONFLICT (series_id, season) DO UPDATE SET by_follow = CASE WHEN seasons.monitored = 1 THEN seasons.by_follow ELSE 1 END, monitored = 1",
+                params![sid, now_s],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE seasons SET monitored = 0, by_follow = 0 WHERE series_id = ?1 AND by_follow = 1",
+                params![sid],
+            )?;
+        }
+        tx.execute(
+            "UPDATE episodes SET monitored = ?3 WHERE series_id = ?1 AND season > 0 AND (air_date_utc IS NULL OR air_date_utc > ?2)",
+            params![sid, now_s, on],
+        )?;
+        let what = if on { "followed" } else { "unfollowed" };
+        event(
+            &tx,
+            &now_s,
+            if on { "monitored" } else { "unmonitored" },
+            Some(&sid),
+            Some(&sid),
+            None,
+            &format!("{id} {what} (new episodes)"),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed > 0)
 }
 
 fn handoff_scope(scope: MediaId) -> String {
@@ -1312,7 +1387,7 @@ pub fn upsert_episodes(
             known.entry(e.season).or_default().insert(e.number);
             if season_monitored.is_none() {
                 tx.execute(
-                    "INSERT OR IGNORE INTO seasons (series_id, season, monitored) VALUES (?1, ?2, ?3)",
+                    "INSERT OR IGNORE INTO seasons (series_id, season, monitored, by_follow) VALUES (?1, ?2, ?3, ?3)",
                     params![sid, e.season, series_monitored && monitor_new],
                 )?;
             }

@@ -280,6 +280,8 @@ enum Effect {
     Add,
     /// POST /grabs.
     Grab,
+    /// POST /stop.
+    Stop,
 }
 
 impl Effect {
@@ -293,6 +295,8 @@ impl Effect {
             Effect::Read => true,
             // Other errors can follow a committed add (for example a failed automatic search).
             Effect::Add => matches!(code, "native_handoff_required" | "unsupported_scope"),
+            // A stop refused for its id or because Arr never had it changed nothing.
+            Effect::Stop => matches!(code, "invalid_media_id" | "not_managed"),
             // Every refusal of a grab comes before the download is recorded (a contradicting
             // payload is blocklisted).
             Effect::Grab => matches!(
@@ -612,6 +616,23 @@ impl Adapter {
         )
     }
 
+    async fn stop(&self, a: MediaArg) -> CallToolResult {
+        let id = match canonical(&a.media_id, Scope::Acquirable) {
+            Ok(id) => id,
+            Err(r) => return r,
+        };
+        respond(
+            self.call(
+                Effect::Stop,
+                &["api", "v1", "stop"],
+                &[],
+                Some(json!({ "media_id": id })),
+            )
+            .await
+            .map(stop_summary),
+        )
+    }
+
     async fn media_status(&self, a: StatusArg) -> CallToolResult {
         let id = match canonical(&a.media_id, Scope::Any) {
             Ok(id) => id,
@@ -771,6 +792,10 @@ impl ServerHandler for Adapter {
                 Ok(a) => self.add_media(a).await,
                 Err(r) => r,
             },
+            "stop" => match parse(args) {
+                Ok(a) => self.stop(a).await,
+                Err(r) => r,
+            },
             "media_status" => match parse(args) {
                 Ok(a) => self.media_status(a).await,
                 Err(r) => r,
@@ -922,6 +947,11 @@ fn tools() -> Vec<Tool> {
             "The default way to add what the user asked for: a movie, one season or one episode by canonical id, monitored, then searched and downloaded automatically by this server's policy. Add exactly the requested scope; do not substitute individual episodes for a requested season without the user's agreement. The result's automatic field says whether a download was queued or nothing could be downloaded yet. Repeating an add creates no duplicate. Titles still managed by Sonarr/Radarr are refused with native_handoff_required and are not adopted.",
             write.clone(),
         ),
+        tool::<MediaArg>(
+            "stop",
+            "Stop getting a movie, season or episode: cancels a download that hasn't finished and stops Arr looking for it. Never deletes anything already in Plex. Use it when the user changes their mind about something they asked for. A download that is nearly done is left to finish. Repeating it is harmless.",
+            write.clone(),
+        ),
         tool::<StatusArg>(
             "media_status",
             "Ownership, acquisition state, per-season and per-episode progress, downloads and items needing attention for a canonical id.",
@@ -1019,6 +1049,25 @@ fn canonical(raw: &str, scope: Scope) -> Result<String, CallToolResult> {
 fn parse<T: DeserializeOwned>(args: serde_json::Map<String, Value>) -> Result<T, CallToolResult> {
     serde_json::from_value(Value::Object(args))
         .map_err(|e| invalid(&format!("invalid arguments: {e}")))
+}
+
+/// A stop's reply with a plain sentence saying what happened.
+fn stop_summary(mut v: Value) -> Value {
+    let cancelled = v["cancelled"].as_u64().unwrap_or(0);
+    let finishing = v["finishing"].as_u64().unwrap_or(0);
+    let mut text = format!(
+        "Arr will not look for it any more. Cancelled {cancelled} download{}.",
+        if cancelled == 1 { "" } else { "s" }
+    );
+    if finishing > 0 {
+        text.push_str(&format!(
+            " {finishing} {} still finishing and will be added to Plex.",
+            if finishing == 1 { "is" } else { "are" }
+        ));
+    }
+    text.push_str(" Nothing already in Plex was touched.");
+    v["message"] = json!(text);
+    v
 }
 
 /// A successful add as the assistant should read it; the core's facts are kept.

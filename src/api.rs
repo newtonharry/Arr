@@ -44,6 +44,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
+mod titles;
+
 /// Every route, for the OpenAPI coverage test: (method, path).
 pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/health"),
@@ -90,6 +92,11 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/feed"),
     ("get", "/api/v1/ideas"),
     ("post", "/api/v1/quick-add"),
+    ("post", "/api/v1/follow"),
+    ("post", "/api/v1/stop"),
+    ("get", "/api/v1/show/{media_id}"),
+    ("get", "/api/v1/show/{media_id}/season/{n}"),
+    ("get", "/api/v1/movie/{media_id}"),
     ("get", "/api/v1/rss"),
     ("get", "/api/v1/setup"),
     ("post", "/api/v1/setup"),
@@ -823,6 +830,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/feed", get(feed))
         .route("/api/v1/ideas", get(ideas))
         .route("/api/v1/quick-add", post(quick_add))
+        .route("/api/v1/follow", post(titles::follow))
+        .route("/api/v1/stop", post(titles::stop))
+        .route("/api/v1/show/{media_id}", get(titles::show))
+        .route("/api/v1/show/{media_id}/season/{n}", get(titles::season))
+        .route("/api/v1/movie/{media_id}", get(titles::movie))
         .route("/api/v1/rss", get(rss_status))
         .route("/api/v1/setup", get(setup_status).post(setup_apply))
         .route("/api/v1/setup/plex", get(setup_plex))
@@ -3512,6 +3524,7 @@ async fn queue_cancel(
             removal: b.remove.unwrap_or(Removal::Keep),
             ignore_seed_criteria: b.ignore_seed_criteria,
             research: b.research,
+            only_unfinished: false,
         },
     )
     .await
@@ -4709,7 +4722,7 @@ async fn feed(State(st): St) -> ApiResult {
             let (title, year, detail) = entry(target, &[target]);
             Some(json!({
                 "key": format!("{kind}:{}", grab_id.map_or_else(|| target.to_string(), str::to_string)),
-                "media_id": media_id, "title": title, "year": year, "detail": detail,
+                "media_id": media_id, "target": target, "title": title, "year": year, "detail": detail,
                 "problem": problem, "grab_id": grab_id,
                 "at": a.get("at").or_else(|| a.get("since")).cloned().unwrap_or(Value::Null),
             }))
@@ -4888,7 +4901,7 @@ fn quick_outcome(v: &Value) -> (&'static str, Option<String>, String) {
     )
 }
 
-/// One tap to get a movie or a show: what a person means by "get me this".
+/// One tap to get a movie, a show, a season or an episode: what a person means by "get me this".
 async fn quick_add(State(st): St, ApiJson(body): ApiJson<QuickAddBody>) -> ApiResult {
     st.loaded()?;
     let id = parse_media_id(&body.media_id)?;
@@ -4955,9 +4968,6 @@ async fn quick_add(State(st): St, ApiJson(body): ApiJson<QuickAddBody>) -> ApiRe
                 "outcome": outcome, "until": until, "message": message,
             }))
         }
-        _ => Err(ApiError::bad_request(
-            ErrorCode::InvalidRequest,
-            "media_id must be a movie or a series",
-        )),
+        MediaId::Season(..) | MediaId::Episode(..) => titles::quick_scope(&st, id).await,
     }
 }

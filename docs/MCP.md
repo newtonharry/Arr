@@ -61,6 +61,7 @@ the SDK:
 |---|---|---|
 | `search_titles` | `kind` (`movie`, `series`), `q` (1 to 100 printable characters), `year`? (1870 to 2100) | `GET /api/v1/discover` |
 | `add_media` | `media_id`: a movie, season or episode | `POST /api/v1/library {"media_id"}` |
+| `stop` | `media_id`: a movie, season or episode | `POST /api/v1/stop {"media_id"}`; the result gains a `message` saying how many downloads were cancelled and how many are still finishing. Never deletes anything in Plex or the library |
 | `media_status` | `media_id`: a movie, series, season or episode | `GET /api/v1/status/{media_id}` |
 | `requests` | `limit`? (1 to 50, default 20) | `GET /api/v1/queue?limit=N`, then `GET /api/v1/requests` (first N shown, with `total` and `omitted`) |
 | `library` | `kind` (`movie`, `series`), `q`? (1 to 100 printable characters), `limit`? (1 to 100, default 50), `offset`? | `GET /api/v1/library/movies` or `/series` with `q`, `limit`, `offset`; returns a compact page (`media_id`, title, year; movies: `owned`, `quality`, `monitored`, `downloading`; series: `episodes` and per-season `owned`/`episodes`) with `total` and `next_offset` |
