@@ -456,6 +456,20 @@ fn plex_fixtures() -> Vec<Value> {
         if let Some(o) = original {
             v["originalTitle"] = json!(o);
         }
+        // Review scores: all sources on the released movie, a junk shape on the foreign one,
+        // none on the others.
+        match key {
+            "rel0001" => {
+                v["Rating"] = json!([
+                    { "image": "imdb://image.rating", "type": "audience", "value": 7.8 },
+                    { "image": "rottentomatoes://image.rating.ripe", "type": "critic", "value": 9.6 },
+                    { "image": "rottentomatoes://image.rating.upright", "type": "audience", "value": 8.7 },
+                    { "image": "themoviedb://image.rating", "type": "audience", "value": 7.379 }
+                ])
+            }
+            "for0001" => v["Rating"] = json!("not a list"),
+            _ => {}
+        }
         v
     };
     vec![
@@ -495,6 +509,30 @@ fn plex_fixtures() -> Vec<Value> {
             "2020-02-02",
             "Canada",
         ),
+    ]
+}
+
+/// Plex shows (matched by `type=2` and a `tvdb://` guid): Slow Horses (the library's) with every
+/// score, and show 5001 with only the Rotten Tomatoes pair, both low.
+fn plex_show_fixtures() -> Vec<Value> {
+    vec![
+        json!({
+            "ratingKey": "shw0001", "type": "show", "title": "Slow Horses",
+            "Guid": [{ "id": "tvdb://372264" }],
+            "Rating": [
+                { "image": "imdb://image.rating", "type": "audience", "value": 8.1 },
+                { "image": "rottentomatoes://image.rating.ripe", "type": "critic", "value": 9.6 },
+                { "image": "rottentomatoes://image.rating.upright", "type": "audience", "value": 8.7 }
+            ],
+        }),
+        json!({
+            "ratingKey": "shw0002", "type": "show", "title": "Low Weight",
+            "Guid": [{ "id": "tvdb://5001" }],
+            "Rating": [
+                { "image": "rottentomatoes://image.rating.rotten", "type": "critic", "value": 3.1 },
+                { "image": "rottentomatoes://image.rating.spilled", "type": "audience", "value": 4.0 }
+            ],
+        }),
     ]
 }
 
@@ -556,16 +594,20 @@ async fn plex_matches(
         return plex_denied(&m);
     }
     let guid = q.get("guid").cloned().unwrap_or_default();
-    let found: Vec<Value> = plex_fixtures()
-        .into_iter()
-        .filter(|f| {
-            f["Guid"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|g| g["id"] == guid.as_str())
-        })
-        .collect();
+    let found: Vec<Value> = if q.get("type").map(String::as_str) == Some("2") {
+        plex_show_fixtures()
+    } else {
+        plex_fixtures()
+    }
+    .into_iter()
+    .filter(|f| {
+        f["Guid"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["id"] == guid.as_str())
+    })
+    .collect();
     axum::Json(json!({ "MediaContainer": { "Metadata": found } })).into_response()
 }
 

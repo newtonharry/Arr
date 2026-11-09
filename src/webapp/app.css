@@ -132,6 +132,11 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 .link-page button:hover{filter:brightness(1.08)}
 .item.arrived h3{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 .idea .meta{color:var(--muted);font-size:14px}
+.scores{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;margin-top:4px}
+.scores .sc-row{color:var(--muted);font-size:14px;margin:0}.scores b{color:var(--ink);font-weight:800}.sc{white-space:nowrap}
+.verdict{display:inline-block;padding:1px 9px;border:1.5px solid var(--line);border-radius:999px;font-size:12px;font-weight:800;color:var(--muted);white-space:nowrap}
+.verdict.likely_good{border-color:var(--teal);color:var(--teal-ink)}
+.idea .scores{flex-direction:column;align-items:flex-start;margin-top:0}.idea .sc{display:block}.idea .dot{display:none}
 .rating{color:var(--ink);font-weight:800}.rating .ic{display:inline-block;vertical-align:-2px;margin-right:3px;width:14px;height:14px;fill:var(--sun-ink);stroke:var(--sun-ink);stroke-width:1.5}
 @media (max-width:420px){.item.need .btn .lbl{display:none}.item.need .btn{padding:0}}
 /* show and movie pages: a sheet over the current screen */

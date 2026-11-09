@@ -42,7 +42,7 @@ Arr's interface exposes the wish and the outcome.
 - Remote access: an ngrok HTTPS domain plus Google sign-in limited to listed accounts
   (docs/REMOTE.md). The same address and sign-in serve the web interface.
 - Plex is where people watch. Arr's interface is where they ask; it should hand off to Plex,
-  not compete with it.
+  not compete with it. People watch on their TV, so there is no "Watch" button in Arr.
 - The AI-assistant route (ChatGPT/Claude over MCP) stays; the interface is an alternative,
   not a replacement.
 

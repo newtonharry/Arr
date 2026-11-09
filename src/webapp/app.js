@@ -37,7 +37,6 @@ const ICONS = {
   search: 'M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14zM20 20l-4-4',
   check: 'M5 12.5l4.5 4.5L19 7.5',
   retry: 'M20 12a8 8 0 1 1-2.5-5.8M20 4v4.5h-4.5',
-  ext: 'M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
   home: 'M4 11l8-7l8 7v8a1 1 0 0 1-1 1h-4v-6h-6v6H5a1 1 0 0 1-1-1z',
   ideas: 'M12 3l2.2 5.8L20 11l-5.8 2.2L12 19l-2.2-5.8L4 11l5.8-2.2z',
   library: 'M4 5h4v14H4zM10 5h4v14h-4zM16.5 5.5l3.7 1l-3.2 13l-3.7-1z',
@@ -76,7 +75,6 @@ async function api(path, { method = 'GET', body, signal } = {}) {
 }
 
 // ---------- small helpers ----------
-const plexUrl = (t) => 'https://app.plex.tv/desktop/#!/search?query=' + encodeURIComponent(t);
 function parseDate(s) {
   if (/^\d{4}-\d\d-\d\d$/.test(s)) { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); }
   return new Date(s);
@@ -92,7 +90,6 @@ function ago(iso) {
 }
 const meta = (it) => it.detail || (it.year ? String(it.year) : '');
 const joinDot = (...p) => p.filter(Boolean).join(' · ');
-const plexLink = (title) => h('a', { class: 'btn', href: plexUrl(title), target: '_blank', rel: 'noopener noreferrer', 'aria-label': `Open ${title} in Plex` }, ic('ext'), 'Watch');
 // Rows need keys that stay put between redraws, even if the server repeats an id.
 function keyed(items, id, fn) {
   const seen = new Map();
@@ -196,8 +193,7 @@ function NeedRow({ it }) {
 function ArrivedRow({ it }) {
   return h('li', { class: 'item arrived' }, h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h('span', { class: 'tag' }, ic('check'), 'In Plex'),
-      h(Title, { title: it.title, id: it.media_id }), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))),
-    plexLink(it.title));
+      h(Title, { title: it.title, id: it.media_id }), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))));
 }
 const STAGES = ['Found', 'Downloading', 'Checking', 'In Plex'];
 // The bar slides from where it last was to where it is now.
@@ -238,6 +234,31 @@ function SoonRow({ it }) {
 function chooseLink(x) {
   return h('a', { class: 'btn' + (x.in_library ? ' ghost' : ''), href: titleHref(x.media_id), 'aria-label': `${x.in_library ? 'Open' : 'Choose'} ${x.title}` }, x.in_library ? 'Open' : 'Choose', ic('right'));
 }
+// IMDb and Rotten Tomatoes scores from Plex, and a quick verdict. Only the scores that exist show.
+const VERDICTS = {
+  likely_good: ['Likely good', 'both high'],
+  probably_skip: ['Probably skip', 'both low'],
+  critics_pick: ['Critics\u2019 pick', 'critics liked it more'],
+  crowd_pleaser: ['Crowd-pleaser', 'audiences liked it more'],
+  mixed: ['Mixed reviews', 'scores are in the middle'],
+};
+function scoreLine(sc) {
+  if (!sc || typeof sc !== 'object') return null;
+  const num = (v, max) => typeof v === 'number' && v >= 0 && v <= max;
+  const parts = [];
+  if (num(sc.imdb, 10)) parts.push(['IMDb', sc.imdb.toFixed(1)]);
+  if (num(sc.critics, 100)) parts.push(['Critics', Math.round(sc.critics) + '%']);
+  if (num(sc.audience, 100)) parts.push(['Audience', Math.round(sc.audience) + '%']);
+  if (!parts.length) return null;
+  const v = VERDICTS[sc.verdict] && num(sc.critics, 100) && num(sc.audience, 100) ? VERDICTS[sc.verdict] : null;
+  const why = v && `Critics ${Math.round(sc.critics)}%, audience ${Math.round(sc.audience)}%: ${v[1]}`;
+  const row = [];
+  parts.forEach(([k, n], i) => {
+    row.push(h('span', { key: k, class: 'sc' }, k + ' ', h('b', null, n), i < parts.length - 1 && h('span', { class: 'dot', 'aria-hidden': 'true' }, ' ·'), ' '));
+  });
+  return h('div', { class: 'scores' }, h('p', { class: 'sc-row' }, row),
+    v && h('span', { class: 'verdict ' + sc.verdict, title: why }, v[0], h('span', { class: 'sr' }, '. ' + why)));
+}
 // TVmaze viewers' average out of 10: a star and the number, read out in words.
 function rating(x) {
   const r = Number(x.rating);
@@ -246,9 +267,10 @@ function rating(x) {
   return h('span', { class: 'rating', title: `Rated ${n} out of 10 by TVmaze viewers` },
     ic('star'), h('span', { 'aria-hidden': 'true' }, n), h('span', { class: 'sr' }, `Rated ${n} out of 10`));
 }
-function ideaMeta(...facts) {
-  const r = rating(facts.shift()), text = joinDot(...facts);
-  return h('p', { class: 'meta' }, r, r && text ? ' · ' : null, text);
+// Plex scores replace the TVmaze star when there are any.
+function ideaMeta(x, ...facts) {
+  const sc = scoreLine(x.scores), r = sc ? null : rating(x), text = joinDot(...facts);
+  return [h('p', { class: 'meta' }, r, r && text ? ' · ' : null, text), sc];
 }
 function IdeaCard({ x }) {
   return h('li', { class: 'idea' }, h(Tile, { title: x.title, mediaId: x.media_id }), h(Title, { title: x.title, id: x.media_id }),
@@ -361,12 +383,12 @@ function SearchRow({ x, label }) {
   // A movie is one tap; a show opens its page to pick what to get.
   if (label === 'Show') {
     return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
-      h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label))),
+      h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores)),
       chooseLink({ media_id: x.media_id, title: x.title, in_library: x.in_catalog && x.monitored }));
   }
   const it = { id: x.media_id, title: x.title, base: x.has_file ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add' };
   return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
-    h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), addMsg(it)), addBtn(it));
+    h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), addMsg(it)), addBtn(it));
 }
 function SearchResults() {
   const { q, rows, notes, busy } = V;
@@ -381,8 +403,7 @@ function libraryRow(x, mv) {
   const title = x.title || 'Untitled';
   const mid = mv ? (x.tmdb_id && `movie:tmdb:${x.tmdb_id}`) : x.tvdb_id ? `series:tvdb:${x.tvdb_id}` : x.tvmaze_id ? `series:tvmaze:${x.tvmaze_id}` : null;
   return { key: mid || title, el: (key) => h('li', { key, class: 'item' }, h(Tile, { title, mediaId: mid }), h('div', { class: 'what' }, h(Title, { title, id: mid }),
-    h('p', { class: 'meta' }, joinDot(x.year, mv ? 'Movie' : 'Show', mv && x.has_file === false && 'Not in Plex yet'))),
-    !(mv && x.has_file === false) && plexLink(title)) };
+    h('p', { class: 'meta' }, joinDot(x.year, mv ? 'Movie' : 'Show', mv && x.has_file === false && 'Not in Plex yet')))) };
 }
 function Library({ t }) {
   const [kind, setKind] = useState(S.kind);
@@ -565,9 +586,9 @@ function errorBody() {
     h(Hint, { text: P.err, role: 'status' }),
     h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'retry', onClick: () => { P.err = ''; bump(); loadTitle(false); } }, ic('retry'), 'Try again'));
 }
-function hero(title, line) {
+function hero(title, line, extra) {
   return h('header', { class: 'hero' }, h(Tile, { title, mediaId: P.data.media_id, big: true }),
-    h('div', { class: 'hero-t' }, h('h1', { id: 'sheet-title' }, title), line && h('p', { class: 'meta' }, line)));
+    h('div', { class: 'hero-t' }, h('h1', { id: 'sheet-title' }, title), line && h('p', { class: 'meta' }, line), extra));
 }
 function Summary({ text }) {
   const el = useRef(null), [over, setOver] = useState(false);
@@ -872,7 +893,7 @@ function seasonItem(s) {
 function showBody() {
   const d = P.data, on = d.following;
   return h('div', { key: 'show', class: 'stack' },
-    hero(d.title, joinDot(d.year, d.network, d.status)),
+    hero(d.title, joinDot(d.year, d.network, d.status), scoreLine(d.scores)),
     h(Summary, { text: d.summary }),
     h('div', null, h('button', { type: 'button', role: 'switch', class: 'switch', 'aria-checked': String(on), 'aria-labelledby': 'sw-t', 'data-fk': 'follow', onClick: toggleFollow },
       h('span', { class: 'what' }, h('span', { class: 'sw-t', id: 'sw-t' }, 'Get new episodes as they air'),
@@ -890,11 +911,11 @@ function movieBody() {
     : st === 'waiting' ? (d.until ? `Out ${fmtDate(d.until)}. Arr will get it then.` : 'Not out yet. Arr will get it then.')
       : st === 'wanted' ? 'Arr is looking for a copy' : 'Not in Plex yet';
   let control = null;
-  if (st === 'in_plex') control = plexLink(d.title);
+  if (st === 'in_plex') control = null;
   else if (st === 'none') control = actionNode(key, 'get', 'Get', d.title, d.media_id);
   else control = actionNode(key, 'stop', 'Stop', d.title, d.media_id);
   return h('div', { key: 'movie', class: 'stack' },
-    hero(d.title, joinDot(d.year, d.runtime_minutes && fmtRuntime(d.runtime_minutes))),
+    hero(d.title, joinDot(d.year, d.runtime_minutes && fmtRuntime(d.runtime_minutes)), scoreLine(d.scores)),
     h(Summary, { text: d.summary }),
     h('section', { class: 'item state' + (st === 'in_plex' ? ' arrived' : ''), 'aria-label': 'Status' },
       h('div', { class: 'what' },
@@ -902,7 +923,7 @@ function movieBody() {
         h('p', { class: 'st' }, st === 'in_plex' ? 'Ready to watch' : line),
         st === 'on_its_way' ? h(Journey, { stage: p == null ? 0 : 1, p, fkey: 'movie:' + d.media_id }) : null,
         msgFor(key)),
-      h('div', { class: 'act' }, control)),
+      control && h('div', { class: 'act' }, control)),
     optionsPanel());
 }
 
