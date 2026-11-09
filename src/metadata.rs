@@ -115,6 +115,7 @@ struct SearchHit {
 pub struct WebShow {
     pub id: u32,
     pub tvdb: Option<u32>,
+    pub imdb: Option<String>,
     pub name: String,
     pub year: Option<u16>,
     pub network: Option<String>,
@@ -323,6 +324,7 @@ impl Tvmaze {
                     WebShow {
                         id: show.show.id,
                         tvdb: show.show.externals.thetvdb,
+                        imdb: show.show.externals.imdb.clone(),
                         name: show.show.name.trim().to_string(),
                         year: show.show.year(),
                         network,

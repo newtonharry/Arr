@@ -4281,7 +4281,8 @@ async fn ideas(State(st): St) -> ApiResult {
         return ok(json!({ "status": "unavailable", "items": [] }));
     };
     let index = st.index();
-    let refs: Vec<(Option<u32>, Option<String>)> = shows.iter().map(|s| (s.tvdb, None)).collect();
+    let refs: Vec<(Option<u32>, Option<String>)> =
+        shows.iter().map(|s| (s.tvdb, s.imdb.clone())).collect();
     let scores = match &st.movies {
         Some(m) => m.show_scores(&refs, SCORES_BUDGET).await,
         None => vec![None; shows.len()],

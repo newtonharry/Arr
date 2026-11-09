@@ -836,7 +836,9 @@ async fn plex_scores_reach_ideas_pages_and_search_and_never_break_them() {
             scheduled(11, "Low Weight", Some(5001), 10, "<p>Plain.</p>"),
             scheduled(372, "Slow Horses", Some(372264), 90, "<p>Spies.</p>"),
             scheduled(13, "No Tvdb Show", None, 99, "<p>Plain.</p>"),
+            scheduled(14, "Imdb Only Show", None, 98, "<p>Plain.</p>"),
         ];
+        m.schedule[3]["_embedded"]["show"]["externals"]["imdb"] = json!("tt9200001");
         m.schedule[1]["_embedded"]["show"]["rating"] = json!({ "average": 8.26 });
     }
     let get = |path: String| {
@@ -870,6 +872,11 @@ async fn plex_scores_reach_ideas_pages_and_search_and_never_break_them() {
         json!({ "critics": 31, "audience": 40, "verdict": "probably_skip" })
     );
     assert!(by("No Tvdb Show")["scores"].is_null(), "{v}");
+    // No TVDB id but an IMDb id: matched by that instead.
+    assert_eq!(
+        by("Imdb Only Show")["scores"],
+        json!({ "imdb": 6.4, "verdict": null })
+    );
     // Show page, by TVDB id.
     let v = get("/app/api/v1/show/series:tvdb:372264".into()).await;
     assert_eq!(v["scores"]["verdict"], "likely_good", "{v}");

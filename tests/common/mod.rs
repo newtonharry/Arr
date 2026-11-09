@@ -513,7 +513,7 @@ fn plex_fixtures() -> Vec<Value> {
 }
 
 /// Plex shows (matched by `type=2` and a `tvdb://` guid): Slow Horses (the library's) with every
-/// score, and show 5001 with only the Rotten Tomatoes pair, both low.
+/// score, show 5001 with only the Rotten Tomatoes pair, both low, and an IMDb-only show.
 fn plex_show_fixtures() -> Vec<Value> {
     vec![
         json!({
@@ -524,6 +524,11 @@ fn plex_show_fixtures() -> Vec<Value> {
                 { "image": "rottentomatoes://image.rating.ripe", "type": "critic", "value": 9.6 },
                 { "image": "rottentomatoes://image.rating.upright", "type": "audience", "value": 8.7 }
             ],
+        }),
+        json!({
+            "ratingKey": "shw0003", "type": "show", "title": "Imdb Only Show",
+            "Guid": [{ "id": "imdb://tt9200001" }],
+            "Rating": [{ "image": "imdb://image.rating", "type": "audience", "value": 6.4 }],
         }),
         json!({
             "ratingKey": "shw0002", "type": "show", "title": "Low Weight",
