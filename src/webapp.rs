@@ -693,62 +693,14 @@ fn title_key(id: &str) -> Option<String> {
     })
 }
 
-/// Remembers who added a title, from an add through the proxy (the name never comes from the
-/// page). A reply that succeeded names the title. A failed one still counts when the title is
-/// tracked afterwards (an add can commit and then fail fetching the torrent): `canon` gives the
-/// catalog's id for a title Arr manages now. The first person is kept.
-#[allow(clippy::too_many_arguments)]
-fn record_add(
-    sessions: &Sessions,
-    method: &Method,
-    path: &str,
-    request: &[u8],
-    email: Option<&str>,
-    status: StatusCode,
-    reply: &[u8],
-    canon: impl Fn(&str) -> Option<String>,
-) {
-    let rest = path.strip_prefix("/api/v1/").unwrap_or("");
-    let parts: Vec<&str> = rest.split('/').collect();
-    if *method != Method::POST
-        || !matches!(
-            parts.as_slice(),
-            ["quick-add"] | ["follow"] | ["copies", _, "get"]
-        )
-    {
-        return;
-    }
-    let Some(name) = display_name(email) else {
-        return;
-    };
-    let req: serde_json::Value = serde_json::from_slice(request).unwrap_or_default();
-    // Turning following off is not an add.
-    if req["on"] == serde_json::Value::Bool(false) {
-        return;
-    }
-    let asked = match parts.as_slice() {
-        ["copies", id, _] => Some(id.to_string()),
-        _ => req["media_id"].as_str().map(str::to_string),
-    };
-    let key = if status.is_success() {
-        let v: serde_json::Value = serde_json::from_slice(reply).unwrap_or_default();
-        if v["following"] == serde_json::Value::Bool(false) {
-            return;
-        }
-        v["media_id"].as_str().and_then(title_key)
-    } else {
-        asked.as_deref().and_then(title_key).and_then(|k| canon(&k))
-    };
-    if let Some(key) = key {
-        sessions.record_requester(&key, &name);
-    }
-}
-
-/// The title reads carry `requested_by`: the first person who added the title, or null.
+/// Who added what, on the way through the proxy. A successful add made by a signed-in person
+/// is remembered by the server (the name never comes from the page), and the title reads
+/// carry `requested_by`: the first person who added the title, or null.
 fn annotate(
     sessions: &Sessions,
     method: &Method,
     path: &str,
+    email: Option<&str>,
     status: StatusCode,
     raw: axum::body::Bytes,
 ) -> axum::body::Bytes {
@@ -757,16 +709,33 @@ fn annotate(
     }
     let rest = path.strip_prefix("/api/v1/").unwrap_or("");
     let parts: Vec<&str> = rest.split('/').collect();
+    let adds = *method == Method::POST
+        && matches!(
+            parts.as_slice(),
+            ["quick-add"] | ["follow"] | ["copies", _, "get"]
+        );
     let reads_list =
         *method == Method::GET && matches!(parts.as_slice(), ["library", "movies" | "series"]);
     let reads_one =
         *method == Method::GET && matches!(parts.as_slice(), ["movie", _] | ["show", _]);
-    if !(reads_list || reads_one) {
+    if !(adds || reads_list || reads_one) {
         return raw;
     }
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
         return raw;
     };
+    if adds {
+        // Turning following off is not an add.
+        if v["following"] != serde_json::Value::Bool(false)
+            && let (Some(name), Some(key)) = (
+                display_name(email),
+                v["media_id"].as_str().and_then(title_key),
+            )
+        {
+            sessions.record_requester(&key, &name);
+        }
+        return raw;
+    }
     let lookup = |id: Option<&str>| {
         id.and_then(title_key)
             .and_then(|k| sessions.requester(&k))
@@ -825,7 +794,6 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     if let Some(ct) = parts.headers.get(header::CONTENT_TYPE) {
         rb = rb.header(header::CONTENT_TYPE, ct);
     }
-    let request_body = bytes.clone();
     let Ok(inner) = rb.body(Body::from(bytes)) else {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request", "bad request");
     };
@@ -834,28 +802,14 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     let Ok(raw) = axum::body::to_bytes(rbody, MAX_PROXY_REPLY).await else {
         return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "reply too large");
     };
-    let index = w.state.index();
-    record_add(
+    let raw = annotate(
         &w.sessions,
         &parts.method,
         &parts_path,
-        &request_body,
         email.as_deref(),
         rp.status,
-        &raw,
-        |key| match key.parse::<MediaId>().ok()? {
-            MediaId::Movie { tmdb } => index
-                .movie(tmdb)
-                .filter(|m| !m.provenance.source_app.ends_with("(unmanaged)"))
-                .map(|m| m.id.to_string()),
-            MediaId::Series(k) => index
-                .series(k)
-                .filter(|s| !s.provenance.source_app.ends_with("(unmanaged)"))
-                .map(|s| s.id.to_string()),
-            _ => None,
-        },
+        raw,
     );
-    let raw = annotate(&w.sessions, &parts.method, &parts_path, rp.status, raw);
     let mut out = Response::new(Body::from(raw));
     *out.status_mut() = rp.status;
     for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
@@ -880,18 +834,14 @@ mod tests {
         email: Option<&str>,
         body: serde_json::Value,
     ) -> serde_json::Value {
-        let reply = Bytes::from(body.to_string());
-        record_add(
+        let out = annotate(
             s,
             &method,
             path,
-            &reply,
             email,
             StatusCode::OK,
-            &reply,
-            |_| None,
+            Bytes::from(body.to_string()),
         );
-        let out = annotate(s, &method, path, StatusCode::OK, reply);
         serde_json::from_slice(&out).unwrap()
     }
 
@@ -970,31 +920,16 @@ mod tests {
             json!({ "media_id": "series:tvdb:5" }),
         );
         assert_eq!(v["requested_by"], "Bob");
-        // A failed add records nothing, unless the title is tracked afterwards (the add
-        // committed, then fetching the torrent failed).
-        let fail = |id: &str, path: &str, who: &str, tracked: bool| {
-            let req = json!({ "media_id": id }).to_string();
-            record_add(
-                &s,
-                &Method::POST,
-                path,
-                req.as_bytes(),
-                Some(who),
-                StatusCode::BAD_GATEWAY,
-                b"{}",
-                |k| tracked.then(|| k.to_string()),
-            );
-        };
-        fail("movie:tmdb:9", "/api/v1/quick-add", "cy@x.org", false);
-        assert_eq!(s.requester("movie:tmdb:9"), None);
-        fail(
-            "movie:tmdb:9",
-            "/api/v1/copies/movie:tmdb:9/get",
-            "cy@x.org",
-            true,
+        // A failed add records nothing.
+        let out = annotate(
+            &s,
+            &Method::POST,
+            "/api/v1/quick-add",
+            Some("cy@x.org"),
+            StatusCode::CONFLICT,
+            Bytes::from(json!({ "media_id": "movie:tmdb:9" }).to_string()),
         );
-        assert_eq!(s.requester("movie:tmdb:9").as_deref(), Some("Cy"));
-        fail("movie:tmdb:9", "/api/v1/quick-add", "dee@x.org", true);
-        assert_eq!(s.requester("movie:tmdb:9").as_deref(), Some("Cy"));
+        assert!(!out.is_empty());
+        assert_eq!(s.requester("movie:tmdb:9"), None);
     }
 }
