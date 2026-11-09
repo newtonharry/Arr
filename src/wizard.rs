@@ -1556,6 +1556,74 @@ token_file = "secrets/mcp_token"
 mod tests {
     use super::*;
 
+    /// The config the setup page writes today must load. With `ARR_WIZARD_CONFIG_OUT` set
+    /// (CI), it is also written there, for tests/upgrade/rollback.sh to give the previous
+    /// release's `arr check`: a new key it doesn't know would break an update's rollback.
+    #[test]
+    fn the_config_the_setup_page_writes_loads() {
+        let out = std::env::var_os("ARR_WIZARD_CONFIG_OUT").map(PathBuf::from);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = out
+            .as_ref()
+            .and_then(|o| o.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| tmp.path().join("state"));
+        crate::fsutil::ensure_private_dir(&root).unwrap();
+        // Folders beside the state folder, not inside it.
+        let folder = |n: &str| {
+            let name = format!("{}-{n}", root.file_name().unwrap().to_string_lossy());
+            root.with_file_name(name)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        let opts = Options {
+            state_dir: root.clone(),
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 8787,
+            torrent_port: 50413,
+            upload_limit_kib: 512,
+            ffprobe: PathBuf::from(folder("ffprobe")),
+            arr: PathBuf::from("arr"),
+            plex_tv: Url::parse("https://plex.tv/").unwrap(),
+            plex_auth: Url::parse("https://app.plex.tv/auth").unwrap(),
+            docker: false,
+            open: false,
+            plex_installer: None,
+            plex_port: 32400,
+            error_reports: true,
+        };
+        let plex = Connected {
+            name: "Plex".into(),
+            base_url: Url::parse("http://127.0.0.1:32400/").unwrap(),
+            token: Secret::new("t".into()),
+            sections: vec![],
+            mounts: vec![],
+        };
+        let lib = |section, plex_path: &str, name: &str| Library {
+            section,
+            plex_path: plex_path.into(),
+            folder: folder(name),
+        };
+        let choices = Choices {
+            movies: None,
+            tv: None,
+            downloads: folder("downloads"),
+            auto_update: false,
+            reporting: true,
+        };
+        let text = render_config(
+            &opts,
+            &plex,
+            Some(&lib(1, "/data/movies", "movies")),
+            Some(&lib(2, "/data/tv", "tv")),
+            &choices,
+        );
+        crate::config::parse_config(&text, &root, "wizard", crate::config::Secrets::Defer)
+            .expect("the rendered config loads");
+        if let Some(o) = out {
+            std::fs::write(o, text).unwrap();
+        }
+    }
+
     #[test]
     fn progress_lines() {
         assert_eq!(

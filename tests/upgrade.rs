@@ -13,13 +13,14 @@
 //! 2. State. `tests/fixtures/state-v0.9.0/` is the state of a managed setup (Plex-bootstrapped
 //!    movie and series, one grab in flight) as the released v0.9.0 binary wrote it: the active
 //!    import with its digests, and the SQLite store. The current code must open it, serve it,
-//!    and still know its titles and its grab. A later change that renames a stored field, a
+//!    and still know its titles, its plans (decoded into the current Plan type) and its grab. A later change that renames a stored field, a
 //!    column or a settings key, or that cannot read an old value, fails here.
 //!
 //! The installers update by swapping the binary and rolling back to the previous one if the new
 //! one does not report healthy, so the reverse also matters: the previous release must start on
 //! the state and config the new one has run. That needs the previous release's binary; it is
-//! checked in CI by `tests/upgrade/rollback.sh`.
+//! checked in CI by `tests/upgrade/rollback.sh`, which installs with the current
+//! install.sh and the current setup page's config so that a new key either writes is caught.
 //!
 //! When a fixture has to change because a release really changed what it writes, add the new
 //! layout next to the old ones; never edit an old one to make a test pass.
@@ -202,6 +203,41 @@ async fn state_written_by_v0_9_0_opens_and_serves() {
     let (s, body) = get("/api/v1/queue?all=true").await;
     assert_eq!(s, 200, "{body}");
     assert!(body.contains("grb_aad47e6df55688785fa2908f"), "{body}");
+    // Its plans are stored as JSON and decoded into the current Plan type: the listing and the
+    // single read both fail if a required field was renamed or removed.
+    let (s, body) = get("/api/v1/plans").await;
+    assert_eq!(s, 200, "{body}");
+    let plans: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(plans["total"], 2, "{body}");
+    let by_state = |state: &str| {
+        plans["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["state"] == state)
+            .unwrap_or_else(|| panic!("no {state} plan: {body}"))
+            .clone()
+    };
+    assert_eq!(by_state("superseded")["id"], "pln_b8a51380258b6172e7363f95");
+    let live = by_state("download_queued");
+    assert_eq!(live["id"], "pln_9c8b32cb1d220af18190a600");
+    assert_eq!(live["target"], "movie:tmdb:603");
+    let (s, body) = get("/api/v1/plans/pln_9c8b32cb1d220af18190a600").await;
+    assert_eq!(s, 200, "{body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(plan["plan"]["state"], "download_queued", "{body}");
+    assert_eq!(plan["plan"]["target"], "movie:tmdb:603", "{body}");
+    assert_eq!(plan["plan"]["execution"]["outcome"], "queued", "{body}");
+    assert_eq!(
+        plan["plan"]["execution"]["grabs"][0], "grb_aad47e6df55688785fa2908f",
+        "the plan names its grab: {body}"
+    );
+    assert_eq!(plan["plan"]["profile"], "setup:movies-hd", "{body}");
+    let stored = state.store.get("pln_9c8b32cb1d220af18190a600".into()).await;
+    assert!(
+        stored.unwrap().is_some(),
+        "decoded from the store as a Plan"
+    );
     let (s, body) = get("/api/v1/readiness").await;
     assert_eq!(s, 200, "{body}");
 
