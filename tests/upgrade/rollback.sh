@@ -54,8 +54,9 @@ trap 'stop; [ -z "$mockpid" ] || kill "$mockpid" 2>/dev/null || true; rm -rf "$w
 
 # --- the previous release, checksum verified
 mkdir "$work/release"
-curl -fsSL "$base/$asset" -o "$work/release/$asset" || fail "cannot download $base/$asset"
-curl -fsSL "$base/$asset.sha256" -o "$work/release/$asset.sha256" || fail "cannot download $base/$asset.sha256"
+# GitHub's release downloads sometimes answer 504 for a moment: retry rather than fail the run.
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 "$base/$asset" -o "$work/release/$asset" || fail "cannot download $base/$asset"
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 "$base/$asset.sha256" -o "$work/release/$asset.sha256" || fail "cannot download $base/$asset.sha256"
 want=$(cut -d' ' -f1 "$work/release/$asset.sha256")
 have=$(sha256sum "$work/release/$asset" | cut -d' ' -f1)
 [ -n "$want" ] && [ "$want" = "$have" ] || fail "checksum mismatch for $asset ($want vs $have)"
