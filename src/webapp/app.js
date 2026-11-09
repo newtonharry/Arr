@@ -619,7 +619,9 @@ async function act(key, kind, scope) {
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   if (tk !== P.token) return;
   P.busy.delete(key); P.msg.set(key, res); say(res.text);
-  if (res.err) paintSheet(); else await loadTitle(true);
+  // Reads the action made stale are issued again (also after a failure), so nothing stays loading.
+  paintSheet();
+  await loadTitle(true);
 }
 async function toggleFollow() {
   if (P.followBusy) return;
@@ -637,7 +639,8 @@ async function toggleFollow() {
     P.data.following = !want;
     P.msg.set('follow', { text: "Couldn't change that. Try again in a moment.", err: true });
     say("Couldn't change that.");
-    return paintSheet();
+    paintSheet();
+    return loadTitle(true);
   }
   say(want ? 'Arr will get new episodes as they air.' : 'Arr will not look for new episodes.');
   await loadTitle(true);

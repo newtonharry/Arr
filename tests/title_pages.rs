@@ -895,3 +895,40 @@ async fn a_download_that_has_all_its_data_is_left_to_finish_by_stop() {
         "its data is not removed"
     );
 }
+
+#[tokio::test]
+async fn a_season_that_appeared_while_following_stops_taking_episodes_when_it_is_switched_off() {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    site.post(
+        "/follow",
+        json!({ "media_id": "series:tvdb:999005", "on": true }),
+    )
+    .await;
+    let ep = |s: u32, n: u32, at: &str| json!({ "season": s, "number": n, "name": format!("Ep {n}"), "type": "regular", "airstamp": at, "runtime": 1 });
+    let refresh = json!({ "name": "refresh_metadata", "media_id": "series:tvdb:999005" });
+    // A whole new season appears while following: it is followed.
+    let mut extra = vec![ep(3, 1, "2099-03-01T02:00:00+00:00")];
+    e.mock
+        .lock()
+        .unwrap()
+        .tvmaze_extra
+        .insert("9005".into(), extra.clone());
+    run_command(&e, refresh.clone()).await;
+    assert_eq!(monitored(&e, "parity", 3).await, 1);
+    site.post(
+        "/follow",
+        json!({ "media_id": "series:tvdb:999005", "on": false }),
+    )
+    .await;
+    assert_eq!(monitored(&e, "parity", 3).await, 0);
+    // A late episode of that season is no longer picked up.
+    extra.push(ep(3, 2, "2099-03-08T02:00:00+00:00"));
+    e.mock
+        .lock()
+        .unwrap()
+        .tvmaze_extra
+        .insert("9005".into(), extra);
+    run_command(&e, refresh).await;
+    assert_eq!(monitored(&e, "parity", 3).await, 0, "following is off");
+}

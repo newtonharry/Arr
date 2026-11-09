@@ -1387,7 +1387,7 @@ pub fn upsert_episodes(
             known.entry(e.season).or_default().insert(e.number);
             if season_monitored.is_none() {
                 tx.execute(
-                    "INSERT OR IGNORE INTO seasons (series_id, season, monitored) VALUES (?1, ?2, ?3)",
+                    "INSERT OR IGNORE INTO seasons (series_id, season, monitored, by_follow) VALUES (?1, ?2, ?3, ?3)",
                     params![sid, e.season, series_monitored && monitor_new],
                 )?;
             }
