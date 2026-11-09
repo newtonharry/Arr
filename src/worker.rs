@@ -577,7 +577,8 @@ async fn run_command(st: &AppState, cmd: &Command, now: OffsetDateTime) -> Comma
                 let Some(section) = plex.section_for(kind) else {
                     return Ok(CommandOutcome::Done(json!({ "skipped": format!("no Plex section configured for {}", kind.label()) })));
                 };
-                // With the root's Plex path configured, only the item's folder is scanned.
+                // With the root's Plex path configured, only the item's folder is scanned (the
+                // whole section while it is empty: Plex ignores folder scans there).
                 let index = st.index();
                 let folder = match id {
                     MediaId::Movie { tmdb } => index.movie(tmdb).and_then(|m| m.folder.clone()),
@@ -587,8 +588,8 @@ async fn run_command(st: &AppState, cmd: &Command, now: OffsetDateTime) -> Comma
                         .and_then(|s| s.folder.clone()),
                 };
                 let path = folder.as_deref().and_then(|f| plex.plex_path(kind, f));
-                match plex.refresh(section, path.as_deref()).await {
-                    Ok(()) => CommandOutcome::Done(json!({ "section": section, "refreshed": true, "scope": if path.is_some() { "folder" } else { "section" } })),
+                match plex.refresh_import(section, path.as_deref()).await {
+                    Ok(folder) => CommandOutcome::Done(json!({ "section": section, "refreshed": true, "scope": if folder { "folder" } else { "section" } })),
                     Err(e) => CommandOutcome::Retry(format!("plex {}", e.describe())),
                 }
             }

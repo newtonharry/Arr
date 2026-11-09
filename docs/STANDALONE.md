@@ -3,9 +3,10 @@
 One `arr` binary, one `config.toml`, one private state directory. Release search
 goes straight to native indexers (The Pirate Bay's JSON API, or any Torznab endpoint),
 downloads run in the embedded BitTorrent engine, completed downloads are validated with
-`ffprobe` and imported into your library, and Plex is refreshed for the imported folder.
-Policy (quality profiles, seed goals, cleanup) is created by `setup`. Nothing writes outside
-the state directory until you enable execution.
+`ffprobe` and imported into your library, and Plex is refreshed for the imported folder
+(the whole library while it is still empty, since Plex skips folder scans there). Policy
+(quality profiles, seed goals, cleanup) is created by `setup`. Nothing writes outside the
+state directory until you enable execution.
 
 Arr no longer imports Sonarr/Radarr settings: a state folder made by the removed `arr import`
 is refused at startup (nothing in it is changed). Set up a new state folder with `arr init`,
