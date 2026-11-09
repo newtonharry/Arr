@@ -4592,9 +4592,8 @@ fn feed_detail(index: &CatalogIndex, targets: &[MediaId]) -> Option<String> {
 fn download_covers(request: MediaId, grab: MediaId) -> bool {
     match (request, grab) {
         (MediaId::Series(a), g) => g.series_key() == Some(a),
-        (MediaId::Season(a, s), MediaId::Season(b, t) | MediaId::Episode(b, t, _)) => {
-            a == b && s == t
-        }
+        // An episode download covers only that episode: the season's other episodes may still be missing.
+        (MediaId::Season(a, s), MediaId::Season(b, t)) => a == b && s == t,
         (MediaId::Episode(a, s, e), MediaId::Season(b, t)) => a == b && s == t && e > 0,
         (r, g) => r == g,
     }
@@ -4612,7 +4611,7 @@ async fn feed(State(st): St) -> ApiResult {
                 downloads::select(c, "active = 1 ORDER BY created_at LIMIT 200", &[])?,
                 downloads::select(
                     c,
-                    "state = 'imported' AND updated_at >= ?1 ORDER BY updated_at DESC LIMIT 20",
+                    "state = 'imported' AND imported_at >= ?1 ORDER BY imported_at DESC LIMIT 20",
                     &[&since],
                 )?,
                 worker::list_requests(c, true)?,
@@ -4654,7 +4653,7 @@ async fn feed(State(st): St) -> ApiResult {
         .map(|g| {
             let targets = targets_of(g);
             let (title, year, detail) = entry(targets[0], &targets);
-            json!({ "media_id": targets[0], "title": title, "year": year, "detail": detail, "at": g.updated_at })
+            json!({ "media_id": targets[0], "title": title, "year": year, "detail": detail, "at": g.imported_at })
         })
         .collect();
 

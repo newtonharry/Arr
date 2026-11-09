@@ -143,7 +143,8 @@ function addControl(it, withMsg = true) {
   return [btn, msg];
 }
 function retryControl(it) {
-  const id = 'r:' + it.key;
+  // Keyed by when it went wrong too, so a later failure of the same item can be retried again.
+  const id = 'r:' + it.key + '|' + it.at;
   const btn = h('button', { type: 'button', class: 'btn coral', 'data-fk': id });
   const msg = h('p', { class: 'msg' });
   track(id, btn, () => {
@@ -371,7 +372,7 @@ function renderLibrary(t) {
       listEl.append(...(r.data.items || []).map(rowFor));
       status.textContent = items.length ? '' : S.filter.trim() ? `No matches for “${S.filter.trim()}”.` : 'Nothing here yet. Add something from the search above.';
       more.replaceChildren(...(items.length < total ? [h('button', { type: 'button', class: 'btn ghost', onclick: () => load(false) }, 'Show more'), h('span', null, `Showing ${items.length} of ${total}`)] : []));
-    } catch { if (my === seq) { status.textContent = ''; if (!items.length) failed(t); } }
+    } catch { if (my === seq && t === token && !S.out) { status.textContent = ''; if (!items.length) failed(t); } }
   }
   let ft = 0;
   filter.addEventListener('input', () => { clearTimeout(ft); ft = setTimeout(() => { S.filter = filter.value; load(true); }, 250); });
