@@ -195,6 +195,76 @@ fn hd_tiers() -> Vec<Tier> {
     ])
 }
 
+/// The Smaller level: 720p only.
+fn smaller_tiers() -> Vec<Tier> {
+    hd_tiers().into_iter().take(3).collect()
+}
+
+/// The Best level: 4K first, and 1080p when no 4K copy exists, so Best never means nothing.
+fn best_tiers() -> Vec<Tier> {
+    use Quality::*;
+    qualities_named(&[
+        ("HDTV-1080p", &[Hdtv1080]),
+        ("WEB 1080p", &[Webdl1080, Webrip1080]),
+        ("Bluray-1080p", &[Bluray1080]),
+        ("HDTV-2160p", &[Hdtv2160]),
+        ("WEB 2160p", &[Webdl2160, Webrip2160]),
+        ("Bluray-2160p", &[Bluray2160]),
+    ])
+}
+
+/// What a person can expect a level to weigh, in MiB per minute of runtime: typical, not a
+/// limit. The web app multiplies it by a title's runtime for its size estimates.
+pub fn typical_mib_per_minute(level: Level) -> f64 {
+    match level {
+        Level::Smaller => 18.0,
+        Level::Standard => 45.0,
+        Level::Best => 130.0,
+    }
+}
+
+/// Adds the Smaller and Best levels next to a managed setup's HD profile (`movies-hd`,
+/// `tv-hd`: the Standard level, whatever its tiers, with its id unchanged), for each media
+/// kind that has one. They take that profile's language rule. They are derived when the settings are loaded and never written to
+/// settings.json: the file an older release reads stays as it was, so a rollback finds the
+/// one profile it expects. A setup document without an HD profile for a media kind gets no
+/// levels for it.
+pub fn with_levels(settings: &mut Settings) {
+    for media in [MediaKind::Movie, MediaKind::Series] {
+        let Some(std) = settings
+            .profiles
+            .iter()
+            .find(|p| p.id == Level::Standard.profile_id(media) && p.media == media)
+            .cloned()
+        else {
+            continue;
+        };
+        for (level, name, tiers) in [
+            (Level::Smaller, "720p (smaller)", smaller_tiers()),
+            (
+                Level::Best,
+                "4K, or 1080p when there is no 4K (best)",
+                best_tiers(),
+            ),
+        ] {
+            let id = level.profile_id(media);
+            if settings.profiles.iter().any(|p| p.id == id) {
+                continue;
+            }
+            settings.profiles.push(Profile {
+                id,
+                media,
+                name: name.into(),
+                upgrade_allowed: false,
+                tiers,
+                cutoff_tier: None,
+                language: std.language.clone(),
+            });
+        }
+    }
+    settings.profiles.sort_by(|a, b| a.id.cmp(&b.id));
+}
+
 /// Default size limits (MiB per minute of runtime): a floor against fake or broken
 /// releases, no ceiling.
 fn default_min(q: Quality) -> f64 {
@@ -1021,6 +1091,10 @@ pub fn replace_conflicts(
     grabs: &[ActiveGrab],
 ) -> Vec<String> {
     let mut out = vec![];
+    // The built-in quality levels exist whatever the document says.
+    let mut with = new.clone();
+    with_levels(&mut with);
+    let new = &with;
     if active_origin == Some("native_snapshot") {
         out.push("a native snapshot import is active: managed setup never replaces imported settings (use a fresh state directory for a standalone deployment)".into());
         return out;
@@ -1196,6 +1270,68 @@ mod tests {
         let (c, _) =
             crate::config::parse_config(&text, &dir, "test", crate::config::Secrets::Read).unwrap();
         (tmp, c)
+    }
+
+    #[test]
+    fn levels_sit_beside_the_default_without_touching_what_is_written() {
+        let (_t, c) = cfg("");
+        let (written, _, _) = normalize(&SetupDoc::default(), &c).unwrap();
+        let mut s = written.clone();
+        with_levels(&mut s);
+        assert_eq!(
+            s.profiles.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            [
+                "setup:movies-best",
+                "setup:movies-hd",
+                "setup:movies-smaller",
+                "setup:tv-best",
+                "setup:tv-hd",
+                "setup:tv-smaller"
+            ]
+        );
+        // The default is Standard, unchanged; adds that name no profile still get it.
+        assert_eq!(
+            s.sole_profile(MediaKind::Movie).unwrap().id,
+            "setup:movies-hd"
+        );
+        assert_eq!(s.sole_profile(MediaKind::Series).unwrap().id, "setup:tv-hd");
+        let q = |id: &str| -> Vec<&'static str> {
+            s.profile(id)
+                .unwrap()
+                .tiers
+                .iter()
+                .flat_map(|t| t.qualities.iter().map(|q| q.as_str()))
+                .collect()
+        };
+        assert!(q("setup:movies-smaller").iter().all(|n| n.contains("720p")));
+        assert!(
+            q("setup:tv-best").contains(&"webdl_2160p")
+                && q("setup:tv-best").contains(&"webdl_1080p")
+        );
+        // The language rule of the default carries over.
+        assert_eq!(
+            s.profile("setup:movies-best").unwrap().language.requirement,
+            s.profile("setup:movies-hd").unwrap().language.requirement
+        );
+        // Idempotent, and a document with its own profiles and no HD one gets none.
+        let again = {
+            let mut t = s.clone();
+            with_levels(&mut t);
+            t.profiles.len()
+        };
+        assert_eq!(again, 6);
+        let mut custom = written;
+        custom.profiles.retain(|p| p.media == MediaKind::Series);
+        custom.profiles[0].id = "setup:tv-anime".into();
+        with_levels(&mut custom);
+        assert_eq!(custom.profiles.len(), 1);
+        // Every ever-offered profile id maps back to its level.
+        for m in [MediaKind::Movie, MediaKind::Series] {
+            for l in Level::ALL {
+                assert_eq!(Level::of(&l.profile_id(m)), Some(l));
+            }
+        }
+        assert_eq!(Level::of("setup:movies-anime"), None);
     }
 
     #[test]

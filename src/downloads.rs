@@ -1097,6 +1097,7 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
     let id2 = id.clone();
     let category = policy.category.clone();
     let coexistence = st.cfg.migration == MigrationMode::Coexistence;
+    let loaded = loaded.clone();
     let result = st
         .store
         .with(move |c| {
@@ -1109,6 +1110,33 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
                 && let Some(why) = library::not_adopted_now(&tx, link.media_id, &link.covers)?
             {
                 return Ok(Err(("not_adopted", why)));
+            }
+            // The copy's quality must be one the title's profile allows now. A list of
+            // copies can be older than a change of quality level; profile changes are
+            // writes, so none can slip in between this check and the insert below.
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM media WHERE id = ?1",
+                    [link.media_id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let profile = stored
+                .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+                .and_then(|v| v["quality_profile"].as_str().map(str::to_string))
+                .and_then(|id| loaded.settings.profile(&id).cloned());
+            let quality: Option<Quality> = serde_json::from_value(json!(link.quality.as_str()))
+                .ok()
+                .filter(|q| *q != Quality::Unknown);
+            if let (Some(p), Some(q)) = (&profile, quality)
+                && p.tier_of(q).is_none()
+            {
+                return Ok(Err((
+                    "quality_changed",
+                    format!(
+                        "this copy is {q}, which the title's quality level no longer allows; look for copies again"
+                    ),
+                )));
             }
             for t in &link.covers {
                 let busy: Option<String> = tx

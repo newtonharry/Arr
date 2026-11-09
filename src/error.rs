@@ -61,6 +61,9 @@ pub enum ErrorCode {
     /// The embedded engine could find no peer for the payload (no tracker it may use, DHT
     /// off or the torrent private, no initial peers); nothing was queued.
     NoPeerDiscovery,
+    /// The copy's quality is no longer allowed by the title's quality level (the list of
+    /// copies is older than a change of level); nothing was queued.
+    QualityChanged,
     /// A managed setup document failed validation.
     InvalidSetup,
     /// Managed setup would replace settings it must not replace (an imported native
@@ -117,6 +120,7 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::UnsupportedScope,
     ErrorCode::IndexerLimitReached,
     ErrorCode::NoPeerDiscovery,
+    ErrorCode::QualityChanged,
     ErrorCode::InvalidSetup,
     ErrorCode::SetupConflict,
     ErrorCode::Internal,

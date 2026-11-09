@@ -942,3 +942,541 @@ async fn a_season_that_appeared_while_following_stops_taking_episodes_when_it_is
     run_command(&e, refresh).await;
     assert_eq!(monitored(&e, "parity", 3).await, 0, "following is off");
 }
+
+// ------------------------------------------------------------------ download options
+
+#[tokio::test]
+async fn the_pages_offer_three_quality_levels_and_changing_one_touches_no_file() {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    // A movie already in Plex sits at Standard, the default every earlier install has; the
+    // levels come with the loaded settings.
+    let (s, v) = site.get("/movie/movie:tmdb:604").await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["level"].clone(), v["tracked"].clone()),
+        (json!("standard"), json!(true))
+    );
+    let levels = v["levels"].as_array().unwrap();
+    let words: Vec<(&str, &str, &str)> = levels
+        .iter()
+        .map(|l| {
+            (
+                l["level"].as_str().unwrap(),
+                l["label"].as_str().unwrap(),
+                l["resolution"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        words,
+        [
+            ("smaller", "Smaller", "720p"),
+            ("standard", "Standard", "1080p"),
+            ("best", "Best", "4K")
+        ]
+    );
+    let mib = |l: &Value| l["size_bytes"].as_f64().unwrap() / 1048576.0;
+    assert_eq!(
+        (mib(&levels[0]), mib(&levels[1]), mib(&levels[2])),
+        (138.0 * 18.0, 138.0 * 45.0, 138.0 * 130.0)
+    );
+    // Changing it is saved, and the file in Plex stays.
+    let (s, v) = site
+        .post(
+            "/quality",
+            json!({ "media_id": "movie:tmdb:604", "level": "best" }),
+        )
+        .await;
+    assert_eq!((s, v["level"].clone()), (200, json!("best")), "{v}");
+    let (_, v) = site.get("/movie/movie:tmdb:604").await;
+    assert_eq!(
+        (v["level"].clone(), v["state"].clone()),
+        (json!("best"), json!("in_plex"))
+    );
+    let (_, lib, _) = e.json(e.get("/api/v1/library/movies?q=Reloaded")).await;
+    assert_eq!(lib["items"][0]["has_file"], true, "{lib}");
+    // A show: per-episode estimates, from its runtime.
+    let v = site.show("series:tvdb:372264").await;
+    assert_eq!(v["level"], "standard");
+    assert!(v["levels"][1]["size_bytes"].as_f64().unwrap() > 0.0, "{v}");
+    let (s, _) = site
+        .post(
+            "/quality",
+            json!({ "media_id": "series:tvdb:372264", "level": "smaller" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(site.show("series:tvdb:372264").await["level"], "smaller");
+    // Bad asks.
+    for (body, want) in [
+        (
+            json!({ "media_id": "movie:tmdb:604", "level": "huge" }),
+            400,
+        ),
+        (
+            json!({ "media_id": "season:tvdb:372264:1", "level": "best" }),
+            400,
+        ),
+        (
+            json!({ "media_id": "movie:tmdb:777", "level": "best" }),
+            404,
+        ),
+    ] {
+        let (s, v) = site.post("/quality", body.clone()).await;
+        assert_eq!(s, want, "{body} {v}");
+    }
+    // A title Arr does not have yet is not tracked; the level goes with the Get.
+    let (_, v) = site.get("/movie/movie:tmdb:900001").await;
+    assert_eq!(
+        (v["tracked"].clone(), v["level"].clone()),
+        (json!(false), json!(null))
+    );
+    let (s, v) = site
+        .post(
+            "/quick-add",
+            json!({ "media_id": "movie:tmdb:900001", "level": "best" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let (_, v) = site.get("/movie/movie:tmdb:900001").await;
+    assert_eq!(
+        (v["tracked"].clone(), v["level"].clone()),
+        (json!(true), json!("best"))
+    );
+    // The default for a title with no say is still Standard (adding without a level).
+    let plex_released = format!("movie:tmdb:{PLEX_RELEASED}");
+    let (s, _) = site
+        .post("/quick-add", json!({ "media_id": plex_released }))
+        .await;
+    assert_eq!(s, 200);
+    let (_, v) = site.get(&format!("/movie/{plex_released}")).await;
+    assert_eq!(v["level"], "standard");
+}
+
+#[tokio::test]
+async fn a_level_decides_what_arr_accepts_and_the_default_is_unchanged() {
+    use arr::settings::{Level, MediaKind};
+    let e = exec().await;
+    let l = e.state.current().unwrap();
+    for m in [MediaKind::Movie, MediaKind::Series] {
+        // Standard keeps the long-standing id; the others sit beside it.
+        assert_eq!(
+            l.settings.sole_profile(m).unwrap().id,
+            Level::Standard.profile_id(m)
+        );
+        let tiers = |lv: Level| {
+            l.settings
+                .profile(&lv.profile_id(m))
+                .unwrap()
+                .tiers
+                .iter()
+                .flat_map(|t| t.qualities.iter().map(|q| q.as_str()))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            tiers(Level::Smaller).iter().all(|q| q.contains("720p")),
+            "{:?}",
+            tiers(Level::Smaller)
+        );
+        assert!(
+            tiers(Level::Standard)
+                .iter()
+                .all(|q| q.contains("720p") || q.contains("1080p"))
+        );
+        let best = tiers(Level::Best);
+        assert!(
+            best.iter().any(|q| q.contains("2160p")) && best.iter().any(|q| q.contains("1080p"))
+        );
+        assert!(!best.iter().any(|q| q.contains("720p")));
+    }
+    // What is written to disk is only the default, so an older release finds what it expects.
+    let dir = e.state.cfg.state_dir.clone();
+    let active = std::fs::read_to_string(dir.join("active-import.json")).unwrap();
+    let import_dir = dir.join("imports").join(
+        serde_json::from_str::<Value>(&active).unwrap()["import_id"]
+            .as_str()
+            .unwrap(),
+    );
+    let on_disk: Value =
+        serde_json::from_slice(&std::fs::read(import_dir.join("settings.json")).unwrap()).unwrap();
+    let ids: Vec<&str> = on_disk["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["setup:movies-hd", "setup:tv-hd"]);
+}
+
+fn leviticus(e: &Exec) {
+    let mk = |title: &str, seeders: i64| {
+        let (_, mut r) = e.publish(
+            title,
+            title,
+            vec![(format!("{title}.mkv"), mkv(1))],
+            1.0,
+            false,
+        );
+        r["seeders"] = json!(seeders);
+        r
+    };
+    let rs = vec![
+        mk("Leviticus.2025.1080p.WEB-DL.x264-UM", 80),
+        mk("Leviticus.2025.720p.BluRay.x264-UM", 1),
+        mk("Leviticus.2025.2160p.WEB-DL.x265-UM", 40),
+        mk("Some.Other.Film.2025.1080p.WEB-DL.x264-UM", 40),
+    ];
+    e.search_results("Leviticus 2025", rs);
+}
+
+#[tokio::test]
+async fn the_copies_list_is_plain_recommended_first_and_says_what_it_skipped() {
+    let e = exec().await;
+    leviticus(&e);
+    let site = signed_in(e.state.clone()).await;
+    let (s, v) = site.get("/copies/movie:tmdb:900001").await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["media_id"], "movie:tmdb:900001");
+    let copies = v["copies"].as_array().unwrap();
+    let line: Vec<(String, String, String, bool)> = copies
+        .iter()
+        .map(|c| {
+            (
+                c["resolution"].as_str().unwrap().into(),
+                c["source"].as_str().unwrap().into(),
+                c["speed"].as_str().unwrap().into(),
+                c["recommended"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(copies.len(), 2, "{v}");
+    assert!(
+        line.contains(&(
+            "1080p".into(),
+            "Web".into(),
+            "fast".into(),
+            copies[0]["recommended"] == true && line[0].0 == "1080p"
+        )) || line
+            .iter()
+            .any(|l| l.0 == "1080p" && l.1 == "Web" && l.2 == "fast"),
+        "{line:?}"
+    );
+    assert!(
+        line.iter()
+            .any(|l| l.0 == "720p" && l.1 == "Blu-ray" && l.2 == "slow"),
+        "{line:?}"
+    );
+    assert_eq!(line.iter().filter(|l| l.3).count(), 1);
+    assert!(line[0].3, "the recommended copy comes first");
+    assert_eq!(v["recommended"], copies[0]["id"]);
+    assert!(copies[0]["size_bytes"].as_i64().unwrap() > 0);
+    // Why the rest were skipped, with no jargon.
+    let reasons: Vec<(&str, u64)> = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["reason"].as_str().unwrap(), s["count"].as_u64().unwrap()))
+        .collect();
+    assert!(
+        reasons.contains(&("not the quality you chose", 1)),
+        "{reasons:?}"
+    );
+    assert!(reasons.contains(&("not the right title", 1)), "{reasons:?}");
+    let text = v.to_string().to_lowercase();
+    for bad in ["release", "indexer", "seeder", "profile", "grab"] {
+        assert!(!text.contains(bad), "{bad} in {text}");
+    }
+    // At the Best level the 4K copy is allowed and the 720p one is not.
+    let (_, v) = site.get("/copies/movie:tmdb:900001?level=best").await;
+    let res: Vec<&str> = v["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["resolution"].as_str().unwrap())
+        .collect();
+    assert!(
+        res.contains(&"4K") && res.contains(&"1080p") && !res.contains(&"720p"),
+        "{res:?}"
+    );
+    // A show is picked by season or episode, not as a whole.
+    let (s, _) = site.get("/copies/series:tvdb:372264").await;
+    assert_eq!(s, 400);
+    let (s, _) = site.get("/copies/movie:tmdb:900001?level=huge").await;
+    assert_eq!(s, 400);
+}
+
+#[tokio::test]
+async fn picking_a_copy_downloads_it_through_the_same_gates() {
+    let e = exec().await;
+    leviticus(&e);
+    let site = signed_in(e.state.clone()).await;
+    let (_, v) = site.get("/copies/movie:tmdb:900001").await;
+    let pick = v["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["resolution"] == "720p")
+        .unwrap()["id"]
+        .clone();
+    // A made-up id is not a copy.
+    let (s, v2) = site
+        .post(
+            "/copies/movie:tmdb:900001/get",
+            json!({ "id": "rel_000000000000000000000000" }),
+        )
+        .await;
+    assert_eq!(
+        (s, v2["error"]["code"].as_str()),
+        (404, Some("release_not_found")),
+        "{v2}"
+    );
+    // The title was not on Arr's list: picking adds it (with the level the page showed), then
+    // downloads exactly that copy, without a search of its own.
+    let (s, v2) = site
+        .post(
+            "/copies/movie:tmdb:900001/get",
+            json!({ "id": pick, "level": "smaller" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v2}");
+    assert_eq!(v2["outcome"], "on_its_way");
+    let (_, q, _) = e.json(e.get("/api/v1/queue")).await;
+    assert_eq!(q["items"].as_array().unwrap().len(), 1, "{q}");
+    let (_, page) = site.get("/movie/movie:tmdb:900001").await;
+    assert_eq!(
+        (page["level"].clone(), page["state"].clone()),
+        (json!("smaller"), json!("on_its_way"))
+    );
+    // Again: no second download.
+    let (s, v2) = site
+        .post("/copies/movie:tmdb:900001/get", json!({ "id": pick }))
+        .await;
+    assert_eq!(
+        (s, v2["error"]["code"].as_str()),
+        (409, Some("already_queued")),
+        "{v2}"
+    );
+    // Stopped: Arr is not getting it, so a copy is not started behind that back.
+    site.post("/stop", json!({ "media_id": "movie:tmdb:900001" }))
+        .await;
+    let (s, v2) = site
+        .post("/copies/movie:tmdb:900001/get", json!({ "id": pick }))
+        .await;
+    assert_eq!(
+        (s, v2["error"]["code"].as_str()),
+        (409, Some("not_managed")),
+        "{v2}"
+    );
+}
+
+#[tokio::test]
+async fn a_copy_of_what_is_already_in_plex_is_never_offered() {
+    let e = exec().await;
+    let t = "The.Matrix.Reloaded.2003.1080p.WEB-DL.x264-UM";
+    let (_, r) = e.publish(t, t, matrix_files(), 8.0, false);
+    e.search_results("The Matrix Reloaded 2003", vec![r]);
+    let site = signed_in(e.state.clone()).await;
+    let (s, v) = site.get("/copies/movie:tmdb:604").await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["copies"].as_array().unwrap().len(), 0, "{v}");
+    assert_eq!(v["recommended"], Value::Null);
+    assert_eq!(
+        v["skipped"][0]["reason"], "you already have it or it's on its way",
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn the_app_reaches_the_option_routes_and_nothing_broader() {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    let (s, _) = site.get("/copies/movie:tmdb:900001").await;
+    assert_eq!(s, 200);
+    let (s, _) = site
+        .post(
+            "/quality",
+            json!({ "media_id": "movie:tmdb:603", "level": "standard" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    for (m, p) in [
+        (Method::POST, "/copies/movie:tmdb:603"),
+        (Method::GET, "/copies/movie:tmdb:603/get"),
+        (Method::GET, "/quality"),
+        (Method::DELETE, "/copies/movie:tmdb:603"),
+        (Method::POST, "/copies/movie:tmdb:603/get/extra"),
+    ] {
+        let (s, v) = site.call(m.clone(), p, Some(json!({}))).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (404, Some("not_found")),
+            "{m} {p}"
+        );
+    }
+}
+
+// ------------------------------------------------------------------ review fixes
+
+#[tokio::test]
+async fn following_a_show_with_a_level_applies_it_and_returns() {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        site.post(
+            "/follow",
+            json!({ "media_id": "series:tvdb:372264", "on": true, "level": "best" }),
+        ),
+    )
+    .await
+    .expect("follow with a level must not wait on the library lock");
+    assert_eq!(r.0, 200, "{}", r.1);
+    assert_eq!(site.show("series:tvdb:372264").await["level"], "best");
+}
+
+#[tokio::test]
+async fn a_season_is_picked_as_a_whole_never_as_one_episode() {
+    let e = start_exec(managed_with_tmdb()).await;
+    let pack = "Parity.Partial.S02.1080p.WEB-DL.x264-UM";
+    let one = "Parity.Partial.S02E01.1080p.WEB-DL.x264-UM";
+    let two = "Parity.Partial.S02E02.720p.WEB-DL.x264-UM";
+    let (_, p) = e.publish(
+        pack,
+        pack,
+        vec![
+            (format!("{pack}/{pack}.E01.mkv"), mkv(1)),
+            (format!("{pack}/{pack}.E02.mkv"), mkv(1)),
+        ],
+        0.016,
+        false,
+    );
+    let (_, a) = e.publish(one, one, vec![(format!("{one}.mkv"), mkv(1))], 0.008, false);
+    let (_, b) = e.publish(two, two, vec![(format!("{two}.mkv"), mkv(1))], 0.008, false);
+    // Single episodes seed better than the pack, so they would rank first if listed.
+    let mut a = a;
+    a["seeders"] = json!(500);
+    e.search_results("Parity Partial S02", vec![a, b, p]);
+    let site = signed_in(e.state.clone()).await;
+    let (s, v) = site.get("/copies/season:tvdb:999005:2").await;
+    assert_eq!(s, 200, "{v}");
+    let copies = v["copies"].as_array().unwrap();
+    assert_eq!(copies.len(), 1, "only the full season: {v}");
+    assert_eq!(copies[0]["resolution"], "1080p");
+    assert_eq!(copies[0]["recommended"], true);
+    let skipped: u64 = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(skipped, 2, "the two single episodes are skipped: {v}");
+}
+
+#[tokio::test]
+async fn a_download_already_underway_keeps_the_quality_it_was_grabbed_under() {
+    let e = exec().await;
+    leviticus(&e);
+    let site = signed_in(e.state.clone()).await;
+    let (_, v) = site.get("/copies/movie:tmdb:900001").await;
+    let pick = v["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["resolution"] == "1080p")
+        .unwrap()["id"]
+        .clone();
+    let (s, v) = site
+        .post("/copies/movie:tmdb:900001/get", json!({ "id": pick }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let (_, q, _) = e.json(e.get("/api/v1/queue")).await;
+    let gid = q["items"][0]["id"].as_str().unwrap().to_string();
+    let hash = e.grab_row(&gid).info_hash;
+    e.tick().await;
+    // The person moves the title to Smaller while the 1080p copy downloads.
+    let (s, _) = site
+        .post(
+            "/quality",
+            json!({ "media_id": "movie:tmdb:900001", "level": "smaller" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    e.fake.lock().unwrap().complete(&hash);
+    e.tick().await;
+    let g = e.grab_row(&gid);
+    assert_eq!(g.state, "imported", "{:?} {:?}", g.failure, g.last_error);
+    let (_, bl, _) = e.json(e.get("/api/v1/blocklist")).await;
+    assert_eq!(bl["items"], json!([]), "{bl}");
+}
+
+/// A tracked movie whose Standard copies were listed, and then its level moved to Smaller.
+async fn stale_standard_list() -> (Exec, Site, Value) {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    // Arr has the title (nothing found yet).
+    let (s, _) = site
+        .post("/quick-add", json!({ "media_id": "movie:tmdb:900001" }))
+        .await;
+    assert_eq!(s, 200);
+    leviticus(&e);
+    let (_, v) = site.get("/copies/movie:tmdb:900001").await;
+    let pick = v["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["resolution"] == "1080p")
+        .unwrap()["id"]
+        .clone();
+    // Another tab saves Smaller.
+    let (s, _) = site
+        .post(
+            "/quality",
+            json!({ "media_id": "movie:tmdb:900001", "level": "smaller" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    (e, site, pick)
+}
+
+#[tokio::test]
+async fn a_stale_pick_after_a_quality_change_is_refused() {
+    let (e, site, pick) = stale_standard_list().await;
+    let (s, v) = site
+        .post("/copies/movie:tmdb:900001/get", json!({ "id": pick }))
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("quality_changed")),
+        "{v}"
+    );
+    let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
+    assert_eq!(q["items"], json!([]), "nothing was queued: {q}");
+    // A copy the new level allows still goes through.
+    let (_, v) = site.get("/copies/movie:tmdb:900001").await;
+    let ok = v["copies"][0]["id"].clone();
+    assert_eq!(v["copies"][0]["resolution"], "720p", "{v}");
+    let (s, v) = site
+        .post("/copies/movie:tmdb:900001/get", json!({ "id": ok }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+}
+
+#[tokio::test]
+async fn a_stale_release_id_is_refused_by_the_grab_route_too() {
+    // POST /grabs is what the MCP start_download tool calls.
+    let (e, _site, pick) = stale_standard_list().await;
+    let (s, v, text) = e
+        .json(
+            e.post("/api/v1/grabs")
+                .json(&json!({ "media_id": "movie:tmdb:900001", "release_ref": pick })),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("quality_changed")),
+        "{text}"
+    );
+    let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
+    assert_eq!(q["items"], json!([]), "{q}");
+}

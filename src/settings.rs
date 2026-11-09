@@ -22,6 +22,54 @@ impl MediaKind {
     }
 }
 
+/// The three quality levels the web app offers: built-in profiles of a managed setup.
+/// Standard is the long-standing default profile (its id is unchanged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Smaller,
+    Standard,
+    Best,
+}
+
+impl Level {
+    pub const ALL: [Level; 3] = [Level::Smaller, Level::Standard, Level::Best];
+
+    pub fn parse(raw: &str) -> Option<Level> {
+        Level::ALL.into_iter().find(|l| l.as_str() == raw)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Smaller => "smaller",
+            Level::Standard => "standard",
+            Level::Best => "best",
+        }
+    }
+
+    /// The profile id of this level for a media kind.
+    pub fn profile_id(self, media: MediaKind) -> String {
+        let kind = match media {
+            MediaKind::Movie => "movies",
+            MediaKind::Series => "tv",
+        };
+        let name = match self {
+            Level::Smaller => "smaller",
+            Level::Standard => "hd",
+            Level::Best => "best",
+        };
+        format!("setup:{kind}-{name}")
+    }
+
+    /// The level a profile id stands for, if it is one of the built-in ones.
+    pub fn of(profile_id: &str) -> Option<Level> {
+        [MediaKind::Movie, MediaKind::Series]
+            .into_iter()
+            .flat_map(|m| Level::ALL.into_iter().map(move |l| (m, l)))
+            .find(|(m, l)| l.profile_id(*m) == profile_id)
+            .map(|(_, l)| l)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -254,9 +302,12 @@ impl Settings {
         self.profiles.iter().find(|p| p.id == id)
     }
 
-    /// The only profile for a media kind, if exactly one exists.
+    /// The profile a title gets when none is named: the only one for a media kind, ignoring
+    /// the built-in Smaller and Best quality levels, which are added next to Standard.
     pub fn sole_profile(&self, media: MediaKind) -> Option<&Profile> {
-        let mut it = self.profiles.iter().filter(|p| p.media == media);
+        let mut it = self.profiles.iter().filter(|p| {
+            p.media == media && !matches!(Level::of(&p.id), Some(Level::Smaller | Level::Best))
+        });
         match (it.next(), it.next()) {
             (Some(p), None) => Some(p),
             _ => None,

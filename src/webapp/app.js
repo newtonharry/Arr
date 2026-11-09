@@ -400,7 +400,7 @@ function renderLibrary(t) {
 
 // ---------- title pages (a show or a movie, as a sheet over the current screen) ----------
 const sheet = $('#sheet'), panel = $('#panel');
-const P = { id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false };
+const P = { id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null };
 let bgHash = '', sheetFills = [];
 const sheetOpen = () => !sheet.hidden;
 // Everything behind the sheet: out of reach of the keyboard and of assistive tech while it is open.
@@ -450,7 +450,7 @@ function openTitle(t) {
     for (const el of behind()) el.inert = true;
   }
   clearTimeout(P.pollT); clearTimeout(P.askT);
-  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false });
+  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, opt: freshOpt() });
   panel.scrollTop = 0;
   paintSheet();
   if (first) panel.querySelector('.close')?.focus({ preventScroll: true });
@@ -612,7 +612,9 @@ async function act(key, kind, scope) {
   P.busy.add(key); P.ask = ''; P.msg.delete(key); paintSheet();
   let res;
   try {
-    const r = await api(kind === 'get' ? '/v1/quick-add' : '/v1/stop', { method: 'POST', body: { media_id: scope } });
+    const body = { media_id: scope };
+    if (kind === 'get' && pickedLevel()) body.level = pickedLevel();
+    const r = await api(kind === 'get' ? '/v1/quick-add' : '/v1/stop', { method: 'POST', body });
     if (!r.ok) res = { text: "Couldn't do that just now. Try again in a moment.", err: true };
     else if (kind === 'get') res = { text: r.data.message || 'Done.', err: r.data.outcome === 'movies_off' };
     else if (r.data.cancelled > 0) res = { text: 'Stopped. Arr cancelled the download and will not look for it.' };
@@ -632,7 +634,7 @@ async function toggleFollow() {
   P.followBusy = true; P.data.following = want; P.msg.delete('follow'); paintSheet();
   let bad = false;
   try {
-    const r = await api('/v1/follow', { method: 'POST', body: { media_id: P.data.media_id, on: want } });
+    const r = await api('/v1/follow', { method: 'POST', body: { media_id: P.data.media_id, on: want, ...(want && pickedLevel() ? { level: pickedLevel() } : {}) } });
     bad = !r.ok;
   } catch { bad = true; }
   if (tk !== P.token) return;
@@ -646,6 +648,159 @@ async function toggleFollow() {
   }
   say(want ? 'Arr will get new episodes as they air.' : 'Arr will not look for new episodes.');
   await loadTitle(true);
+}
+
+// ----- download options: a quality level, and a list of copies to pick from
+const freshOpt = () => ({ open: false, level: null, saving: false, copiesOpen: false, copies: { st: 'idle' }, season: null, picking: '' });
+const LEVEL_WORDS = { smaller: 'Smaller', standard: 'Standard', best: 'Best' };
+function fmtSize(bytes) {
+  if (!(bytes > 0)) return '';
+  const gb = bytes / 1024 ** 3;
+  return gb >= 1 ? `${gb >= 10 ? Math.round(gb) : gb.toFixed(1)} GB` : `${Math.max(1, Math.round(bytes / 1024 ** 2 / 10) * 10)} MB`;
+}
+// The level shown: the one picked on this page, else the title's own, else Standard.
+const shownLevel = () => P.opt.level || P.data.level || 'standard';
+// A level picked for a title Arr does not have yet travels with the Get.
+const pickedLevel = () => (P.data && P.data.levels.length && !P.data.tracked && P.opt.level) || null;
+async function setLevel(level) {
+  const o = P.opt, d = P.data;
+  if (o.saving || level === shownLevel()) return;
+  o.level = level; o.gen = (o.gen || 0) + 1; P.msg.delete('opt'); o.copies = { st: 'idle' };
+  if (!d.tracked) {
+    // Nothing to save yet: Arr uses it when the person taps Get.
+    say(`${LEVEL_WORDS[level]} quality. Arr will use it when you tap Get.`);
+    paintSheet();
+    if (o.copiesOpen) loadCopies();
+    return;
+  }
+  o.saving = true; paintSheet();
+  const tk = P.token;
+  let res;
+  try {
+    const r = await api('/v1/quality', { method: 'POST', body: { media_id: d.media_id, level } });
+    res = r.ok ? { text: `Saved. Arr will look for ${LEVEL_WORDS[level].toLowerCase()} quality from now on. Nothing already in Plex changes.` }
+      : { text: "Couldn't change that just now. Try again in a moment.", err: true };
+  } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  if (tk !== P.token) return;
+  o.saving = false;
+  if (res.err) o.level = null;
+  P.msg.set('opt', res); say(res.text); paintSheet();
+  P.seq++;
+  await loadTitle(true);
+  if (tk !== P.token) return;
+  if (!res.err) { o.level = null; paintSheet(); }
+  // An open list is looked up again for the level now in force.
+  if (o.copiesOpen) loadCopies();
+}
+const copyScope = () => (P.kind === 'movie' ? P.data.media_id : P.data.media_id.replace(/^series:/, 'season:') + ':' + (P.opt.season ?? defaultSeason()));
+function defaultSeason() {
+  const aired = P.data.seasons.filter((s) => s.aired_count > 0);
+  return (aired.length ? aired[aired.length - 1] : P.data.seasons[P.data.seasons.length - 1] || { number: 1 }).number;
+}
+async function loadCopies() {
+  const o = P.opt, tk = P.token, scope = copyScope(), gen = (o.gen = (o.gen || 0) + 1);
+  o.copies = { st: 'loading', scope };
+  paintSheet();
+  const lv = pickedLevel();
+  let c;
+  try {
+    const r = await api(`/v1/copies/${enc(scope)}` + (lv ? `?level=${lv}` : ''));
+    c = r.ok ? { st: 'ready', scope, data: r.data } : { st: 'error', scope };
+  } catch { c = { st: 'error', scope }; }
+  // Only the newest lookup counts: an older answer is for a level or season no longer shown.
+  if (tk !== P.token || o.gen !== gen) return;
+  o.copies = c; paintSheet();
+  if (c.st === 'ready') say(c.data.copies.length ? plural(c.data.copies.length, 'copy', 'copies') + ' found.' : "Arr couldn't find any copies right now.");
+}
+function toggleCopies() {
+  const o = P.opt;
+  o.copiesOpen = !o.copiesOpen;
+  if (o.copiesOpen && o.copies.st !== 'ready' && o.copies.st !== 'loading') loadCopies(); else paintSheet();
+}
+const PICK_ERRORS = {
+  already_queued: 'Arr is already getting that one.',
+  blocklisted: "That copy failed before, so Arr won't try it again.",
+  release_not_found: 'That list is out of date. Look again and pick one.',
+  quality_changed: 'That copy no longer matches the quality you chose. Look again and pick one.',
+  not_managed: 'Arr is not getting this right now. Tap Get to start again.',
+  not_adopted: 'Arr is not getting this right now. Tap Get to start again.',
+};
+async function pickCopy(c) {
+  const o = P.opt;
+  if (o.picking) return;
+  const tk = P.token;
+  o.picking = c.id; P.msg.delete('copy'); P.seq++; paintSheet();
+  const scope = o.copies.data.media_id;
+  let res;
+  try {
+    const r = await api(`/v1/copies/${enc(scope)}/get`, { method: 'POST', body: { id: c.id, ...(pickedLevel() ? { level: pickedLevel() } : {}) } });
+    if (r.ok) res = { text: r.data.message || 'Arr is getting that copy now.' };
+    else res = { text: PICK_ERRORS[r.data && r.data.error && r.data.error.code] || "Couldn't start that one just now. Try again in a moment.", err: true };
+  } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  if (tk !== P.token) return;
+  o.picking = '';
+  P.msg.set('copy', res); say(res.text);
+  if (!res.err) { o.copiesOpen = false; o.copies = { st: 'idle' }; }
+  paintSheet();
+  await loadTitle(true);
+}
+function levelChoice(l) {
+  const on = shownLevel() === l.level, d = P.data;
+  const size = l.size_bytes ? fmtSize(l.size_bytes) : '';
+  return h('label', { class: 'lv-opt' },
+    h('input', { type: 'radio', name: 'level', value: l.level, checked: on, disabled: P.opt.saving, 'data-fk': 'lv:' + l.level, onchange: () => setLevel(l.level) }),
+    h('span', { class: 'lv-t' }, l.label), h('span', { class: 'lv-r' }, l.resolution), size && h('span', { class: 'lv-s' }, size));
+}
+function copyRow(c) {
+  const line = [c.resolution, c.source].filter(Boolean).join(' · ') || 'Unknown quality';
+  const speed = { fast: 'Fast', ok: 'Medium speed', slow: 'Slow' }[c.speed];
+  const busy = P.opt.picking === c.id;
+  const label = `${line}${c.size_bytes ? ', ' + fmtSize(c.size_bytes) : ''}`;
+  return h('li', { class: 'item copy' + (c.recommended ? ' rec' : '') },
+    h('div', { class: 'what' },
+      h('h3', null, line),
+      h('p', { class: 'meta' }, joinDot(fmtSize(c.size_bytes), speed)),
+      c.recommended && h('span', { class: 'tag' }, ic('check'), 'Recommended')),
+    h('button', { type: 'button', class: 'btn' + (c.recommended ? '' : ' ghost'), 'data-fk': 'copy:' + c.id, 'data-s': busy ? 'busy' : null, 'aria-disabled': P.opt.picking ? 'true' : 'false', 'aria-label': `Get this copy: ${label}${c.recommended ? ', recommended' : ''}`, onclick: () => pickCopy(c) }, busy ? 'Getting…' : 'Get this one'));
+}
+function copiesNode() {
+  const c = P.opt.copies;
+  if (c.st === 'loading' || (c.st === 'idle' && P.opt.saving)) {
+    return h('div', { class: 'copies', 'aria-busy': 'true' }, h('span', { class: 'sr', role: 'status' }, 'Looking for copies'),
+      h('ul', { class: 'list' }, [1, 2, 3].map(() => h('li', { class: 'item' }, h('div', { class: 'what' }, h('div', { class: 'sk', style: 'width:45%' }), h('div', { class: 'sk', style: 'width:30%;margin-top:8px' })), h('div', { class: 'sk', style: 'width:92px;height:44px;border-radius:12px' })))));
+  }
+  const retry = h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'copies-retry', onclick: loadCopies }, ic('retry'), 'Try again');
+  if (c.st === 'error') return h('div', { class: 'copies' }, hint("Couldn't look for copies just now.", 'status'), retry);
+  if (c.st !== 'ready') return null;
+  const n = c.data.skipped.reduce((a, x) => a + x.count, 0);
+  const skipped = n ? h('p', { class: 'hint skipped' }, `Skipped ${plural(n, 'copy', 'copies')}: ` + c.data.skipped.map((x) => `${x.count} ${x.reason}`).join(', ') + '.') : null;
+  if (!c.data.copies.length) return h('div', { class: 'copies' }, hint("Arr couldn't find any copies right now.", 'status'), skipped, retry);
+  return h('div', { class: 'copies' }, h('ul', { class: 'list' }, c.data.copies.map(copyRow)), skipped);
+}
+function optionsPanel() {
+  const o = P.opt, d = P.data, lv = d.levels.length > 0;
+  const cur = lv ? d.levels.find((l) => l.level === shownLevel()) : null;
+  const sub = cur ? `Quality: ${cur.label} (${cur.resolution})` : 'Choose a copy yourself';
+  const season = P.kind === 'show' && o.copiesOpen && d.seasons.length > 1
+    ? h('label', { class: 'pick-season' }, h('span', null, 'Season'),
+      h('select', { 'data-fk': 'season-pick', onchange: (e) => { o.season = Number(e.target.value); o.copies = { st: 'idle' }; loadCopies(); } },
+        d.seasons.map((s) => h('option', { value: s.number, selected: s.number === (o.season ?? defaultSeason()) }, 'Season ' + s.number)))) : null;
+  const fs = lv && h('fieldset', { class: 'lv', disabled: o.saving, 'aria-busy': o.saving ? 'true' : null },
+    h('legend', null, 'Quality'),
+    h('p', { class: 'lv-note' }, P.kind === 'movie' ? 'Estimated size of this movie at each level.' : 'Estimated size of each episode at each level.'),
+    h('div', { class: 'lv-row' }, d.levels.map(levelChoice)),
+    h('p', { class: 'lv-note' }, shownLevel() === 'best' ? 'Best takes 1080p when there is no 4K copy. ' : '', 'This never removes or replaces anything already in Plex. It only changes what Arr looks for next.'),
+    !d.tracked && o.level ? h('p', { class: 'lv-note' }, 'Arr will use this when you tap Get.') : null,
+    msgFor('opt'));
+  return h('section', { class: 'opts', 'aria-label': 'Download options' },
+    h('button', { type: 'button', class: 'opts-head', 'aria-expanded': String(o.open), 'aria-controls': 'opts-body', 'data-fk': 'opts', onclick: () => { o.open = !o.open; paintSheet(); } },
+      h('span', { class: 'what' }, h('span', { class: 'sw-t' }, 'Download options'), h('span', { class: 'sw-m' }, sub)), ic('down')),
+    o.open && h('div', { id: 'opts-body', class: 'opts-body' },
+      fs,
+      h('div', { class: 'copies-box' },
+        h('button', { type: 'button', class: 'link', 'aria-expanded': String(o.copiesOpen), 'aria-controls': 'copies', 'data-fk': 'copies-open', onclick: toggleCopies }, 'Choose a copy yourself', ic('right')),
+        h('div', { id: 'copies' }, o.copiesOpen && [season, copiesNode()]),
+        msgFor('copy'))));
 }
 
 // ----- the show page
@@ -720,6 +875,7 @@ function showBody() {
       h('span', { class: 'what' }, h('span', { class: 'sw-t', id: 'sw-t' }, 'Get new episodes as they air'),
         h('span', { class: 'sw-m' }, on ? 'Arr gets each new episode when it airs.' : 'Off. Arr is not looking for new episodes.')),
       h('span', { class: 'track', 'aria-hidden': 'true' }, h('i'))), msgFor('follow')),
+    optionsPanel(),
     section('seasons', 'Seasons', d.seasons.length ? h('ul', { class: 'list' }, d.seasons.map(seasonItem)) : hint('No seasons are listed for this show yet. Check back soon.')));
 }
 
@@ -751,7 +907,8 @@ function movieBody() {
         h('p', { class: 'st' }, st === 'in_plex' ? 'Ready to watch' : line),
         st === 'on_its_way' ? journeyEl(p == null ? 0 : 1, p, 'movie:' + d.media_id) : null,
         msgFor(key)),
-      h('div', { class: 'act' }, control)));
+      h('div', { class: 'act' }, control)),
+    optionsPanel());
 }
 
 // ---------- sign in ----------

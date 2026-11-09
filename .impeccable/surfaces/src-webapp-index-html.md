@@ -17,7 +17,7 @@ Owner and household (non-technical), at home or away, find a movie or show, add 
 - Adding a show: latest season plus every new episode; earlier seasons from the show's page.
 - Artwork: Plex art for owned items, TVmaze for shows, TMDB for movies (with TMDB logo attribution), a title tile otherwise.
 - Ideas: TVmaze schedule for shows plus movies related to ones added; TMDB trending only if TMDB's terms allow.
-- No release picking, quality, speeds, seeders, or jargon (indexer, grab, queue).
+- Download options (2026-11-09), collapsed on every title page: three plain quality levels (Smaller, Standard, Best) and "Choose a copy yourself". Still no Radarr-style profile editing and no jargon (release, indexer, seeders, profile, grab, queue).
 
 ## Direction contract
 THESIS: One calm feed that answers "is my thing coming?", with search pinned on top. It refuses the *arr dashboard (tables of queue rows, stats, settings) and the Plex clone (walls of posters).

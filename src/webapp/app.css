@@ -207,3 +207,41 @@ body.sheet-open{overflow:hidden}
 .what .st{color:var(--ink);font-size:16px}
 .ask{justify-content:flex-start}
 .act:has(.ask){flex-basis:100%;margin-left:0}
+
+/* download options on a show or movie page */
+.opts{background:var(--card);border:2px solid var(--line);border-radius:18px;overflow:hidden}
+.opts-head{display:flex;align-items:center;gap:12px;width:100%;min-height:64px;padding:12px;background:none;border:0;text-align:left;cursor:pointer}
+.opts-head .what{flex:1;min-width:0}
+.opts-head .ic{color:var(--muted);transition:transform .2s}
+.opts-head[aria-expanded=true] .ic{transform:rotate(180deg)}
+.opts-body{display:grid;gap:16px;padding:4px 12px 14px;border-top:2px solid var(--line);padding-top:14px}
+.lv{border:0;padding:0;min-width:0;display:grid;gap:8px}
+.lv legend{font-size:13px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;padding:0;margin-bottom:2px}
+.lv-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.lv-opt{position:relative;display:flex;flex-direction:column;gap:2px;min-height:88px;padding:10px 10px;border:2px solid var(--line);border-radius:14px;background:var(--bg);cursor:pointer}
+.lv-opt input{position:absolute;inset:0;opacity:0;margin:0;cursor:pointer}
+.lv-opt:has(input:checked){border-color:var(--teal);background:color-mix(in srgb,var(--teal) 12%,var(--card))}
+.lv-opt:has(input:focus-visible){outline:3px solid var(--ring);outline-offset:3px}
+.lv-t{font-weight:800;font-size:16px;line-height:1.2}
+.lv-r{font-weight:700;font-size:14px;color:var(--teal-ink)}
+.lv-s{font-size:13px;color:var(--muted);line-height:1.3}
+.lv-note{color:var(--muted);font-size:14px}
+.lv[disabled]{opacity:.7}
+.copies-box{display:grid;gap:10px;justify-items:start}
+.copies-box .link{display:inline-flex;align-items:center;gap:2px;padding-left:0}
+.copies-box .link .ic{width:18px;height:18px}
+.copies-box .link[aria-expanded=true] .ic{transform:rotate(90deg)}
+#copies{width:100%;display:grid;gap:10px}
+.copies{display:grid;gap:10px;justify-items:start}
+.copies .list{width:100%}
+.item.copy{padding:10px 12px}
+.item.copy.rec{border-color:var(--teal)}
+.item.copy h3{white-space:normal}
+.copy .tag{margin-top:2px}
+.skipped{padding:0}
+.pick-season{display:flex;align-items:center;gap:10px;font-weight:800}
+.pick-season select{min-height:44px;border:2px solid var(--line);border-radius:12px;background:var(--bg);padding:0 12px;font:inherit;font-weight:700;color:inherit}
+.copies-box .msg{margin-top:0}
+@media (max-width:359px){.lv-row{grid-template-columns:1fr}.lv-opt{min-height:0}}
+#copies:empty{display:none}
+.lv-s{white-space:nowrap}

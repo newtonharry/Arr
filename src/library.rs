@@ -554,6 +554,33 @@ pub fn is_managed(c: &Connection, id: &str) -> Result<Option<bool>> {
     )
 }
 
+/// Sets the quality profile of a title already in the catalog (a movie or a series). Files
+/// already owned are untouched: the profile only decides what is looked for next. False when
+/// the catalog has no such title.
+pub fn set_quality_profile(
+    c: &mut Connection,
+    id: MediaId,
+    profile: &str,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let tx = c.transaction()?;
+    let sid = id.to_string();
+    let data: Option<String> = tx
+        .query_row("SELECT data FROM media WHERE id = ?1", [&sid], |r| r.get(0))
+        .optional()?;
+    let Some(data) = data else {
+        return Ok(false);
+    };
+    let mut v: serde_json::Value = serde_json::from_str(&data)?;
+    v["quality_profile"] = serde_json::Value::String(profile.to_string());
+    tx.execute(
+        "UPDATE media SET data = ?2, updated_at = ?3 WHERE id = ?1",
+        params![sid, serde_json::to_string(&v)?, now_s(now)],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Adds (or re-manages) a movie.
 pub fn add_movie(
     c: &mut Connection,

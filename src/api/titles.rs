@@ -65,6 +65,11 @@ struct Show {
     rows: Vec<Row>,
     /// Season counts from an import, when no episode list is known.
     snapshot: Vec<SeasonInfo>,
+    /// Minutes per episode, when known, for the size estimates.
+    runtime: Option<u32>,
+    /// The quality profile of the show in the catalog, and whether the catalog has it.
+    profile: Option<String>,
+    tracked: bool,
 }
 
 fn status_word(raw: Option<&str>) -> Option<&'static str> {
@@ -185,7 +190,16 @@ async fn load_show(st: &Arc<AppState>, key: SeriesKey) -> Result<Show, ApiError>
         .with(move |c| library::following(c, id))
         .await
         .map_err(internal("following"))?;
+    let runtime = catalog
+        .as_ref()
+        .and_then(|s| s.runtime_minutes)
+        .or_else(|| target.as_ref().and_then(|t| t.runtime_minutes))
+        .or_else(|| show.as_ref().and_then(|s| s.runtime.or(s.average_runtime)))
+        .filter(|m| *m > 0);
     Ok(Show {
+        runtime,
+        profile: catalog.as_ref().and_then(|s| s.quality_profile.clone()),
+        tracked: catalog.is_some(),
         id,
         title,
         year,
@@ -294,10 +308,20 @@ pub(super) async fn show(State(st): St, p: Result<Path<String>, PathRejection>) 
             }
         })
         .collect();
-    ok(json!({
+    let mut v = json!({
         "media_id": s.id, "title": s.title, "year": s.year, "network": s.network,
         "summary": s.summary, "status": s.status, "following": s.following, "seasons": seasons,
-    }))
+    });
+    let l = st.loaded()?;
+    options::page_fields(
+        &mut v,
+        &l.settings,
+        MediaKind::Series,
+        s.profile.as_deref(),
+        s.tracked,
+        s.runtime,
+    );
+    ok(v)
 }
 
 /// `GET /show/{media_id}/season/{n}`: the episodes of one season.
@@ -395,10 +419,20 @@ pub(super) async fn movie(State(st): St, p: Result<Path<String>, PathRejection>)
         .and_then(|m| m.overview)
         .map(|t| cut(t.trim(), 400))
         .filter(|t| !t.is_empty());
-    ok(json!({
+    let mut v = json!({
         "media_id": id, "title": title, "year": year, "runtime_minutes": runtime,
         "summary": summary, "state": state, "progress": progress, "until": until,
-    }))
+    });
+    let l = st.loaded()?;
+    options::page_fields(
+        &mut v,
+        &l.settings,
+        MediaKind::Movie,
+        catalog.as_ref().and_then(|m| m.quality_profile.as_deref()),
+        catalog.is_some(),
+        runtime,
+    );
+    ok(v)
 }
 
 #[derive(Deserialize)]
@@ -406,6 +440,9 @@ pub(super) async fn movie(State(st): St, p: Result<Path<String>, PathRejection>)
 pub(super) struct FollowBody {
     media_id: String,
     on: bool,
+    /// smaller, standard or best: the quality the person picked on the page.
+    #[serde(default)]
+    level: Option<String>,
 }
 
 /// `POST /follow`: get a series' new episodes as they air, or stop doing that.
@@ -414,6 +451,14 @@ pub(super) async fn follow(State(st): St, ApiJson(body): ApiJson<FollowBody>) ->
     let l = st.loaded()?;
     let id = parse_media_id(&body.media_id)?;
     let key = series_key_of(id)?;
+    let profile = match (&body.level, body.on) {
+        (Some(l), true) => Some(options::level_profile(&st, id, l)?),
+        _ => None,
+    };
+    if let Some(p) = &profile {
+        // The library lock is already held above.
+        options::set_profile(&st, id, p).await?;
+    }
     let now = OffsetDateTime::now_utc();
     let index = st.index();
     let known = index.series(key).map(|s| s.id);
@@ -456,7 +501,7 @@ pub(super) async fn follow(State(st): St, ApiJson(body): ApiJson<FollowBody>) ->
                 media_id: id.to_string(),
                 monitored: None,
                 monitor: None,
-                quality_profile: None,
+                quality_profile: profile,
                 root_folder: None,
                 search: false,
                 metadata: None,
@@ -597,8 +642,12 @@ pub(super) async fn stop(State(st): St, ApiJson(body): ApiJson<StopBody>) -> Api
 }
 
 /// A season or episode quick add's reply, in the app's words.
-pub(super) async fn quick_scope(st: &Arc<AppState>, id: MediaId) -> ApiResult {
-    let v = add_value(st, id.to_string(), None, true).await?;
+pub(super) async fn quick_scope(
+    st: &Arc<AppState>,
+    id: MediaId,
+    profile: Option<String>,
+) -> ApiResult {
+    let v = add_value(st, id.to_string(), None, true, profile).await?;
     let scope: MediaId = v["scope"]
         .as_str()
         .and_then(|s| s.parse().ok())
