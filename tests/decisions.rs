@@ -15,7 +15,10 @@ use arr::settings::{LanguageRequirement, Settings};
 use arr::target::{
     EpisodeInfo, MovieTarget, Ownership, SeasonTarget, SeriesTarget, Source, Target,
 };
-use common::{FRANCHISE_ALIASES, FRANCHISE_FILE, release, snapshot, with_franchise_movie};
+use common::{
+    ExecOptions, FRANCHISE_ALIASES, FRANCHISE_FILE, managed_settings, release, snapshot,
+    with_franchise_movie,
+};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
@@ -42,7 +45,7 @@ fn series(title: &str, tvdb: u32, year: Option<u16>, aliases: Vec<AltTitle>) -> 
         original_language: Some("english".into()),
         series_type: "standard".into(),
         scene_numbering: false,
-        quality_profile: Some("sonarr:6".into()),
+        quality_profile: Some("setup:tv-hd".into()),
         root_folder: Some("/tvshows".into()),
         identity_conflict: false,
         metadata_source: Source::Catalog,
@@ -101,7 +104,7 @@ fn movie(title: &str, tmdb: u32, year: u16, ownership: Ownership) -> MovieTarget
         original_language: Some("english".into()),
         is_available: Some(true),
         ownership,
-        quality_profile: Some("radarr:6".into()),
+        quality_profile: Some("setup:movies-hd".into()),
         root_folder: None,
         identity_conflict: false,
         metadata_source: Source::Catalog,
@@ -117,15 +120,36 @@ struct Env {
     settings: Settings,
     catalog: CatalogIndex,
     blocked: Option<std::collections::HashSet<String>>,
+    /// Settings from a Sonarr/Radarr snapshot (`with`): the targets' managed profile ids are
+    /// mapped to the snapshot's.
+    snapshot_profiles: bool,
 }
 
 impl Env {
+    /// The managed setup's settings (the default stack's policy; TV takes any hardcoded subs).
     fn new() -> Self {
-        let (settings, catalog) = load(&snapshot());
+        Env::managed(ExecOptions {
+            tv_extra: "allow_hardcoded_subs = true\n".into(),
+            ..Default::default()
+        })
+    }
+
+    /// As `new`, with revision upgrades of owned files enabled.
+    fn upgrading() -> Self {
+        Env::managed(ExecOptions {
+            tv_extra: "allow_hardcoded_subs = true\nrevision_upgrades = true\n".into(),
+            movies_extra: "revision_upgrades = true\n".into(),
+            ..Default::default()
+        })
+    }
+
+    fn managed(o: ExecOptions) -> Self {
+        let (_, catalog) = load(&snapshot());
         Env {
-            settings,
+            settings: managed_settings(&o),
             catalog,
             blocked: None,
+            snapshot_profiles: false,
         }
     }
 
@@ -135,13 +159,18 @@ impl Env {
             settings,
             catalog,
             blocked: None,
+            snapshot_profiles: true,
         }
     }
 
     fn eval_release(&self, target: &Target, scope: Scope, r: Value) -> Decision {
         let r: ProwlarrRelease = serde_json::from_value(r).unwrap();
         let p = release::parse(r.title.as_deref().unwrap());
-        let profile_id = target.quality_profile().map(str::to_string);
+        let profile_id = target.quality_profile().map(|p| match (self.snapshot_profiles, p) {
+            (true, "setup:movies-hd") => "radarr:6".to_string(),
+            (true, "setup:tv-hd") => "sonarr:6".to_string(),
+            _ => p.to_string(),
+        });
         let ctx = EvalContext {
             target,
             scope,
@@ -705,7 +734,7 @@ fn rev(version: u8, real: u8) -> Revision {
 
 #[test]
 fn revision_upgrades_follow_native_rules() {
-    let env = Env::new();
+    let env = Env::upgrading();
     let owned_movie = |ev: Option<FileEvidence>| {
         let mut m = movie("The Matrix", 603, 1999, Ownership::Owned);
         m.existing = ev;
@@ -896,7 +925,7 @@ fn queued_and_blocklisted_releases_are_rejected() {
 
 #[test]
 fn season_pack_replaces_owned_episodes_only_by_revision() {
-    let env = Env::new();
+    let env = Env::upgrading();
     let web = Some(Quality::Webdl1080);
     let mut list = eps(&[1, 2], &[], 6);
     for e in list.iter_mut().filter(|e| e.ownership == Ownership::Owned) {

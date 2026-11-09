@@ -2209,6 +2209,30 @@ pub async fn seed_standard_library(
     }
 }
 
+/// The settings the managed setup of the harness produces (profiles, size limits, download and
+/// indexer policy), for tests that evaluate decisions without a server.
+pub fn managed_settings(o: &ExecOptions) -> arr::settings::Settings {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let (movies, tv) = (tmp.path().join("movies"), tmp.path().join("tv"));
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    write_managed_config(
+        &dir,
+        SocketAddr::from(([127, 0, 0, 1], 9)),
+        false,
+        &format!(
+            "[library]\nmovies = '{}'\ntv = '{}'\n[migration]\nmode = \"coexistence\"\n",
+            movies.display(),
+            tv.display()
+        ),
+    );
+    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let doc: arr::setup::SetupDoc =
+        serde_json::from_value(setup_document(o)).unwrap();
+    arr::setup::normalize(&doc, &cfg).unwrap().0
+}
+
 /// Config and secrets of the managed stack for tests that run their own server or engine:
 /// `[server]`, the native Torznab `[[indexer]]` (id 1) on the mock, `[tvmaze]` when asked,
 /// then `extra` (whole sections). The state is not set up (`setup_managed` does that).
