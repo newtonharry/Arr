@@ -390,15 +390,16 @@ function Install-Arr {
 	if ($PublicUrl) { Say "  any device:    $PublicUrl   (sign in with Google)" }
 	# A first install has nobody signed in yet: a link that works once, for 15 minutes. Anyone
 	# who has it can sign in, so it is made only when a person is at the console (not ARR_YES,
-	# not redirected) and goes to the host, never into output that could be captured. (With
+	# not redirected) and goes straight to the console with [Console]::WriteLine: Write-Host output can still be
+	# captured by stream redirection (*> file), the console can't. (With
 	# remote access it would name the public address, which may not be reachable yet, so it
 	# names this computer.)
 	if ($firstInstall -and (Interactive) -and -not [Console]::IsOutputRedirected) {
 		$link = & { $ErrorActionPreference = 'Continue'; & $Arr app-link --config $Config 2>$null | Select-Object -First 1 }
 		if ($link) {
-			Say ''
-			Say 'To sign in on this computer, open this link. It works once, within 15 minutes:'
-			Say ("  " + ($link -replace '^https://[^/]*', "http://localhost:$Port"))
+			[Console]::WriteLine('')
+			[Console]::WriteLine('To sign in on this computer, open this link. It works once, within 15 minutes:')
+			[Console]::WriteLine("  " + ($link -replace '^https://[^/]*', "http://localhost:$Port"))
 		}
 	}
 	Say ''
