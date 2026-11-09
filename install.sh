@@ -221,7 +221,7 @@ toml() { # a TOML basic string
 sha256() {
 	if have sha256sum; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
-fetch() { curl -fsSL --retry 3 "$@"; }
+fetch() { curl -fsSL --retry 6 --retry-delay 10 "$@"; }
 
 # On a re-run the arr this run replaced stays as arr.previous, and config.toml and secrets/
 # as they were stay in SNAP (inside this run's private temp folder), until the new one
@@ -1321,7 +1321,7 @@ if [ "$AUTO_UPDATE" = 1 ]; then
 		cat <<'EOF'
 set -eu
 log() { printf 'arr-update: %s\n' "$*"; }
-fetch() { curl -fsSL --retry 3 "$@"; }
+fetch() { curl -fsSL --retry 6 --retry-delay 10 "$@"; }
 sha256() {
 	if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
@@ -1376,7 +1376,7 @@ shlock)
 esac
 
 RELEASES=${ARR_RELEASES_URL:-https://github.com/$REPO/releases}
-latest=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" | sed 's#.*/tag/##')
+latest=$(curl -fsSLI --retry 6 --retry-delay 10 -o /dev/null -w '%{url_effective}' "$RELEASES/latest" | sed 's#.*/tag/##')
 case "$latest" in v[0-9]*) ;; *) log "couldn't find the latest release"; exit 1 ;; esac
 current="v$("$ARR" --version | awk '{print $2}')"
 if ! newer "$latest" "$current"; then
