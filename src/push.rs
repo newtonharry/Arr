@@ -411,10 +411,10 @@ pub fn items_from_feed(feed: &Value) -> Vec<Item> {
         let (Some(what), Some(key)) = (describe(i), i["key"].as_str()) else {
             continue;
         };
-        // The time the item entered the list is part of the key: a retry that fails again is new.
-        let at = i["at"].as_str().unwrap_or_default();
+        // Keyed by the item alone: its `at` moves on every download poll, so it is not part
+        // of the key (an unchanged problem must not be announced again).
         out.push(Item {
-            key: format!("needs:{key}:{at}"),
+            key: format!("needs:{key}"),
             body: format!("{what} needs you"),
             url: route_of(i["media_id"].as_str().unwrap_or_default()),
         });
@@ -825,17 +825,18 @@ mod tests {
     }
 
     #[test]
-    fn a_needs_you_item_that_comes_back_is_announced_again() {
+    fn an_unchanged_needs_you_item_is_not_announced_again_when_its_time_moves() {
         let item = |at: &str| {
             json!({ "needs_you": [{ "key": "download_failed:g1", "media_id": "movie:tmdb:603",
                 "title": "The Matrix", "detail": null, "at": at }] })
         };
         let first = items_from_feed(&item("2026-01-01T00:00:00Z"));
         let seen: HashSet<String> = first.iter().map(|i| i.key.clone()).collect();
-        let same = items_from_feed(&item("2026-01-01T00:00:00Z"));
-        assert!(fresh(&seen, true, &same).is_empty(), "unchanged");
-        let retried = items_from_feed(&item("2026-01-02T00:00:00Z"));
-        assert_eq!(fresh(&seen, true, &retried).len(), 1, "failed again");
+        let polled = items_from_feed(&item("2026-01-01T00:05:00Z"));
+        assert!(
+            fresh(&seen, true, &polled).is_empty(),
+            "same problem, later poll"
+        );
     }
 
     #[test]
