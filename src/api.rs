@@ -62,6 +62,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("patch", "/api/v1/library/{media_id}"),
     ("delete", "/api/v1/library/{media_id}"),
     ("get", "/api/v1/library/roots"),
+    ("get", "/api/v1/storage"),
     ("get", "/api/v1/wanted"),
     ("get", "/api/v1/calendar"),
     ("get", "/api/v1/discover"),
@@ -97,6 +98,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("post", "/api/v1/quick-add"),
     ("post", "/api/v1/follow"),
     ("post", "/api/v1/stop"),
+    ("post", "/api/v1/remove"),
     ("post", "/api/v1/quality"),
     ("get", "/api/v1/copies/{media_id}"),
     ("post", "/api/v1/copies/{media_id}/get"),
@@ -753,6 +755,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/library/movies", get(library_movies))
         .route("/api/v1/library/series", get(library_series))
         .route("/api/v1/library/roots", get(library_roots))
+        .route("/api/v1/storage", get(storage))
         .route(
             "/api/v1/library/{media_id}",
             axum::routing::patch(library_patch).delete(library_remove),
@@ -790,6 +793,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/quick-add", post(quick_add))
         .route("/api/v1/follow", post(titles::follow))
         .route("/api/v1/stop", post(titles::stop))
+        .route("/api/v1/remove", post(titles::remove))
         .route("/api/v1/quality", post(options::quality))
         .route("/api/v1/copies/{media_id}", get(options::copies))
         .route("/api/v1/copies/{media_id}/get", post(options::copies_get))
@@ -1437,6 +1441,73 @@ struct ListQuery {
     q: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
+    /// `title` (A to Z), `added` (newest first) or `size` (largest first).
+    sort: Option<String>,
+}
+
+/// How a library list is ordered when the caller asks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LibrarySort {
+    Title,
+    Added,
+    Size,
+}
+
+fn library_sort(raw: Option<&str>) -> Result<Option<LibrarySort>, ApiError> {
+    match raw {
+        None => Ok(None),
+        Some("title") => Ok(Some(LibrarySort::Title)),
+        Some("added") => Ok(Some(LibrarySort::Added)),
+        Some("size") => Ok(Some(LibrarySort::Size)),
+        Some(_) => Err(ApiError::bad_request(
+            ErrorCode::InvalidQuery,
+            "sort must be title, added or size",
+        )),
+    }
+}
+
+/// When each title was added to the catalog (RFC 3339), by media id.
+async fn added_times(st: &AppState) -> Result<std::collections::HashMap<String, String>, ApiError> {
+    st.store
+        .with(|c| {
+            let mut stmt = c.prepare("SELECT id, added_at FROM media")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal("added"))
+}
+
+fn series_size(s: &crate::catalog::Series) -> u64 {
+    s.episodes
+        .iter()
+        .flatten()
+        .filter_map(|e| e.file.as_ref().and_then(|f| f.size))
+        .sum()
+}
+
+fn movie_size(m: &crate::catalog::Movie) -> u64 {
+    m.file.as_ref().and_then(|f| f.size).unwrap_or(0)
+}
+
+/// Orders `items` as asked: `added` and `size` put the newest and the largest first.
+fn sort_library<T>(
+    items: &mut [T],
+    sort: LibrarySort,
+    title: impl Fn(&T) -> &str,
+    added: impl Fn(&T) -> String,
+    size: impl Fn(&T) -> u64,
+) {
+    items.sort_by(|a, b| {
+        let by_title = title(a).cmp(title(b));
+        match sort {
+            LibrarySort::Title => by_title,
+            LibrarySort::Added => added(b).cmp(&added(a)).then(by_title),
+            LibrarySort::Size => size(b).cmp(&size(a)).then(by_title),
+        }
+    });
 }
 
 fn page_bounds(limit: Option<u32>, offset: Option<u32>) -> Result<(usize, usize), ApiError> {
@@ -1498,13 +1569,35 @@ async fn library_movies(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
             all
         }
     };
-    let items: Vec<_> = items
+    let mut items: Vec<_> = items
         .into_iter()
         .filter(|m| managed(&m.provenance.source_app))
         .collect();
-    ok(
-        json!({ "total": items.len(), "items": items.iter().skip(offset).take(limit).collect::<Vec<_>>(), "observation": observation(&l) }),
-    )
+    let added = added_times(&st).await?;
+    let when = |id: &MediaId| added.get(&id.to_string()).cloned().unwrap_or_default();
+    if let Some(sort) = library_sort(q.sort.as_deref())? {
+        sort_library(
+            &mut items,
+            sort,
+            |m| m.title.as_str(),
+            |m| when(&m.id),
+            |m| movie_size(m),
+        );
+    }
+    let views: Vec<Value> = items
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|m| {
+            let mut v = serde_json::to_value(m).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("added_at".into(), json!(added.get(&m.id.to_string())));
+                o.insert("size_bytes".into(), json!(movie_size(m)));
+            }
+            v
+        })
+        .collect();
+    ok(json!({ "total": items.len(), "items": views, "observation": observation(&l) }))
 }
 
 async fn library_series(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult {
@@ -1519,10 +1612,20 @@ async fn library_series(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
             all
         }
     };
-    let items: Vec<_> = items
+    let mut items: Vec<_> = items
         .into_iter()
         .filter(|s| managed(&s.provenance.source_app))
         .collect();
+    let added = added_times(&st).await?;
+    if let Some(sort) = library_sort(q.sort.as_deref())? {
+        sort_library(
+            &mut items,
+            sort,
+            |s| s.title.as_str(),
+            |s| added.get(&s.id.to_string()).cloned().unwrap_or_default(),
+            |s| series_size(s),
+        );
+    }
     let now = OffsetDateTime::now_utc();
     let views: Vec<Value> = items
         .iter()
@@ -1531,6 +1634,8 @@ async fn library_series(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
         .map(|s| {
             let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
             if let Some(m) = v.as_object_mut() {
+                m.insert("added_at".into(), json!(added.get(&s.id.to_string())));
+                m.insert("size_bytes".into(), json!(series_size(s)));
                 // Live per-season counts (the snapshot's statistics go stale after imports).
                 m.insert("seasons".into(), json!(season_summaries(s, now, None)));
                 let eps = m.remove("episodes");
@@ -2226,6 +2331,36 @@ async fn library_remove(State(st): St, p: Result<Path<String>, PathRejection>) -
             format!("{e:#}"),
         )),
     }
+}
+
+/// `GET /storage`: free and total space of the drive(s) holding the movie and TV folders.
+/// Drives are named Movies, TV or Movies and TV; folder paths are never part of the reply.
+async fn storage(State(st): St) -> ApiResult {
+    let (movies, tv) = match &st.cfg.library {
+        Some(l) => (l.movies.clone(), l.tv.clone()),
+        None => (None, None),
+    };
+    let drives = tokio::task::spawn_blocking(move || {
+        let one = |label: &str, p: &std::path::Path| {
+            crate::paths::disk_space(p).map(
+                |(free, total)| json!({ "label": label, "free_bytes": free, "total_bytes": total }),
+            )
+        };
+        let mut out = vec![];
+        match (movies, tv) {
+            (Some(m), Some(t)) if crate::paths::same_drive(&m, &t) => {
+                out.extend(one("Movies and TV", &m));
+            }
+            (m, t) => {
+                out.extend(m.and_then(|p| one("Movies", &p)));
+                out.extend(t.and_then(|p| one("TV", &p)));
+            }
+        }
+        out
+    })
+    .await
+    .map_err(|e| ApiError::internal("storage", e.to_string()))?;
+    ok(json!({ "drives": drives }))
 }
 
 async fn library_roots(State(st): St) -> ApiResult {
