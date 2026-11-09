@@ -33,6 +33,10 @@ jobs:
         run: |
           cargo build --release --locked
           sh tests/installer/linux.sh
+      # Auto-update rolls back to the previous binary when the new one is not healthy, so the
+      # latest published release must still start on what this build has run on (and back).
+      - name: Rollback to the latest release
+        run: sh tests/upgrade/rollback.sh target/release/arr
 
   # The macOS installer path: the real "Install Plex for me", install.sh with remote access
   # (launchd), and uninstalling Arr and Plex while keeping media.

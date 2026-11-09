@@ -1,0 +1,47 @@
+{
+  "schema_version": null,
+  "movies": {
+    "enabled": null,
+    "root": null,
+    "maximum_size_mb": null,
+    "allow_hardcoded_subs": null,
+    "prefer_propers_and_repacks": null,
+    "revision_upgrades": null,
+    "torrent_delay_minutes": null,
+    "bypass_delay_if_highest_quality": null,
+    "redownload_failed": null,
+    "redownload_failed_interactive": null,
+    "rss_sync_interval_minutes": null,
+    "availability_delay_days": null,
+    "copy_using_hardlinks": null,
+    "minimum_free_space_mb": null,
+    "replace_illegal_characters": null
+  },
+  "tv": {
+    "enabled": null,
+    "root": null,
+    "maximum_size_mb": null,
+    "allow_hardcoded_subs": null,
+    "prefer_propers_and_repacks": null,
+    "revision_upgrades": null,
+    "torrent_delay_minutes": null,
+    "bypass_delay_if_highest_quality": null,
+    "redownload_failed": null,
+    "redownload_failed_interactive": null,
+    "rss_sync_interval_minutes": null,
+    "availability_delay_days": null,
+    "copy_using_hardlinks": null,
+    "minimum_free_space_mb": null,
+    "replace_illegal_characters": null
+  },
+  "profiles": [],
+  "size_limits": [],
+  "download": {
+    "movie_category": null,
+    "tv_category": null,
+    "initial_state": null,
+    "remove_completed": null,
+    "remove_failed": null
+  },
+  "indexers": null
+}
