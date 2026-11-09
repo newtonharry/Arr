@@ -809,6 +809,11 @@ function closeConfirm() {
   P.confirm = false;
   after(() => $('#panel [data-fk="remove"]')?.focus({ preventScroll: true }));
 }
+// Forget what the page remembers of an add or a retry for this title, so it can be added again.
+function forget(id) {
+  const bare = id.replace(/^series:/, '');
+  for (const k of [...A.keys()]) if (k === id || (k.startsWith('r:') && k.includes(bare))) A.delete(k);
+}
 async function doRemove() {
   if (P.removing) return;
   const tk = P.token, d = P.data;
@@ -826,6 +831,7 @@ async function doRemove() {
   P.removing = false;
   if (!res.ok) { P.msg.set('remove', res); say(res.text); closeConfirm(); return; }
   P.confirm = false;
+  forget(d.media_id);
   S.stale = true; // the screen under the sheet is drawn again, without this title
   dismiss();
   say(`${d.title} removed. Anything already in Plex stays there.`);

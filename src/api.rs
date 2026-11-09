@@ -1481,10 +1481,14 @@ async fn added_times(st: &AppState) -> Result<std::collections::HashMap<String, 
 }
 
 fn series_size(s: &crate::catalog::Series) -> u64 {
+    // A file that holds several episodes counts once.
+    let mut seen = HashSet::new();
     s.episodes
         .iter()
         .flatten()
-        .filter_map(|e| e.file.as_ref().and_then(|f| f.size))
+        .filter_map(|e| e.file.as_ref())
+        .filter(|f| f.path.as_ref().is_none_or(|p| seen.insert(p.clone())))
+        .filter_map(|f| f.size)
         .sum()
 }
 
