@@ -3,7 +3,7 @@
 One `arr` binary, one `config.toml`, one private state directory. Release search
 goes straight to native indexers (The Pirate Bay's JSON API, or any Torznab endpoint),
 downloads run in the embedded BitTorrent engine, completed downloads are validated with
-`ffprobe` and imported into your library, and Plex is refreshed for the imported folder.
+`ffprobe` and imported into your library, and Plex is refreshed for the imported folder (the whole library while it is still empty, since Plex skips folder scans there).
 Policy (quality profiles, seed goals, cleanup) is created by `setup`, not copied from a
 Sonarr/Radarr snapshot. Nothing writes outside the state directory until you enable execution.
 

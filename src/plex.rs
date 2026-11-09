@@ -1,7 +1,8 @@
 //! Optional Plex hook: refreshes the configured library section after an import
 //! (`POST /library/sections/{id}/refresh`, `X-Plex-Token` header; `GET` when a server answers
 //! 405), limited to the imported folder (`?path=`) when the library root's Plex path is
-//! configured. Bounded by the configured timeout; retried by the worker's command attempts. A
+//! configured and the section already has items (Plex ignores folder scans in an empty
+//! library, so the first title gets a whole-section scan). Bounded by the configured timeout; retried by the worker's command attempts. A
 //! failed refresh never undoes an import. The token never reaches logs or responses.
 //!
 //! Setup discovery reads `GET /library/sections` (read-only, bounded) to list sections and
@@ -433,6 +434,32 @@ impl Plex {
         .await
     }
 
+    /// Scans what an import added: only `path` (a Plex-side folder) when given, unless the
+    /// section is empty. Plex ignores a folder scan in an empty library (it logs "Refreshing 0
+    /// IDs" and scans nothing), so the first title in a library gets a whole-section scan, which
+    /// costs nothing there. When the check itself fails, the folder scan goes ahead as before.
+    /// Returns whether the scan was limited to the folder.
+    pub async fn refresh_import(
+        &self,
+        section: u32,
+        path: Option<&str>,
+    ) -> Result<bool, UpstreamError> {
+        let path = match path {
+            Some(p) if !self.section_is_empty(section).await => Some(p),
+            _ => None,
+        };
+        self.refresh(section, path).await?;
+        Ok(path.is_some())
+    }
+
+    /// True only when Plex says the section has no items.
+    async fn section_is_empty(&self, section: u32) -> bool {
+        match self.section_items(section, 0, 1).await {
+            Ok(page) => page.total.map_or(page.items.is_empty(), |t| t == 0),
+            Err(_) => false,
+        }
+    }
+
     /// Refreshes a section, only `path` (a Plex-side folder) when given.
     pub async fn refresh(&self, section: u32, path: Option<&str>) -> Result<(), UpstreamError> {
         let mut url = self
@@ -470,6 +497,61 @@ impl Plex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use url::Url;
+
+    /// A first import into an empty library scans the whole section (Plex ignores a folder
+    /// scan there); otherwise only the folder, including when the emptiness check fails.
+    #[tokio::test]
+    async fn import_refresh_scans_the_whole_section_while_it_is_empty() {
+        use axum::extract::{Path, RawQuery, State};
+        type Log = Arc<Mutex<Vec<String>>>;
+        async fn all(Path(id): Path<u32>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            match id {
+                1 => axum::Json(serde_json::json!({ "MediaContainer": { "size": 0, "totalSize": 0, "offset": 0 } })).into_response(),
+                2 => axum::Json(serde_json::json!({ "MediaContainer": { "size": 1, "totalSize": 3, "offset": 0,
+                    "Metadata": [{ "ratingKey": "1", "type": "movie", "title": "A" }] } })).into_response(),
+                _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        async fn refresh(State(log): State<Log>, Path(id): Path<u32>, RawQuery(q): RawQuery) {
+            log.lock()
+                .unwrap()
+                .push(format!("{id}?{}", q.unwrap_or_default()));
+        }
+        let log: Log = Arc::default();
+        let app = axum::Router::new()
+            .route("/library/sections/{id}/all", axum::routing::get(all))
+            .route(
+                "/library/sections/{id}/refresh",
+                axum::routing::post(refresh),
+            )
+            .with_state(log.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let plex = Plex::new(PlexConfig {
+            base_url: base.clone(),
+            token: crate::config::Secret::new("t".into()),
+            movie_section: Some(1),
+            tv_section: Some(2),
+            movies_path: Some("/m".into()),
+            tv_path: Some("/t".into()),
+            timeout: std::time::Duration::from_secs(5),
+            discover_url: base.clone(),
+            metadata_url: base.clone(),
+            image_base_url: base,
+        });
+        assert!(!plex.refresh_import(1, Some("/m/A (2000)")).await.unwrap());
+        assert!(plex.refresh_import(2, Some("/t/B")).await.unwrap());
+        assert!(plex.refresh_import(3, Some("/m/C")).await.unwrap());
+        assert!(!plex.refresh_import(2, None).await.unwrap());
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["1?", "2?path=%2Ft%2FB", "3?path=%2Fm%2FC", "2?"]
+        );
+    }
 
     #[test]
     fn items_and_provider_ids() {
