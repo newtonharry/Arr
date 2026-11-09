@@ -634,6 +634,47 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
         ))
         .await;
     assert_eq!(s, 200, "{v}");
+
+    // Another copy of the same episode: while it downloads it is on its way and the failure
+    // no longer needs anyone; once it is in the library, neither does the failure.
+    let title = "Slow.Horses.S01E02.1080p.WEB-DL.x264-OK";
+    let (ok_hash, r) = e.publish(
+        title,
+        title,
+        vec![(format!("{title}.mkv"), mkv(2))],
+        1.5,
+        false,
+    );
+    e.search_results("Slow Horses S01E02", vec![r]);
+    let (s, v, text) = e
+        .json(e.post("/api/v1/plans").json(
+            &json!({ "media_id": "episode:tvdb:372264:1:2", "execute": true, "replan": true }),
+        ))
+        .await;
+    assert_eq!(s, 201, "{text}");
+    let again = first_grab(&v);
+    e.tick().await;
+    let v = feed().await;
+    assert_eq!(v["needs_you"], json!([]), "{v}");
+    assert!(
+        v["on_its_way"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["grab_id"] == again.as_str()),
+        "{v}"
+    );
+    e.complete(&ok_hash);
+    e.tick().await;
+    assert_eq!(e.grab_row(&again).state, "imported");
+    assert_eq!(e.grab_row(&failed).state, "failed");
+    let v = feed().await;
+    assert_eq!(v["needs_you"], json!([]), "{v}");
+    let (_, a, _) = e.json(e.get("/api/v1/attention")).await;
+    assert!(
+        !a.to_string().contains(&failed),
+        "the API's attention list drops it too: {a}"
+    );
 }
 
 // ------------------------------------------------------------------ ideas
