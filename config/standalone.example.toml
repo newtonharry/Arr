@@ -18,7 +18,7 @@ dir = "."
 # The Pirate Bay's JSON API, natively. Its magnets carry no trackers unless you list some,
 # so the embedded engine below needs dht = true (or magnet_trackers, or initial_peers).
 [[indexer]]
-id = 1                                  # keep imported ids (Prowlarr id) when migrating
+id = 1
 name = "The Pirate Bay"
 kind = "thepiratebay"
 base_url = "https://apibay.org/"        # the exact API base URL you trust
@@ -82,6 +82,8 @@ max_active_downloads = 3
 # seeding_time_limit_minutes = 4320
 
 [migration]
+# Still written so a rolled-back older release (which requires it) keeps working;
+# "coexistence" is the only mode.
 mode = "coexistence"
 
 [library]
