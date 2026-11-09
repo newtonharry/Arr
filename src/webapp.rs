@@ -4,14 +4,17 @@
 //! one-time link made by `arr app-link`. A session is an opaque cookie whose SHA-256 is kept
 //! in `web.sqlite` (private, in the state directory). The page talks to `/app/api/...` only:
 //! `/app/api/v1/*` is an allow-listed, in-process proxy to the API router that adds the API
-//! bearer token, so the token never reaches a browser.
+//! bearer token, so the token never reaches a browser. Posters come from `/app/art/{media_id}`
+//! (see `art.rs`), so the browser never contacts TMDB or TVmaze.
 
 use crate::api::AppState;
+use crate::art::Art;
 use crate::config::{OAuthConfig, RuntimeConfig};
 use crate::fsutil;
+use crate::ids::MediaId;
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::{Form, Request, State};
+use axum::extract::{Form, Path as UrlPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -159,6 +162,8 @@ pub fn app_link(cfg: &RuntimeConfig) -> Result<String> {
 }
 
 struct Web {
+    state: Arc<AppState>,
+    art: Art,
     sessions: Arc<Sessions>,
     api: Router,
     token: String,
@@ -168,8 +173,10 @@ struct Web {
 type Wa = State<Arc<Web>>;
 
 /// The web app's routes. Has no fallback of its own (the API router's serves unknown paths).
-pub fn router(state: &AppState, api: Router) -> Result<Router> {
+pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
     let web = Arc::new(Web {
+        state: state.clone(),
+        art: Art::new(&state.cfg.state_dir)?,
         sessions: Sessions::open(&state.cfg.state_dir)?,
         api,
         token: state.cfg.api_token.expose().to_string(),
@@ -193,6 +200,10 @@ pub fn router(state: &AppState, api: Router) -> Result<Router> {
             get(|| async { asset("image/svg+xml", MASCOT) }),
         )
         .route(
+            "/app/tmdb.svg",
+            get(|| async { asset("image/svg+xml", TMDB_LOGO) }),
+        )
+        .route(
             "/app/fonts/nunito-latin.woff2",
             get(|| async { font(FONT_LATIN) }),
         )
@@ -201,6 +212,7 @@ pub fn router(state: &AppState, api: Router) -> Result<Router> {
             get(|| async { font(FONT_LATIN_EXT) }),
         )
         .route("/app/link", get(link_page).post(link_consume))
+        .route("/app/art/{media_id}", get(art))
         .route("/app/api/me", get(me))
         .route("/app/api/signout", post(signout))
         .route("/app/api/v1/{*rest}", any(proxy))
@@ -211,6 +223,7 @@ const INDEX: &str = include_str!("webapp/index.html");
 const APP_JS: &str = include_str!("webapp/app.js");
 const APP_CSS: &str = include_str!("webapp/app.css");
 const MASCOT: &str = include_str!("webapp/mascot.svg");
+const TMDB_LOGO: &str = include_str!("webapp/tmdb.svg");
 const FONT_LATIN: &[u8] = include_bytes!("webapp/fonts/nunito-latin.woff2");
 const FONT_LATIN_EXT: &[u8] = include_bytes!("webapp/fonts/nunito-latin-ext.woff2");
 
@@ -378,6 +391,40 @@ impl Web {
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         r
     }
+}
+
+/// A poster. Same-origin `<img>` requests carry the cookie but not the app header, so this
+/// checks the session only. No poster is a plain 404: the app keeps its title tile.
+async fn art(State(w): Wa, headers: HeaderMap, UrlPath(id): UrlPath<String>) -> Response {
+    if w.session(&headers).is_none() {
+        return w.unauthorized();
+    }
+    let Ok(id) = id.parse::<MediaId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request", "not a media id");
+    };
+    let mut r = match w.art.poster(&w.state, &id).await {
+        Some((bytes, kind)) => {
+            let mut r = ([(header::CONTENT_TYPE, kind)], bytes).into_response();
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=604800"),
+            );
+            r
+        }
+        None => {
+            let mut r = StatusCode::NOT_FOUND.into_response();
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=3600"),
+            );
+            r
+        }
+    };
+    r.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    r
 }
 
 async fn me(State(w): Wa, headers: HeaderMap) -> Response {

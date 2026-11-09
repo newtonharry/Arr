@@ -41,6 +41,14 @@ pub struct TvmazeShow {
     pub kind: Option<String>,
     #[serde(default)]
     pub externals: TvmazeExternals,
+    #[serde(default)]
+    pub image: Option<TvmazeImage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TvmazeImage {
+    #[serde(default)]
+    pub medium: Option<String>,
 }
 
 impl TvmazeShow {
@@ -462,6 +470,8 @@ pub struct TmdbMovie {
     pub alternative_titles: TmdbAltTitles,
     #[serde(default)]
     pub release_dates: TmdbReleaseDates,
+    #[serde(default)]
+    pub poster_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

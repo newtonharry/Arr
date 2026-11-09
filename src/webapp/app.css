@@ -49,7 +49,9 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 .problem .ic{width:16px;height:16px;margin-top:2px}
 .msg{margin-top:6px;font-weight:700;color:var(--teal-ink)!important}.msg:empty{display:none}.msg[data-err]{color:var(--coral-ink)!important}
 .what .btn{margin-top:8px}
-.tile{width:46px;height:68px;border-radius:10px;flex:none;display:grid;place-items:center;color:#fff;font-weight:800;font-size:16px;letter-spacing:.02em;user-select:none}
+.tile{width:46px;height:68px;border-radius:10px;flex:none;display:grid;place-items:center;color:#fff;font-weight:800;font-size:16px;letter-spacing:.02em;user-select:none;position:relative;overflow:hidden}
+.tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .2s ease-out}
+.tile img.on{opacity:1}
 .t0{background:linear-gradient(#2fa391,#0f4f46)}.t1{background:linear-gradient(#d1573a,#7a2a1c)}.t2{background:linear-gradient(#b0791c,#5b3a0a)}.t3{background:linear-gradient(#3f6b8f,#16263a)}
 .t4{background:linear-gradient(#7d6bb3,#2f2550)}.t5{background:linear-gradient(#4f8a3c,#25451b)}.t6{background:linear-gradient(#b5476f,#5b1d38)}.t7{background:linear-gradient(#5f7170,#232d2d)}
 .date{width:46px;height:52px;border-radius:12px;background:var(--sun-bg);color:var(--sun-ink);display:grid;place-items:center;align-content:center;text-align:center;flex:none;font-weight:800;line-height:1.05;font-size:12px;text-transform:uppercase}
@@ -98,7 +100,10 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 .filter::placeholder{color:var(--muted);opacity:1}
 .more{display:grid;justify-items:center;gap:6px;margin-top:14px;color:var(--muted)}
 .busy{opacity:.55;transition:opacity .2s}
-.foot{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:14px;padding-bottom:24px}
+.foot{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:14px;padding-bottom:24px}
+.credit{flex-basis:100%;font-size:13px;line-height:1.5}
+.credit img{height:11px;width:auto;vertical-align:-1px;margin:0 2px}
+.credit a{color:inherit}
 @media (min-width:760px){
   body{padding-bottom:0}
   .top{grid-template-columns:1fr auto;padding-top:28px}

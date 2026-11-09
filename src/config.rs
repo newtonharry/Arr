@@ -293,6 +293,9 @@ struct TvmazeSection {
     enabled: bool,
     #[serde(default = "d_tvmaze_url")]
     base_url: String,
+    /// Where TVmaze serves its pictures (posters are fetched only from here).
+    #[serde(default = "d_tvmaze_image_url")]
+    image_base_url: String,
     #[serde(default = "d_meta_timeout")]
     timeout_secs: u64,
 }
@@ -302,6 +305,7 @@ impl Default for TvmazeSection {
         TvmazeSection {
             enabled: false,
             base_url: d_tvmaze_url(),
+            image_base_url: d_tvmaze_image_url(),
             timeout_secs: d_meta_timeout(),
         }
     }
@@ -309,6 +313,9 @@ impl Default for TvmazeSection {
 
 fn d_tvmaze_url() -> String {
     "https://api.tvmaze.com".into()
+}
+fn d_tvmaze_image_url() -> String {
+    "https://static.tvmaze.com".into()
 }
 fn d_meta_timeout() -> u64 {
     15
@@ -321,6 +328,9 @@ struct TmdbSection {
     enabled: bool,
     #[serde(default = "d_tmdb_url")]
     base_url: String,
+    /// Where TMDB serves its pictures (posters are fetched only from here).
+    #[serde(default = "d_tmdb_image_url")]
+    image_base_url: String,
     credential_file: Option<String>,
     #[serde(default = "d_meta_timeout")]
     timeout_secs: u64,
@@ -331,6 +341,7 @@ impl Default for TmdbSection {
         TmdbSection {
             enabled: false,
             base_url: d_tmdb_url(),
+            image_base_url: d_tmdb_image_url(),
             credential_file: None,
             timeout_secs: d_meta_timeout(),
         }
@@ -339,6 +350,9 @@ impl Default for TmdbSection {
 
 fn d_tmdb_url() -> String {
     "https://api.themoviedb.org".into()
+}
+fn d_tmdb_image_url() -> String {
+    "https://image.tmdb.org".into()
 }
 
 #[derive(Deserialize)]
@@ -906,6 +920,8 @@ pub struct ProwlarrConfig {
 #[derive(Debug, Clone)]
 pub struct MetadataConfig {
     pub base_url: Url,
+    /// The only host posters are fetched from.
+    pub image_base_url: Url,
     pub timeout: Duration,
     pub credential: Option<Secret>,
 }
@@ -1139,6 +1155,7 @@ pub fn parse_config(
     let tvmaze = if fc.tvmaze.enabled {
         Some(MetadataConfig {
             base_url: parse_base_url(&fc.tvmaze.base_url, "tvmaze.base_url")?,
+            image_base_url: parse_base_url(&fc.tvmaze.image_base_url, "tvmaze.image_base_url")?,
             timeout: Duration::from_secs(within(
                 "tvmaze.timeout_secs",
                 fc.tvmaze.timeout_secs,
@@ -1158,6 +1175,7 @@ pub fn parse_config(
             .context("tmdb.enabled requires tmdb.credential_file (a TMDB v4 read access token or v3 API key)")?;
         Some(MetadataConfig {
             base_url: parse_base_url(&fc.tmdb.base_url, "tmdb.base_url")?,
+            image_base_url: parse_base_url(&fc.tmdb.image_base_url, "tmdb.image_base_url")?,
             timeout: Duration::from_secs(within(
                 "tmdb.timeout_secs",
                 fc.tmdb.timeout_secs,
