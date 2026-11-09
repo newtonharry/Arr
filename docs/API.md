@@ -552,6 +552,30 @@ Queue actions:
 peers). `GET /api/v1/diagnostics` adds `search_backend` with each native indexer's origin,
 limits, caps and health.
 
+### Web app notifications (signed-in browser routes)
+
+These belong to the web app, not the bearer-token API, so they are not in the OpenAPI
+document. They take the web app's session cookie and the `X-Arr-App: 1` header, like every
+`/app/api` route, and answer `401` without a sign-in.
+
+- `GET /app/api/v1/notifications/key`: `{"key": "<base64url>"}`, the server's VAPID public
+  key (the browser's `applicationServerKey`). The key pair is made on first use and kept in
+  `STATE/secrets/vapid_key`.
+- `POST /app/api/v1/notifications/subscribe`: a browser's `PushSubscription.toJSON()`,
+  `{"endpoint", "keys": {"p256dh", "auth"}}`. `204` when stored (sending the same endpoint
+  again updates it), `400 invalid_request` for a bad body, keys or endpoint, `409
+  too_many_devices` past 100 devices. The endpoint must be `https`, on the default port, at
+  a public host (never a private, loopback or link-local address), and at most 2048
+  characters.
+- `DELETE /app/api/v1/notifications/subscribe`: `{"endpoint"}`; `204`.
+
+Arr checks the web app's feed once a minute and pushes "*Title* is ready to watch" for each
+new item in Arrived and "*Title* needs you" for each new item in Needs you, as an encrypted
+(RFC 8291 `aes128gcm`) message with a VAPID (RFC 8292) `Authorization` header. The message is
+`{"title", "body", "url"}`. The first pass after the feature is first used only records what
+is there. A subscription the push service answers `404` or `410` for is dropped. The service
+worker is served at `/app/sw.js` (scope `/app/`).
+
 ### Remote MCP
 
 With `[mcp] enabled`, `POST /mcp` serves MCP over Streamable HTTP (stateless JSON) with its
