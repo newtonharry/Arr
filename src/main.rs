@@ -329,6 +329,15 @@ async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: boo
     )?;
     let state_dir = cfg.state_dir.clone();
     let active = import::load_active(&state_dir)?;
+    // Refuse before anything is opened or changed (the state database is not touched).
+    if active
+        .as_ref()
+        .is_some_and(|l| !l.manifest.files.contains_key(setup::SOURCE_FILE))
+    {
+        anyhow::bail!(
+            "managed setup refused:\n- this state folder holds a Sonarr/Radarr snapshot import, which Arr no longer supports and managed setup never replaces; nothing in it was changed. Set up a new state folder with `arr setup` and `arr bootstrap`"
+        );
+    }
     let managed = active
         .as_ref()
         .filter(|l| l.manifest.files.contains_key(setup::SOURCE_FILE));

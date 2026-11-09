@@ -2119,6 +2119,8 @@ async fn bootstrap_refuses_unavailable_roots_and_unmapped_paths_and_snapshot_sta
     normalized.catalog.import_id = normalized.report.import_id.clone();
     arr::import::write_and_activate(&p.state, "source-native.json", b"{}", &normalized).unwrap();
     let pointer = std::fs::read(p.state.join("active-import.json")).unwrap();
+    let db_path = p.state.join("state.sqlite");
+    let db_before = std::fs::read(&db_path).unwrap();
     let err = api::AppState::new(cfg)
         .err()
         .expect("a snapshot import is refused");
@@ -2128,8 +2130,17 @@ async fn bootstrap_refuses_unavailable_roots_and_unmapped_paths_and_snapshot_sta
         "{msg}"
     );
     let config_path = p.state.join("config.toml");
-    let (ok, _, text) = cli(&["setup", "--config", config_path.to_str().unwrap()]);
-    assert!(!ok && text.contains("no longer supports"), "{text}");
+    for extra in [&[][..], &["--dry-run"][..]] {
+        let mut args = vec!["setup", "--config", config_path.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let (ok, _, text) = cli(&args);
+        assert!(!ok && text.contains("no longer supports"), "{text}");
+    }
+    assert_eq!(
+        std::fs::read(&db_path).unwrap(),
+        db_before,
+        "neither the startup nor the setup refusal opened or migrated the database"
+    );
     assert_eq!(
         std::fs::read(p.state.join("active-import.json")).unwrap(),
         pointer,

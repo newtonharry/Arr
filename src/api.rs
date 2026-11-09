@@ -1249,7 +1249,7 @@ async fn readiness(State(st): St) -> Response {
     if st.cfg.execution_enabled {
         for m in [MediaKind::Movie, MediaKind::Series] {
             let b = downloads::execution_blocker(&st, m);
-            checks.push(json!({ "name": format!("execution_{}", m.label()), "status": if b.is_none() { "ok" } else { "blocked" }, "reason": b.map(|x| json!({ "code": x.0, "message": x.1 })) }));
+            checks.push(json!({ "name": format!("execution_{}", if m == MediaKind::Movie { "radarr" } else { "sonarr" }), "status": if b.is_none() { "ok" } else { "blocked" }, "reason": b.map(|x| json!({ "code": x.0, "message": x.1 })) }));
         }
     }
     let ready = db_ok && st.current().is_some();
@@ -1382,7 +1382,12 @@ async fn diagnostics(State(st): St) -> ApiResult {
     let mut exec = serde_json::Map::new();
     for m in [MediaKind::Movie, MediaKind::Series] {
         exec.insert(
-            m.label().into(),
+            (if m == MediaKind::Movie {
+                "radarr"
+            } else {
+                "sonarr"
+            })
+            .into(),
             json!(
                 downloads::execution_blocker(&st, m)
                     .map(|(c, msg)| json!({ "code": c, "message": msg }))
