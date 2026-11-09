@@ -269,6 +269,8 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             "/app/mascot.svg",
             get(|| async { asset("image/svg+xml", MASCOT) }),
         )
+        // Browsers ask for /favicon.ico whatever the page says: send them to the mascot.
+        .route("/favicon.ico", get(favicon))
         .route(
             "/app/tmdb.svg",
             get(|| async { asset("image/svg+xml", TMDB_LOGO) }),
@@ -337,6 +339,21 @@ const ICON_MASKABLE: &[u8] = include_bytes!("webapp/icons/icon-maskable-512.png"
 const FONT_LATIN: &[u8] = include_bytes!("webapp/fonts/nunito-latin.woff2");
 const FONT_LATIN_EXT: &[u8] = include_bytes!("webapp/fonts/nunito-latin-ext.woff2");
 
+async fn favicon() -> Response {
+    let mut r = Response::new(Body::empty());
+    *r.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+    r.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_static("/app/mascot.svg"),
+    );
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    secure_headers(&mut r);
+    r
+}
+
 fn secure_headers(r: &mut Response) {
     let h = r.headers_mut();
     h.insert(
@@ -378,7 +395,7 @@ fn font(content_type: &'static str, body: &'static [u8]) -> Response {
 /// A small HTML page (the link pages), styled by the app's stylesheet.
 fn page(status: StatusCode, body: &str) -> Response {
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arr</title><link rel=\"stylesheet\" href=\"/app/app.css\"></head><body><main class=\"link-page\"><img src=\"/app/mascot.svg\" alt=\"\" width=\"64\" height=\"64\">{body}</main></body></html>"
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arr</title><link rel=\"icon\" href=\"/app/mascot.svg\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/app/app.css\"></head><body><main class=\"link-page\"><img src=\"/app/mascot.svg\" alt=\"\" width=\"64\" height=\"64\">{body}</main></body></html>"
     );
     let mut r = (
         status,

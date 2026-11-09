@@ -40,6 +40,8 @@ pub struct FakeTorrent {
     pub seeding_time: i64,
     pub seeding_time_limit: i64,
     pub priorities: Vec<i64>,
+    /// Download speed in bytes per second (a test sets it; zero when not moving).
+    pub speed: i64,
 }
 
 /// What an add carried (the controls a test asserts on).
@@ -165,6 +167,11 @@ impl FakeState {
         }
     }
 
+    /// Sets how fast the torrent downloads (bytes per second).
+    pub fn set_speed(&mut self, hash: &str, bytes_per_sec: i64) {
+        self.torrents.get_mut(hash).unwrap().speed = bytes_per_sec;
+    }
+
     pub fn set_state(&mut self, hash: &str, state: &str, progress: f64) {
         let t = self.torrents.get_mut(hash).unwrap();
         t.state = state.into();
@@ -211,7 +218,7 @@ impl Fake {
             size: size as i64,
             amount_left: ((1.0 - t.progress) * size as f64) as i64,
             save_path: t.save_path.clone(),
-            dlspeed: 0,
+            dlspeed: t.speed,
             eta: 8_640_000,
             content_path: Some(if multi {
                 format!("{}/{}", t.save_path, t.name)
@@ -349,6 +356,7 @@ impl Fake {
                 ratio_limit: req.ratio_limit.unwrap_or(-2.0),
                 seeding_time: 0,
                 seeding_time_limit: req.seeding_time_limit_minutes.unwrap_or(-2),
+                speed: 0,
             };
             s.torrents.insert(hash, t);
         }

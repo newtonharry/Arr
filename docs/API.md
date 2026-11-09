@@ -197,6 +197,14 @@ have none. The plain API does not return it. The movie and show pages also carry
   - requests that expired in the last 14 days.
 
   No notifications are sent.
+- **`GET /api/v1/feed`** is what the web app's home shows, in plain words: `needs_you`,
+  `on_its_way`, `arrived`, `looking` and `coming_up`. Catalog and state only, no network
+  calls. Two things in it help a client explain itself:
+  - each `needs_you` item has `problem` (a short sentence), plus `kind` (`download_failed`,
+    `import_blocked` or `request_expired`) and `failure` (why a download failed, for example
+    `stalled` or `wrong_quality`; null otherwise);
+  - each `on_its_way` item has `eta_seconds`, the time left at the download's recent rate
+    (smoothed over polls, kept in memory), or null when unknown, paused or stalled.
 - Season counts in `/library/series`, `/discover` and `/media/{series}` come from the live
   episode list (`source: live`), not from the snapshot's statistics.
 
