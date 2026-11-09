@@ -165,6 +165,7 @@ Density is relaxed: 44px minimum targets, 18px card corners, 2px borders, 10px b
 - Single centred column, max 680px; bottom tab bar on phones, top-right tabs on desktop.
 - Title tiles (coloured initials) stand in for artwork; no posters yet.
 - The four-stop journey line is the signature element.
+- Built with Preact (vendored in `src/webapp/vendor/`, written with `h`, no JSX, no build step); the look lives in `app.css` alone.
 
 ## Colors
 
