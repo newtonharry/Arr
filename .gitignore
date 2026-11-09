@@ -6,3 +6,6 @@
 *.sqlite*
 /config/local*
 !config/local.example.toml
+/.impeccable/mocks/
+/.impeccable/questions/
+/.impeccable/review/

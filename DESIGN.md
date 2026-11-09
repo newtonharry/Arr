@@ -1,0 +1,305 @@
+---
+name: Arr
+description: A warm, rounded home-cinema feed where teal means arrival, coral means "needs you", and a cream page holds white cards with warm borders.
+colors:
+  cream: "#fff8ef"
+  card: "#ffffff"
+  ink: "#23302f"
+  muted-ink: "#566563"
+  warm-line: "#eadfce"
+  teal: "#1c8576"
+  teal-ink: "#17766a"
+  on-teal: "#ffffff"
+  coral: "#ff7a5c"
+  coral-ink: "#a8331a"
+  sun-tint: "#fff1c9"
+  sun-ink: "#6b4c00"
+  focus-ring: "#0b5fff"
+  selection: "#bfe9e1"
+  night: "#161d1d"
+  night-card: "#202a2a"
+  night-ink: "#f1ece2"
+  night-muted-ink: "#b4c0bd"
+  night-line: "#334141"
+  night-teal: "#4fd1bd"
+  night-on-teal: "#0f1f1d"
+  night-coral-ink: "#ff9a82"
+  night-sun-tint: "#3b3316"
+  night-sun-ink: "#ffd97a"
+  night-focus-ring: "#8ab4ff"
+  night-selection: "#1f5c53"
+typography:
+  brand:
+    fontFamily: "Nunito, ui-rounded, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+    fontSize: "24px"
+    fontWeight: 800
+    lineHeight: 1.4
+  headline:
+    fontFamily: "Nunito, ui-rounded, system-ui, sans-serif"
+    fontSize: "28px"
+    fontWeight: 800
+    lineHeight: 1.15
+  title:
+    fontFamily: "Nunito, ui-rounded, system-ui, sans-serif"
+    fontSize: "16px"
+    fontWeight: 800
+    lineHeight: 1.3
+  body:
+    fontFamily: "Nunito, ui-rounded, system-ui, sans-serif"
+    fontSize: "15px"
+    fontWeight: 500
+    lineHeight: 1.4
+  meta:
+    fontFamily: "Nunito, ui-rounded, system-ui, sans-serif"
+    fontSize: "14px"
+    fontWeight: 500
+    lineHeight: 1.4
+  label:
+    fontFamily: "Nunito, ui-rounded, system-ui, sans-serif"
+    fontSize: "13px"
+    fontWeight: 800
+    lineHeight: 1.4
+    letterSpacing: "0.06em"
+rounded:
+  tile: "10px"
+  idea-tile: "12px"
+  button: "12px"
+  filter: "14px"
+  card: "18px"
+  pill: "999px"
+spacing:
+  xs: "6px"
+  sm: "10px"
+  md: "12px"
+  lg: "18px"
+  gutter: "20px"
+  stack: "22px"
+components:
+  search-field:
+    backgroundColor: "{colors.card}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.card}"
+    height: "56px"
+    padding: "0 16px"
+  item-row:
+    backgroundColor: "{colors.card}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.card}"
+    padding: "12px"
+  item-row-arrived:
+    backgroundColor: "{colors.card}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.card}"
+  title-tile:
+    textColor: "#ffffff"
+    rounded: "{rounded.tile}"
+    width: "46px"
+    height: "68px"
+  button-primary:
+    backgroundColor: "{colors.teal}"
+    textColor: "{colors.on-teal}"
+    rounded: "{rounded.button}"
+    padding: "0 14px"
+    height: "44px"
+  button-primary-night:
+    backgroundColor: "{colors.night-teal}"
+    textColor: "{colors.night-on-teal}"
+    rounded: "{rounded.button}"
+  button-needs-you:
+    backgroundColor: "transparent"
+    textColor: "{colors.coral-ink}"
+    rounded: "{rounded.button}"
+    padding: "0 14px"
+    height: "44px"
+  button-ghost:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.button}"
+    height: "44px"
+  button-done:
+    backgroundColor: "transparent"
+    textColor: "{colors.teal-ink}"
+    rounded: "{rounded.button}"
+    height: "44px"
+  tab-bar:
+    backgroundColor: "{colors.card}"
+    textColor: "{colors.muted-ink}"
+  tab-current-desktop:
+    backgroundColor: "{colors.teal}"
+    textColor: "{colors.on-teal}"
+    rounded: "{rounded.button}"
+    height: "44px"
+  date-chip:
+    backgroundColor: "{colors.sun-tint}"
+    textColor: "{colors.sun-ink}"
+    rounded: "{rounded.button}"
+    width: "46px"
+    height: "52px"
+  segmented-pill:
+    textColor: "{colors.ink}"
+    rounded: "{rounded.pill}"
+    height: "44px"
+    padding: "0 16px"
+  segmented-pill-selected:
+    backgroundColor: "{colors.teal}"
+    textColor: "{colors.on-teal}"
+    rounded: "{rounded.pill}"
+---
+
+# Design System: Arr
+
+## Overview
+
+**Creative North Star: "The Home Cinema Foyer"**
+
+Arr's web app is one calm feed on a warm cream page: white rounded cards, ink-green text, a single teal for action and arrival, a friendly round typeface, and the mascot as the brand mark. It is the same world as the Arr website (`site/style.css`, the brand source), carried into a phone-first, single-column app. It reads like a household noticeboard for a TV room, not an admin console: nothing shows a queue table, a speed or a setting, and nothing imitates a wall of posters.
+
+The page answers one question, "is my thing coming?". Search is pinned at the top; below it the feed deals out sections (what arrived, what is on its way, what needs you, what is coming up). Each row is a title tile or date chip, a title, and one next fact. Colour carries meaning, not decoration: teal says "it is here or you can act", coral says "this needs you", sun-yellow says "a date". Everything else is cream, white, ink and warm line.
+
+Density is relaxed: 44px minimum targets, 18px card corners, 2px borders, 10px between rows, 22px between sections. Dark mode is the website's night palette, not an inversion.
+
+**Key Characteristics:**
+- Cream page, white cards, every card outlined in a 2px warm line.
+- Teal is the only action colour; coral is reserved for "Needs you".
+- Nunito (self-hosted) at weights 500 to 800; bold, rounded, no thin weights.
+- Single centred column, max 680px; bottom tab bar on phones, top-right tabs on desktop.
+- Title tiles (coloured initials) stand in for artwork; no posters yet.
+- The four-stop journey line is the signature element.
+
+## Colors
+
+A warm, food-and-lamplight palette: cream and white grounds, deep green-black ink, one sea-teal, one coral, one pale sun yellow. Defined once as custom properties on `:root` in `src/webapp/app.css`; dark values replace them under `prefers-color-scheme: dark`. Frontmatter holds light values by plain name and dark values with a `night-` prefix. Where the dark value of a token is unchanged (coral, white tile text) there is no `night-` entry.
+
+### Primary
+- **Sea Teal** (`teal`, #1c8576; dark `night-teal` #4fd1bd): fills for the primary button, the selected pill, the journey fill and arrived-row border; the search glyph; `accent-color` and caret. White text on it in light mode, deep teal-black (`night-on-teal` #0f1f1d) in dark.
+- **Teal Ink** (`teal-ink`, #17766a; dark is the same as `night-teal`): teal used as text or small glyph on cards and cream (links, tags like "In Plex", the current tab, done-state buttons, success messages). Darker than Sea Teal so it holds contrast on white.
+
+### Secondary
+- **Needs-You Coral** (`coral`, #ff7a5c, same in dark): the border of the outlined "Needs you" button only.
+- **Coral Ink** (`coral-ink`, #a8331a; dark `night-coral-ink` #ff9a82): the text of problem lines, error messages and the coral button label. Coral is a signal, never a fill and never decoration.
+
+### Tertiary
+- **Sun Tint** (`sun-tint`, #fff1c9; dark `night-sun-tint` #3b3316) with **Sun Ink** (`sun-ink`, #6b4c00; dark `night-sun-ink` #ffd97a): the date chip and the inline banner. Always a soft tint with matching dark text. (The website's saturated sun #ffc94d is used for its pills and is not used in the app.)
+
+### Neutral
+- **Cream** (`cream`, #fff8ef; dark `night` #161d1d): the page.
+- **Card White** (`card`, #ffffff; dark `night-card` #202a2a): rows, the search field, the tab bar, filter input.
+- **Ink** (`ink`, #23302f; dark `night-ink` #f1ece2): headings and body.
+- **Muted Ink** (`muted-ink`, #566563; dark `night-muted-ink` #b4c0bd): meta lines, section labels, inactive tabs, placeholders.
+- **Warm Line** (`warm-line`, #eadfce; dark `night-line` #334141): every 2px border, the search field's drop, the journey track, scrollbar thumbs.
+- **Focus Ring** (`focus-ring`, #0b5fff; dark `night-focus-ring` #8ab4ff): 3px focus outline, 3px offset. Deliberately not a brand colour.
+- **Selection** (`selection` #bfe9e1; dark `night-selection` #1f5c53): text selection.
+
+Title-tile gradients (eight fixed pairs, `.t0` to `.t7`: teal, coral-red, ochre, slate-blue, violet, green, berry, grey) are a decorative set used only on tiles, with white initials; they are not part of the semantic palette.
+
+### Named Rules
+**The Coral Means Needs-You Rule.** Coral appears only on rows in "Needs you" and error messages. If an item is not waiting on a person, it is not coral.
+
+**The Two Teals Rule.** Sea Teal fills; Teal Ink writes. Never set small teal text in `teal` on a white or cream ground.
+
+**The Dates Are Sun Rule.** A date is a pale sun chip. Sun is not used for status, warnings or buttons.
+
+## Typography
+
+**Display / Body Font:** Nunito (self-hosted woff2, latin and latin-ext, variable weight 500 to 800) with `ui-rounded, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`.
+
+**Character:** one round, friendly family at heavy weights; hierarchy comes from weight and size, not from a second face. Tabular numerals are on for the whole page so dates, percentages and times line up.
+
+### Hierarchy
+- **Brand** (800, 24px, 1.4): the "Arr" word beside the mascot.
+- **Headline** (800, 28px, 1.15): sign-in headline; empty-state heading is 22px/800 in ink.
+- **Title** (800, 16px, 1.3): item titles, one line with ellipsis (two-line clamp for arrived rows and ideas at 14px).
+- **Body** (500, 15px, 1.4): default text; search input is 17px/600.
+- **Meta** (500, 14px, muted ink): the one next fact under a title, single line with ellipsis; 12px/800 for tags and tab labels.
+- **Label** (800, 13px, +0.06em, uppercase, muted ink): section headings in the feed, with an optional right-aligned link in sentence case 14px/800.
+
+### Named Rules
+**The Heavy Round Rule.** Titles and controls are 800; supporting text is 500 to 600. No light weights.
+
+**The Plain Words Rule.** Copy is household English: "Found, getting ready", "Downloading", "Checking the file", "In Plex", "Watch". No indexer, grab, queue, quality or seeder vocabulary anywhere a household member reads.
+
+## Layout
+
+A single centred column, `max-width: 680px`, 20px side gutters, on every viewport. Page structure: brand row, search field, banner (only when non-empty), then the feed in `main`, then a quiet footer with who is signed in and Sign out. Sections stack with 22px between them; rows in a list are 10px apart and each row is a full-width card. The ideas section is the one horizontal scroller: 132px-wide cards with proximity snap, bleeding to the page edge (`margin: 0 -20px`).
+
+Responsive: under 760px the tab bar is fixed to the bottom (68px plus safe-area inset, 56px tall targets, icon over 12px label) and the page pads for it. From 760px the same nav moves to the top right on the brand row as 44px pills; the current tab fills teal. Under 420px the coral button in a Needs-you row collapses to its icon. Under 360px journey labels drop to 11px. Safe-area insets are respected top and bottom.
+
+Rows align centre, except search results and library entries which top-align. Targets are 44px minimum.
+
+## Elevation & Depth
+
+Flat and tonal: depth is made with white cards on cream and 2px warm borders, not blur. The one lift is the search field's drop, a solid offset in the warm line colour with no blur: `box-shadow: 0 5px 0 var(--line)` on the search field (the website's install card uses the same device at 8px). It makes the search read as the pressable heart of the page. No other element in the app has a shadow. State depth is a 1px press (`translateY(1px)`) and a `brightness(1.08)` lift on hover.
+
+### Named Rules
+**The One Drop Rule.** Only the search field carries a drop. Rows, buttons and tabs sit flat on their border.
+
+## Shapes
+
+Soft, generous corners with a consistent grammar: 18px for cards, rows and the search field; 12px for buttons, date chips, the banner and idea tiles; 14px for the filter input; 10px for list title tiles; full pill (999px) for the segmented filter buttons. All containers are outlined in a 2px `warm-line` border; focus outlines follow an 8px radius. Teal marks arrival by recolouring the row border (arrived rows only). Journey stops are 11px circles with a 2px teal ring. Icons are inline SVG line icons: 22px, 2.2 stroke, round caps and joins (14 to 18px inside tags and buttons).
+
+## Components
+
+### Search Field
+Full width, 56px tall, white, 2px warm border, 18px radius, the solid 5px drop, a teal magnifier glyph and a 17px/600 input with muted placeholder "Find a movie or show". Focus shows the 3px blue ring around the whole field, not the input.
+
+### Item Rows
+White card, 2px warm border, 18px radius, 12px padding, 12px gap: lead tile or date chip, a text column (title, one meta line), and a trailing action when needed.
+- **Arrived:** teal border, an "In Plex" tag (teal ink, check glyph, 12px/800) above the title, and a teal Watch button on the right that opens Plex.
+- **On its way:** title, status line ("42% downloaded", "Paused"), then the journey line.
+- **Needs you:** neutral border (the card stays calm), a coral-ink problem line with an alert glyph, and the coral outline button.
+- **Coming up / looking:** a sun date chip as the lead, "Out 14 Nov. Arr will get it then."
+
+### Title Tiles
+46x68px portrait block, 10px radius, vertical two-stop gradient picked deterministically from the title (8 sets), white initials at 16px/800. In ideas they widen to a 132x92 block with 28px initials. They are honest placeholders for artwork and are used wherever a poster would sit.
+
+### Buttons
+- **Primary (teal):** 44px tall, 12px radius, 0 14px padding, 2px teal border and fill, white text (dark mode: teal-black on light teal), 14px/800, optional 18px icon. Hover brightens; active presses 1px. Used for Add and Watch.
+- **Needs-you (coral outline):** transparent fill, 2px coral border, coral-ink label, same size. Used only inside Needs-you rows ("Try again" style actions).
+- **Done:** after adding, the primary button becomes transparent with warm border and teal-ink label ("Added", "In Plex", "Following").
+- **Ghost:** transparent, warm border, ink label, border turns teal on hover.
+- **Link button:** no fill, teal-ink, 800, underlined, 44px tall (Sign out, "see all").
+- Busy is 70% opacity with progress cursor.
+
+### Journey Line
+The signature. A 36px-tall four-stop track under any item on its way: Found, Downloading, Checking, In Plex. A 3px warm-line rail with a teal fill that scales from the left (`scaleX`, 0.9s `cubic-bezier(0.16, 1, 0.3, 1)`) as Arr works; stops are 11px circles, hollow until reached, solid teal when on; stop one is left-aligned, stop four right-aligned, two and three centred at one third and two thirds. The current stop's label is ink 800, others muted 600 at 12px. Paused turns the fill muted grey. The last stop, In Plex, is reached only when the row moves to Arrived.
+
+### Tabs
+Home / Ideas / Library, icon plus label. Phone: bottom bar, white, 2px warm top border, inactive muted 12px/800, current teal ink. Desktop: top-right pills, inactive muted with teal on hover, current filled teal with on-teal text.
+
+### Date Chips
+46x52px, 12px radius, sun tint with sun ink text: a 12px uppercase month or day name over a 20px day number. Used as the lead for anything with a date.
+
+### Segmented Pills and Filter
+Pill buttons (999px, 2px warm border, 44px tall, 800) for choices like Movies / Shows; selected is teal filled with on-teal text. The library filter input is 44px, white, 2px warm border, 14px radius.
+
+### Empty and Sign-in
+Centred mascot (96px empty, 120px sign-in), a heading, one muted line (max 30ch) and at most one teal button. The mascot (`src/webapp/mascot.svg`) is the brand mark at 34px beside "Arr" and as the favicon.
+
+### Motion
+Short and meaningful only: the journey fill (0.9s expo-out), 0.2s opacity on busy lists, 1px press. Everything is disabled under `prefers-reduced-motion`. The website's mascot bob is not in the app.
+
+## Do's and Don'ts
+
+### Do:
+- **Do** keep the cream page, white cards, ink text and 2px `warm-line` borders on every container; dark mode swaps to the `night-` values.
+- **Do** use Sea Teal for fills and arrival (primary button, journey, arrived border) and Teal Ink for teal text.
+- **Do** use coral only for things that need a person, as the outlined button, its border and the coral-ink problem or error text.
+- **Do** give each item a title tile (or date chip when it has a date) and one next fact; let the journey line show progress instead of numbers and states.
+- **Do** write plain household English; say what happened to the person's film ("In Plex", "Out 14 Nov. Arr will get it then.").
+- **Do** keep 44px minimum targets, the 3px ring focus outline, and visible hover/pressed/busy/done states.
+- **Do** use Nunito at 500 to 800 and 18px/12px/pill radii as listed.
+
+### Don't:
+- **Don't** use coral as a fill, an accent, a badge or decoration; if nothing needs the person, nothing is coral.
+- **Don't** add posters, poster grids or backdrops until artwork is sourced; use title tiles. Never fake a poster with a stock image.
+- **Don't** put jargon, speeds, seeders, quality, indexer, grab or queue rows, tables, charts or settings on a feed screen.
+- **Don't** add a shadow to anything but the search field, and do not apply the drop to rows, buttons or tabs.
+- **Don't** use saturated sun yellow (#ffc94d) in the app; dates use the pale sun tint.
+- **Don't** set small teal text in Sea Teal on white or cream; use Teal Ink.
+- **Don't** introduce a second typeface, light weights, or new radii outside the existing set.
+- **Don't** treat `src/wizard/app.css` as this system (see below).
+
+### Known drift (not canonized, not repaired)
+- The setup page `src/wizard/app.css` is an older, plainer look: cool grey ground (#f4f4f1), amber accent (#c47f12 / #e5a00d), system sans, square-ish cards. It should be brought into this system later; do not copy its values.
+- The website (`site/style.css`) is the brand source but differs by name and a few values: `--accent`/`--surface`/`--warm` for the app's `--teal`/`--card`/`--coral`, a saturated sun, a code-dark panel, a 24px install card with an 8px drop, 20px step cards, and no teal-ink split. The app is the authority for app UI.
+- The search field's drop is a hard offset (0 blur) in the line colour, where the direction contract calls it a "soft drop". It is recorded as built and limited to search; future surfaces should not treat a hard offset shadow as a general pattern.
