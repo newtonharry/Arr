@@ -436,8 +436,9 @@ impl Plex {
 
     /// Scans what an import added: only `path` (a Plex-side folder) when given, unless the
     /// section is empty. Plex ignores a folder scan in an empty library (it logs "Refreshing 0
-    /// IDs" and scans nothing), so the first title in a library gets a whole-section scan, which
-    /// costs nothing there. When the check itself fails, the folder scan goes ahead as before.
+    /// IDs" and scans nothing), so the first title in a library gets a whole-section scan: the
+    /// only scan Plex will run there, even when the folders already hold many files Plex never
+    /// scanned. When the check itself fails, the folder scan goes ahead as before.
     /// Returns whether the scan was limited to the folder.
     pub async fn refresh_import(
         &self,
@@ -501,31 +502,64 @@ mod tests {
     use url::Url;
 
     /// A first import into an empty library scans the whole section (Plex ignores a folder
-    /// scan there); otherwise only the folder, including when the emptiness check fails.
+    /// scan there); otherwise only the folder, including when the emptiness check fails. The
+    /// check asks for one item with the token; a server that answers POST with 405 gets GET.
     #[tokio::test]
     async fn import_refresh_scans_the_whole_section_while_it_is_empty() {
         use axum::extract::{Path, RawQuery, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
         type Log = Arc<Mutex<Vec<String>>>;
-        async fn all(Path(id): Path<u32>) -> axum::response::Response {
-            use axum::response::IntoResponse;
-            match id {
-                1 => axum::Json(serde_json::json!({ "MediaContainer": { "size": 0, "totalSize": 0, "offset": 0 } })).into_response(),
-                2 => axum::Json(serde_json::json!({ "MediaContainer": { "size": 1, "totalSize": 3, "offset": 0,
-                    "Metadata": [{ "ratingKey": "1", "type": "movie", "title": "A" }] } })).into_response(),
-                _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
+        fn token(h: &HeaderMap) -> bool {
+            h.get("x-plex-token").and_then(|v| v.to_str().ok()) == Some("t")
         }
-        async fn refresh(State(log): State<Log>, Path(id): Path<u32>, RawQuery(q): RawQuery) {
+        async fn all(
+            State(log): State<Log>,
+            h: HeaderMap,
+            Path(id): Path<u32>,
+            RawQuery(q): RawQuery,
+        ) -> axum::response::Response {
+            let q = q.unwrap_or_default();
+            log.lock().unwrap().push(format!("all {id}?{q}"));
+            if !token(&h) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            let one = serde_json::json!([{ "ratingKey": "1", "type": "movie", "title": "A" }]);
+            let doc = match id {
+                1 => serde_json::json!({ "size": 0, "totalSize": 0, "offset": 0 }),
+                2 => serde_json::json!({ "size": 1, "totalSize": 3, "offset": 0, "Metadata": one }),
+                // No totalSize: the page itself decides.
+                4 => serde_json::json!({ "size": 0, "offset": 0 }),
+                5 | 6 => serde_json::json!({ "size": 1, "offset": 0, "Metadata": one }),
+                _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            axum::Json(serde_json::json!({ "MediaContainer": doc })).into_response()
+        }
+        async fn refresh(
+            State(log): State<Log>,
+            method: axum::http::Method,
+            h: HeaderMap,
+            Path(id): Path<u32>,
+            RawQuery(q): RawQuery,
+        ) -> StatusCode {
+            if !token(&h) {
+                return StatusCode::UNAUTHORIZED;
+            }
+            // Section 6 is a server that only takes GET.
+            if id == 6 && method == axum::http::Method::POST {
+                return StatusCode::METHOD_NOT_ALLOWED;
+            }
             log.lock()
                 .unwrap()
-                .push(format!("{id}?{}", q.unwrap_or_default()));
+                .push(format!("{method} {id}?{}", q.unwrap_or_default()));
+            StatusCode::OK
         }
         let log: Log = Arc::default();
         let app = axum::Router::new()
             .route("/library/sections/{id}/all", axum::routing::get(all))
             .route(
                 "/library/sections/{id}/refresh",
-                axum::routing::post(refresh),
+                axum::routing::post(refresh).get(refresh),
             )
             .with_state(log.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -543,13 +577,47 @@ mod tests {
             metadata_url: base.clone(),
             image_base_url: base,
         });
+        let scans = |log: &Log| -> Vec<String> {
+            let mut l = log.lock().unwrap();
+            let out = l
+                .iter()
+                .filter(|e| !e.starts_with("all "))
+                .cloned()
+                .collect();
+            l.clear();
+            out
+        };
+        // Empty (totalSize 0, or no total and no items): the whole section.
         assert!(!plex.refresh_import(1, Some("/m/A (2000)")).await.unwrap());
+        assert!(!plex.refresh_import(4, Some("/m/D")).await.unwrap());
+        assert_eq!(scans(&log), ["POST 1?", "POST 4?"]);
+        // Has items (with or without a total), or the check failed: only the folder.
         assert!(plex.refresh_import(2, Some("/t/B")).await.unwrap());
+        assert!(plex.refresh_import(5, Some("/t/E")).await.unwrap());
         assert!(plex.refresh_import(3, Some("/m/C")).await.unwrap());
-        assert!(!plex.refresh_import(2, None).await.unwrap());
         assert_eq!(
-            *log.lock().unwrap(),
-            ["1?", "2?path=%2Ft%2FB", "3?path=%2Fm%2FC", "2?"]
+            scans(&log),
+            [
+                "POST 2?path=%2Ft%2FB",
+                "POST 5?path=%2Ft%2FE",
+                "POST 3?path=%2Fm%2FC"
+            ]
+        );
+        // POST answered 405: GET, still only the folder.
+        assert!(plex.refresh_import(6, Some("/m/F")).await.unwrap());
+        assert_eq!(scans(&log), ["GET 6?path=%2Fm%2FF"]);
+        // No folder: the whole section, without asking whether it is empty.
+        assert!(!plex.refresh_import(2, None).await.unwrap());
+        assert_eq!(*log.lock().unwrap(), ["POST 2?"]);
+        // The emptiness check asked for one item with the token.
+        log.lock().unwrap().clear();
+        plex.refresh_import(1, Some("/m/A")).await.unwrap();
+        let first = log.lock().unwrap()[0].clone();
+        assert!(
+            first.starts_with("all 1?")
+                && first.contains("X-Plex-Container-Start=0")
+                && first.contains("X-Plex-Container-Size=1"),
+            "{first}"
         );
     }
 
