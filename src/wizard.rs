@@ -37,6 +37,7 @@ use tokio::sync::Notify;
 const INDEX_HTML: &str = include_str!("wizard/index.html");
 const APP_JS: &str = include_str!("wizard/app.js");
 const APP_CSS: &str = include_str!("wizard/app.css");
+const QRCODEGEN_JS: &str = crate::webapp::QRCODEGEN_JS;
 
 const COOKIE: &str = "arr_setup";
 /// Every change must carry this header; a plain cross-site form can't set it.
@@ -70,6 +71,8 @@ pub struct Options {
     pub plex_port: u16,
     /// The installer was told yes (`--error-reports`): the page starts with reports on.
     pub error_reports: bool,
+    /// The public HTTPS address the installer is about to set up (remote access), if any.
+    pub public_url: Option<String>,
 }
 
 struct Wizard {
@@ -166,6 +169,12 @@ pub async fn run(mut opts: Options) -> Result<()> {
             config.display()
         );
     }
+    // Shown on the Done screen: only a plain https address.
+    opts.public_url = opts
+        .public_url
+        .take()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| u.starts_with("https://") && !u.contains(char::is_whitespace));
     fsutil::ensure_private_dir(&opts.state_dir)?;
     let client_id = plexsignin::client_id(&opts.state_dir)?;
     if !opts.bind.is_loopback() && !private_lan(opts.bind) {
@@ -286,6 +295,7 @@ fn router(wiz: Arc<Wizard>) -> Router {
         .route("/api/reporting", post(set_reporting))
         .route("/api/folder", post(folder))
         .route("/api/apply", post(apply))
+        .route("/api/app-link", post(app_link))
         .route("/api/finish", post(finish))
         .route_layer(middleware::from_fn_with_state(wiz.clone(), guard));
     Router::new()
@@ -295,6 +305,10 @@ fn router(wiz: Arc<Wizard>) -> Router {
             get(|| async { asset("text/javascript", APP_JS) }),
         )
         .route("/app.css", get(|| async { asset("text/css", APP_CSS) }))
+        .route(
+            "/qrcodegen.js",
+            get(|| async { asset("text/javascript", QRCODEGEN_JS) }),
+        )
         .merge(api)
         .layer(middleware::from_fn(secure_headers))
         .with_state(wiz)
@@ -448,6 +462,11 @@ fn snapshot(wiz: &Wizard) -> Value {
         "media_movies": crate::plexinstall::default_media().join("Movies"),
         "media_tv": crate::plexinstall::default_media().join("TV Shows"),
         "phase": inner.phase,
+        // Where to find the app once setup is done (the Done screen shows it).
+        "app": {
+            "url": format!("http://localhost:{}", wiz.opts.port),
+            "public_url": wiz.opts.public_url,
+        },
         "reporting": {
             "available": crate::report::available(),
             "enabled": wiz.reporting.lock().unwrap().as_ref().is_some_and(|r| r.is_on()),
@@ -1439,6 +1458,23 @@ fn progress(line: &str) -> Option<String> {
     Some(format!("{what}: {done} of {total}"))
 }
 
+/// A one-time sign-in link for the app this setup just made (the same one `arr app-link`
+/// makes), so "Open Arr" lands signed in. The link is only in this reply: it isn't logged,
+/// and the page keeps it in memory until the one click that uses it.
+async fn app_link(State(wiz): St) -> Response {
+    if !matches!(wiz.inner.lock().unwrap().phase, Phase::Done) {
+        return problem(StatusCode::CONFLICT, "setup isn't finished");
+    }
+    let config = wiz.opts.state_dir.join("config.toml");
+    match crate::config::load(&config).and_then(|cfg| crate::webapp::app_link(&cfg)) {
+        Ok(url) => Json(json!({ "url": url })).into_response(),
+        Err(_) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "couldn't make a sign-in link",
+        ),
+    }
+}
+
 async fn finish(State(wiz): St) -> Response {
     if !matches!(wiz.inner.lock().unwrap().phase, Phase::Done) {
         return problem(StatusCode::CONFLICT, "setup isn't finished");
@@ -1590,6 +1626,7 @@ mod tests {
             plex_installer: None,
             plex_port: 32400,
             error_reports: true,
+            public_url: None,
         };
         let plex = Connected {
             name: "Plex".into(),

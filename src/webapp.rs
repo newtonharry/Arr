@@ -204,12 +204,36 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             get(|| async { asset("image/svg+xml", TMDB_LOGO) }),
         )
         .route(
+            "/app/qrcodegen.js",
+            get(|| async { asset("text/javascript; charset=utf-8", QRCODEGEN_JS) }),
+        )
+        .route(
+            "/app/manifest.webmanifest",
+            get(|| async { asset("application/manifest+json", MANIFEST) }),
+        )
+        .route(
             "/app/fonts/nunito-latin.woff2",
-            get(|| async { font(FONT_LATIN) }),
+            get(|| async { font("font/woff2", FONT_LATIN) }),
         )
         .route(
             "/app/fonts/nunito-latin-ext.woff2",
-            get(|| async { font(FONT_LATIN_EXT) }),
+            get(|| async { font("font/woff2", FONT_LATIN_EXT) }),
+        )
+        .route(
+            "/app/icons/apple-touch-icon.png",
+            get(|| async { font("image/png", ICON_APPLE) }),
+        )
+        .route(
+            "/app/icons/icon-192.png",
+            get(|| async { font("image/png", ICON_192) }),
+        )
+        .route(
+            "/app/icons/icon-512.png",
+            get(|| async { font("image/png", ICON_512) }),
+        )
+        .route(
+            "/app/icons/icon-maskable-512.png",
+            get(|| async { font("image/png", ICON_MASKABLE) }),
         )
         .route("/app/link", get(link_page).post(link_consume))
         .route("/app/art/{media_id}", get(art))
@@ -224,6 +248,16 @@ const APP_JS: &str = include_str!("webapp/app.js");
 const APP_CSS: &str = include_str!("webapp/app.css");
 const MASCOT: &str = include_str!("webapp/mascot.svg");
 const TMDB_LOGO: &str = include_str!("webapp/tmdb.svg");
+/// Nayuki's QR Code generator (MIT), unmodified; the header of the file says where from.
+pub(crate) const QRCODEGEN_JS: &str = include_str!("webapp/qrcodegen.js");
+const MANIFEST: &str = include_str!("webapp/manifest.webmanifest");
+// The icons are webapp/mascot.svg on the cream background (#fff8ef), rendered once with
+// headless Chrome at 180, 192 and 512 pixels; the maskable one has extra padding so a
+// phone's round or squircle mask never cuts the mascot.
+const ICON_APPLE: &[u8] = include_bytes!("webapp/icons/apple-touch-icon.png");
+const ICON_192: &[u8] = include_bytes!("webapp/icons/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("webapp/icons/icon-512.png");
+const ICON_MASKABLE: &[u8] = include_bytes!("webapp/icons/icon-maskable-512.png");
 const FONT_LATIN: &[u8] = include_bytes!("webapp/fonts/nunito-latin.woff2");
 const FONT_LATIN_EXT: &[u8] = include_bytes!("webapp/fonts/nunito-latin-ext.woff2");
 
@@ -254,8 +288,9 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
     r
 }
 
-fn font(body: &'static [u8]) -> Response {
-    let mut r = ([(header::CONTENT_TYPE, "font/woff2")], body).into_response();
+/// A file that never changes (a font or an icon), cached for a week.
+fn font(content_type: &'static str, body: &'static [u8]) -> Response {
+    let mut r = ([(header::CONTENT_TYPE, content_type)], body).into_response();
     r.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=604800, immutable"),
@@ -434,7 +469,9 @@ async fn me(State(w): Wa, headers: HeaderMap) -> Response {
     let Some((_, email)) = w.session(&headers) else {
         return w.unauthorized();
     };
-    let mut r = Json(json!({ "email": email })).into_response();
+    // Where Arr is reachable from other devices, for "Use Arr on your phone".
+    let public_url = w.oauth.as_ref().map(|o| o.public_url.as_str());
+    let mut r = Json(json!({ "email": email, "public_url": public_url })).into_response();
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r

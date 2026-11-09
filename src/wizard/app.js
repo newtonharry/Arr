@@ -39,6 +39,7 @@ function render(s) {
     return;
   }
   if (phase === "done") {
+    showDone(s);
     return;
   }
   // The form is back, and Finish starts again where it stopped (the import resumes).
@@ -252,7 +253,6 @@ function startProgressPolling() {
   poll(async () => {
     const s = await call("GET", "/api/state");
     render(s);
-    if (s.phase.state === "done") call("POST", "/api/finish").catch(() => {});
     return s.phase.state === "working";
   }, 1000);
 }
@@ -345,3 +345,129 @@ call("GET", "/api/state").then((s) => {
   else if (s.install.state === "done" && !s.plex && s.signed_in) linkPlex(s);
   if (s.phase.state === "working") startProgressPolling();
 }).catch((e) => showError(e.message));
+
+// ---- The Done screen: where Arr is, and a button that opens it already signed in.
+
+let doneShown = false;
+let appLink = null; // in memory only: it's used by one click and never put in the page
+
+function showDone(s) {
+  if (doneShown) return;
+  doneShown = true;
+  $("app-local").textContent = s.app.url;
+  const remote = !!s.app.public_url;
+  $("remote-yes").hidden = !remote;
+  $("remote-no").hidden = remote;
+  if (remote) {
+    $("app-public").textContent = s.app.public_url;
+    $("app-qr").replaceChildren(qrSvg(s.app.public_url));
+  }
+  const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+  $("bookmark-hint").textContent = `Once Arr is open, bookmark it: press ${mac ? "⌘D" : "Ctrl+D"}. On a phone: Share → Add to Home Screen.`;
+  // Arr runs on this port once the installer starts it, so this page can ask it, as itself.
+  const here = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  $("open-elsewhere").hidden = here;
+  $("open-box").hidden = !here;
+  if (here) prepareOpen();
+  else call("POST", "/api/finish").catch(() => {});
+}
+
+// Makes the sign-in link while this setup page is still running, lets it go, then waits for
+// the app to answer on the same address before enabling the button.
+async function prepareOpen() {
+  try { appLink = (await call("POST", "/api/app-link")).url; } catch (_) { appLink = null; }
+  call("POST", "/api/finish").catch(() => {});
+  const status = $("open-status");
+  if (!appLink) {
+    $("open-box").hidden = true;
+    return;
+  }
+  const started = Date.now();
+  const look = async () => {
+    let up = false;
+    try {
+      const r = await fetch("/api/v1/health", { cache: "no-store" });
+      up = r.ok;
+    } catch (_) { /* the setup page has gone and Arr isn't up yet */ }
+    if (up) {
+      status.textContent = "Arr is running.";
+      $("open-arr").disabled = false;
+      return;
+    }
+    if (Date.now() - started > 90000) status.textContent = "Arr is taking a while to start. The terminal says what it's doing.";
+    setTimeout(look, 1000);
+  };
+  look();
+}
+
+// Opens Arr signed in. The link is spent here, by a POST to the app (as its own page, so
+// the browser stores the session for this address), and the new tab then goes to the app's
+// front page: no token ever sits in a tab's address or history.
+$("open-arr").addEventListener("click", async () => {
+  if (!appLink) return;
+  const button = $("open-arr"), status = $("open-status");
+  // Opened now, while the click still counts, so the browser doesn't block it.
+  const tab = window.open("", "_blank");
+  if (tab) { try { tab.opener = null; } catch (_) { /* fine */ } }
+  const token = new URL(appLink).searchParams.get("t");
+  appLink = null;
+  button.disabled = true;
+  status.textContent = "Signing in…";
+  let ok = false;
+  try {
+    const r = await fetch("/app/link", {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ t: token }),
+    });
+    ok = r.type === "opaqueredirect" || r.status === 303;
+  } catch (_) { /* Arr isn't answering */ }
+  if (ok) {
+    if (tab) tab.location.href = `${location.origin}/`;
+    else window.open(`${location.origin}/`, "_blank");
+    status.textContent = "Opened in a new tab.";
+    return;
+  }
+  if (tab) tab.close();
+  // Expired or already used: a new one, if this page can still ask for it.
+  try {
+    appLink = (await call("POST", "/api/app-link")).url;
+    status.textContent = "That sign-in didn't work. Click Open Arr to try again.";
+    button.disabled = false;
+  } catch (_) {
+    status.textContent = `That sign-in link has expired. Open ${location.origin} and use the new link the installer printed in the terminal, or run "arr app-link" there.`;
+  }
+});
+
+for (const b of document.querySelectorAll("button.copy")) {
+  b.addEventListener("click", async () => {
+    const node = $(b.dataset.from), note = b.nextElementSibling;
+    let ok = false;
+    try { await navigator.clipboard.writeText(node.textContent); ok = true; } catch (_) { /* select it instead */ }
+    if (!ok) {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      try { ok = document.execCommand("copy"); } catch (_) { /* by hand */ }
+    }
+    note.textContent = ok ? "Copied" : "Press Ctrl+C to copy";
+  });
+}
+
+// The code is always dark on white, so a phone can scan it in either theme.
+function qrSvg(text) {
+  const NS = "http://www.w3.org/2000/svg", pad = 3;
+  const q = qrcodegen.QrCode.encodeText(text, qrcodegen.QrCode.Ecc.MEDIUM);
+  const svg = document.createElementNS(NS, "svg"), bg = document.createElementNS(NS, "rect"), path = document.createElementNS(NS, "path");
+  let d = "";
+  for (let y = 0; y < q.size; y++) for (let x = 0; x < q.size; x++) if (q.getModule(x, y)) d += `M${x + pad},${y + pad}h1v1h-1z`;
+  svg.setAttribute("viewBox", `0 0 ${q.size + pad * 2} ${q.size + pad * 2}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `QR code for ${text}`);
+  svg.setAttribute("shape-rendering", "crispEdges");
+  bg.setAttribute("width", "100%"); bg.setAttribute("height", "100%"); bg.setAttribute("fill", "#fff");
+  path.setAttribute("d", d); path.setAttribute("fill", "#000");
+  svg.append(bg, path);
+  return svg;
+}
