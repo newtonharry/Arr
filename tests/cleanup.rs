@@ -38,7 +38,7 @@ async fn imported_movie(e: &Exec) -> Imported {
         .unwrap()
         .to_string();
     e.tick().await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(g.state, "imported", "{:?}", g.last_error);
@@ -61,8 +61,9 @@ async fn ownership_moves_and_symlinks_refuse_cleanup() {
     // Category changed by the user: treated as user-managed.
     let e = start_exec(ExecOptions::default()).await;
     let i = imported_movie(&e).await;
-    qb::seeded(&e.qb, &i.hash, 3.0, 9000, true);
-    e.qb.lock()
+    e.seeded(&i.hash, 3.0, 9000, true);
+    e.fake
+        .lock()
         .unwrap()
         .torrents
         .get_mut(&i.hash)
@@ -72,7 +73,7 @@ async fn ownership_moves_and_symlinks_refuse_cleanup() {
     let g = e.grab_row(&i.id);
     assert_eq!(g.cleanup, "blocked");
     assert!(g.cleanup_detail.unwrap().contains("user-managed"));
-    assert!(i.source.exists() && e.qb.lock().unwrap().torrents.contains_key(&i.hash));
+    assert!(i.source.exists() && e.fake.lock().unwrap().torrents.contains_key(&i.hash));
     let (_, v, _) = e.json(e.get(&format!("/api/v1/queue/{}", i.id))).await;
     assert_eq!(v["grab"]["status"], "cleanup_blocked");
     assert_library_intact(&i).await;
@@ -80,13 +81,14 @@ async fn ownership_moves_and_symlinks_refuse_cleanup() {
     // Moved by the user to another directory.
     let e = start_exec(ExecOptions::default()).await;
     let i = imported_movie(&e).await;
-    qb::seeded(&e.qb, &i.hash, 3.0, 9000, true);
-    e.qb.lock()
+    e.seeded(&i.hash, 3.0, 9000, true);
+    e.fake
+        .lock()
         .unwrap()
         .torrents
         .get_mut(&i.hash)
         .unwrap()
-        .save_path = "/downloads/elsewhere".into();
+        .save_path = format!("{}/elsewhere", arr::paths::client_form(&e.downloads));
     e.tick().await;
     let g = e.grab_row(&i.id);
     assert_eq!(g.cleanup, "blocked");
@@ -100,7 +102,7 @@ async fn ownership_moves_and_symlinks_refuse_cleanup() {
     // A directory inside the download replaced by a symlink into the library.
     let e = start_exec(ExecOptions::default()).await;
     let i = imported_movie(&e).await;
-    qb::seeded(&e.qb, &i.hash, 3.0, 9000, true);
+    e.seeded(&i.hash, 3.0, 9000, true);
     let sample_dir = e.downloads.join(format!("{NAME}/Sample"));
     std::fs::remove_dir_all(&sample_dir).unwrap();
     std::os::unix::fs::symlink(e.movies.join("The Matrix (1999)"), &sample_dir).unwrap();
@@ -109,7 +111,7 @@ async fn ownership_moves_and_symlinks_refuse_cleanup() {
     assert_eq!(g.cleanup, "blocked", "{:?}", g.cleanup_detail);
     assert!(g.cleanup_detail.unwrap().contains("symbolic link"));
     assert!(
-        e.qb.lock().unwrap().torrents.contains_key(&i.hash),
+        e.fake.lock().unwrap().torrents.contains_key(&i.hash),
         "the client was never asked to delete"
     );
     assert_library_intact(&i).await;
@@ -124,7 +126,7 @@ async fn ownership_moves_and_symlinks_refuse_cleanup() {
 async fn restart_at_the_removal_boundary_finishes_cleanup_and_never_redownloads() {
     let mut e = start_exec(ExecOptions::default()).await;
     let i = imported_movie(&e).await;
-    qb::seeded(&e.qb, &i.hash, 2.5, 9000, true);
+    e.seeded(&i.hash, 2.5, 9000, true);
     // Boundary 1: removal journaled, crash before the client was asked.
     let files = json!([{ "path": i.source, "size": std::fs::metadata(&i.source).unwrap().len(), "ino": ino(&i.source) }]).to_string();
     let (id, f2) = (i.id.clone(), files.clone());
@@ -134,7 +136,7 @@ async fn restart_at_the_removal_boundary_finishes_cleanup_and_never_redownloads(
         .unwrap();
     e.restart().await;
     e.tick().await; // still present and ours: asked again
-    assert!(!e.qb.lock().unwrap().torrents.contains_key(&i.hash));
+    assert!(!e.fake.lock().unwrap().torrents.contains_key(&i.hash));
     e.tick().await; // gone: finished
     let g = e.grab_row(&i.id);
     assert_eq!(
@@ -156,7 +158,7 @@ async fn restart_at_the_removal_boundary_finishes_cleanup_and_never_redownloads(
         .store
         .blocking(move |c| Ok(c.execute("UPDATE grabs SET cleanup = 'removing', cleanup_files = ?2, cleanup_at = '2026-01-01T00:00:00Z' WHERE id = ?1", rusqlite::params![id, files])?))
         .unwrap();
-    e.qb.lock().unwrap().torrents.remove(&i.hash);
+    e.fake.lock().unwrap().torrents.remove(&i.hash);
     e.restart().await;
     let report = e.tick().await;
     assert!(report.tasks.contains(&"downloads".to_string()));
@@ -179,7 +181,7 @@ async fn restart_at_the_removal_boundary_finishes_cleanup_and_never_redownloads(
     e.tick_at(time::OffsetDateTime::now_utc() + Duration::from_secs(3600))
         .await;
     assert_eq!(e.grab_row(&i.id).state, "imported");
-    assert_eq!(e.qb.lock().unwrap().add_fields.len(), 1);
+    assert_eq!(e.fake.lock().unwrap().add_fields.len(), 1);
     let (_, v, _) = e.json(e.get("/api/v1/blocklist")).await;
     assert!(v["items"].as_array().unwrap().is_empty());
 }
@@ -187,10 +189,8 @@ async fn restart_at_the_removal_boundary_finishes_cleanup_and_never_redownloads(
 #[tokio::test]
 async fn disabled_flags_keep_downloads() {
     // Native flags off.
-    let mut snap = snapshot();
-    snap["radarr"]["downloadclient"][0]["removeCompletedDownloads"] = json!(false);
     let e = start_exec(ExecOptions {
-        snapshot: snap,
+        download_extra: "remove_completed = false\n".into(),
         ..Default::default()
     })
     .await;
@@ -198,9 +198,9 @@ async fn disabled_flags_keep_downloads() {
     let g = e.grab_row(&i.id);
     assert_eq!(g.cleanup, "disabled");
     assert!(!g.remove_completed);
-    qb::seeded(&e.qb, &i.hash, 5.0, 99999, true);
+    e.seeded(&i.hash, 5.0, 99999, true);
     e.tick().await;
-    assert!(i.source.exists() && e.qb.lock().unwrap().torrents.contains_key(&i.hash));
+    assert!(i.source.exists() && e.fake.lock().unwrap().torrents.contains_key(&i.hash));
     let (_, v, _) = e.json(e.get(&format!("/api/v1/queue/{}", i.id))).await;
     assert_eq!(v["grab"]["status"], "imported");
     assert_eq!(v["grab"]["cleanup"]["state"], "disabled");
@@ -213,7 +213,7 @@ async fn disabled_flags_keep_downloads() {
     .await;
     let i = imported_movie(&e).await;
     assert_eq!(e.grab_row(&i.id).cleanup, "disabled");
-    qb::seeded(&e.qb, &i.hash, 5.0, 99999, true);
+    e.seeded(&i.hash, 5.0, 99999, true);
     e.tick().await;
     assert!(i.source.exists());
     let (_, v, _) = e.json(e.get("/api/v1/capabilities")).await;
@@ -221,7 +221,7 @@ async fn disabled_flags_keep_downloads() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["name"] == "download_cleanup")
+        .find(|c| c["name"] == "embedded_download_cleanup")
         .unwrap()
         .clone();
     assert_eq!(cap["configured"], false);
@@ -233,12 +233,12 @@ async fn unlimited_or_unknown_share_limits_keep_seeding() {
     let i = imported_movie(&e).await;
     // The user set the torrent to unlimited and paused it: never removed automatically.
     {
-        let mut q = e.qb.lock().unwrap();
+        let mut q = e.fake.lock().unwrap();
         let t = q.torrents.get_mut(&i.hash).unwrap();
         t.ratio_limit = -1.0;
         t.seeding_time_limit = -1;
     }
-    qb::seeded(&e.qb, &i.hash, 7.0, 999999, true);
+    e.seeded(&i.hash, 7.0, 999999, true);
     e.tick().await;
     assert!(i.source.exists());
     assert!(
@@ -249,13 +249,13 @@ async fn unlimited_or_unknown_share_limits_keep_seeding() {
     );
     // Global limits: enabled at ratio 1.5 but the indexer goal (2.0) is not met yet.
     {
-        let mut q = e.qb.lock().unwrap();
-        q.prefs = json!({ "max_ratio_enabled": true, "max_ratio": 1.5, "max_seeding_time_enabled": false, "max_seeding_time": -1 });
+        let mut q = e.fake.lock().unwrap();
+        q.ratio_limit = Some(1.5);
         let t = q.torrents.get_mut(&i.hash).unwrap();
         t.ratio_limit = -2.0;
         t.seeding_time_limit = -2;
     }
-    qb::seeded(&e.qb, &i.hash, 1.6, 999999, true);
+    e.seeded(&i.hash, 1.6, 999999, true);
     e.tick().await;
     assert!(i.source.exists());
     assert!(
@@ -266,7 +266,7 @@ async fn unlimited_or_unknown_share_limits_keep_seeding() {
         "{:?}",
         e.grab_row(&i.id).cleanup_detail
     );
-    qb::seeded(&e.qb, &i.hash, 2.0, 999999, true);
+    e.seeded(&i.hash, 2.0, 999999, true);
     e.tick().await;
     e.tick().await;
     assert_eq!(e.grab_row(&i.id).cleanup, "cleaned");
@@ -275,14 +275,7 @@ async fn unlimited_or_unknown_share_limits_keep_seeding() {
 
 #[tokio::test]
 async fn failed_download_cleanup_keeps_blocklist_and_retry_choice() {
-    let mut snap = snapshot();
-    snap["radarr"]["config/downloadclient"]["autoRedownloadFailed"] = json!(true);
-    let e = start_exec(ExecOptions {
-        snapshot: snap,
-        extra: "".into(),
-        ..Default::default()
-    })
-    .await;
+    let e = start_exec(ExecOptions::default()).await;
     let (hash, r) = e.publish(
         NAME,
         NAME,
@@ -316,7 +309,7 @@ async fn failed_download_cleanup_keeps_blocklist_and_retry_choice() {
     // (single-file torrent: the data lives directly in the save path)
     std::fs::write(e.downloads.join(format!("{NAME}.mkv")), b"partial").unwrap();
     std::fs::write(e.downloads.join("someone-elses.mkv"), b"untracked").unwrap();
-    qb::set_state(&e.qb, &hash, "stalledDL", 0.3);
+    e.set_state(&hash, "stalledDL", 0.3);
     e.tick_at(t0 + Duration::from_secs(60)).await; // progress since the last poll
     e.tick_at(t0 + Duration::from_secs(90)).await; // no progress: the stall timer starts
     e.tick_at(t0 + Duration::from_secs(60 + 13 * 3600)).await; // beyond the 12 h stall timeout
@@ -378,7 +371,7 @@ async fn explicit_removal_needs_met_seed_goal_or_override() {
         .await;
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["grab"]["cleanup"]["state"], "kept");
-    assert!(i.source.exists() && e.qb.lock().unwrap().torrents.contains_key(&i.hash));
+    assert!(i.source.exists() && e.fake.lock().unwrap().torrents.contains_key(&i.hash));
     // Explicit data removal while the goal is unmet: refused, actionable.
     let (s, v, _) = e
         .json(
@@ -405,7 +398,7 @@ async fn explicit_removal_needs_met_seed_goal_or_override() {
         )
         .await;
     assert_eq!(s, 200, "{v}");
-    assert!(!e.qb.lock().unwrap().torrents.contains_key(&i.hash));
+    assert!(!e.fake.lock().unwrap().torrents.contains_key(&i.hash));
     e.tick().await;
     assert_eq!(e.grab_row(&i.id).cleanup, "cleaned");
     assert!(!i.source.exists());

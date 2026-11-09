@@ -166,7 +166,6 @@ async fn silent_peer(to: SocketAddr, t: &TorrentFixture) -> tokio::task::JoinHan
 }
 
 struct Opts {
-    mode: &'static str,
     tmdb: bool,
     download_limit: Option<u32>,
     max_active: u32,
@@ -176,7 +175,6 @@ struct Opts {
 impl Default for Opts {
     fn default() -> Self {
         Opts {
-            mode: "coexistence",
             tmdb: false,
             download_limit: None,
             max_active: 3,
@@ -233,6 +231,7 @@ async fn start(o: Opts) -> Emb {
     } else {
         String::new()
     };
+
     let limit = o
         .download_limit
         .map(|l| format!("download_limit_bytes_per_sec = {l}\n"))
@@ -240,13 +239,12 @@ async fn start(o: Opts) -> Emb {
     let extra = format!(
         "[execution]\nenabled = true\ndownload_cleanup = true\n\
          [embedded]\ndownload_dir = '{dl}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ndht = false\nlocal_discovery = false\ninitial_peers = [\"{seed}\"]\nmax_active_downloads = {max}\n{limit}\
-         [migration]\nmode = '{mode}'\n\
+         [migration]\nmode = \"coexistence\"\n\
          [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = false\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 3600\n{stall}{tmdb}",
         dl = downloads.display(),
         seed = seeder.addr(),
         max = o.max_active,
-        mode = o.mode,
         movies = movies.display(),
         tv = tv.display(),
         stall = o
@@ -254,8 +252,12 @@ async fn start(o: Opts) -> Emb {
             .map(|m| format!("stall_timeout_minutes = {m}\n"))
             .unwrap_or_default(),
     );
-    write_state(&dir, &snapshot(), &extra, Some(mock_addr), true);
+    write_managed_config(&dir, mock_addr, true, &extra);
     let (state, base, server) = serve(&dir).await;
+    let client = reqwest::Client::new();
+    setup_managed(&base, &client).await;
+    seed_standard_library(&base, &client, &movies, &tv, true).await;
+    mock.lock().unwrap().log.clear();
     Emb {
         base,
         client: reqwest::Client::new(),
@@ -475,7 +477,10 @@ async fn a_new_movie_arrives_over_bittorrent_imports_and_seeds_to_ratio_two_acro
         .unwrap_or_else(|| panic!("{text}"))
         .to_string();
     let g = e.grab(&id);
-    assert_eq!((g.category.as_str(), g.seed_ratio), ("radarr", Some(2.0)));
+    assert_eq!(
+        (g.category.as_str(), g.seed_ratio),
+        ("um-movies", Some(2.0))
+    );
     assert_eq!(g.save_path, arr::paths::client_form(&e.downloads));
 
     // Real bytes from the controlled peer, every piece checked, then the normal import.
@@ -688,7 +693,6 @@ async fn a_season_pack_pauses_resumes_and_survives_an_abrupt_engine_stop() {
 #[tokio::test]
 async fn a_magnet_resolves_from_its_peer_and_unsafe_foreign_or_unaccounted_downloads_fail_closed() {
     let e = start(Opts {
-        mode: "legacy",
         ..Default::default()
     })
     .await;
@@ -797,7 +801,6 @@ async fn a_magnet_resolves_from_its_peer_and_unsafe_foreign_or_unaccounted_downl
 #[tokio::test]
 async fn grabs_beyond_the_active_download_limit_wait_in_the_outbox() {
     let e = start(Opts {
-        mode: "legacy",
         download_limit: Some(16 * 1024),
         max_active: 1,
         ..Default::default()
@@ -872,7 +875,7 @@ async fn a_state_is_bound_to_its_first_download_backend() {
         tmp.path().join("dl").display()
     );
     let (addr, _mock) = start_mock().await;
-    write_state(&dir, &snapshot(), &embedded, Some(addr), false);
+    write_managed_config(&dir, addr, false, &embedded);
     let state = api::AppState::new(config::load(&dir.join("config.toml")).unwrap()).unwrap();
     assert!(
         !state.client.as_ref().unwrap().embedded().unwrap().started(),
@@ -884,7 +887,7 @@ async fn a_state_is_bound_to_its_first_download_backend() {
         "{lib}[qbittorrent]\nbase_url = \"http://127.0.0.1:9/\"\nsave_path = \"/downloads\"\nlocal_path = '{}'\n",
         tmp.path().join("qb").display()
     );
-    write_state(&dir, &snapshot(), &qbit, Some(addr), false);
+    write_managed_config(&dir, addr, false, &qbit);
     let err = api::AppState::new(config::load(&dir.join("config.toml")).unwrap())
         .err()
         .unwrap();
@@ -918,14 +921,22 @@ async fn the_server_process_killed_mid_download_resumes_and_imports() {
         "[execution]\nenabled = true\ndownload_cleanup = true\n\
          [embedded]\ndownload_dir = '{}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\ninitial_peers = [\"{}\"]\ndownload_limit_bytes_per_sec = 16384\n\
          [migration]\nmode = \"coexistence\"\n\
-         [library]\nmovies = '{}'\nsample_detection = false\nprobe_timeout_secs = 30\n\
+         [library]\nmovies = '{}'\ntv = '{}'\nsample_detection = false\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 1\n\
          [tmdb]\nenabled = true\nbase_url = \"http://{mock_addr}/tmdb\"\ncredential_file = \"secrets/tmdb\"\n",
         downloads.display(),
         seeder.addr(),
-        movies.display()
+        movies.display(),
+        root.join("tv").display()
     );
-    write_state(&dir, &snapshot(), &extra, Some(mock_addr), false);
+    std::fs::create_dir_all(root.join("tv")).unwrap();
+    write_managed_config(&dir, mock_addr, false, &extra);
+    {
+        let (state, base, server) = serve(&dir).await;
+        setup_managed(&base, &reqwest::Client::new()).await;
+        server.abort();
+        drop(state);
+    }
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -1263,7 +1274,6 @@ async fn the_engine_lock_is_held_until_its_session_has_actually_stopped() {
 #[tokio::test]
 async fn concurrent_controls_fabricate_no_bytes_and_seeding_time_accrues_below_a_second() {
     let e = start(Opts {
-        mode: "legacy",
         ..Default::default()
     })
     .await;
@@ -1358,7 +1368,6 @@ async fn concurrent_controls_fabricate_no_bytes_and_seeding_time_accrues_below_a
 #[tokio::test]
 async fn a_replayed_add_of_an_active_torrent_counts_nothing_again_and_keeps_its_check() {
     let e = start(Opts {
-        mode: "legacy",
         ..Default::default()
     })
     .await;
@@ -1461,7 +1470,6 @@ async fn connected_without_data(e: &Emb, hash: &str) {
 #[tokio::test]
 async fn a_download_with_peers_connected_but_no_data_fails_at_the_stall_timeout() {
     let mut e = start(Opts {
-        mode: "legacy",
         stall_minutes: Some(30),
         ..Default::default()
     })
@@ -1549,7 +1557,6 @@ async fn a_download_with_peers_connected_but_no_data_fails_at_the_stall_timeout(
 #[tokio::test]
 async fn a_completed_payload_changed_while_stopped_is_checked_again_before_any_import() {
     let mut e = start(Opts {
-        mode: "legacy",
         ..Default::default()
     })
     .await;

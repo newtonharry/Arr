@@ -18,7 +18,7 @@ fn coexistence() -> ExecOptions {
     ExecOptions {
         mode: "coexistence",
         categories: CATS,
-        ..Default::default()
+        ..ExecOptions::legacy()
     }
 }
 
@@ -345,7 +345,7 @@ async fn coexistence_refuses_a_qbittorrent_category_any_native_client_uses() {
     // Default categories are the native ones.
     let e = start_exec(ExecOptions {
         mode: "coexistence",
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (s, v, text) = e
@@ -378,7 +378,7 @@ async fn coexistence_refuses_a_qbittorrent_category_any_native_client_uses() {
     let e = start_exec(ExecOptions {
         mode: "coexistence",
         categories: Some(("um-movies", "radarr")),
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (s, v, _) = e
@@ -783,7 +783,7 @@ async fn a_legacy_seeded_state_switched_to_coexistence_refuses_unadopted_items_a
     let mut e = start_exec(ExecOptions {
         mode: "legacy",
         categories: CATS,
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let cfg = e.dir.join("config.toml");
@@ -1047,7 +1047,7 @@ async fn preserve_monitoring_reports_native_specials_and_refuses_unsupported_tit
     let e = start_exec(ExecOptions {
         mode: "legacy",
         categories: CATS,
-        ..Default::default()
+        ..ExecOptions::legacy()
     })
     .await;
     let (s, _, _) = e

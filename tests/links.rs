@@ -91,7 +91,7 @@ fn last_add_magnet(e: &Exec) -> Option<String> {
 
 #[tokio::test]
 async fn http_magnet_url_proxy_is_fetched_queued_submitted_and_imported() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (hash, mut r) = matrix(&e);
     r["magnetUrl"] = json!(proxy(&e, &hash));
     r["downloadUrl"] = Value::Null;
@@ -143,7 +143,7 @@ async fn http_magnet_url_proxy_is_fetched_queued_submitted_and_imported() {
 #[tokio::test]
 async fn proxy_redirects_resolve_to_a_validated_magnet_or_a_same_origin_torrent() {
     // Magnet-only indexer: the proxy answers 302 to the magnet.
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (hash, mut r) = matrix(&e);
     let magnet = r["magnetUrl"].as_str().unwrap().to_string();
     e.mock
@@ -168,7 +168,7 @@ async fn proxy_redirects_resolve_to_a_validated_magnet_or_a_same_origin_torrent(
     assert!(e.qb.lock().unwrap().torrents.contains_key(&hash));
 
     // One same-origin hop to the torrent (relative `Location`).
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (hash, mut r) = matrix(&e);
     e.mock.lock().unwrap().redirects.insert(
         "hop".into(),
@@ -193,7 +193,7 @@ async fn proxy_redirects_resolve_to_a_validated_magnet_or_a_same_origin_torrent(
 #[tokio::test]
 async fn an_unusable_link_field_never_hides_a_usable_one() {
     for case in 0..5 {
-        let e = start_exec(ExecOptions::default()).await;
+        let e = start_exec(ExecOptions::legacy()).await;
         let (hash, r) = matrix(&e);
         let magnet = r["magnetUrl"].as_str().unwrap().to_string();
         let good = proxy(&e, &hash);
@@ -243,7 +243,7 @@ async fn an_unusable_link_field_never_hides_a_usable_one() {
 
 #[tokio::test]
 async fn links_that_cannot_be_resolved_fail_closed_without_leaking() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (hash, _) = matrix(&e);
     let base = format!("http://{}/prowlarr", e.mock_addr);
     {
@@ -371,7 +371,7 @@ async fn links_that_cannot_be_resolved_fail_closed_without_leaking() {
 
 #[tokio::test]
 async fn an_execution_that_queues_nothing_says_so_and_keeps_the_request() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (_, mut r) = matrix(&e);
     r["magnetUrl"] = json!(format!(
         "http://tracker.invalid/1/download?apikey={PROWLARR_KEY}&passkey={FAKE_PASSKEY}"
@@ -436,7 +436,7 @@ fn requests(e: &Exec) -> Vec<Value> {
 
 #[tokio::test]
 async fn a_partially_refused_execution_keeps_the_request_until_the_missing_unit_is_queued() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let ep = |n: u8| format!("Parity.Partial.S01E0{n}.1080p.WEB-DL.x264-NEW");
     let (e1_hash, e1) = e.publish(
         &ep(1),
@@ -536,7 +536,7 @@ async fn a_partially_refused_execution_keeps_the_request_until_the_missing_unit_
 
 #[tokio::test]
 async fn a_refusal_for_an_already_queued_unit_creates_no_request() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions::legacy()).await;
     let (_, r) = matrix(&e);
     e.search_results("The Matrix 1999", vec![r]);
     // A shadow plan, then the same release is grabbed interactively.

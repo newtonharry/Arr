@@ -1,3 +1,6 @@
+//! LEGACY-ONLY (removed with the qBittorrent client): used by the suites that test that
+//! integration. The managed stack uses `arr::client::fake` instead.
+//!
 //! Loopback qBittorrent WebUI API mock: 4.3.9 (WebAPI 2.8.2) or 5.x (2.11) behaviour, cookie
 //! sessions, multipart adds, hash-filtered info, files/properties/preferences, pause/resume vs
 //! stop/start, delete (with real file deletion on the shared local directory), and injectable

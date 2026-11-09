@@ -6,41 +6,36 @@
 mod common;
 
 use common::*;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::path::Path;
 
 const OLD: &str = "Parity.Show.S01E01.1080p.WEB-DL.x264-OLD.mkv";
 
-/// The synthetic snapshot plus "Parity Show" (tvdb 999002): three aired episodes, E01 owned
-/// with full native EpisodeFile evidence (WEBDL-1080p, revision 1).
-fn parity_snapshot(e01_revision: Option<i64>) -> Value {
-    let mut s = snapshot();
-    s["sonarr"]["series"].as_array_mut().unwrap().push(json!({
-        "id": 30, "title": "Parity Show", "alternateTitles": [], "year": 2024, "tvdbId": 999002, "seriesType": "standard", "runtime": 50,
-        "originalLanguage": { "id": 1, "name": "English" }, "status": "continuing", "monitored": true, "qualityProfileId": 6,
-        "path": "/tvshows/Parity Show",
-        "seasons": [{ "seasonNumber": 1, "monitored": true, "statistics": { "episodeFileCount": 1, "episodeCount": 3, "totalEpisodeCount": 3 } }],
-    }));
-    let mut quality = json!({ "quality": { "id": 3, "name": "WEBDL-1080p", "source": "web", "resolution": 1080 } });
-    if let Some(v) = e01_revision {
-        quality["revision"] = json!({ "version": v, "real": 0, "isRepack": false });
+/// A managed library with "Parity Show" (tvdb 999002): three aired episodes, E01 owned by a
+/// file on disk (WEBDL-1080p, revision 1) when `owned`.
+async fn parity(o: ExecOptions, owned: bool) -> Exec {
+    let e = start_exec(o).await;
+    if owned {
+        place_old_file(&e);
     }
-    let ep = |n: i64, owned: bool| {
-        let mut e = json!({ "seasonNumber": 1, "episodeNumber": n, "title": format!("Ep {n}"), "airDateUtc": format!("2024-05-0{n}T02:00:00Z"), "runtime": 50, "hasFile": owned, "monitored": true });
-        if owned {
-            e["episodeFile"] = json!({ "relativePath": format!("Season 1/{OLD}"), "size": 1234, "quality": quality.clone() });
-        }
-        e
-    };
-    s["sonarr"]["episode_samples"]["30"] = json!([ep(1, true), ep(2, false), ep(3, false)]);
-    s
+    e.add("series:tvdb:999002").await;
+    e
 }
 
 fn place_old_file(e: &Exec) -> std::path::PathBuf {
     let p = e.tv.join("Parity Show/Season 1").join(OLD);
-    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(&p, mkv(1)).unwrap();
+    if !p.exists() {
+        put(&e.tv, &format!("Parity Show/Season 1/{OLD}"), &mkv(1));
+    }
     p
+}
+
+/// The native "propers and repacks: prefer and upgrade" setting, as a managed policy.
+fn revisions() -> ExecOptions {
+    ExecOptions {
+        tv_extra: "revision_upgrades = true\n".into(),
+        ..Default::default()
+    }
 }
 
 async fn grab_episode(
@@ -74,10 +69,13 @@ fn episode_owned(e: &Exec, n: u16) -> bool {
 
 #[tokio::test]
 async fn unplayable_media_fails_is_blocklisted_and_never_owned() {
-    let e = start_exec(ExecOptions {
-        snapshot: parity_snapshot(Some(1)),
-        ..Default::default()
-    })
+    let e = parity(
+        ExecOptions {
+            tv_extra: "redownload_failed = false\n".into(),
+            ..Default::default()
+        },
+        true,
+    )
     .await;
     let full = mkv(3);
     let cases: Vec<(u16, &str, Vec<u8>)> = vec![
@@ -94,7 +92,7 @@ async fn unplayable_media_fails_is_blocklisted_and_never_owned() {
     ];
     for (ep, title, bytes) in cases {
         let (id, hash) = grab_episode(&e, ep, title, vec![(format!("{title}.mkv"), bytes)]).await;
-        qb::complete(&e.qb, &hash);
+        e.complete(&hash);
         e.tick().await;
         let g = e.grab_row(&id);
         assert_eq!(
@@ -142,7 +140,7 @@ async fn unplayable_media_fails_is_blocklisted_and_never_owned() {
         )],
     )
     .await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     assert_eq!(e.grab_row(&id).failure.as_deref(), Some("invalid_media"));
 }
@@ -150,16 +148,11 @@ async fn unplayable_media_fails_is_blocklisted_and_never_owned() {
 #[cfg(unix)] // Unix permissions or symlinks
 #[tokio::test]
 async fn symlinks_existing_destinations_and_free_space_block_without_writing() {
-    let mut snap = parity_snapshot(Some(1));
-    let e = start_exec(ExecOptions {
-        snapshot: snap.clone(),
-        ..Default::default()
-    })
-    .await;
+    let e = parity(ExecOptions::default(), true).await;
     // 1. The completed source was replaced by a symlink pointing elsewhere.
     let title = "Parity.Show.S01E02.1080p.WEB-DL.x264-LINK";
     let (id, hash) = grab_episode(&e, 2, title, vec![(format!("{title}.mkv"), mkv(2))]).await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     let src = e.downloads.join(format!("{title}.mkv"));
     let elsewhere = e.downloads.parent().unwrap().join("outside.mkv");
     std::fs::write(&elsewhere, mkv(2)).unwrap();
@@ -191,7 +184,7 @@ async fn symlinks_existing_destinations_and_free_space_block_without_writing() {
     std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
     std::fs::write(&existing, b"user's own file").unwrap();
     let (id, hash) = grab_episode(&e, 3, title, vec![(format!("{title}.mkv"), mkv(2))]).await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(g.state, "import_blocked");
@@ -212,17 +205,17 @@ async fn symlinks_existing_destinations_and_free_space_block_without_writing() {
     assert!(existing.is_file() && episode_owned(&e, 3));
 
     // 3. Minimum free space far above what the disk has: blocked, nothing written.
-    for app in ["radarr", "sonarr"] {
-        snap[app]["config/mediamanagement"]["minimumFreeSpaceWhenImporting"] = json!(1u64 << 40);
-    }
-    let e = start_exec(ExecOptions {
-        snapshot: snap,
-        ..Default::default()
-    })
+    let e = parity(
+        ExecOptions {
+            tv_extra: "minimum_free_space_mb = 10000000\n".into(),
+            ..Default::default()
+        },
+        true,
+    )
     .await;
     let title = "Parity.Show.S01E02.1080p.WEB-DL.x264-SPACE";
     let (id, hash) = grab_episode(&e, 2, title, vec![(format!("{title}.mkv"), mkv(2))]).await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(g.state, "import_blocked");
@@ -260,18 +253,19 @@ fn walk(dir: &Path) -> Vec<String> {
 
 #[tokio::test]
 async fn copy_fallback_and_native_sample_durations() {
-    let mut snap = parity_snapshot(Some(1));
-    snap["sonarr"]["config/mediamanagement"]["copyUsingHardlinks"] = json!(false);
-    let e = start_exec(ExecOptions {
-        snapshot: snap,
-        sample_detection: true,
-        ..Default::default()
-    })
+    let e = parity(
+        ExecOptions {
+            tv_extra: "copy_using_hardlinks = false\n".into(),
+            sample_detection: true,
+            ..Default::default()
+        },
+        true,
+    )
     .await;
     // A 3-second file for a 50-minute runtime is a sample (native minimum 600 s).
     let title = "Parity.Show.S01E02.1080p.WEB-DL.x264-SHORT";
     let (id, hash) = grab_episode(&e, 2, title, vec![(format!("{title}.mkv"), mkv(3))]).await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(g.failure.as_deref(), Some("invalid_media"));
@@ -281,18 +275,17 @@ async fn copy_fallback_and_native_sample_durations() {
         "{err}"
     );
 
-    let e = start_exec(ExecOptions {
-        snapshot: {
-            let mut s = parity_snapshot(Some(1));
-            s["sonarr"]["config/mediamanagement"]["copyUsingHardlinks"] = json!(false);
-            s
+    let e = parity(
+        ExecOptions {
+            tv_extra: "copy_using_hardlinks = false\n".into(),
+            ..Default::default()
         },
-        ..Default::default()
-    })
+        true,
+    )
     .await;
     let title = "Parity.Show.S01E02.1080p.WEB-DL.x264-COPY";
     let (id, hash) = grab_episode(&e, 2, title, vec![(format!("{title}.mkv"), mkv(2))]).await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     assert_eq!(e.grab_row(&id).state, "imported");
     let dest = e.tv.join(format!("Parity Show/Season 1/{title}.mkv"));
@@ -306,21 +299,8 @@ async fn copy_fallback_and_native_sample_durations() {
 
 #[tokio::test]
 async fn season_pack_maps_exact_multi_episode_ownership() {
-    let mut snap = parity_snapshot(Some(1));
     // Nothing owned yet in this variant.
-    for e in snap["sonarr"]["episode_samples"]["30"]
-        .as_array_mut()
-        .unwrap()
-    {
-        e["hasFile"] = json!(false);
-        e.as_object_mut().unwrap().remove("episodeFile");
-    }
-    snap["sonarr"]["series"][2]["seasons"][0]["statistics"]["episodeFileCount"] = json!(0);
-    let e = start_exec(ExecOptions {
-        snapshot: snap,
-        ..Default::default()
-    })
-    .await;
+    let e = parity(ExecOptions::default(), false).await;
     let name = "Parity.Show.S01.1080p.WEB-DL.x264-UM";
     let files = vec![
         (
@@ -350,7 +330,7 @@ async fn season_pack_maps_exact_multi_episode_ownership() {
     let g = e.grab_row(&id);
     assert_eq!(g.targets.len(), 3);
     e.tick().await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(g.state, "imported", "{:?}", g.last_error);
@@ -387,11 +367,7 @@ async fn season_pack_maps_exact_multi_episode_ownership() {
 
 #[tokio::test]
 async fn native_revision_upgrade_replaces_only_the_managed_file() {
-    let e = start_exec(ExecOptions {
-        snapshot: parity_snapshot(Some(1)),
-        ..Default::default()
-    })
-    .await;
+    let e = parity(revisions(), true).await;
     let old = place_old_file(&e);
     let old_bytes = std::fs::read(&old).unwrap();
     // Ordinary search of an owned episode: nothing (owned, upgrades off).
@@ -458,7 +434,7 @@ async fn native_revision_upgrade_replaces_only_the_managed_file() {
         .to_string();
     assert!(e.grab_row(&id).targets[0].replaces);
     e.tick().await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(g.state, "imported", "{:?}", g.last_error);
@@ -496,12 +472,18 @@ async fn native_revision_upgrade_replaces_only_the_managed_file() {
 #[tokio::test]
 async fn unknown_revision_fails_closed_and_import_time_recheck_protects_the_original() {
     // Unknown revision in the native evidence: no revision upgrade is planned.
-    let e = start_exec(ExecOptions {
-        snapshot: parity_snapshot(None),
-        ..Default::default()
-    })
-    .await;
+    let e = parity(revisions(), true).await;
     place_old_file(&e);
+    e.state
+        .store
+        .blocking(|c| {
+            Ok(c.execute(
+                "UPDATE files SET revision_version = NULL, revision_real = NULL WHERE path LIKE '%-OLD.mkv'",
+                [],
+            )?)
+        })
+        .unwrap();
+    e.state.reload_index().await.unwrap();
     let proper = "Parity.Show.S01E01.PROPER.1080p.WEB-DL.x264-UM";
     let (_, r) = e.publish(
         proper,
@@ -527,11 +509,7 @@ async fn unknown_revision_fails_closed_and_import_time_recheck_protects_the_orig
     );
 
     // Known revision at plan time, but the evidence changes before import (equal now): refused.
-    let e = start_exec(ExecOptions {
-        snapshot: parity_snapshot(Some(1)),
-        ..Default::default()
-    })
-    .await;
+    let e = parity(revisions(), true).await;
     let old = place_old_file(&e);
     let (hash, r) = e.publish(
         proper,
@@ -561,7 +539,7 @@ async fn unknown_revision_fails_closed_and_import_time_recheck_protects_the_orig
         })
         .unwrap();
     e.state.reload_index().await.unwrap();
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(g.state, "import_blocked");
@@ -575,11 +553,7 @@ async fn unknown_revision_fails_closed_and_import_time_recheck_protects_the_orig
 
 #[tokio::test]
 async fn crash_recovery_restores_originals_and_rolls_back_uncommitted_imports() {
-    let mut e = start_exec(ExecOptions {
-        snapshot: parity_snapshot(Some(1)),
-        ..Default::default()
-    })
-    .await;
+    let mut e = parity(ExecOptions::default(), true).await;
     let old = place_old_file(&e);
     let original = std::fs::read(&old).unwrap();
     let season = old.parent().unwrap().to_path_buf();
@@ -683,14 +657,10 @@ async fn crash_recovery_restores_originals_and_rolls_back_uncommitted_imports() 
 #[tokio::test]
 async fn unreadable_sources_block_instead_of_failing_the_release() {
     use std::os::unix::fs::PermissionsExt;
-    let e = start_exec(ExecOptions {
-        snapshot: parity_snapshot(Some(1)),
-        ..Default::default()
-    })
-    .await;
+    let e = parity(ExecOptions::default(), true).await;
     let title = "Parity.Show.S01E02.1080p.WEB-DL.x264-PERM";
     let (id, hash) = grab_episode(&e, 2, title, vec![(format!("{title}.mkv"), mkv(2))]).await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     let src = e.downloads.join(format!("{title}.mkv"));
     std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
     if std::fs::File::open(&src).is_ok() {
@@ -712,11 +682,7 @@ async fn unreadable_sources_block_instead_of_failing_the_release() {
 
 #[tokio::test]
 async fn a_lower_resolution_proper_is_not_an_exact_quality_revision() {
-    let e = start_exec(ExecOptions {
-        snapshot: parity_snapshot(Some(1)),
-        ..Default::default()
-    })
-    .await;
+    let e = parity(revisions(), true).await;
     let old = place_old_file(&e);
     let original = std::fs::read(&old).unwrap();
     // Advertised as the owned WEBDL-1080p with a higher revision; the file is 720p.
@@ -739,7 +705,7 @@ async fn a_lower_resolution_proper_is_not_an_exact_quality_revision() {
         .unwrap_or_else(|| panic!("{text}"))
         .to_string();
     e.tick().await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(

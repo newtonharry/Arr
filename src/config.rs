@@ -56,6 +56,18 @@ struct FileConfig {
     mcp: Option<McpSection>,
     #[serde(default)]
     reporting: ReportingSection,
+    /// Tests only (`test-client` feature): the in-memory download client replaces the
+    /// embedded engine. The section does not exist in a release build, which rejects it.
+    #[cfg(feature = "test-client")]
+    test_client: Option<TestClientSection>,
+}
+
+#[cfg(feature = "test-client")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestClientSection {
+    /// The registry key of the shared in-memory state (`client::fake::handle`).
+    id: String,
 }
 
 /// Opt-in error reports (docs/PRIVACY.md): off unless the user said yes during setup.
@@ -976,6 +988,9 @@ pub struct RuntimeConfig {
     pub mcp: Option<McpConfig>,
     /// Send scrubbed error reports (`[reporting] enabled`, docs/PRIVACY.md).
     pub reporting: bool,
+    /// Tests only: the id of the in-memory download client that replaces the embedded engine.
+    #[cfg(feature = "test-client")]
+    pub test_client: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -1631,6 +1646,8 @@ pub fn parse_config(
             indexers,
             mcp,
             reporting: fc.reporting.enabled,
+            #[cfg(feature = "test-client")]
+            test_client: fc.test_client.map(|t| t.id),
         },
         pending,
     ))

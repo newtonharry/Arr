@@ -2,14 +2,22 @@
 //! process. Configuration selects exactly one; there is no fallback between them. Both speak
 //! the same normalised view (`qbit::TorrentInfo` and friends), so acquisition, monitoring,
 //! import and cleanup policies are shared.
+//!
+//! With the `test-client` feature (integration tests only; never in a release build) a third
+//! implementation, `Fake`, replaces the embedded engine when `[test_client]` is configured.
 
 use crate::embedded::Embedded;
 use crate::qbit::{AddRequest, Preferences, Properties, Qbit, TorrentFile, TorrentInfo};
 use crate::upstream::UpstreamError;
 
+#[cfg(feature = "test-client")]
+pub mod fake;
+
 pub enum Client {
     Qbit(Qbit),
     Embedded(Embedded),
+    #[cfg(feature = "test-client")]
+    Fake(fake::Fake),
 }
 
 impl Client {
@@ -18,6 +26,8 @@ impl Client {
         match self {
             Client::Qbit(_) => "qbittorrent",
             Client::Embedded(_) => "embedded",
+            #[cfg(feature = "test-client")]
+            Client::Fake(_) => "embedded",
         }
     }
 
@@ -26,27 +36,36 @@ impl Client {
         match self {
             Client::Qbit(_) => "qbittorrent",
             Client::Embedded(_) => "embedded engine",
+            #[cfg(feature = "test-client")]
+            Client::Fake(_) => "embedded engine",
         }
+    }
+
+    /// Whether this client has the embedded engine's semantics (no qBittorrent behind it).
+    pub fn embedded_semantics(&self) -> bool {
+        !matches!(self, Client::Qbit(_))
     }
 
     pub fn embedded(&self) -> Option<&Embedded> {
         match self {
             Client::Embedded(e) => Some(e),
-            Client::Qbit(_) => None,
+            _ => None,
         }
     }
 
     pub fn qbit(&self) -> Option<&Qbit> {
         match self {
             Client::Qbit(q) => Some(q),
-            Client::Embedded(_) => None,
+            _ => None,
         }
     }
 
-    pub fn save_path(&self) -> &str {
+    pub fn save_path(&self) -> String {
         match self {
-            Client::Qbit(q) => q.save_path(),
-            Client::Embedded(e) => e.save_path(),
+            Client::Qbit(q) => q.save_path().to_string(),
+            Client::Embedded(e) => e.save_path().to_string(),
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.save_path(),
         }
     }
 
@@ -54,6 +73,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.info(hashes).await,
             Client::Embedded(e) => e.info(hashes).await,
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.info(hashes).await,
         }
     }
 
@@ -61,6 +82,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.files(hash).await,
             Client::Embedded(e) => e.files(hash).await,
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.files(hash).await,
         }
     }
 
@@ -68,6 +91,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.add(req).await,
             Client::Embedded(e) => e.add(req).await,
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.add(req).await,
         }
     }
 
@@ -75,6 +100,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.pause(hash).await,
             Client::Embedded(e) => e.pause(hash).await,
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.pause(hash).await,
         }
     }
 
@@ -82,6 +109,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.resume(hash).await,
             Client::Embedded(e) => e.resume(hash).await,
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.resume(hash).await,
         }
     }
 
@@ -90,6 +119,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.delete(hash, delete_files).await,
             Client::Embedded(e) => e.delete(hash, delete_files).await,
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.delete(hash).await,
         }
     }
 
@@ -98,7 +129,7 @@ impl Client {
     pub async fn set_force_start(&self, hash: &str) -> Result<(), UpstreamError> {
         match self {
             Client::Qbit(q) => q.set_force_start(hash).await,
-            Client::Embedded(_) => Ok(()),
+            _ => Ok(()),
         }
     }
 
@@ -106,6 +137,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.set_category(hash, category).await,
             Client::Embedded(e) => e.set_category(hash, category).await,
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.set_category(hash, category).await,
         }
     }
 
@@ -113,6 +146,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.preferences().await,
             Client::Embedded(e) => Ok(e.preferences()),
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => Ok(f.preferences()),
         }
     }
 
@@ -120,6 +155,8 @@ impl Client {
         match self {
             Client::Qbit(q) => q.properties(hash).await,
             Client::Embedded(e) => e.properties(hash).await,
+            #[cfg(feature = "test-client")]
+            Client::Fake(f) => f.properties(hash).await,
         }
     }
 }

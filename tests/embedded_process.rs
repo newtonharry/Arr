@@ -167,7 +167,26 @@ async fn sigkill_recovers_partial_download_then_real_upload_accounting() {
         seed.listen_addr().unwrap(),
         movies.display()
     );
-    common::write_state(&state, &common::snapshot(), &extra, Some(mock_addr), false);
+    common::write_managed_config(&state, mock_addr, false, &extra);
+    // The ratio-two seed goal (the setup default is ratio one).
+    let settings = root.join("setup.toml");
+    std::fs::write(
+        &settings,
+        "[[indexers]]\nid = 1\nseed_ratio = 2.0\nseed_time_minutes = -1\n",
+    )
+    .unwrap();
+    let setup = std::process::Command::new(env!("CARGO_BIN_EXE_arr"))
+        .args(["setup", "--config"])
+        .arg(state.join("config.toml"))
+        .arg("--settings")
+        .arg(&settings)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
     let config_path = state.join("config.toml");
     let config_text = std::fs::read_to_string(&config_path).unwrap().replacen(
         "[server]\n",

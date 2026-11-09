@@ -364,6 +364,11 @@ right to.
   cargo test --locked                 # needs /usr/bin/ffmpeg
   ```
 
+  The integration tests run the default stack (managed setup, a native Torznab indexer) with
+  an in-memory stand-in for the download engine. It lives behind the `test-client` cargo
+  feature, which `cargo test` switches on through a dev-dependency of the crate on itself; a
+  release build never contains it and rejects the `[test_client]` config section it uses.
+
 - **Migrating from Sonarr/Radarr, Prowlarr or qBittorrent.** Arr can import their settings
   and keep using Prowlarr or qBittorrent; see [docs/MIGRATION.md](docs/MIGRATION.md).
 

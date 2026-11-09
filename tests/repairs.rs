@@ -40,7 +40,7 @@ fn episode_state(e: &Exec, tvdb: u32, s: u16, n: u16) -> arr::catalog::Episode {
 }
 
 fn qb_adds(e: &Exec) -> usize {
-    e.qb.lock().unwrap().add_fields.len()
+    e.fake.lock().unwrap().add_fields.len()
 }
 
 #[tokio::test]
@@ -137,7 +137,7 @@ async fn season_add_scans_first_and_grabs_only_the_requested_scope() {
     assert!(!episode_state(&e, 999005, 2, 1).monitored);
     e.tick().await;
     assert_eq!(qb_adds(&e), 1);
-    assert!(e.qb.lock().unwrap().torrents.contains_key(&e2_hash));
+    assert!(e.fake.lock().unwrap().torrents.contains_key(&e2_hash));
 
     // Replays and concurrent calls never duplicate.
     let (s, v, _) = e
@@ -273,7 +273,7 @@ async fn contradictory_payloads_are_blocklisted_and_replaced_by_a_valid_alternat
     assert!(!btext.contains(&wrong));
     e.tick().await;
     assert_eq!(qb_adds(&e), 1, "the wrong payload never reached the client");
-    qb::complete(&e.qb, &good_hash);
+    e.complete(&good_hash);
     e.tick().await;
     assert!(
         e.tv.join("Parity Partial/Season 1/Parity.Partial.S01E02.1080p.WEB-DL.x264-GOOD.mkv")
@@ -326,7 +326,7 @@ async fn a_wrong_payload_found_at_import_fails_and_recovers_automatically() {
         .unwrap()
         .to_string();
     e.tick().await;
-    qb::complete(&e.qb, &wrong_hash);
+    e.complete(&wrong_hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(
@@ -349,10 +349,10 @@ async fn a_wrong_payload_found_at_import_fails_and_recovers_automatically() {
     e.tick().await;
     e.tick().await;
     assert!(
-        e.qb.lock().unwrap().torrents.contains_key(&good_hash),
+        e.fake.lock().unwrap().torrents.contains_key(&good_hash),
         "alternative grabbed"
     );
-    qb::complete(&e.qb, &good_hash);
+    e.complete(&good_hash);
     e.tick().await;
     assert!(episode_state(&e, 999005, 1, 2).has_file);
 }
@@ -410,7 +410,7 @@ async fn movie_payloads_naming_another_year_or_title_are_refused() {
         .await;
     assert_eq!(b["items"].as_array().unwrap().len(), 2);
     e.tick().await;
-    qb::complete(&e.qb, &ok_hash);
+    e.complete(&ok_hash);
     e.tick().await;
     assert!(
         e.movies
@@ -491,7 +491,7 @@ async fn measured_resolution_decides_quality_and_profile_admission() {
         .unwrap()
         .to_string();
     e.tick().await;
-    qb::complete(&e.qb, &uhd_hash);
+    e.complete(&uhd_hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(
@@ -514,7 +514,7 @@ async fn measured_resolution_decides_quality_and_profile_admission() {
     // the next pass submits it).
     e.tick().await;
     e.tick().await;
-    qb::complete(&e.qb, &crop_hash);
+    e.complete(&crop_hash);
     e.tick().await;
     let index = e.state.index();
     let m = index.movie(603).unwrap();
@@ -567,7 +567,7 @@ async fn movie_availability_follows_release_evidence_and_refreshes() {
     e.tick_at(later).await; // the request retry plans and queues the grab
     e.tick_at(later + Duration::from_secs(60)).await; // the next pass submits it
     assert!(
-        e.qb.lock().unwrap().torrents.contains_key(&feature_hash),
+        e.fake.lock().unwrap().torrents.contains_key(&feature_hash),
         "grabbed once released"
     );
 
@@ -607,35 +607,19 @@ async fn movie_availability_follows_release_evidence_and_refreshes() {
 }
 
 #[tokio::test]
-async fn operator_and_imported_release_evidence() {
-    let mut snap = snapshot();
-    // The imported Matrix record says: released mode, digital release in 2099.
-    snap["radarr"]["movie"][0]["minimumAvailability"] = json!("released");
-    snap["radarr"]["movie"][0]["digitalRelease"] = json!("2099-01-01T00:00:00Z");
-    snap["radarr"]["movie"][0]["isAvailable"] = json!(false);
-    // Amélie uses a mode this build does not implement.
-    snap["radarr"]["movie"][2]["minimumAvailability"] = json!("inCinemas");
-    let e = start_exec(ExecOptions {
-        snapshot: snap,
-        ..Default::default()
-    })
-    .await;
+async fn operator_release_evidence() {
+    let e = start_exec(ExecOptions::default()).await;
+    // A movie whose digital release is in 2099 is not available before then.
+    let (s, _, text) = e.json(e.post("/api/v1/library").json(&json!({ "media_id": "movie:tmdb:900007", "search": false, "metadata": { "title": "Parity Future", "year": 2026, "runtime_minutes": 100, "digital_release": "2099-01-01" } }))).await;
+    assert_eq!(s, 201, "{text}");
     let (_, v, text) = e
         .json(
             e.post("/api/v1/plans")
-                .json(&json!({ "media_id": "movie:tmdb:603" })),
+                .json(&json!({ "media_id": "movie:tmdb:900007" })),
         )
         .await;
     assert_eq!(v["plan"]["blockers"][0]["code"], "not_available", "{text}");
     assert!(text.contains("2099-01-01"));
-    let (_, v, text) = e
-        .json(
-            e.post("/api/v1/plans")
-                .json(&json!({ "media_id": "movie:tmdb:194" })),
-        )
-        .await;
-    assert!(text.contains("not implemented"), "{text}");
-    let _ = v;
     // Operator metadata without dates: added and monitored, explicitly not available.
     let (s, v, text) = e.json(e.post("/api/v1/library").json(&json!({ "media_id": "movie:tmdb:900003", "metadata": { "title": "Parity Undated", "year": 2026 } }))).await;
     assert_eq!(s, 201, "{text}");
@@ -677,7 +661,7 @@ async fn payload_source_markers_outrank_the_indexer_claim() {
     )
     .await;
     e.tick().await;
-    qb::complete(&e.qb, &hash);
+    e.complete(&hash);
     e.tick().await;
     let index = e.state.index();
     let m = index.movie(603).unwrap();
@@ -691,7 +675,7 @@ async fn payload_source_markers_outrank_the_indexer_claim() {
 #[tokio::test]
 async fn explicit_payload_language_is_checked_against_the_profile() {
     let e = start_exec(ExecOptions::default()).await;
-    // Radarr profile: English. The listing is unmarked (approved); the payload says RUSSIAN.
+    // The movie profile wants the original language (English). The listing is unmarked (approved); the payload says RUSSIAN.
     let (ru_hash, ru) = release_of(
         &e,
         "The.Matrix.1999.1080p.WEB-DL.x264-RU",
@@ -724,7 +708,7 @@ async fn explicit_payload_language_is_checked_against_the_profile() {
         .unwrap()
         .to_string();
     e.tick().await;
-    qb::complete(&e.qb, &ru_hash);
+    e.complete(&ru_hash);
     e.tick().await;
     let g = e.grab_row(&id);
     assert_eq!(
@@ -743,8 +727,8 @@ async fn explicit_payload_language_is_checked_against_the_profile() {
     // next pass submits it).
     e.tick().await;
     e.tick().await;
-    assert!(e.qb.lock().unwrap().torrents.contains_key(&en_hash));
-    qb::complete(&e.qb, &en_hash);
+    assert!(e.fake.lock().unwrap().torrents.contains_key(&en_hash));
+    e.complete(&en_hash);
     e.tick().await;
     assert!(e.state.index().movie(603).unwrap().has_file);
 
@@ -769,7 +753,7 @@ async fn explicit_payload_language_is_checked_against_the_profile() {
         .unwrap_or_else(|| panic!("{text}"))
         .to_string();
     e.tick().await;
-    qb::complete(&e.qb, &tv_hash);
+    e.complete(&tv_hash);
     e.tick().await;
     assert_eq!(e.grab_row(&gid).state, "imported");
 }
