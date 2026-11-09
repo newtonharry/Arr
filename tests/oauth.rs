@@ -696,7 +696,7 @@ async fn sign_in_issues_tokens_that_survive_a_restart_and_refresh_rotates() {
     assert_eq!(v["expires_in"], 3600);
     let (at, rt) = mcp_tokens(&v);
     assert!(at.starts_with("arr_at_") && rt.starts_with("arr_rt_"));
-    assert_eq!(list_tools(&env, &at).await, 7);
+    assert_eq!(list_tools(&env, &at).await, 8);
 
     // Refresh rotates: the old refresh token is dead, the new pair works.
     let (s, v) = env
@@ -709,11 +709,11 @@ async fn sign_in_issues_tokens_that_survive_a_restart_and_refresh_rotates() {
         .token(&[("grant_type", "refresh_token"), ("refresh_token", &rt)])
         .await;
     assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
-    assert_eq!(list_tools(&env, &at2).await, 7);
+    assert_eq!(list_tools(&env, &at2).await, 8);
 
     // Tokens survive a restart, and only their hashes are stored.
     env.restart(&[EMAIL]).await;
-    assert_eq!(list_tools(&env, &at2).await, 7);
+    assert_eq!(list_tools(&env, &at2).await, 8);
     let raw = std::fs::read(env.dir.path().join("oauth.sqlite")).unwrap();
     assert!(!String::from_utf8_lossy(&raw).contains(&at2));
     let (s, v) = env

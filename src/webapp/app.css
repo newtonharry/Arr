@@ -198,3 +198,4 @@ body.sheet-open{overflow:hidden}
 .sbtn .meta{white-space:normal}
 .what .st{color:var(--ink);font-size:16px}
 .ask{justify-content:flex-start}
+.act:has(.ask){flex-basis:100%;margin-left:0}

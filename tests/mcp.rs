@@ -24,9 +24,10 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 const BIN: &str = env!("CARGO_BIN_EXE_arr");
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 8] = [
     "search_titles",
     "add_media",
+    "stop",
     "media_status",
     "requests",
     "library",
@@ -304,7 +305,7 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
     let tools = listings[0].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, TOOLS);
-    let expected: [(&str, &[&str], &[&str], bool); 7] = [
+    let expected: [(&str, &[&str], &[&str], bool); 8] = [
         (
             "search_titles",
             &["kind", "q", "year"],
@@ -312,6 +313,7 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
             true,
         ),
         ("add_media", &["media_id"], &["media_id"], false),
+        ("stop", &["media_id"], &["media_id"], false),
         ("media_status", &["media_id"], &["media_id"], true),
         ("requests", &["limit"], &[], true),
         (
@@ -404,6 +406,8 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
         assert!(description(tool).starts_with("Manual mode only"), "{tool}");
     }
     assert!(description("start_download").contains("explicitly chose"));
+    assert!(description("stop").starts_with("Stop getting a movie, season or episode"));
+    assert!(description("stop").contains("Never deletes anything already in Plex"));
     for tool in TOOLS {
         assert!(!description(tool).contains("changes nothing"), "{tool}");
     }
@@ -1346,4 +1350,50 @@ async fn the_token_never_leaves_through_stdout_stderr_or_results() {
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn stop_ends_the_search_for_a_wanted_movie_and_says_what_happened() {
+    let e = start_exec(ExecOptions {
+        tmdb: true,
+        ..coexistence()
+    })
+    .await;
+    let token = e.dir.join("secrets/api_token");
+    let s = launch(Launch::new(&e.base, &token)).await;
+    // No release exists: the movie is wanted and Arr keeps looking.
+    let r = s
+        .call("add_media", json!({ "media_id": "movie:tmdb:900001" }))
+        .await;
+    ok(&r);
+    let r = s
+        .call("stop", json!({ "media_id": "movie:tmdb:900001" }))
+        .await;
+    let v = ok(&r);
+    assert_eq!(
+        (v["stopped"].clone(), v["cancelled"].clone()),
+        (json!(true), json!(0)),
+        "{v}"
+    );
+    let message = v["message"].as_str().unwrap();
+    assert!(
+        message.contains("Cancelled 0 downloads") && message.contains("Nothing already in Plex"),
+        "{message}"
+    );
+    let r = s
+        .call("media_status", json!({ "media_id": "movie:tmdb:900001" }))
+        .await;
+    assert_eq!(ok(&r)["monitored"], false);
+    // Whole series are not stopped here, and something Arr never had changed nothing.
+    let r = s
+        .call("stop", json!({ "media_id": "series:tvdb:372264" }))
+        .await;
+    assert_eq!(failed(&r).0, "invalid_arguments");
+    let r = s
+        .call("stop", json!({ "media_id": "movie:tmdb:777" }))
+        .await;
+    let (code, v) = failed(&r);
+    assert_eq!(code, "not_managed", "{v}");
+    assert_eq!(v["outcome"], "not_applied");
+    s.finish().await;
 }
