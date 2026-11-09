@@ -39,6 +39,8 @@ jobs:
       - name: Rollback to the latest release
         env:
           ARR_CARGO_FLAGS: --locked
+          # Signed-in downloads keep working when GitHub's anonymous downloads are timing out.
+          GH_TOKEN: ${{ github.token }}
         run: sh tests/upgrade/rollback.sh target/release/arr
 
   # The macOS installer path: the real "Install Plex for me", install.sh with remote access
