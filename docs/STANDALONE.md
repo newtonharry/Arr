@@ -172,6 +172,24 @@ The process stops gracefully on SIGTERM (the worker finishes its pass, the engin
 counters). `RUST_LOG` controls logging (stderr). Keep the API on loopback; for anything else
 set `allow_non_loopback = true` deliberately and put TLS in front.
 
+`install.sh` and `install.ps1` write the equivalent for you, in one of two modes, and choosing
+one changes only the service definitions (the binary, config and state folder are the same):
+
+- **Starts at boot** (before anyone logs in): a system-wide systemd unit; a per-user systemd
+  unit with lingering on (`loginctl enable-linger`); on macOS launch daemons in
+  `/Library/LaunchDaemons` that run as the installing user (`UserName`), with the same labels
+  as the login items; on Windows tasks with an `AtStartup` trigger (and `AtLogOn`) that run as
+  you whether or not you're logged on (S4U, no stored password).
+- **Starts at log-in**: a per-user systemd unit without lingering; on macOS LaunchAgents; on
+  Windows tasks that start at log-on.
+
+Putting a service in the first mode on a Mac or on Windows needs an administrator once; an
+installer run with nobody to ask (`--yes`, the daily updater) never asks, and keeps whichever
+mode is installed. To restart Arr without administrator rights in the first mode, end your own
+`arr serve` process on macOS (launchd's `KeepAlive` starts it again from the binary on disk), or
+`Stop-ScheduledTask Arr; Start-ScheduledTask Arr` on Windows (the installer gives your account
+control of the tasks it registered for you).
+
 ## Release binary
 
 ```bash

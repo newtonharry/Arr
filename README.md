@@ -38,7 +38,9 @@ The script takes a few minutes. It:
      starts it at every log-in, and makes `~/Media/Movies` and `~/Media/TV Shows`;
    - Windows: see below;
 4. imports your Plex library, so Arr knows what you own. It downloads nothing at this step;
-5. starts Arr as a service (systemd on Linux, launchd on macOS);
+5. starts Arr as a service (systemd on Linux, launchd on macOS), and can start it when the
+   computer starts rather than when you log in (see
+   [Starting when the computer starts](#starting-when-the-computer-starts));
 6. offers to set up access from ChatGPT on your phone (see below; you can say no and do it
    later).
 
@@ -62,15 +64,63 @@ On the PC that runs Plex, open PowerShell (Start menu, type "PowerShell") and pa
 irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex
 ```
 
-It needs no administrator rights. It installs FFmpeg with `winget` if it's missing (it asks
-first), opens the same setup page, and starts Arr in the background whenever you log in, as
-Plex itself does on Windows. Arr lives in `%LOCALAPPDATA%\Programs\Arr`, its config and data
+It needs no administrator rights, except to start Arr when the computer starts (see
+[Starting when the computer starts](#starting-when-the-computer-starts)). It installs FFmpeg
+with `winget` if it's missing (it asks first), opens the same setup page, and starts Arr in the
+background whenever you log in, as Plex itself does on Windows, or at boot if you choose that.
+Arr lives in `%LOCALAPPDATA%\Programs\Arr`, its config and data
 in `%LOCALAPPDATA%\Arr` (only your account can open it), and its log in
 `%LOCALAPPDATA%\Arr\arr.log`. Windows Firewall may ask whether `arr-background` may accept
 connections: allowing it lets other torrent peers reach you, which makes downloads faster.
 Options are environment variables, listed at the top of
 [`install.ps1`](install.ps1). At the end it offers to set up access from ChatGPT on your phone
 (see below).
+
+### Starting when the computer starts
+
+After a power cut a Plex box often sits at its login screen. Arr can start before anyone logs
+in, with its tunnel (and the daily update job), on every system:
+
+- **Linux, installed with `sudo`:** always. The systemd service starts at boot.
+- **Linux, installed without `sudo`:** the installer turns on lingering (`loginctl enable-linger`),
+  which lets your user services start at boot and keep running after you log out. It tries
+  without a password; at a terminal it then runs `sudo loginctl enable-linger <you>` (one
+  password prompt); with nobody to ask it prints that command.
+- **macOS:** the installer asks "Start Arr when this computer starts, even before anyone logs
+  in?" (default yes). Yes installs launch daemons in `/Library/LaunchDaemons` with the same names
+  as the login items; they run as you, with your files, and the login items are removed so two
+  copies never fight over the port. It needs your admin password once. If FileVault is on, the
+  Mac still waits at its unlock screen after a power cut; Arr starts as soon as it is unlocked.
+  Media on an external drive or in Desktop, Documents or Downloads may need `arr` added under
+  System Settings, Privacy & Security, Full Disk Access.
+- **Windows:** the installer asks the same question (default yes). Yes re-registers the **Arr**,
+  **Arr tunnel** and **Arr update** tasks to also start at boot and to run whether or not you're
+  logged on (no password stored; they still run as you, not as an administrator). Windows asks
+  permission once (a UAC prompt), or run the installer from a PowerShell opened as
+  administrator. It has to be your own account that is an administrator: a standard user who
+  approves the prompt with another administrator's password stays on start-at-log-in, and the
+  installer says so. Windows gives a task like that no network credentials, so media on a network
+  drive mapped to a letter (`Z:`) isn't reachable until you log in: use a local drive.
+
+For scripts: `--at-boot` or `--no-at-boot` (`install.sh`), `$env:ARR_AT_BOOT = '1'` or `'0'`
+(`install.ps1`; PowerShell's `irm | iex` can't take flags). Without a flag the question is asked
+only when someone is at the terminal. An install run with nobody to ask (`--yes` without
+`--at-boot`, no terminal, and the daily update job) never asks for a password: it keeps the
+kind of install you have, leaves its service definitions as they are if changing them would need
+an administrator, and still swaps the binary, restarts Arr, checks it answers and goes back to
+the old version if it doesn't. To change the kind later, run the installer again with the flag;
+switching back from boot to log-in also needs the password.
+
+An older Arr's tools don't know about boot services, and are safe to leave in place until you
+run the installer again (it rewrites the updater every time). On a Mac, an updater from before
+this existed can't restart a system daemon: it swaps the binary, sees the new version never
+answered, and puts the old one back, so Arr keeps running but doesn't update. An old
+`install.sh` run against a start-at-boot Mac adds a login item next to the daemon; the two fight
+over the port until the next run of the current installer, which removes the login item. On
+Windows, an old updater works on the boot tasks as they are (you can start and stop them). An
+old installer registers the Arr task at log-on again: either that works and the install goes
+back to starting at log-in, or Windows refuses and the installer stops with an error while Arr
+keeps running. Run the current installer again to start at boot.
 
 ### Updates
 
@@ -146,8 +196,10 @@ command again restarts it too, or:
 
 - Linux, installed with `sudo`: `sudo systemctl restart arr`
 - Linux, installed without: `systemctl --user restart arr`
-- macOS: `launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr`
-- Windows, in PowerShell: `Stop-ScheduledTask Arr; Start-ScheduledTask Arr`
+- macOS: `launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr`; if Arr starts at boot
+  it is a system daemon that runs as you, so end your own process instead and launchd starts it
+  again: `pkill -u "$(id -u)" -f 'arr serve'` (or `sudo launchctl kickstart -k system/io.github.newtonharry.arr`)
+- Windows, in PowerShell: `Stop-ScheduledTask Arr; Start-ScheduledTask Arr` (also when Arr starts at boot)
 
 #### Changing library folders, Plex libraries or Arr's port
 
@@ -237,7 +289,8 @@ should ask you first: updates change the software on your machine without furthe
 
 Useful flags: `--movies DIR`, `--tv DIR`, `--downloads DIR`, `--plex-url URL`, `--port N`,
 `--upload-limit-kib N`, `--search-only` (don't download; `arr set ... downloading on` turns it
-on later), `--install-only`.
+on later), `--install-only`, `--at-boot` / `--no-at-boot` (without a terminal the installer
+never asks for a password, so on a Mac `--at-boot` is what lets it use `sudo`: tell the user).
 `install.sh --help` lists them all.
 
 To confirm the install worked, the agent can run `arr check --config <state dir>/config.toml`;

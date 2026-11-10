@@ -102,6 +102,65 @@ grep -A1 '^\[reporting\]$' "$state/config.toml" | grep -q '^enabled = false$' ||
 [ "$(arr_pid)" != "$pid" ] || fail "a rerun that changed a setting didn't restart Arr"
 still_running "a rerun with --no-error-reports"
 
+echo "== --at-boot: launch daemons that run as you, started before anyone logs in"
+label=io.github.newtonharry
+daemons=/Library/LaunchDaemons
+# A sudo that records its use and refuses: from here on, nothing may need a password.
+shim=$(mktemp -d)
+printf '#!/bin/sh\necho "$*" >>"%s/sudo.called"\nexit 1\n' "$shim" >"$shim/sudo"
+chmod +x "$shim/sudo"
+daemon_pid() { sudo launchctl print "system/$label.arr" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p'; }
+# Passwordless sudo on the runner stands in for the one password a person types.
+if sh install.sh "$@" --at-boot >boot.out 2>&1; then cat boot.out; fail "the public check passed on --at-boot"; fi
+ends_at_public_check boot.out "--at-boot"
+for p in arr arr-tunnel; do
+	[ -f "$daemons/$label.$p.plist" ] || { cat boot.out; fail "no $p daemon"; }
+	[ "$(stat -f %Su "$daemons/$label.$p.plist")" = root ] || fail "the $p daemon isn't root's file"
+	[ ! -e "$HOME/Library/LaunchAgents/$label.$p.plist" ] || fail "the $p login item is still there next to its daemon"
+	sudo plutil -lint "$daemons/$label.$p.plist" >/dev/null || fail "the $p daemon is not a valid plist"
+done
+grep -q "<key>UserName</key><string>$(id -un)</string>" "$daemons/$label.arr.plist" || fail "the daemon doesn't run as you"
+pid=$(daemon_pid)
+[ -n "$pid" ] || { sudo launchctl print "system/$label.arr"; fail "launchd shows no running Arr daemon"; }
+[ "$(ps -o user= -p "$pid" | tr -d ' ')" = "$(id -un)" ] || fail "the Arr daemon doesn't run as $(id -un)"
+curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "the daemon doesn't answer"
+[ "$(stat -f %Su "$state/arr.log")" = "$(id -un)" ] || fail "arr.log isn't yours"
+[ "$(stat -f %Su "$state/config.toml")" = "$(id -un)" ] || fail "config.toml isn't yours"
+[ ! -e "$shim/sudo.called" ] || fail "the sudo shim was called"
+
+echo "== a rerun without a terminal asks for no password and restarts Arr by ending its process"
+if PATH="$shim:$PATH" sh install.sh --yes --no-auto-update >unattended.out 2>&1; then cat unattended.out; fail "the public check passed on a rerun"; fi
+ends_at_public_check unattended.out "an unattended rerun"
+[ ! -e "$shim/sudo.called" ] || { cat "$shim/sudo.called"; fail "an unattended rerun used sudo"; }
+new=$(daemon_pid)
+[ -n "$new" ] && [ "$new" != "$pid" ] || fail "an unattended rerun didn't restart the daemon (pid $pid -> $new)"
+curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "arr doesn't answer after the unattended rerun"
+[ -f "$daemons/$label.arr.plist" ] && [ ! -e "$HOME/Library/LaunchAgents/$label.arr.plist" ] || fail "an unattended rerun changed the kind of install"
+
+echo "== the updater at boot: restarts Arr, and rolls back, with no password"
+# "v99.0.0" is served, but holds this build: Arr answers as the old version, so the updater
+# must put the old binary back and start it again.
+python3 tests/installer/relserver.py 8996 "$dist" >/dev/null 2>&1 &
+relserver=$!
+trap 'kill $server $relserver 2>/dev/null || true' EXIT
+sleep 1
+if sh install.sh "$@" --at-boot --auto-update >update-install.out 2>&1; then cat update-install.out; fail "the public check passed"; fi
+[ -f "$daemons/$label.arr-update.plist" ] || { cat update-install.out; fail "no update daemon"; }
+[ ! -e "$HOME/Library/LaunchAgents/$label.arr-update.plist" ] || fail "an update login item next to the update daemon"
+cp "$HOME/.local/bin/arr" arr.before
+pid=$(daemon_pid)
+if ARR_RELEASES_URL=http://127.0.0.1:8996/releases PATH="$shim:$PATH" sh "$HOME/.local/bin/arr-update" >update.out 2>&1; then
+	cat update.out; fail "the updater called a version that never answered a success"
+fi
+cat update.out
+grep -q "v99.0.0 didn't start; going back" update.out || fail "the updater didn't roll back"
+! grep -q "didn't start either" update.out || fail "the old version didn't come back"
+cmp -s "$HOME/.local/bin/arr" arr.before || fail "the old binary wasn't put back"
+[ ! -e "$shim/sudo.called" ] || { cat "$shim/sudo.called"; fail "the updater used sudo"; }
+curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "Arr was left stopped by the rollback"
+new=$(daemon_pid)
+[ -n "$new" ] && [ "$new" != "$pid" ] || fail "the updater never restarted the daemon"
+
 echo "== running as root on a Mac is refused"
 if sudo sh install.sh --yes >root.out 2>&1; then cat root.out; fail "install.sh ran as root on a Mac"; fi
 grep -q 'without sudo' root.out || { cat root.out; fail "the refusal doesn't say to run it without sudo"; }
@@ -110,9 +169,11 @@ echo "== uninstall Arr and Plex, keeping media"
 sh uninstall.sh --yes --all --delete-data
 [ ! -e "$app" ] || fail "the Plex app is still there"
 [ ! -e "$HOME/Library/LaunchAgents/io.github.newtonharry.plex.plist" ] || fail "Plex's login agent is still there"
-for p in arr arr-tunnel; do
+for p in arr arr-tunnel arr-update; do
 	[ ! -e "$HOME/Library/LaunchAgents/io.github.newtonharry.$p.plist" ] || fail "$p login agent is still there"
+	[ ! -e "/Library/LaunchDaemons/io.github.newtonharry.$p.plist" ] || fail "$p launch daemon is still there"
 done
+! sudo launchctl print system/io.github.newtonharry.arr >/dev/null 2>&1 || fail "the Arr daemon is still loaded"
 [ ! -e "$state" ] || fail "Arr's data is still there"
 [ ! -e "$HOME/.local/bin/arr" ] || fail "the arr program is still there"
 [ -f "$HOME/Media/Movies/keep.mkv" ] || fail "media was deleted"

@@ -141,6 +141,12 @@ ARR_FOUND=""
 SYSTEM_UNIT=/etc/systemd/system/arr.service
 USER_UNIT="${XDG_CFG:-$U_HOME/.config}/systemd/user/arr.service"
 PLIST="$U_HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
+# Started at boot, a Mac's Arr is a launch daemon that runs as the user who installed it.
+LD_DIR="${ARR_LAUNCH_DAEMONS_DIR:-/Library/LaunchDaemons}" # (the variable is for tests)
+DPLIST="$LD_DIR/io.github.newtonharry.arr.plist"
+daemon_mine() { # daemon_mine <plist>: is it the daemon of the user running this?
+	[ -f "$1" ] && [ "$(sed -n 's#.*<key>UserName</key><string>\([^<]*\)</string>.*#\1#p' "$1" | head -n1)" = "${SUDO_USER:-$(id -un)}" ]
+}
 unquote() { sed 's/%%/%/g; s/\$\$/$/g; s/\\"/"/g; s/\\\\/\\/g'; }
 from_unit() { # from_unit <unit file>: sets ARR_BIN and ARR_CONFIG from ExecStart
 	line=$(sed -n 's/^ExecStart=//p' "$1" | head -n1)
@@ -188,6 +194,7 @@ toml_paths() { # toml_paths <file> <key regex>
 ARR_BIN="" ARR_CONFIG=""
 if [ -f "$SYSTEM_UNIT" ]; then from_unit "$SYSTEM_UNIT"; ARR_FOUND="system service"
 elif [ -f "$USER_UNIT" ]; then from_unit "$USER_UNIT"; ARR_FOUND="user service"
+elif daemon_mine "$DPLIST"; then from_plist "$DPLIST"; ARR_FOUND="start-at-boot service"
 elif [ -f "$PLIST" ]; then from_plist "$PLIST"; ARR_FOUND="login item"; fi
 [ -z "$BIN_DIR" ] || ARR_BIN="$BIN_DIR/arr"
 [ -z "$STATE_DIR" ] || ARR_CONFIG="$STATE_DIR/config.toml"
@@ -337,6 +344,12 @@ if [ "$DO_ARR" = 1 ]; then
 		run $AS_USER systemctl --user daemon-reload || true
 	fi
 	for p in arr arr-tunnel arr-update; do
+		# The start-at-boot daemon (removing it asks for your password through sudo), then the login item.
+		d="$LD_DIR/io.github.newtonharry.$p.plist"
+		if daemon_mine "$d"; then
+			run $SUDO launchctl bootout "system/io.github.newtonharry.$p" 2>/dev/null || true
+			remove_file "$d"
+		fi
 		f="$U_HOME/Library/LaunchAgents/io.github.newtonharry.$p.plist"
 		[ -f "$f" ] || continue
 		if [ -n "$AS_USER" ]; then run launchctl bootout "gui/$U_UID" "$f" 2>/dev/null || true
