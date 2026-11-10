@@ -38,7 +38,8 @@ initial_peers = []                   # default none: explicit peers for every to
 max_active_downloads = 3             # 1..100; further grabs wait in the outbox, no attempt counted
 # ratio_limit = 2.0                  # 0..1000: share limit when the indexer sets no seed ratio
 # seeding_time_limit_minutes = 4320  # 0..5256000: same, for seeding time
-metadata_timeout_secs = 60           # 5..600: magnet metadata wait
+metadata_timeout_secs = 180          # 5..600: magnet metadata wait per attempt
+# upnp = false                       # default true: ask the router to forward the torrent port (opt-out; never written by Arr)
 # movie_category = "um-movies"       # labels; default: the imported native client category
 # tv_category = "um-tv"
 ```
@@ -50,7 +51,7 @@ metadata_timeout_secs = 60           # 5..600: magnet metadata wait
 - a `download_dir` inside or around the state directory, or overlapping a library root;
 - a malformed `listen` or `initial_peers` entry;
 - a zero rate limit, or an out-of-range limit;
-- unknown keys (for example `upnp`; UPnP is never enabled).
+- unknown keys, and a `upnp` that is not true or false.
 
 **Refused at engine start** (and so at `serve` startup):
 - a symlink anywhere in `download_dir` or its ancestors;
@@ -262,7 +263,10 @@ download-directory binding, persisted state, symlinks, admission) are stated in 
 
 **Visibility.**
 - `GET /api/v1/diagnostics` gives `download_client.backend` and `embedded`:
-  - engine, status, listen address and transport (`tcp`);
+  - engine, status, listen address and transport (`tcp+utp`);
+  - `ipv6` (whether the listener is really dual-stack), `upnp` and `upnp_mapping`, and
+    `connections`: outgoing connection attempts, successes and errors since the engine
+    started, per transport (`tcp`, `utp`) and address family (`v4`, `v6`). Counts only;
   - the DHT, LSD, UPnP, PEX and tracker settings;
   - aggregates of the engine's own state: `torrents`, `engine_states` (checking,
     downloading, seeding, paused, error, complete), `live_peers`, and the measured
@@ -276,10 +280,16 @@ download-directory binding, persisted state, symlinks, admission) are stated in 
   counts for the engine.
 
 **Networking.**
-- **Off by default:** DHT and LSD. UPnP is never on.
+- **Off by default:** DHT and LSD. **On by default:** UPnP; set `upnp = false` to opt out.
+  Arr never writes this key. Only the torrent listen port is mapped: librqbit asks the
+  router for one TCP mapping of that port (the same external and internal number), with a
+  60 s lease renewed every 30 s, and searches for a gateway every 60 s. It maps nothing
+  else (never the Arr web port, and not the uTP/UDP port) and reports no result.
 - **Trackers:** on by default.
-- **Transport:** TCP only, IPv4-only when `listen` is IPv4. librqbit can also do uTP; this
-  app does not configure it.
+- **Transport:** TCP and uTP on the same port number. When `listen` is `0.0.0.0` the
+  engine binds `[::]` with the same port, which accepts IPv4 and IPv6 (DHT and trackers
+  then give IPv6 peers too); a host without IPv6 stays on IPv4. Any other `listen` address
+  is used exactly as written, so `127.0.0.1` stays IPv4 on loopback.
 - **Private torrents:** librqbit uses no DHT, LSD or PEX for them, and only their first
   tracker.
 - **PEX** cannot be disabled in librqbit 9.0.1 for public torrents. It only learns
@@ -460,7 +470,7 @@ seeding obligation remains.
     full piece check re-runs; they never silently accept it.
 - **Not implemented:** sequential download, first/last-piece priority and the Subfolder
   layout (refused); per-torrent rate limits (session-wide only); queue priorities (only the
-  outbox limit). uTP is supported by librqbit, but this app configures TCP only.
+  outbox limit).
 - **Startup cost.**
   - With `initial_peers`, every incomplete torrent is re-added at engine start, which
     re-checks its data. This is needed because librqbit 9.0.1 neither persists explicit
@@ -470,7 +480,12 @@ seeding obligation remains.
 - **Kept data is not reused.** Data kept by a forget-only cancel is not reused by a later
   grab of the same release (it is refused as unadmitted existing files).
 - **Magnet wait.** Magnet metadata is fetched during submission, up to
-  `metadata_timeout_secs`.
+  `metadata_timeout_secs` (default 180 s). A timed-out attempt drops the magnet from the
+  engine, so the peers found so far are lost and the next attempt starts again.
+- **Slots.** A queued grab starts when fewer than `max_active_downloads` downloads are
+  making progress. A download with no progress for 5 minutes, and a grab still waiting for
+  magnet metadata, do not use a slot. At most `2 × max_active_downloads` incomplete grabs
+  are in the engine at once, however idle.
 - **Counters are approximate.** Within one observation interval they undercount, never
   overcount.
 - **Private torrents.** librqbit uses only the first tracker of a private multi-tracker
