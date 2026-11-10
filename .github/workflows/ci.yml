@@ -372,7 +372,7 @@ jobs:
           if ($i -lt 0) { Fail 'cannot find the end of install.ps1' }
           Invoke-Expression $text.Substring(0, $i) # its functions, without running the installer
           $pw = 'Arr-ci-' + [guid]::NewGuid().ToString('N')
-          net user arrtest $pw /add | Out-Null
+          net user arrtest $pw /add /Y | Out-Null
           if ($LASTEXITCODE) { Fail 'cannot create the test user' }
           $user = "$env:COMPUTERNAME\arrtest"
           $dir = 'C:\ProgramData\arr-ci'
