@@ -6,7 +6,10 @@ use crate::{config, fsutil, metadata::Tmdb, plex::Plex, tmdbkey, upstream::Upstr
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
-pub const NAMES: &str = "tmdb-key, plex-token, plex-url, downloading, upload-limit-kib, torrent-port, error-reports, api-token, mcp-token";
+pub const NAMES: &str = "tmdb-key, plex-token, plex-url, downloading, upload-limit-kib, torrent-port, error-reports, default-indexers, api-token, mcp-token";
+
+/// Remembers that Knaben was offered, so removing it later sticks (a file beside config.toml).
+pub const INDEXER_MARKER: &str = "default-indexers";
 
 /// What a secret setting is called when asking for it, or `None` when the value (if any)
 /// comes from the command line. Unknown names are an error.
@@ -15,7 +18,7 @@ pub fn secret(name: &str) -> Result<Option<&'static str>> {
         "tmdb-key" => Some("TMDB key"),
         "plex-token" => Some("Plex token"),
         "plex-url" | "downloading" | "upload-limit-kib" | "torrent-port" | "error-reports"
-        | "api-token" | "mcp-token" => None,
+        | "default-indexers" | "api-token" | "mcp-token" => None,
         _ => bail!("there's no setting called {name:?}; settings: {NAMES}"),
     })
 }
@@ -52,6 +55,12 @@ pub async fn run(config_path: &Path, name: &str, value: Option<&str>) -> Result<
     let dir = config_path.parent().context("the config has no folder")?;
     let table: toml::Table = toml::from_str(&old)
         .with_context(|| format!("{} isn't a valid config", config_path.display()))?;
+    if name == "default-indexers" {
+        if value.is_some_and(|v| !v.trim().is_empty()) {
+            bail!("`arr set default-indexers` takes no value");
+        }
+        return default_indexers(config_path, &old, &table, dir).await;
+    }
     let plan = plan(&table, dir, name, value)?;
     // The line editor can't handle every way TOML can say a key (dotted or quoted keys,
     // values over several lines), so the result must say exactly what was meant.
@@ -117,6 +126,76 @@ pub async fn run(config_path: &Path, name: &str, value: Option<&str>) -> Result<
             Err(anyhow::anyhow!(e))
         }
     }
+}
+
+/// The Knaben entry added to an install that searches The Pirate Bay (its id is chosen).
+fn knaben_entry(id: u32) -> String {
+    format!(
+        "[[indexer]]\nid = {id}\nname = \"Knaben\"\nkind = \"knaben\"\nbase_url = \"https://api.knaben.org/\"\n"
+    )
+}
+
+/// Adds Knaben to an install that still has only the default public source. Nothing existing
+/// is touched: the entry is appended with the lowest free id from 2. It is added once: when
+/// Knaben is configured, was offered before (the marker file) or the install doesn't use The
+/// Pirate Bay (Prowlarr, or its own indexers), the config is left as it is.
+async fn default_indexers(
+    config_path: &Path,
+    old: &str,
+    table: &toml::Table,
+    dir: &Path,
+) -> Result<String> {
+    let marker = dir.join(INDEXER_MARKER);
+    let remember = || fsutil::atomic_replace_private(&marker, b"knaben\n");
+    let entries: &[toml::Value] = table
+        .get("indexer")
+        .and_then(toml::Value::as_array)
+        .map_or(&[], Vec::as_slice);
+    let kinds: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("kind").and_then(toml::Value::as_str))
+        .collect();
+    if table.contains_key("prowlarr") {
+        return Ok("This install searches through Prowlarr; no search source was added.".into());
+    }
+    if kinds.contains(&"knaben") {
+        if !marker.exists() {
+            remember()?;
+        }
+        return Ok("Knaben is already a search source here.".into());
+    }
+    if marker.exists() {
+        return Ok("Knaben was offered before and isn't configured; left as it is. Add it to config.toml to use it (config/standalone.example.toml).".into());
+    }
+    if !kinds.contains(&"thepiratebay") {
+        return Ok(
+            "No search source was added: this install doesn't use the default public source."
+                .into(),
+        );
+    }
+    let used: Vec<i64> = entries
+        .iter()
+        .filter_map(|e| e.get("id").and_then(toml::Value::as_integer))
+        .collect();
+    let id = (2..).find(|i| !used.contains(&i64::from(*i))).unwrap_or(2);
+    let nl = if old.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut text = old.trim_end().to_string();
+    text.push_str(nl);
+    text.push_str(nl);
+    text.push_str(&knaben_entry(id).replace('\n', nl));
+    // Added to a config that loads, and the result must load too, or the old text goes back.
+    fsutil::atomic_replace_private(config_path, text.as_bytes())?;
+    if let Err(e) = config::load(config_path).context("Arr wouldn't start with that change") {
+        let mut e = format!("{e:#}");
+        if let Err(r) = fsutil::atomic_replace_private(config_path, old.as_bytes()) {
+            e += &format!(", and couldn't put back {}: {r:#}", config_path.display());
+        }
+        bail!(e);
+    }
+    remember()?;
+    Ok(format!(
+        "Added Knaben as search source {id}, next to The Pirate Bay. Run `arr setup` and restart Arr to use it."
+    ))
 }
 
 /// The first of `keys` that `text` doesn't set to the intended value under `[section]` (or
@@ -314,6 +393,7 @@ fn usage(name: &str) -> &'static str {
     match name {
         "plex-url" => "Plex's address, like http://127.0.0.1:32400",
         "downloading" | "error-reports" => "on or off",
+        "default-indexers" => "no value",
         "upload-limit-kib" => "KiB/s, 0 for no limit",
         _ => "a port from 1 to 65535",
     }

@@ -274,6 +274,27 @@ function Install-Arr {
 		if ($env:ARR_UPLOAD_LIMIT_KIB) { Set-Arr upload-limit-kib $UploadLimit }
 		if ($env:ARR_TORRENT_PORT) { Set-Arr torrent-port $TorrentPort }
 		if ($env:ARR_ERROR_REPORTS) { Set-Arr error-reports $(if ($env:ARR_ERROR_REPORTS -eq '1') { 'on' } else { 'off' }) }
+		# Knaben next to The Pirate Bay, once (arr set default-indexers adds it only to an install
+		# that still has the default source, and never again after it was taken out). Optional: a
+		# failure carries on without it. Running setup again gives it its policy and keeps the
+		# profiles and goals already there.
+		$beforeIndexers = "$Config.before-indexers"
+		Copy-Item $Config $beforeIndexers -Force
+		$out = Run-Arr set --config $Config default-indexers
+		if ($LASTEXITCODE -ne 0) {
+			Write-Warning "$(($out -join ' ') -replace '^Error: ', ''); carrying on without the new search source."
+		} else {
+			Say $out
+			if ((Get-FileHash $Config).Hash -ne (Get-FileHash $beforeIndexers).Hash) {
+				Run-Arr setup --config $Config --add-default-indexers | Out-Null
+				if ($LASTEXITCODE -ne 0) {
+					Copy-Item $beforeIndexers $Config -Force
+					Remove-Item (Join-Path $StateDir 'default-indexers') -Force -ErrorAction SilentlyContinue
+					Write-Warning "arr setup didn't accept the new search source, so it was not added; Arr carries on as it was."
+				}
+			}
+		}
+		Remove-Item $beforeIndexers -Force -ErrorAction SilentlyContinue
 	} else {
 		Step 'Setting up Arr in your web browser'
 		if (Test-Path "$Config.failed") { Say "(config.toml.failed in $StateDir is the last setup attempt that failed; this starts over)" }
@@ -925,6 +946,10 @@ function Save-Settings($stateDir) {
 	if (Test-Path $snap) { Remove-Item -Recurse -Force $snap }
 	New-Item -ItemType Directory $snap | Out-Null
 	Copy-Item (Join-Path $stateDir 'config.toml') $snap
+	# The managed settings pointer and the "Knaben was offered" note change with the config.
+	foreach ($f in 'active-import.json', 'default-indexers') {
+		if (Test-Path (Join-Path $stateDir $f)) { Copy-Item (Join-Path $stateDir $f) $snap }
+	}
 	$secrets = Join-Path $stateDir 'secrets'
 	if (Test-Path $secrets) { Copy-Item $secrets $snap -Recurse }
 	$script:Snapshot = $snap
@@ -941,6 +966,10 @@ function Undo-Run {
 	if (-not $snap) { return }
 	$stateDir = Split-Path $snap
 	Copy-Item (Join-Path $snap 'config.toml') (Join-Path $stateDir 'config.toml') -Force
+	foreach ($f in 'active-import.json', 'default-indexers') {
+		if (Test-Path (Join-Path $snap $f)) { Copy-Item (Join-Path $snap $f) (Join-Path $stateDir $f) -Force }
+		else { Remove-Item (Join-Path $stateDir $f) -Force -ErrorAction SilentlyContinue }
+	}
 	$secrets = Join-Path $stateDir 'secrets'
 	$saved = Join-Path $snap 'secrets'
 	if (Test-Path $saved) {

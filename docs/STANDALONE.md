@@ -1,7 +1,8 @@
 # Standalone deployment (no Sonarr, Radarr, Prowlarr or qBittorrent)
 
 One `arr` binary, one `config.toml`, one private state directory. Release search
-goes straight to native indexers (The Pirate Bay's JSON API, or any Torznab endpoint),
+goes straight to native indexers (The Pirate Bay's JSON API, Knaben's JSON API, or any Torznab
+endpoint),
 downloads run in the embedded BitTorrent engine, completed downloads are validated with
 `ffprobe` and imported into your library, and Plex is refreshed for the imported folder
 (the whole library while it is still empty, since Plex skips folder scans there). Policy
@@ -32,7 +33,8 @@ arr init --state-dir "$STATE"  # API token + standalone config template (never o
 
 1. **Edit `$STATE/config.toml`** (see [config/standalone.example.toml](../config/standalone.example.toml)):
    - `[[indexer]]`: id 1, `kind = "thepiratebay"`, `base_url = "https://apibay.org/"` (the exact
-     API base you trust), and/or a `kind = "torznab"` endpoint with `api_key_file`;
+     API base you trust); id 2, `kind = "knaben"`, `base_url = "https://api.knaben.org/"`;
+     and/or a `kind = "torznab"` endpoint with `api_key_file`;
    - `[embedded]`: `download_dir` (dedicated), `listen`, and **`dht = true`** — TPB magnets carry
      no trackers unless you list public `magnet_trackers`, so without the DHT (or initial
      peers) they could never find a peer. Such grabs are refused (`no_peer_discovery`) and
@@ -119,6 +121,10 @@ settings in the running process (no restart). Connections and credentials stay i
 
 ## Native indexers
 
+With more than one indexer, a torrent several of them return (the same info-hash) is one
+candidate: the copy with the most seeders is kept, then the later publish date. Every query
+still runs once per indexer, and the search view lists each.
+
 - **The Pirate Bay** (`kind = "thepiratebay"`): `q.php?q=<keywords>&cat=<categories>` with
   spaces encoded `%20` and a literal comma list (the API answers `+`-encoded spaces with its
   "no results" row), and `precompiled/data_top100_recent.json` for RSS. Torznab movie
@@ -129,6 +135,29 @@ settings in the running process (no restart). Connections and credentials stay i
   an empty array is reported `empty_unconfirmed`. One page of at most 100 rows: a full page is
   reported truncated. Magnets are built from the info-hash with only your `magnet_trackers`
   (public trackers; no query strings, values never echoed). Optional `uploaders` allowlist.
+- **Knaben** (`kind = "knaben"`): `POST {base}v1` with a JSON body: the search text matched
+  against titles (every word must match), `categories`, `order_by` seeders, `size` 100,
+  `hide_unsafe` and `hide_xxx` on. Knaben aggregates several public trackers (The Pirate Bay
+  among them), so one query reaches releases a single tracker's search misses. Its category ids
+  are `N * 1000000` for a top level and `+ k * 1000` for a sub-category; Arr searches TV
+  (2000000 and 2001000 to 2008000) and Movies (3000000 and 3001000 to 3007000) only, and
+  keeps a hit when any of its ids is one it asked for (a season pack filed under "Movies / HD"
+  that also carries TV's id still counts as TV). Torznab 2000 and 5000 map to those parents;
+  a request that maps to none is refused. `seeders` and `peers` are the counts stored from
+  the source tracker, and `peers` is the **leecher** count (48 seeders with 3 peers is a
+  healthy torrent, not an inconsistency); `liveSeeders` and `livePeers` are the same counts read
+  from the trackers when Knaben last saw the torrent (`lastSeen`), and Arr uses them when
+  `lastSeen` is within three days, the stored counts otherwise. The same torrent listed by
+  several trackers comes once, with the larger seeder count. Magnets are rebuilt from the
+  info-hash with only your `magnet_trackers`, exactly as for The Pirate Bay (Knaben's own
+  tracker list is not copied). One page of at most 100 hits; a full page is reported
+  truncated; `total` 0 with relation `eq` is a confirmed empty. Requests go through the same
+  per-indexer gate as every provider (`min_interval_ms`, `max_concurrent`, `cache_ttl_secs`,
+  `query_limit`, HTTP 429 and `Retry-After` backoff; a 5xx fails that search only). The
+  User-Agent is `arr/<version>` and nothing else identifies you. `recent_feed = true` (off by
+  default: Knaben has no static recent file, so a feed read is a query) reads the newest
+  hits in your categories. Keys: `magnet_trackers`, `recent_feed` and the limits; `uploaders`
+  is The Pirate Bay's only.
 - **Torznab** (`kind = "torznab"`, spec 1.3): `t=caps` (cached a day; search must be
   available; the result limit is honoured), `t=search` with `offset` paging (`total`
   honoured, `max_pages` bound), typed `<error>` codes (100–102 credentials, 500/501 limits,

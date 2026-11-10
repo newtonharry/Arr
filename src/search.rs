@@ -284,6 +284,12 @@ fn ascii_fold(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether `new` should replace `old`, two copies of one release: more seeders win (a count
+/// beats an unknown one), then the later publish date (RFC 3339, UTC). A tie keeps `old`.
+fn fresher_copy(new: &ProwlarrRelease, old: &ProwlarrRelease) -> bool {
+    (new.seeders, new.publish_date.as_deref()) > (old.seeders, old.publish_date.as_deref())
+}
+
 /// One query per target (plus an ASCII-folded variant for non-ASCII titles).
 ///
 /// A native "(YYYY)" disambiguator ("WAR (2026)", "Doctor Who (2005)") stays in TV queries as
@@ -585,7 +591,14 @@ pub async fn run(
                 for r in o.releases.iter() {
                     let k = r.dedupe_key();
                     match by_key.get(&k) {
-                        Some(&j) => found[j].1.push(i),
+                        Some(&j) => {
+                            found[j].1.push(i);
+                            // The same torrent from two indexers (same info-hash): keep
+                            // the copy with more seeders, then the fresher one.
+                            if fresher_copy(r, &found[j].0) {
+                                found[j].0 = r.clone();
+                            }
+                        }
                         None => {
                             by_key.insert(k, found.len());
                             found.push((r.clone(), vec![i]));
@@ -947,6 +960,40 @@ mod tests {
         let r: ProwlarrRelease =
             serde_json::from_value(serde_json::json!({ "infoHash": "a".repeat(40) })).unwrap();
         assert_eq!(release_ref(&r), "rel_bbca78a99506a586158db3db");
+    }
+
+    #[test]
+    fn the_better_copy_of_one_torrent_wins() {
+        let copy = |seeders: Option<i64>, date: Option<&str>| -> ProwlarrRelease {
+            serde_json::from_value(serde_json::json!({
+                "infoHash": "a".repeat(40), "seeders": seeders, "publishDate": date,
+            }))
+            .unwrap()
+        };
+        let old = copy(Some(10), Some("2026-01-01T00:00:00Z"));
+        assert!(
+            fresher_copy(&copy(Some(11), None), &old),
+            "more seeders win"
+        );
+        assert!(!fresher_copy(
+            &copy(Some(9), Some("2027-01-01T00:00:00Z")),
+            &old
+        ));
+        assert!(
+            fresher_copy(&copy(Some(10), Some("2026-02-01T00:00:00Z")), &old),
+            "then fresher"
+        );
+        assert!(
+            !fresher_copy(&copy(Some(10), Some("2026-01-01T00:00:00Z")), &old),
+            "a tie keeps the first"
+        );
+        assert!(
+            fresher_copy(&copy(Some(0), None), &copy(None, None)),
+            "a count beats unknown"
+        );
+        assert!(!fresher_copy(&copy(None, None), &old));
+        // Same hash, same release ref: replacing keeps plans and the blocklist valid.
+        assert_eq!(release_ref(&old), release_ref(&copy(Some(99), None)));
     }
 
     fn season_target(title: &str) -> Target {

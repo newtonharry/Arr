@@ -22,6 +22,7 @@ pub mod ids;
 pub mod import;
 pub mod indexer;
 pub mod ingest;
+pub mod knaben;
 pub mod library;
 pub mod lifecycle;
 pub mod logbuf;

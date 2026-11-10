@@ -267,7 +267,9 @@ without results, `empty: "confirmed" | "unconfirmed"`, and indexers the settings
 cannot be searched appear with status `unavailable`. `completeness.provider` is then
 `complete` (every indexer answered in full; an explicit "no results" counts) or `incomplete`
 (issues `query_failed`, `page_failed`, `page_limit`, `indexer_unavailable`,
-`empty_unconfirmed`, each with its `indexer`). Through Prowlarr it stays `unverified`. A
+`empty_unconfirmed`, each with its `indexer`). Through Prowlarr it stays `unverified`. The same
+torrent (info-hash) from several indexers is one candidate: the copy with more seeders, then
+the later publish date, is kept, and `found_by` lists every query that returned it. A
 release whose tracker seed requirement (Torznab `minimumratio`/`minimumseedtime`) the
 indexer's seed goal cannot meet is rejected `seed_requirement_unmet`.
 
@@ -550,7 +552,8 @@ Queue actions:
 `settings_mapping` of every indexer id, `ok`/`degraded`/`blocked`) and `peer_discovery`
 (embedded engine: `ok`, or `blocked` when trackerless magnets meet DHT off and no initial
 peers). `GET /api/v1/diagnostics` adds `search_backend` with each native indexer's origin,
-limits, caps and health.
+limits, caps and health; its `kind` is `thepiratebay`, `knaben` or `torznab`, and
+`recent_feed` says whether an RSS read of the indexer is on.
 
 ### Web app notifications (signed-in browser routes)
 

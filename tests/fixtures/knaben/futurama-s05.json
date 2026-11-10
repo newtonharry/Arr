@@ -1,0 +1,115 @@
+{
+ "hits": [
+  {
+   "bytes": 4133906022,
+   "cachedOrigin": "The Pirate Bay (proxy)",
+   "category": "Movies / HD",
+   "categoryId": [
+    2000000,
+    3001000
+   ],
+   "date": "2025-09-18T23:00:00+00:00",
+   "description": "Uploader: TvTeam<br>Futurama-1999-S05 1080p WEBRip 10bit EAC3 2 0 x265-iVy",
+   "details": "https://knaben.xyz/thepiratebay/description.php?id=80555971",
+   "grabs": 608,
+   "hash": "5772EC994F69FEB83F7100F592CCFDFBD49305C2",
+   "id": "75fdbf0008165b9511921d47a9e105a8290e6c5d",
+   "lastSeen": "2026-11-08T15:01:08+00:00",
+   "link": null,
+   "livePeers": 3,
+   "liveSeeders": 39,
+   "magnetUrl": "magnet:?xt=urn:btih:5772EC994F69FEB83F7100F592CCFDFBD49305C2&dn=Futurama-1999-S05+1080p+WEBRip+10bit+EAC3+2+0+x265-iVy&tr=http%3A%2F%2Fp4p.arenabg.com%3A1337%2Fannounce",
+   "peers": 3,
+   "score": null,
+   "seeders": 48,
+   "title": "Futurama-1999-S05 1080p WEBRip 10bit EAC3 2 0 x265-iVy",
+   "tracker": "The Pirate Bay",
+   "trackerId": "thepiratebay",
+   "virusDetection": 0.17464074615345282
+  },
+  {
+   "bytes": 3661459619,
+   "cachedOrigin": "The Pirate Bay (proxy)",
+   "category": "TV",
+   "categoryId": [
+    2000000
+   ],
+   "date": "2021-03-04T23:00:00+00:00",
+   "description": "Uploader: Cybotage<br>Futurama.S05.WEBRip.x264-ION10",
+   "details": "https://knaben.xyz/thepiratebay/description.php?id=41906513",
+   "grabs": 440,
+   "hash": "D949036CAD9CECDC08FE1A012EBBB523A5E6CD8E",
+   "id": "3566d773e0689bf4cddee23f362a517e37a4e172",
+   "lastSeen": "2026-11-04T03:19:32+00:00",
+   "link": null,
+   "livePeers": 1,
+   "liveSeeders": 22,
+   "magnetUrl": "magnet:?xt=urn:btih:D949036CAD9CECDC08FE1A012EBBB523A5E6CD8E&dn=Futurama.S05.WEBRip.x264-ION10&tr=http%3A%2F%2Fp4p.arenabg.com%3A1337%2Fannounce",
+   "peers": 0,
+   "score": null,
+   "seeders": 27,
+   "title": "Futurama.S05.WEBRip.x264-ION10",
+   "tracker": "The Pirate Bay",
+   "trackerId": "thepiratebay",
+   "virusDetection": 0.1702713048211231
+  },
+  {
+   "bytes": 238477639,
+   "cachedOrigin": "The Pirate Bay (proxy)",
+   "category": "TV / HD",
+   "categoryId": [
+    2000000,
+    2001000
+   ],
+   "date": "2019-09-05T23:00:00+00:00",
+   "description": "Futurama.S05E02.720p.WEB.H264-BATV[ettv]",
+   "details": "https://knaben.xyz/thepiratebay/description.php?id=34527639",
+   "grabs": 111,
+   "hash": "1A94CEEBC237E72CD70C3BC276171D8437295E4C",
+   "id": "b39f79a5e29cb05928509bf7e2786c0118df5ecf",
+   "lastSeen": "2026-10-28T22:59:47+00:00",
+   "link": null,
+   "livePeers": 1,
+   "liveSeeders": 12,
+   "magnetUrl": "magnet:?xt=urn:btih:1A94CEEBC237E72CD70C3BC276171D8437295E4C&dn=Futurama.S05E02.720p.WEB.H264-BATV%5Bettv%5D&tr=http%3A%2F%2Fp4p.arenabg.com%3A1337%2Fannounce",
+   "peers": 2,
+   "score": null,
+   "seeders": 10,
+   "title": "Futurama.S05E02.720p.WEB.H264-BATV[ettv]",
+   "tracker": "The Pirate Bay",
+   "trackerId": "thepiratebay",
+   "virusDetection": 0.03757560741005732
+  },
+  {
+   "bytes": 3722063268,
+   "cachedOrigin": "The Pirate Bay",
+   "category": "TV",
+   "categoryId": [
+    2000000
+   ],
+   "date": "2008-08-06T03:08:48+00:00",
+   "description": "Uploader: killerdemon<br>Futurama - Season 5 [Complete]",
+   "details": "https://knaben.xyz/thepiratebay/description.php?id=4330146",
+   "grabs": 5,
+   "hash": "A66E62D18B9A83810631E73AD22B13BDA7C9BD6D",
+   "id": "9fd9a74858b154aaf1f55799eabe7d0459a26c4f",
+   "lastSeen": "2026-11-08T20:21:57+00:00",
+   "link": null,
+   "livePeers": 0,
+   "liveSeeders": 4,
+   "magnetUrl": "magnet:?xt=urn:btih:A66E62D18B9A83810631E73AD22B13BDA7C9BD6D&dn=Futurama+-+S05+%5BComplete%5D&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce",
+   "peers": 0,
+   "score": null,
+   "seeders": 2,
+   "title": "Futurama - S05 [Complete]",
+   "tracker": "The Pirate Bay",
+   "trackerId": "thepiratebay",
+   "virusDetection": 0.1693712896596052
+  }
+ ],
+ "max_score": null,
+ "total": {
+  "relation": "eq",
+  "value": 18
+ }
+}

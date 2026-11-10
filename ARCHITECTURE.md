@@ -32,7 +32,7 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
   anything the catalog or active downloads use. A state folder whose active import came from
   the removed Sonarr/Radarr snapshot importer (`source-native.json`) is refused at startup and
   left untouched; its stored fields stay readable so a rolled-back older release still works.
-- **Search backend: exactly one.** Native indexers (`[[indexer]]`: The Pirate Bay's JSON API,
+- **Search backend: exactly one.** Native indexers (`[[indexer]]`: The Pirate Bay's JSON API, Knaben's JSON API,
   generic Torznab) or Prowlarr; configuring both is refused and nothing falls back.
 - Outbound requests go only to base URLs from `config.toml`. API callers cannot supply a URL
   or a credential (managed setup carries policy only).
@@ -68,7 +68,7 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
 | `config`, `fsutil`, `paths` | runtime config validation; owner-only files; client-to-local path mapping, safe relative names, symlink-free checks, free space |
 | `client`, `embedded` | the download client: qBittorrent or the embedded librqbit engine (own records, persisted lifetime counters, share limits, piece verification, confinement checks) behind one normalised view |
 | `upstream`, `prowlarr`, `metadata`, `qbit`, `plex` | bounded HTTP with classified errors (`Retry-After`); Prowlarr search, download fetch and Torznab feed; TVmaze/TMDB (incl. TMDB find by IMDB id); qBittorrent client (cookie session, 4.x/5.x naming); Plex refresh, sections and paginated library enumeration |
-| `indexer`, `tpb`, `torznab` | native indexers: the registry and provider contract (gate, health, mapping of imported ids, seed goals, `Backend` = native or Prowlarr); The Pirate Bay's JSON API; Torznab caps/search/RSS, the shared hardened RSS parser, credential confinement and guarded downloads |
+| `indexer`, `tpb`, `knaben`, `torznab` | native indexers: the registry and provider contract (gate, health, mapping of imported ids, seed goals, `Backend` = native or Prowlarr); The Pirate Bay's JSON API; Knaben's JSON search API (an aggregate of public trackers); Torznab caps/search/RSS, the shared hardened RSS parser, credential confinement and guarded downloads |
 | `setup`, `bootstrap` | managed setup documents normalised into `Settings` with an empty catalog, replacement guards, Plex mapping checks; the read-only, resumable Plex library bootstrap into owned, unmonitored catalog entries |
 | `torrent`, `fixture` | magnet/`.torrent` info-hash identity; authored fixtures (ffmpeg media, `.torrent` with real piece hashes) |
 | `library` | the managed catalog: insert-only seeding from imports, add/monitor/remove, episode upserts, wanted, calendar, history events |
