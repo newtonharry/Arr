@@ -134,12 +134,29 @@ response bodies or credentials.
 - **`DELETE /api/v1/library/{media_id}`** stops managing a movie or series. Files, history and
   ownership evidence are kept. It answers `409 active_downloads` while downloads for the item
   are active. In coexistence mode every grab (manual, plan, request, RSS, worker search) re-reads adoption from the stored rows in the transaction that records it, so a release or unmonitoring committed while its torrent was being fetched wins: the grab is refused (`409 not_adopted`) and nothing is recorded or submitted. A grab recorded first makes a later release answer `409 active_downloads`.
+- **`POST /api/v1/remove`** with `{"media_id"}` (a movie or series) is `DELETE /library/{media_id}`
+  for people: it first cancels the title's downloads that have not finished (with their
+  download data) and ends its retrying request, then stops managing it. Answers
+  `{media_id, managed: false, cancelled}`. A download whose data is all there and that is being
+  added to Plex is left to finish, and the call answers `409 active_downloads` until it is done.
+  Files in the library are never touched. The web app's "Remove from Arr" uses it.
 - **`GET /api/v1/library/roots`** shows each root's status from the last rescan.
+- **`GET /api/v1/storage`** returns `{drives: [{label, free_bytes, total_bytes}]}`: the drive
+  holding the movie folder and the one holding the TV folder, or a single `Movies and TV` entry
+  when both are on the same drive. Labels are `Movies`, `TV` or `Movies and TV`; paths are never
+  returned. A folder that cannot be read is left out.
 - **`GET /api/v1/wanted?media_id=&limit=&offset=`** lists monitored, aired, missing items
   that are not being downloaded, with their search schedule. These are searched only on
   request (`search_missing`); routine acquisition is RSS.
 - **`GET /api/v1/calendar?start=&end=`** lists episodes in a window (at most 92 days), each
   with `owned`, `queued`, `missing`, `unknown` or `upcoming`.
+
+The web app's proxy (`/app/api/v1/...`, signed-in browsers only) adds one key to these replies:
+`requested_by`, the name of the person who first added the title from the web app, or `null`
+(on library items and on the movie and show pages). The name is the part of a Google account's
+address before the `@`; a sign-in link carries no name, and adds made through this API or MCP
+have none. The plain API does not return it. The movie and show pages also carry `removable`
+(Arr manages the title, so it can stop tracking it).
 
 ### Ownership, live status and attention
 
@@ -185,10 +202,13 @@ response bodies or credentials.
 
 ### Catalog and discovery
 
-- **`GET /api/v1/library/movies?q=&limit=&offset=`** and
-  **`GET /api/v1/library/series?q=&limit=&offset=`** return the managed catalog (seeded from
+- **`GET /api/v1/library/movies?q=&sort=&limit=&offset=`** and
+  **`GET /api/v1/library/series?q=&sort=&limit=&offset=`** return the managed catalog (seeded from
   the import, then updated by this server; removed items are hidden). Series include
-  `episode_counts`.
+  `episode_counts`. Every item carries `added_at` (when the title entered the catalog, RFC 3339)
+  and `size_bytes` (the file, or the sum of a series' episode files, as far as Arr knows them).
+  `sort` is `title` (A to Z), `added` (newest first) or `size` (largest first); without it the
+  list is A to Z, with `q` in match order.
   `q` is a folded title/alias search: accents and case are ignored, and an exact key match is
   listed first. Responses are `{total, items, observation: {import_id, observed_at, note}}`.
 - **`GET /api/v1/discover?kind=movie|series&q=&year=`** merges catalog hits with TVmaze (for

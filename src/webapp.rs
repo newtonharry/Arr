@@ -77,7 +77,9 @@ fn open_db(state_dir: &Path) -> Result<rusqlite::Connection> {
          CREATE TABLE IF NOT EXISTS links (
             hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS hidden_ideas (
-            media_id TEXT PRIMARY KEY, at INTEGER);",
+            media_id TEXT PRIMARY KEY, at INTEGER);
+         CREATE TABLE IF NOT EXISTS requested_by (
+            media_id TEXT PRIMARY KEY, name TEXT NOT NULL, at INTEGER NOT NULL);",
     )?;
     Ok(db)
 }
@@ -162,6 +164,25 @@ impl Sessions {
             "SELECT kind, email FROM sessions WHERE hash = ?1 AND expires_at > ?2",
             rusqlite::params![sha256_hex(id), now()],
             |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    }
+
+    /// Remembers who first added a title (a movie or a show). Later adds keep the first name.
+    fn record_requester(&self, media_id: &str, name: &str) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT OR IGNORE INTO requested_by (media_id, name, at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![media_id, name, now()],
+        );
+    }
+
+    fn requester(&self, media_id: &str) -> Option<String> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT name FROM requested_by WHERE media_id = ?1",
+            [media_id],
+            |r| r.get(0),
         )
         .ok()
     }
@@ -620,6 +641,7 @@ fn allowed(method: &Method, path: &str) -> bool {
         Method::GET => matches!(
             parts.as_slice(),
             ["feed"]
+                | ["storage"]
                 | ["ideas"]
                 | ["discover"]
                 | ["library", "movies" | "series"]
@@ -629,7 +651,7 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | ["copies", _]
         ),
         Method::POST => match parts.as_slice() {
-            ["quick-add" | "follow" | "stop" | "quality"] => true,
+            ["quick-add" | "follow" | "stop" | "quality" | "remove"] => true,
             ["ideas", "hide"] => true,
             ["copies", id, "get"] => !id.is_empty(),
             ["queue", id, "retry"] => !id.is_empty(),
@@ -640,14 +662,105 @@ fn allowed(method: &Method, path: &str) -> bool {
     }
 }
 
+/// A name to show for a signed-in person: the part of their address before the `@`, with
+/// words split on `.`, `_` and `-` and capitalised ("harry.newton" is "Harry Newton"). A
+/// sign-in link carries no identity, so it has no name.
+fn display_name(email: Option<&str>) -> Option<String> {
+    let local = email?.split('@').next()?;
+    let name: Vec<String> = local
+        .split(['.', '_', '-', '+'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map_or(String::new(), |f| {
+                f.to_uppercase()
+                    .chain(c.flat_map(char::to_lowercase))
+                    .collect()
+            })
+        })
+        .collect();
+    let name: String = name.join(" ").chars().take(60).collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The id a requester is kept under: a movie, or the show for a season or episode.
+fn title_key(id: &str) -> Option<String> {
+    Some(match id.parse::<MediaId>().ok()? {
+        m @ MediaId::Movie { .. } => m.to_string(),
+        MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
+            MediaId::Series(k).to_string()
+        }
+    })
+}
+
+/// Who added what, on the way through the proxy. A successful add made by a signed-in person
+/// is remembered by the server (the name never comes from the page), and the title reads
+/// carry `requested_by`: the first person who added the title, or null.
+fn annotate(
+    sessions: &Sessions,
+    method: &Method,
+    path: &str,
+    email: Option<&str>,
+    status: StatusCode,
+    raw: axum::body::Bytes,
+) -> axum::body::Bytes {
+    if !status.is_success() {
+        return raw;
+    }
+    let rest = path.strip_prefix("/api/v1/").unwrap_or("");
+    let parts: Vec<&str> = rest.split('/').collect();
+    let adds = *method == Method::POST
+        && matches!(
+            parts.as_slice(),
+            ["quick-add"] | ["follow"] | ["copies", _, "get"]
+        );
+    let reads_list =
+        *method == Method::GET && matches!(parts.as_slice(), ["library", "movies" | "series"]);
+    let reads_one =
+        *method == Method::GET && matches!(parts.as_slice(), ["movie", _] | ["show", _]);
+    if !(adds || reads_list || reads_one) {
+        return raw;
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    if adds {
+        // Turning following off is not an add.
+        if v["following"] != serde_json::Value::Bool(false)
+            && let (Some(name), Some(key)) = (
+                display_name(email),
+                v["media_id"].as_str().and_then(title_key),
+            )
+        {
+            sessions.record_requester(&key, &name);
+        }
+        return raw;
+    }
+    let lookup = |id: Option<&str>| {
+        id.and_then(title_key)
+            .and_then(|k| sessions.requester(&k))
+            .map_or(serde_json::Value::Null, serde_json::Value::String)
+    };
+    if reads_one {
+        let who = lookup(v["media_id"].as_str());
+        v["requested_by"] = who;
+    } else if let Some(items) = v["items"].as_array_mut() {
+        for item in items {
+            let who = lookup(item["id"].as_str());
+            item["requested_by"] = who;
+        }
+    }
+    serde_json::to_vec(&v).map_or(raw, Into::into)
+}
+
 async fn proxy(State(w): Wa, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     if let Some(r) = w.check_app(&parts.headers) {
         return r;
     }
-    if w.session(&parts.headers).is_none() {
+    let Some((_, email)) = w.session(&parts.headers) else {
         return w.unauthorized();
-    }
+    };
     let path = parts
         .uri
         .path()
@@ -664,6 +777,7 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
             "request body too large",
         );
     };
+    let parts_path = path.clone();
     let uri = match parts.uri.query() {
         Some(q) => format!("{path}?{q}"),
         None => path,
@@ -688,6 +802,14 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     let Ok(raw) = axum::body::to_bytes(rbody, MAX_PROXY_REPLY).await else {
         return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "reply too large");
     };
+    let raw = annotate(
+        &w.sessions,
+        &parts.method,
+        &parts_path,
+        email.as_deref(),
+        rp.status,
+        raw,
+    );
     let mut out = Response::new(Body::from(raw));
     *out.status_mut() = rp.status;
     for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
@@ -698,4 +820,116 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     out.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+
+    fn call(
+        s: &Sessions,
+        method: Method,
+        path: &str,
+        email: Option<&str>,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let out = annotate(
+            s,
+            &method,
+            path,
+            email,
+            StatusCode::OK,
+            Bytes::from(body.to_string()),
+        );
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn names_come_from_the_address() {
+        assert_eq!(
+            display_name(Some("harry.newton@example.com")).as_deref(),
+            Some("Harry Newton")
+        );
+        assert_eq!(display_name(Some("SAM_o@x.org")).as_deref(), Some("Sam O"));
+        assert_eq!(display_name(Some("@x.org")), None);
+        assert_eq!(display_name(None), None);
+    }
+
+    #[test]
+    fn the_first_person_to_add_a_title_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let s = Sessions::open(dir.path()).unwrap();
+        let add = json!({ "media_id": "movie:tmdb:603", "title": "The Matrix" });
+        // A sign-in link has no name: nothing is recorded.
+        call(&s, Method::POST, "/api/v1/quick-add", None, add.clone());
+        assert_eq!(s.requester("movie:tmdb:603"), None);
+        call(
+            &s,
+            Method::POST,
+            "/api/v1/quick-add",
+            Some("ann@x.org"),
+            add.clone(),
+        );
+        call(
+            &s,
+            Method::POST,
+            "/api/v1/quick-add",
+            Some("bob@x.org"),
+            add,
+        );
+        assert_eq!(s.requester("movie:tmdb:603").as_deref(), Some("Ann"));
+        // An episode or season add counts for its show; turning following off does not.
+        call(
+            &s,
+            Method::POST,
+            "/api/v1/copies/season:tvdb:5:2/get",
+            Some("bob@x.org"),
+            json!({ "media_id": "season:tvdb:5:2" }),
+        );
+        assert_eq!(s.requester("series:tvdb:5").as_deref(), Some("Bob"));
+        call(
+            &s,
+            Method::POST,
+            "/api/v1/follow",
+            Some("ann@x.org"),
+            json!({ "media_id": "series:tvdb:6", "following": false }),
+        );
+        assert_eq!(s.requester("series:tvdb:6"), None);
+        // Reads carry the name, or null.
+        let v = call(
+            &s,
+            Method::GET,
+            "/api/v1/library/movies",
+            None,
+            json!({ "items": [{ "id": "movie:tmdb:603" }, { "id": "movie:tmdb:1" }] }),
+        );
+        assert_eq!(v["items"][0]["requested_by"], "Ann");
+        assert!(v["items"][1]["requested_by"].is_null());
+        let v = call(
+            &s,
+            Method::GET,
+            "/api/v1/show/series:tvdb:5",
+            None,
+            json!({ "media_id": "series:tvdb:5" }),
+        );
+        assert_eq!(v["requested_by"], "Bob");
+        // A failed add records nothing.
+        let out = annotate(
+            &s,
+            &Method::POST,
+            "/api/v1/quick-add",
+            Some("cy@x.org"),
+            StatusCode::CONFLICT,
+            Bytes::from(json!({ "media_id": "movie:tmdb:9" }).to_string()),
+        );
+        assert!(!out.is_empty());
+        assert_eq!(s.requester("movie:tmdb:9"), None);
+    }
 }

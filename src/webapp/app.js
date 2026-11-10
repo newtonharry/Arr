@@ -4,8 +4,15 @@ import { h, render, Fragment } from '/app/vendor/preact.mjs';
 import { useState, useEffect, useLayoutEffect, useRef } from '/app/vendor/hooks.mjs';
 
 const $ = (s) => document.querySelector(s);
+// The library order the person picked last, kept in this browser only.
+const SORTS = [['added', 'Recently added'], ['title', 'Title A–Z'], ['size', 'Size']];
+function savedSort() {
+  try { const v = localStorage.getItem('arr.librarySort'); if (SORTS.some(([k]) => k === v)) return v; } catch { /* storage blocked: use the default */ }
+  return 'added';
+}
+function saveSort(v) { try { localStorage.setItem('arr.librarySort', v); } catch { /* storage blocked: the choice lasts until the page closes */ } }
 // Module state, read while rendering. Whatever changes it calls bump() to draw it again.
-const S = { feed: null, ideas: null, ideasAt: 0, out: false, all: false, kind: 'movies', filter: '', me: null, tmdb: false, banner: '', live: '' };
+const S = { feed: null, ideas: null, ideasAt: 0, out: false, all: false, kind: 'movies', filter: '', sort: savedSort(), me: null, tmdb: false, banner: '', live: '' };
 let V = { t: 'hint', text: '' }; // what the main area shows
 const R = { path: null }; // the screen under the sheet, for the active tab
 const A = new Map(); // add / retry state by id, kept for the session
@@ -481,21 +488,45 @@ function SearchResults() {
 }
 
 // ---------- library ----------
+// Drives are sold in decimal units, so the space is shown that way ("4 TB").
+function fmtDisk(bytes) {
+  const tb = bytes / 1e12;
+  if (tb >= 1) return `${Number(tb.toFixed(1))} TB`;
+  return `${Math.max(0, Math.round(bytes / 1e9))} GB`;
+}
+// How full the drives holding the library are. Quiet if Arr can't tell.
+function Storage() {
+  const [drives, setDrives] = useState([]);
+  useEffect(() => {
+    let live = true;
+    api('/v1/storage').then((r) => { if (live && r.ok) setDrives((r.data.drives || []).filter((d) => d.total_bytes > 0)); }).catch(() => {});
+    return () => { live = false; };
+  }, []);
+  if (!drives.length) return null;
+  return h('div', { class: 'drives' }, drives.map((d) => {
+    const low = d.free_bytes < d.total_bytes * 0.1, used = Math.round((1 - d.free_bytes / d.total_bytes) * 100);
+    return h('div', { key: d.label, class: 'drive' + (low ? ' low' : '') },
+      h('p', { class: 'drive-t' }, `${d.label} drive: ${fmtDisk(d.free_bytes)} free of ${fmtDisk(d.total_bytes)}`, low && h('b', null, ' · Running low on space')),
+      h('div', { class: 'meter', role: 'meter', 'aria-label': `${d.label} drive, ${used}% full`, 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': used }, h('i', { style: { width: used + '%' } })));
+  }));
+}
 function libraryRow(x, mv) {
   const title = x.title || 'Untitled';
   const mid = mv ? (x.tmdb_id && `movie:tmdb:${x.tmdb_id}`) : x.tvdb_id ? `series:tvdb:${x.tvdb_id}` : x.tvmaze_id ? `series:tvmaze:${x.tvmaze_id}` : null;
   return { key: mid || title, el: (key) => h('li', { key, class: 'item' }, h(Tile, { title, mediaId: mid }), h('div', { class: 'what' }, h(Title, { title, id: mid }),
-    h('p', { class: 'meta' }, joinDot(x.year, mv ? 'Movie' : 'Show', mv && x.has_file === false && 'Not in Plex yet')))) };
+    h('p', { class: 'meta' }, joinDot(x.year, mv ? 'Movie' : 'Show', mv && x.has_file === false && 'Not in Plex yet')),
+    x.requested_by && h('p', { class: 'meta' }, `Added by ${x.requested_by}`))) };
 }
 function Library({ t }) {
   const [kind, setKind] = useState(S.kind);
   const [fv, setFv] = useState(S.filter);
+  const [sort, setSort] = useState(S.sort);
   const [st, setSt] = useState({ items: [], total: 0, status: 'Loading…' });
   const m = useRef({ seq: 0, items: [], ft: 0 }).current;
   async function load(reset) {
     const my = ++m.seq;
     if (reset) { m.items = []; setSt({ items: [], total: 0, status: 'Loading…' }); }
-    const qs = `limit=50&offset=${m.items.length}` + (S.filter.trim() ? '&q=' + encodeURIComponent(S.filter.trim()) : '');
+    const qs = `limit=50&offset=${m.items.length}&sort=${S.sort}` + (S.filter.trim() ? '&q=' + encodeURIComponent(S.filter.trim()) : '');
     try {
       const r = await api(`/v1/library/${S.kind}?${qs}`);
       if (my !== m.seq || t !== token) return;
@@ -507,6 +538,7 @@ function Library({ t }) {
   useEffect(() => { load(true); return () => clearTimeout(m.ft); }, []);
   const mv = kind === 'movies';
   return h(Section, { id: 'lib', title: 'Library' }, h('div', null,
+    h(Storage),
     h('div', { class: 'bar' },
       h('div', { class: 'seg', role: 'group', 'aria-label': 'What to show' },
         [['movies', 'Movies'], ['series', 'Shows']].map(([k, l]) =>
@@ -514,7 +546,10 @@ function Library({ t }) {
       h('input', {
         type: 'search', class: 'filter', placeholder: 'Filter your library', 'aria-label': 'Filter your library', autocomplete: 'off', value: fv,
         onInput: (e) => { const v = e.target.value; setFv(v); clearTimeout(m.ft); m.ft = setTimeout(() => { S.filter = v; load(true); }, 250); },
-      })),
+      }),
+      h('label', { class: 'sort' }, h('span', { class: 'sr' }, 'Sort by'),
+        h('select', { value: sort, onChange: (e) => { S.sort = e.target.value; saveSort(S.sort); setSort(S.sort); load(true); } },
+          SORTS.map(([k, l]) => h('option', { key: k, value: k }, l))))),
     h('p', { class: 'hint', role: 'status' }, st.status || null),
     h('ul', { class: 'list' }, keyed(st.items.map((x) => libraryRow(x, mv)), (r) => r.key, (r, key) => r.el(key))),
     h('div', { class: 'more' }, st.items.length < st.total ? [
@@ -523,7 +558,7 @@ function Library({ t }) {
 }
 
 // ---------- title pages (a show or a movie, as a sheet over the current screen) ----------
-const P = { shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null };
+const P = { confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null };
 let bgHash = '';
 const enc = encodeURIComponent;
 const pct = (p) => Math.round(p * 100);
@@ -557,7 +592,7 @@ function openTitle(t) {
     P.shown = true; // the page behind goes inert with the same redraw
   }
   clearTimeout(P.pollT); clearTimeout(P.askT);
-  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, opt: freshOpt() });
+  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, removing: false, opt: freshOpt() });
   after(() => {
     const panel = $('#panel');
     panel.scrollTop = 0;
@@ -569,7 +604,7 @@ function closeSheet() {
   if (!P.shown) return;
   clearTimeout(P.pollT); clearTimeout(P.askT);
   P.token++;
-  P.shown = false;
+  P.shown = false; P.confirm = false;
   document.title = pageName(parseHash(bgHash).path) + ' · Arr';
   after(() => {
     window.scrollTo(0, P.scrollY);
@@ -586,12 +621,12 @@ function dismiss() {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape' || !P.shown) return;
   e.preventDefault();
-  if (P.ask) { P.ask = ''; bump(); } else dismiss();
+  if (P.confirm) { if (!P.removing) closeConfirm(); } else if (P.ask) { P.ask = ''; bump(); } else dismiss();
 });
 // Tab and Shift-Tab stay inside the sheet.
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Tab' || !P.shown) return;
-  const panel = $('#panel');
+  const panel = $('#confirm') || $('#panel'); // an open question holds the focus until it is answered
   const f = [...panel.querySelectorAll('a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])')].filter((x) => !x.hidden && x.getClientRects().length);
   const a = document.activeElement;
   if (!f.length) { e.preventDefault(); panel.focus(); return; }
@@ -650,10 +685,11 @@ function Sheet() {
   const open = P.shown;
   const body = !open ? null : P.data ? (P.kind === 'show' ? showBody() : movieBody()) : P.err ? errorBody() : skeleton();
   return h('div', { id: 'sheet', class: 'sheet', hidden: !open, onClick: (e) => { if (e.target === e.currentTarget) dismiss(); } },
-    h('div', { class: 'panel', id: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title', tabindex: '-1' },
+    h('div', { class: 'panel', id: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title', tabindex: '-1', inert: open && P.confirm },
       open ? [
         h('div', { key: 'bar', class: 'sheet-bar' }, h('button', { type: 'button', class: 'btn ghost close', 'aria-label': 'Close', 'data-fk': 'close', onClick: dismiss }, ic('close'))),
-        h('div', { key: 'body', class: 'sheet-body' }, body)] : null));
+        h('div', { key: 'body', class: 'sheet-body' }, body)] : null),
+    open && P.confirm && P.data ? h(ConfirmRemove) : null);
 }
 function skeleton() {
   const bar = (w, extra) => h('div', { class: 'sk', style: { width: w, ...extra } });
@@ -668,9 +704,9 @@ function errorBody() {
     h(Hint, { text: P.err, role: 'status' }),
     h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'retry', onClick: () => { P.err = ''; bump(); loadTitle(false); } }, ic('retry'), 'Try again'));
 }
-function hero(title, line, extra) {
+function hero(title, line, extra, by) {
   return h('header', { class: 'hero' }, h(Tile, { title, mediaId: P.data.media_id, big: true }),
-    h('div', { class: 'hero-t' }, h('h1', { id: 'sheet-title' }, title), line && h('p', { class: 'meta' }, line), extra));
+    h('div', { class: 'hero-t' }, h('h1', { id: 'sheet-title' }, title), line && h('p', { class: 'meta' }, line), extra, by && h('p', { class: 'meta' }, `Added by ${by}`)));
 }
 function Genres({ list }) {
   return list && list.length ? h('ul', { class: 'genres', 'aria-label': 'Genres' }, list.map((g) => h('li', { key: g }, g))) : null;
@@ -760,6 +796,55 @@ async function toggleFollow() {
   }
   say(want ? 'Arr will get new episodes as they air.' : 'Arr will not look for new episodes.');
   await loadTitle(true);
+}
+
+// ----- remove a title from Arr (files are never touched)
+function removeNode() {
+  if (!P.data.removable) return null;
+  return h('div', { class: 'remove' },
+    h('button', { type: 'button', class: 'link danger', 'data-fk': 'remove', onClick: () => { P.confirm = true; P.msg.delete('remove'); after(() => $('#confirm [data-fk="rm-cancel"]')?.focus({ preventScroll: true })); } }, 'Remove from Arr'),
+    msgFor('remove'));
+}
+function closeConfirm() {
+  P.confirm = false;
+  after(() => $('#panel [data-fk="remove"]')?.focus({ preventScroll: true }));
+}
+// Forget what the page remembers of an add or a retry for this title, so it can be added again.
+function forget(id) {
+  const bare = id.replace(/^series:/, '');
+  for (const k of [...A.keys()]) if (k === id || (k.startsWith('r:') && k.includes(bare))) A.delete(k);
+}
+async function doRemove() {
+  if (P.removing) return;
+  const tk = P.token, d = P.data;
+  P.removing = true; bump();
+  let res = null;
+  try {
+    const r = await api('/v1/remove', { method: 'POST', body: { media_id: d.media_id } });
+    const code = r.data && r.data.error && r.data.error.code;
+    if (r.ok) res = { ok: true };
+    else if (code === 'active_downloads') res = { text: 'A download is nearly done and is being added to Plex. Try again in a minute.', err: true };
+    else if (code === 'not_managed') res = { text: 'Arr is not tracking this one.', err: true };
+    else res = { text: "Couldn't remove it just now. Try again in a moment.", err: true };
+  } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  if (tk !== P.token) return;
+  P.removing = false;
+  if (!res.ok) { P.msg.set('remove', res); say(res.text); closeConfirm(); return; }
+  P.confirm = false;
+  forget(d.media_id);
+  S.stale = true; // the screen under the sheet is drawn again, without this title
+  dismiss();
+  say(`${d.title} removed. Anything already in Plex stays there.`);
+}
+function ConfirmRemove() {
+  const d = P.data, busy = P.removing;
+  return h('div', { class: 'confirm-back', onClick: (e) => { if (e.target === e.currentTarget && !P.removing) closeConfirm(); } },
+    h('div', { id: 'confirm', class: 'confirm', role: 'alertdialog', 'aria-modal': 'true', 'aria-labelledby': 'confirm-t', 'aria-describedby': 'confirm-d' },
+      h('h2', { id: 'confirm-t' }, `Remove ${d.title} from Arr?`),
+      h('p', { id: 'confirm-d' }, 'Arr will stop getting new copies and episodes of ', h('em', null, d.title), '. Anything already in Plex stays there. To delete files, use Plex.'),
+      h('div', { class: 'confirm-act' },
+        h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'rm-cancel', 'aria-disabled': busy ? 'true' : 'false', onClick: () => { if (!P.removing) closeConfirm(); } }, 'Cancel'),
+        h('button', { type: 'button', class: 'btn danger', 'data-fk': 'rm-go', 'data-s': busy ? 'busy' : null, 'aria-disabled': busy ? 'true' : 'false', onClick: doRemove }, busy ? 'Removing…' : 'Remove'))));
 }
 
 // ----- download options: a quality level, and a list of copies to pick from
@@ -982,7 +1067,7 @@ function seasonItem(s) {
 function showBody() {
   const d = P.data, on = d.following;
   return h('div', { key: 'show', class: 'stack' },
-    hero(d.title, joinDot(d.year, d.network, d.status, d.runtime_minutes && `${d.runtime_minutes}m episodes`), scoreLine(d.scores)),
+    hero(d.title, joinDot(d.year, d.network, d.status, d.runtime_minutes && `${d.runtime_minutes}m episodes`), scoreLine(d.scores), d.requested_by),
     h(Summary, { text: d.summary }),
     h(Genres, { list: d.genres }),
     h('div', null, h('button', { type: 'button', role: 'switch', class: 'switch', 'aria-checked': String(on), 'aria-labelledby': 'sw-t', 'data-fk': 'follow', onClick: toggleFollow },
@@ -990,6 +1075,7 @@ function showBody() {
         h('span', { class: 'sw-m' }, on ? 'Arr gets each new episode when it airs.' : 'Off. Arr is not looking for new episodes.')),
       h('span', { class: 'track', 'aria-hidden': 'true' }, h('i'))), msgFor('follow')),
     optionsPanel(),
+    removeNode(),
     h(Section, { id: 'seasons', title: 'Seasons' }, d.seasons.length ? h('ul', { class: 'list' }, d.seasons.map(seasonItem)) : h(Hint, { text: 'No seasons are listed for this show yet. Check back soon.' })),
     h(Cast, { list: d.cast }));
 }
@@ -1006,7 +1092,7 @@ function movieBody() {
   else if (st === 'none') control = actionNode(key, 'get', 'Get', d.title, d.media_id);
   else control = actionNode(key, 'stop', 'Stop', d.title, d.media_id);
   return h('div', { key: 'movie', class: 'stack' },
-    hero(d.title, joinDot(d.year, d.runtime_minutes && fmtRuntime(d.runtime_minutes)), scoreLine(d.scores)),
+    hero(d.title, joinDot(d.year, d.runtime_minutes && fmtRuntime(d.runtime_minutes)), scoreLine(d.scores), d.requested_by),
     h(Summary, { text: d.summary }),
     h(Genres, { list: d.genres }),
     h('section', { class: 'item state' + (st === 'in_plex' ? ' arrived' : ''), 'aria-label': 'Status' },
@@ -1017,7 +1103,8 @@ function movieBody() {
         msgFor(key)),
       control && h('div', { class: 'act' }, control)),
     optionsPanel(),
-    h(Cast, { list: d.cast }));
+    h(Cast, { list: d.cast }),
+    removeNode());
 }
 
 // ---------- sign in ----------
@@ -1050,7 +1137,10 @@ function route() {
   if (P.shown) {
     closeSheet();
     // Back to the screen the sheet was opened over: it is still there as it was.
-    if (hash === bgHash) { if (onHome()) loadFeed(); return; }
+    if (hash === bgHash) {
+      if (S.stale) { S.stale = false; renderPath(path, q, hash); } else if (onHome()) loadFeed();
+      return;
+    }
   }
   renderPath(path, q, hash);
 }

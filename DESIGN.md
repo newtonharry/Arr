@@ -274,7 +274,10 @@ Home / Ideas / Library, icon plus label. Phone: bottom bar, white, 2px warm top 
 46x52px, 12px radius, sun tint with sun ink text: a 12px uppercase month or day name over a 20px day number. Used as the lead for anything with a date.
 
 ### Segmented Pills and Filter
-Pill buttons (999px, 2px warm border, 44px tall, 800) for choices like Movies / Shows; selected is teal filled with on-teal text. The library filter input is 44px, white, 2px warm border, 14px radius.
+Pill buttons (999px, 2px warm border, 44px tall, 800) for choices like Movies / Shows; selected is teal filled with on-teal text. The library filter input is 44px, white, 2px warm border, 14px radius; the sort select next to it matches it and wraps below on a phone.
+
+### Drive Meter and Confirm Dialog
+The drive meter is a text line ("Movies drive: 1.2 TB free of 4 TB") over a 10px pill track, teal fill. Under 10% free the line and fill turn coral ink and add "Running low on space"; it is the warning colour, not sun. A destructive question (Remove from Arr) is a centred white card with a 2px warm border over the scrim, inside the sheet; Cancel is first and holds the focus when it opens, Remove is a filled coral-ink button. Tab stays in the card and Escape closes it.
 
 ### Ideas, Search and Title-page Extras
 - **Genre chips:** the segmented pill style above, one row that scrolls sideways on a phone: "All" plus the six genres most ideas share. One is selected at a time and nothing is saved.

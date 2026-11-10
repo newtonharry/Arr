@@ -25,7 +25,10 @@ replaces the usual Sonarr, Radarr, Prowlarr and qBittorrent stack.
 
 Until now the only ways in were an AI assistant over MCP ("add season 2 of Severance") and the
 JSON API. The web interface adds a direct way to find and add movies and shows, see what's on
-its way, see what's coming up, and browse ideas and the library, without an assistant. Ideas leave out what the household already has and can drop a show with "Not interested" (for everyone using that Arr); search shows recent and popular titles before typing and marks what is already in Plex; show and movie pages carry the summary, genres and top cast.
+its way, see what's coming up, and browse ideas and the library, without an assistant. Ideas leave out what the household already has and can drop a show with "Not interested" (for everyone using that Arr); search shows recent and popular titles before typing and marks what is already in Plex; show and movie pages carry the summary, genres and top cast. The library sorts by recently added, title or
+size, shows how much space the drive has left (and says so when it runs low), shows who added
+each title, and lets a person make Arr stop tracking a title. That last one never deletes files:
+anything already in Plex stays, and deleting is left to Plex.
 
 Success: someone who has never seen Arr finds a film, taps once, and later finds it in Plex,
 without learning any media-server vocabulary.
