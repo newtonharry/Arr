@@ -71,6 +71,35 @@ pub struct Embedded {
     check_gate: Arc<tokio::sync::RwLock<()>>,
     /// The state directory's exclusive engine lock, held until the session has stopped.
     lock: Mutex<Option<std::fs::File>>,
+    /// Whether the session bound dual-stack (IPv4 and IPv6); set once it has started.
+    dual_stack: std::sync::OnceLock<bool>,
+}
+
+/// Where the engine listens: the configured address, or `[::]` with the same port when that
+/// is `0.0.0.0` and IPv6 is usable (the listener then accepts both families).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenPlan {
+    addr: SocketAddr,
+    dual_stack: bool,
+}
+
+fn listen_plan(configured: SocketAddr, ipv6: bool) -> ListenPlan {
+    match configured.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() && ipv6 => ListenPlan {
+            addr: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, configured.port())),
+            dual_stack: true,
+        },
+        // A specific address stays exactly as configured; an IPv6 one keeps IPv6 on, as before.
+        _ => ListenPlan {
+            addr: configured,
+            dual_stack: configured.is_ipv6(),
+        },
+    }
+}
+
+/// Whether this host can bind an IPv6 socket at all.
+fn ipv6_available() -> bool {
+    std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).is_ok()
 }
 
 /// Identity of one engine live state. A weak reference keeps its allocation, so the address
@@ -457,6 +486,7 @@ impl Embedded {
             #[cfg(test)]
             check_gate: Arc::default(),
             lock: Mutex::new(None),
+            dual_stack: std::sync::OnceLock::new(),
         }
     }
 
@@ -470,7 +500,7 @@ impl Embedded {
 
     /// Starts the session (once): listeners, persistence and fast-resume under the state
     /// directory, and every persisted torrent resumed after the checks below. DHT, local
-    /// discovery and UPnP only as configured (UPnP never).
+    /// discovery and UPnP only as configured (UPnP on unless `upnp = false`).
     pub async fn start(&self) -> Result<Arc<Session>, UpstreamError> {
         self.session.get_or_try_init(|| self.open()).await.cloned()
     }
@@ -490,40 +520,49 @@ impl Embedded {
             .map_err(|e| io_failure("creating the download directory", &e))?;
         self.check_persisted(&persistence).await?;
         self.reset_pending_verification().await?;
-        let dht = c.dht.then(|| DhtSessionConfig {
-            bootstrap_addrs: None,
-            port: None,
-            persistence: Some(DhtPersistenceConfig {
-                dump_interval: None,
-                config_filename: Some(c.session_dir.join("dht.json")),
-            }),
-        });
-        let opts = SessionOptions {
-            dht,
-            disable_trackers: !c.trackers,
-            fastresume: true,
-            persistence: Some(SessionPersistenceConfig::Json {
-                folder: Some(persistence),
-            }),
-            listen: Some(ListenerOptions {
-                mode: ListenerMode::TcpOnly,
-                listen_addr: c.listen,
-                enable_upnp_port_forwarding: false,
-                ipv4_only: c.listen.is_ipv4(),
+        // Dual-stack when the configured address is 0.0.0.0 and this host has IPv6; a host
+        // without it starts on IPv4 as before.
+        let mut plan = listen_plan(c.listen, ipv6_available());
+        let session = loop {
+            let dht = c.dht.then(|| DhtSessionConfig {
+                bootstrap_addrs: None,
+                port: None,
+                persistence: Some(DhtPersistenceConfig {
+                    dump_interval: None,
+                    config_filename: Some(c.session_dir.join("dht.json")),
+                }),
+            });
+            let opts = SessionOptions {
+                dht,
+                disable_trackers: !c.trackers,
+                fastresume: true,
+                persistence: Some(SessionPersistenceConfig::Json {
+                    folder: Some(persistence.clone()),
+                }),
+                listen: Some(ListenerOptions {
+                    mode: ListenerMode::TcpAndUtp,
+                    listen_addr: plan.addr,
+                    enable_upnp_port_forwarding: c.upnp,
+                    ipv4_only: !plan.dual_stack,
+                    ..Default::default()
+                }),
+                ratelimits: LimitsConfig {
+                    upload_bps: c.upload_bps,
+                    download_bps: c.download_bps,
+                },
+                peer_limit: c.peer_limit,
+                disable_local_service_discovery: !c.local_discovery,
+                ipv4_only: !plan.dual_stack,
                 ..Default::default()
-            }),
-            ratelimits: LimitsConfig {
-                upload_bps: c.upload_bps,
-                download_bps: c.download_bps,
-            },
-            peer_limit: c.peer_limit,
-            disable_local_service_discovery: !c.local_discovery,
-            ipv4_only: c.listen.is_ipv4(),
-            ..Default::default()
+            };
+            match Session::new_with_opts(c.download_dir.clone(), opts).await {
+                Ok(s) => break s,
+                // Never fail startup over IPv6: try again on IPv4 only.
+                Err(_) if plan.addr != c.listen => plan = listen_plan(c.listen, false),
+                Err(e) => return Err(engine_failure("starting the engine session", &e)),
+            }
         };
-        let session = Session::new_with_opts(c.download_dir.clone(), opts)
-            .await
-            .map_err(|e| engine_failure("starting the engine session", &e))?;
+        let _ = self.dual_stack.set(plan.dual_stack);
         if let Err(e) = self.after_restore(&session).await {
             // Nothing is left running when startup fails.
             session.stop().await;
@@ -758,11 +797,17 @@ impl Embedded {
         let mut v = json!({
             "backend": "embedded",
             "engine": ENGINE,
-            "transport": "tcp",
+            "transport": "tcp+utp",
+            "ipv6": self.dual_stack.get().copied().unwrap_or(false),
             "trackers": c.trackers,
             "dht": c.dht,
             "local_discovery": c.local_discovery,
-            "upnp": false,
+            "upnp": c.upnp,
+            "upnp_mapping": if c.upnp {
+                "TCP, the listen port only; asked of the router every 30 s with a 60 s lease (librqbit 9.0.1 reports no mapping result)"
+            } else {
+                "off"
+            },
             "pex": "on for public torrents (not configurable in librqbit 9.0.1); never for private torrents",
             "initial_peers": c.initial_peers.len(),
             "max_active_downloads": c.max_active_downloads,
@@ -773,6 +818,13 @@ impl Embedded {
             Some(s) => {
                 v["status"] = json!("running");
                 v["listen"] = json!(s.listen_addr().map(|a| a.to_string()));
+                // Outgoing connections since the engine started, by transport.
+                // Counts only: attempts, successes and errors per address family.
+                let cs = s.stats_snapshot().connections;
+                v["connections"] = json!({
+                    "tcp": serde_json::to_value(&cs.tcp).unwrap_or(Value::Null),
+                    "utp": serde_json::to_value(&cs.utp).unwrap_or(Value::Null),
+                });
                 let mut n = [0u64; 6];
                 let (mut peers, mut down, mut up) = (0u64, 0u64, 0u64);
                 let all: Vec<Arc<ManagedTorrent>> =
@@ -850,7 +902,6 @@ impl Embedded {
     /// peers without writing anything. Returns `Ok(true)` once the engine manages it.
     pub async fn add(&self, req: &AddRequest) -> Result<bool, UpstreamError> {
         let session = self.start().await?;
-        let _ops = self.ops.lock().await;
         let peers = (!self.cfg.initial_peers.is_empty()).then(|| self.cfg.initial_peers.clone());
         let bytes: Vec<u8> = match &req.payload {
             Payload::Torrent(b) => b.clone(),
@@ -878,6 +929,10 @@ impl Embedded {
                 }
             }
         };
+        // Fetching metadata writes nothing and can wait minutes, so the operations lock is
+        // taken only once the metadata is in hand: pausing, resuming and removing other
+        // torrents are not held up behind a magnet that is still looking for peers.
+        let _ops = self.ops.lock().await;
         let t = inspect(&bytes).map_err(invalid)?;
         if let Payload::Magnet(m) = &req.payload
             && crate::torrent::magnet_hash(m).ok().as_deref() != Some(t.hash.as_str())
@@ -1475,6 +1530,24 @@ impl Embedded {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_plan_goes_dual_stack_only_for_the_unspecified_ipv4_address() {
+        let a = |t: &str| t.parse::<SocketAddr>().unwrap();
+        let dual = listen_plan(a("0.0.0.0:50413"), true);
+        assert_eq!((dual.addr, dual.dual_stack), (a("[::]:50413"), true));
+        // No IPv6 on the host: as configured.
+        let v4 = listen_plan(a("0.0.0.0:50413"), false);
+        assert_eq!((v4.addr, v4.dual_stack), (a("0.0.0.0:50413"), false));
+        // A specific address stays as given.
+        for t in ["127.0.0.1:0", "192.168.1.5:6881"] {
+            let p = listen_plan(a(t), true);
+            assert_eq!((p.addr, p.dual_stack), (a(t), false), "{t}");
+        }
+        // An address configured as IPv6 is untouched (IPv6 stays on, as before).
+        let p = listen_plan(a("[::]:6881"), false);
+        assert_eq!((p.addr, p.dual_stack), (a("[::]:6881"), true));
+    }
     use std::time::Duration;
 
     #[cfg(unix)]
@@ -1655,6 +1728,7 @@ mod tests {
             ratio_limit: None,
             seeding_time_limit_minutes: None,
             metadata_timeout: Duration::from_secs(5),
+            upnp: false,
             movie_category: None,
             tv_category: None,
         };
