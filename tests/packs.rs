@@ -293,6 +293,45 @@ async fn a_download_that_started_moving_after_the_plan_is_kept_and_its_episode_l
 }
 
 #[tokio::test]
+async fn a_download_that_finished_after_the_plan_is_not_downloaded_again() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (g4, _) = single(&e, 4, "SLOW").await;
+    let (g6, _) = single(&e, 6, "DEAD").await;
+    e.tick().await;
+    make_idle(&e, &g4);
+    make_idle(&e, &g6);
+    e.state.reload_index().await.unwrap();
+
+    publish_pack(&e);
+    let (s, v, text) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": SEASON, "execute": false, "replan": true })),
+        )
+        .await;
+    assert_eq!(s, 201, "{text}");
+    assert_eq!(v["plan"]["candidates"][0]["supersedes"], json!([4, 6]));
+    let plan_id = v["plan"]["id"].as_str().unwrap().to_string();
+
+    // E04's download finishes and is imported before the plan runs.
+    mark(
+        &e,
+        "UPDATE grabs SET state = 'imported', active = 0 WHERE id = ?1",
+        &g4,
+    );
+
+    let (s, v, text) = e
+        .json(e.post(&format!("/api/v1/plans/{plan_id}/execute")))
+        .await;
+    assert_eq!(s, 200, "{text}");
+    let pack = v["plan"]["execution"]["grabs"][0].as_str().unwrap();
+    let mut got = targets(&e, pack);
+    got.sort();
+    assert_eq!(got, [ep(2), ep(5), ep(6)], "E04 is not fetched again");
+    assert_eq!(e.grab_row(&g6).state, "cancelled");
+}
+
+#[tokio::test]
 async fn a_pack_is_not_planned_when_every_missing_episode_keeps_its_download() {
     let e = start_exec(ExecOptions::default()).await;
     // Three downloads are under way and moving; the fourth episode was picked by hand and

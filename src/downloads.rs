@@ -1105,13 +1105,16 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
             // active grab joins the grab. One the decision marked as taken over (`supersedes`)
             // is taken over if its grab is still idle, unconfirmed or unsent, automatic and
             // not paused; if it has started making progress since, that grab is kept and the
-            // episode is left out of this one. Anything else already downloading refuses.
+            // episode is left out of this one. If that grab has finished since (imported, or
+            // gone), the episode is left out too: it may be owned now, and a later search
+            // looks again. Anything else already downloading refuses.
             let mut covers: Vec<MediaId> = vec![];
             let mut taken: Vec<String> = vec![];
             let mut left_out: Vec<MediaId> = vec![];
             for t in &link.covers {
                 let active = active_covers(&tx, now, Some(&t.to_string()))?;
                 match active.as_slice() {
+                    [] if link.supersedes.contains(t) => left_out.push(*t),
                     [] => covers.push(*t),
                     [a] if link.supersedes.contains(t) && a.replaceable => {
                         if !taken.contains(&a.grab_id) {
