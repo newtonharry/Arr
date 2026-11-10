@@ -301,7 +301,7 @@ async function hideIdea(x) {
   toast('Hidden', async () => {
     back(); bump();
     try { await api('/v1/ideas/hide/' + encodeURIComponent(x.media_id), { method: 'DELETE' }); } catch { /* shown again for now; hidden again on the next load */ }
-    return 'It is back in Ideas.';
+    return { ok: true, text: 'It is back in Ideas.' };
   });
   let ok = false;
   try { ok = (await api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } })).ok; } catch { /* below */ }
