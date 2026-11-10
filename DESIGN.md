@@ -217,7 +217,7 @@ Title-tile gradients (eight fixed pairs, `.t0` to `.t7`: teal, coral-red, ochre,
 ### Named Rules
 **The Heavy Round Rule.** Titles and controls are 800; supporting text is 500 to 600. No light weights.
 
-**The Plain Words Rule.** Copy is household English: "Found, getting ready", "Downloading", "Checking the file", "In Plex", "Watch". No indexer, grab, queue, quality or seeder vocabulary anywhere a household member reads.
+**The Plain Words Rule.** Copy is household English: "Found, getting ready", "Downloading", "Checking the file", "In Plex", "Ready to watch". No indexer, grab, queue, quality or seeder vocabulary anywhere a household member reads.
 
 ## Layout
 
@@ -245,16 +245,19 @@ Full width, 56px tall, white, 2px warm border, 18px radius, the solid 5px drop, 
 
 ### Item Rows
 White card, 2px warm border, 18px radius, 12px padding, 12px gap: lead tile or date chip, a text column (title, one meta line), and a trailing action when needed.
-- **Arrived:** teal border, an "In Plex" tag (teal ink, check glyph, 12px/800) above the title, and a teal Watch button on the right that opens Plex.
+- **Arrived:** teal border, an "In Plex" tag (teal ink, check glyph, 12px/800) above the title. There is no Watch button: people watch on their TV, so Arrived rows and the movie page just say "In Plex" and "Ready to watch".
 - **On its way:** title, status line ("42% downloaded", "Paused"), then the journey line.
 - **Needs you:** neutral border (the card stays calm), a coral-ink problem line with an alert glyph, and the coral outline button.
 - **Coming up / looking:** a sun date chip as the lead, "Out 14 Nov. Arr will get it then."
+
+### Scores
+A calm line of plain-text labels, "IMDb 7.8 · Critics 96% · Audience 87%" (14px muted, the numbers in ink at 800), showing only the scores Plex gave. It sits under the meta line on Ideas and Search rows, under the title on the show and movie sheets, and stacks one per line on the narrow Ideas cards. Next to it, a small outlined pill gives the verdict ("Likely good", "Critics’ pick", "Crowd-pleaser", "Mixed reviews", "Probably skip"). The pill is neutral (teal ink only for "Likely good"); "Probably skip" is never coral, because it is advice, not an error. Its `title` and screen-reader text give the reason ("Critics 96%, audience 87%: both high"). No third-party logos. Plex scores replace the TVmaze star; with none, the star stays.
 
 ### Title Tiles
 46x68px portrait block, 10px radius, vertical two-stop gradient picked deterministically from the title (8 sets), white initials at 16px/800. In ideas they widen to a 132x92 block with 28px initials. They are honest placeholders for artwork and are used wherever a poster would sit.
 
 ### Buttons
-- **Primary (teal):** 44px tall, 12px radius, 0 14px padding, 2px teal border and fill, white text (dark mode: teal-black on light teal), 14px/800, optional 18px icon. Hover brightens; active presses 1px. Used for Add and Watch.
+- **Primary (teal):** 44px tall, 12px radius, 0 14px padding, 2px teal border and fill, white text (dark mode: teal-black on light teal), 14px/800, optional 18px icon. Hover brightens; active presses 1px. Used for Add and Get.
 - **Needs-you (coral outline):** transparent fill, 2px coral border, coral-ink label, same size. Used only inside Needs-you rows ("Try again" style actions).
 - **Done:** after adding, the primary button becomes transparent with warm border and teal-ink label ("Added", "In Plex", "Following").
 - **Ghost:** transparent, warm border, ink label, border turns teal on hover.

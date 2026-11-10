@@ -7,6 +7,7 @@ use crate::upstream::{self, TtlCache, UpstreamError};
 use reqwest::Url;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -114,6 +115,7 @@ struct SearchHit {
 pub struct WebShow {
     pub id: u32,
     pub tvdb: Option<u32>,
+    pub imdb: Option<String>,
     pub name: String,
     pub year: Option<u16>,
     pub network: Option<String>,
@@ -322,6 +324,7 @@ impl Tvmaze {
                     WebShow {
                         id: show.show.id,
                         tvdb: show.show.externals.thetvdb,
+                        imdb: show.show.externals.imdb.clone(),
                         name: show.show.name.trim().to_string(),
                         year: show.show.year(),
                         network,
@@ -454,6 +457,123 @@ impl Tvmaze {
     }
 }
 
+/// Public review scores read from Plex's metadata service: IMDb's out of 10, and Rotten
+/// Tomatoes' critic and audience scores as percents.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Scores {
+    pub imdb: Option<f64>,
+    pub critics: Option<u8>,
+    pub audience: Option<u8>,
+}
+
+/// A quick read of the two Rotten Tomatoes scores together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    LikelyGood,
+    ProbablySkip,
+    CriticsPick,
+    CrowdPleaser,
+    Mixed,
+}
+
+impl Verdict {
+    pub fn code(self) -> &'static str {
+        match self {
+            Verdict::LikelyGood => "likely_good",
+            Verdict::ProbablySkip => "probably_skip",
+            Verdict::CriticsPick => "critics_pick",
+            Verdict::CrowdPleaser => "crowd_pleaser",
+            Verdict::Mixed => "mixed",
+        }
+    }
+}
+
+/// A score Plex gives out of 10, or none when it is missing, not a finite number or out of range.
+fn tenths(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .filter(|n| n.is_finite() && (0.0..=10.0).contains(n))
+}
+
+impl Scores {
+    pub fn is_empty(&self) -> bool {
+        *self == Scores::default()
+    }
+
+    /// Reads Plex's `Rating` array loosely: an odd shape, a missing value or an out-of-range one
+    /// is no score, never an error. IMDb is kept to one decimal; Rotten Tomatoes (out of 10 in
+    /// Plex) becomes a percent. Other sources are ignored.
+    pub fn from_ratings(ratings: &Value) -> Scores {
+        let mut out = Scores::default();
+        for r in ratings.as_array().into_iter().flatten() {
+            let (Some(image), Some(kind)) = (r["image"].as_str(), r["type"].as_str()) else {
+                continue;
+            };
+            let Some(n) = tenths(&r["value"]) else {
+                continue;
+            };
+            if image.starts_with("imdb://") {
+                out.imdb = out.imdb.or(Some((n * 10.0).round() / 10.0));
+            } else if image.starts_with("rottentomatoes://") {
+                let pct = Some((n * 10.0).round() as u8);
+                match kind {
+                    "critic" => out.critics = out.critics.or(pct),
+                    "audience" => out.audience = out.audience.or(pct),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// The verdict, from the two Rotten Tomatoes scores; none when either is missing.
+    pub fn verdict(&self) -> Option<Verdict> {
+        let (c, a) = (i16::from(self.critics?), i16::from(self.audience?));
+        Some(if c >= 70 && a >= 70 {
+            Verdict::LikelyGood
+        } else if c < 50 && a < 50 {
+            Verdict::ProbablySkip
+        } else if c - a >= 15 {
+            Verdict::CriticsPick
+        } else if a - c >= 15 {
+            Verdict::CrowdPleaser
+        } else {
+            Verdict::Mixed
+        })
+    }
+
+    /// `{"imdb": 7.8, "critics": 96, "audience": 87, "verdict": "likely_good"}`, with unknown
+    /// scores left out and a null verdict when it cannot be told.
+    pub fn json(&self) -> Value {
+        let mut v = serde_json::Map::new();
+        if let Some(n) = self.imdb {
+            v.insert("imdb".into(), n.into());
+        }
+        if let Some(n) = self.critics {
+            v.insert("critics".into(), n.into());
+        }
+        if let Some(n) = self.audience {
+            v.insert("audience".into(), n.into());
+        }
+        v.insert(
+            "verdict".into(),
+            self.verdict().map_or(Value::Null, |d| d.code().into()),
+        );
+        Value::Object(v)
+    }
+}
+
+/// The `scores` key of an API answer: null when there are none.
+pub fn scores_json(s: Option<Scores>) -> Value {
+    s.filter(|s| !s.is_empty())
+        .map_or(Value::Null, |s| s.json())
+}
+
+/// Plex's `Rating` array, read loosely (see `Scores::from_ratings`).
+fn loose_scores<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Scores>, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(Some(Scores::from_ratings(&v)).filter(|s| !s.is_empty()))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TmdbSearchResult {
     pub id: u32,
@@ -465,6 +585,9 @@ pub struct TmdbSearchResult {
     pub release_date: Option<String>,
     #[serde(default)]
     pub original_language: Option<String>,
+    /// Plex answers only; never read from TMDB.
+    #[serde(default, skip_deserializing)]
+    pub scores: Option<Scores>,
 }
 
 #[derive(Deserialize)]
@@ -512,6 +635,9 @@ pub struct TmdbMovie {
     /// Plex's poster address (Plex answers only; never read from TMDB).
     #[serde(default, skip_deserializing)]
     pub plex_thumb: Option<String>,
+    /// IMDb and Rotten Tomatoes scores (Plex answers only).
+    #[serde(default, skip_deserializing)]
+    pub scores: Option<Scores>,
     /// The only digital date is "Plex shows it for sale or streaming today", not a published
     /// date: a refresh keeps an earlier recorded date instead of moving it forward.
     #[serde(default, skip_deserializing)]
@@ -807,6 +933,8 @@ struct PlexMeta {
     thumb: Option<String>,
     #[serde(default)]
     summary: Option<String>,
+    #[serde(rename = "Rating", default, deserialize_with = "loose_scores")]
+    scores: Option<Scores>,
 }
 
 impl PlexMeta {
@@ -886,6 +1014,10 @@ struct PlexInner {
     metas: TtlCache<String, Option<PlexMeta>>,
     /// Finished movies by TMDB id.
     movies: TtlCache<u32, Option<TmdbMovie>>,
+    /// Show scores by Plex guid (`tvdb://<id>` or `imdb://tt...`).
+    shows: TtlCache<String, Option<Scores>>,
+    /// Bounds the show lookups in flight.
+    lookups: tokio::sync::Semaphore,
 }
 
 /// A Plex key is letters and digits only; anything else is never put in a path.
@@ -905,6 +1037,8 @@ impl PlexMovies {
                 client_id,
                 metas: TtlCache::new(METADATA_TTL, 512),
                 movies: TtlCache::new(METADATA_TTL, 512),
+                shows: TtlCache::new(METADATA_TTL, 512),
+                lookups: tokio::sync::Semaphore::new(PLEX_LOOKUPS),
             }),
         }
     }
@@ -1037,6 +1171,7 @@ impl PlexMovies {
                                 .clone()
                                 .or(m.year.map(|y| y.to_string())),
                             original_language: None,
+                            scores: m.scores,
                         })
                     }
                     Ok(None) => {}
@@ -1049,6 +1184,62 @@ impl PlexMovies {
             Some(e) if results.is_empty() => Err(e),
             _ => Ok(results),
         }
+    }
+
+    /// The Plex guid a show is looked up by: its TVDB id, else its IMDb id.
+    fn show_guid(tvdb: Option<u32>, imdb: Option<&str>) -> Option<String> {
+        match (tvdb.filter(|n| *n > 0), imdb.filter(|i| imdb_shape(i))) {
+            (Some(n), _) => Some(format!("tvdb://{n}")),
+            (None, Some(i)) => Some(format!("imdb://{i}")),
+            _ => None,
+        }
+    }
+
+    async fn fetch_show_scores(&self, guid: &str) -> Result<(), UpstreamError> {
+        let Ok(_slot) = self.inner.lookups.acquire().await else {
+            return Ok(());
+        };
+        let meta = self
+            .first_meta("library/metadata/matches", &[("type", "2"), ("guid", guid)])
+            .await?;
+        self.inner
+            .shows
+            .insert(guid.to_string(), meta.and_then(|m| m.scores));
+        Ok(())
+    }
+
+    /// Scores for several shows, one entry per input. Lookups run (a few at a time) in the
+    /// background and are waited for at most `budget`; a lookup that fails or is not ready
+    /// leaves that show without scores, and a slow one still finishes into the cache.
+    pub async fn show_scores(
+        &self,
+        shows: &[(Option<u32>, Option<String>)],
+        budget: Duration,
+    ) -> Vec<Option<Scores>> {
+        let guids: Vec<Option<String>> = shows
+            .iter()
+            .map(|(t, i)| Self::show_guid(*t, i.as_deref()))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let tasks: Vec<_> = guids
+            .iter()
+            .flatten()
+            .filter(|g| self.inner.shows.get(g).is_none() && seen.insert(g.as_str()))
+            .map(|g| {
+                let (this, guid) = (self.clone(), g.clone());
+                tokio::spawn(async move { this.fetch_show_scores(&guid).await })
+            })
+            .collect();
+        let _ = tokio::time::timeout(budget, async {
+            for t in tasks {
+                let _ = t.await;
+            }
+        })
+        .await;
+        guids
+            .iter()
+            .map(|g| g.as_ref().and_then(|g| self.inner.shows.get(g)).flatten())
+            .collect()
     }
 
     pub async fn find_imdb(&self, imdb: &str) -> Result<Option<u32>, UpstreamError> {
@@ -1136,6 +1327,7 @@ fn plex_movie(id: u32, m: &PlexMeta, on_sale: bool) -> TmdbMovie {
         poster_path: None,
         overview: m.summary.clone().filter(|t| !t.trim().is_empty()),
         plex_thumb: m.thumb.clone(),
+        scores: m.scores,
         observed_digital: on_sale,
     }
 }
@@ -1168,6 +1360,18 @@ impl Movies {
 
     pub fn has_plex(&self) -> bool {
         self.plex.is_some()
+    }
+
+    /// Show scores (see `PlexMovies::show_scores`); all unknown without a Plex sign-in.
+    pub async fn show_scores(
+        &self,
+        shows: &[(Option<u32>, Option<String>)],
+        budget: Duration,
+    ) -> Vec<Option<Scores>> {
+        match &self.plex {
+            Some(p) => p.show_scores(shows, budget).await,
+            None => vec![None; shows.len()],
+        }
     }
 
     /// Results from Plex, or from TMDB when Plex fails or finds nothing, with what each
@@ -1250,6 +1454,7 @@ impl Movies {
 /// leaves out (a poster first, and "on sale today" when TMDB has no digital date).
 fn merge(plex: TmdbMovie, mut tmdb: TmdbMovie) -> TmdbMovie {
     tmdb.plex_thumb = plex.plex_thumb;
+    tmdb.scores = plex.scores;
     tmdb.overview = plex
         .overview
         .or(tmdb.overview.filter(|t| !t.trim().is_empty()));
@@ -1327,5 +1532,142 @@ mod release_date_tests {
         let r = movie("", &[(4, "not a date at all"), (4, "2026-02-03")]).release();
         assert_eq!(r.digital_release.as_deref(), Some("2026-02-03"));
         assert_eq!(r.in_cinemas, None);
+    }
+}
+
+#[cfg(test)]
+mod score_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rt(c: Option<u8>, a: Option<u8>) -> Scores {
+        Scores {
+            imdb: None,
+            critics: c,
+            audience: a,
+        }
+    }
+
+    #[test]
+    fn reads_every_rotten_tomatoes_image() {
+        let ripe = Scores::from_ratings(&json!([
+            { "image": "imdb://image.rating", "type": "audience", "value": 7.8 },
+            { "image": "rottentomatoes://image.rating.ripe", "type": "critic", "value": 9.6 },
+            { "image": "rottentomatoes://image.rating.upright", "type": "audience", "value": 8.7 },
+            { "image": "themoviedb://image.rating", "type": "audience", "value": 7.379 }
+        ]));
+        assert_eq!(
+            ripe,
+            Scores {
+                imdb: Some(7.8),
+                critics: Some(96),
+                audience: Some(87)
+            }
+        );
+        let bad = Scores::from_ratings(&json!([
+            { "image": "rottentomatoes://image.rating.rotten", "type": "critic", "value": 3.1 },
+            { "image": "rottentomatoes://image.rating.spilled", "type": "audience", "value": 4.0 },
+            { "image": "imdb://image.rating", "type": "audience", "value": 6.04 }
+        ]));
+        assert_eq!(
+            bad,
+            Scores {
+                imdb: Some(6.0),
+                critics: Some(31),
+                audience: Some(40)
+            }
+        );
+    }
+
+    #[test]
+    fn missing_and_junk_ratings_are_no_scores() {
+        for v in [
+            json!(null),
+            json!("7.8"),
+            json!({}),
+            json!([]),
+            json!([1, "x", null, []]),
+            json!([{ "image": "imdb://image.rating" }]),
+            json!([{ "image": "imdb://image.rating", "type": "audience", "value": "7.8" }]),
+            json!([{ "image": "imdb://image.rating", "type": "audience", "value": 11 }]),
+            json!([{ "image": "imdb://image.rating", "type": "audience", "value": -0.5 }]),
+            json!([{ "image": "rottentomatoes://x", "type": "critic", "value": null }]),
+            json!([{ "image": "rottentomatoes://x", "type": "other", "value": 5 }]),
+            json!([{ "image": 5, "type": "critic", "value": 5 }]),
+        ] {
+            assert!(Scores::from_ratings(&v).is_empty(), "{v}");
+        }
+        // One good entry survives the bad ones, and the edges of the range count.
+        let s = Scores::from_ratings(&json!([
+            { "image": "rottentomatoes://x", "type": "critic", "value": 12 },
+            { "image": "rottentomatoes://x", "type": "critic", "value": 10 },
+            { "image": "rottentomatoes://x", "type": "audience", "value": 0 }
+        ]));
+        assert_eq!((s.critics, s.audience), (Some(100), Some(0)));
+    }
+
+    #[test]
+    fn a_rating_of_the_wrong_shape_does_not_fail_the_answer() {
+        for rating in [json!("junk"), json!(7), json!({ "a": 1 }), json!([[1]])] {
+            let m: PlexMeta = serde_json::from_value(json!({ "title": "x", "Rating": rating }))
+                .expect("loose parse");
+            assert!(m.scores.is_none());
+        }
+        let m: PlexMeta = serde_json::from_value(json!({
+            "title": "x", "Rating": [{ "image": "imdb://image.rating", "type": "audience", "value": 7.8 }]
+        }))
+        .unwrap();
+        assert_eq!(m.scores.and_then(|s| s.imdb), Some(7.8));
+    }
+
+    #[test]
+    fn the_verdict_table() {
+        use Verdict::*;
+        let v = |c, a| rt(Some(c), Some(a)).verdict();
+        assert_eq!(v(70, 70), Some(LikelyGood));
+        assert_eq!(v(100, 71), Some(LikelyGood));
+        // Just under 70 on one side is not "likely good".
+        assert_eq!(v(69, 90), Some(CrowdPleaser));
+        assert_eq!(v(90, 69), Some(CriticsPick));
+        assert_eq!(v(69, 70), Some(Mixed));
+        assert_eq!(v(49, 49), Some(ProbablySkip));
+        assert_eq!(v(0, 0), Some(ProbablySkip));
+        assert_eq!(v(50, 49), Some(Mixed));
+        assert_eq!(v(49, 50), Some(Mixed));
+        // A gap of 15 counts, 14 does not.
+        assert_eq!(v(65, 50), Some(CriticsPick));
+        assert_eq!(v(64, 50), Some(Mixed));
+        assert_eq!(v(50, 65), Some(CrowdPleaser));
+        assert_eq!(v(50, 64), Some(Mixed));
+        // Both under 50 wins over a big gap; likely good wins over a gap.
+        assert_eq!(v(49, 10), Some(ProbablySkip));
+        assert_eq!(v(100, 70), Some(LikelyGood));
+        assert_eq!(rt(Some(90), None).verdict(), None);
+        assert_eq!(rt(None, Some(90)).verdict(), None);
+        assert_eq!(Scores::default().verdict(), None);
+    }
+
+    #[test]
+    fn scores_serialise_with_unknown_keys_left_out() {
+        let full = Scores {
+            imdb: Some(7.8),
+            critics: Some(96),
+            audience: Some(87),
+        };
+        assert_eq!(
+            full.json(),
+            json!({ "imdb": 7.8, "critics": 96, "audience": 87, "verdict": "likely_good" })
+        );
+        let part = Scores {
+            imdb: Some(5.0),
+            critics: None,
+            audience: Some(80),
+        };
+        assert_eq!(
+            part.json(),
+            json!({ "imdb": 5.0, "audience": 80, "verdict": null })
+        );
+        assert_eq!(scores_json(None), json!(null));
+        assert_eq!(scores_json(Some(Scores::default())), json!(null));
     }
 }

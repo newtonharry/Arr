@@ -70,6 +70,9 @@ struct Show {
     /// The quality profile of the show in the catalog, and whether the catalog has it.
     profile: Option<String>,
     tracked: bool,
+    /// The ids Plex can look the show up by, for its review scores.
+    tvdb: Option<u32>,
+    imdb: Option<String>,
 }
 
 fn status_word(raw: Option<&str>) -> Option<&'static str> {
@@ -196,7 +199,20 @@ async fn load_show(st: &Arc<AppState>, key: SeriesKey) -> Result<Show, ApiError>
         .or_else(|| target.as_ref().and_then(|t| t.runtime_minutes))
         .or_else(|| show.as_ref().and_then(|s| s.runtime.or(s.average_runtime)))
         .filter(|m| *m > 0);
+    let tvdb = match key {
+        SeriesKey::Tvdb(n) => Some(n),
+        SeriesKey::Tvmaze(_) => None,
+    }
+    .or_else(|| catalog.as_ref().map(|s| s.tvdb_id))
+    .or_else(|| target.as_ref().and_then(|t| t.tvdb_id))
+    .or_else(|| show.as_ref().and_then(|s| s.externals.thetvdb));
+    let imdb = catalog
+        .as_ref()
+        .and_then(|s| s.imdb_id.clone())
+        .or_else(|| show.as_ref().and_then(|s| s.externals.imdb.clone()));
     Ok(Show {
+        tvdb,
+        imdb,
         runtime,
         profile: catalog.as_ref().and_then(|s| s.quality_profile.clone()),
         tracked: catalog.is_some(),
@@ -278,7 +294,34 @@ fn series_key_of(id: MediaId) -> Result<SeriesKey, ApiError> {
 pub(super) async fn show(State(st): St, p: Result<Path<String>, PathRejection>) -> ApiResult {
     st.loaded()?;
     let key = series_key_of(media_id(p)?)?;
-    let s = load_show(&st, key).await?;
+    // Review scores are optional and never slow the page past their budget. When the id in the
+    // address is already a TVDB id the lookup starts alongside the page's own work.
+    let early = match key {
+        SeriesKey::Tvdb(n) => Some((Some(n), None)),
+        SeriesKey::Tvmaze(_) => None,
+    };
+    let lookup = |ids: (Option<u32>, Option<String>)| {
+        let st = st.clone();
+        async move {
+            match &st.movies {
+                Some(m) => m.show_scores(&[ids], SCORES_BUDGET).await.pop().flatten(),
+                None => None,
+            }
+        }
+    };
+    let started = early.is_some();
+    let (s, early_scores) = tokio::join!(load_show(&st, key), async {
+        match early {
+            Some(ids) => lookup(ids).await,
+            None => None,
+        }
+    });
+    let s = s?;
+    let scores = if started {
+        early_scores
+    } else {
+        lookup((s.tvdb, s.imdb.clone())).await
+    };
     let mut numbers: Vec<u16> = s.rows.iter().map(|r| r.season).collect();
     numbers.extend(s.snapshot.iter().map(|x| x.number));
     numbers.sort_unstable();
@@ -311,6 +354,7 @@ pub(super) async fn show(State(st): St, p: Result<Path<String>, PathRejection>) 
     let mut v = json!({
         "media_id": s.id, "title": s.title, "year": s.year, "network": s.network,
         "summary": s.summary, "status": s.status, "following": s.following, "seasons": seasons,
+        "scores": metadata::scores_json(scores),
     });
     let l = st.loaded()?;
     options::page_fields(
@@ -415,6 +459,7 @@ pub(super) async fn movie(State(st): St, p: Result<Path<String>, PathRejection>)
             }
         }
     }
+    let scores = meta.as_ref().and_then(|m| m.scores);
     let summary = meta
         .and_then(|m| m.overview)
         .map(|t| cut(t.trim(), 400))
@@ -422,6 +467,7 @@ pub(super) async fn movie(State(st): St, p: Result<Path<String>, PathRejection>)
     let mut v = json!({
         "media_id": id, "title": title, "year": year, "runtime_minutes": runtime,
         "summary": summary, "state": state, "progress": progress, "until": until,
+        "scores": metadata::scores_json(scores),
     });
     let l = st.loaded()?;
     options::page_fields(

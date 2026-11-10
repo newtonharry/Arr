@@ -826,6 +826,115 @@ async fn ideas_come_from_the_web_schedule_and_are_cached() {
 }
 
 #[tokio::test]
+async fn plex_scores_reach_ideas_pages_and_search_and_never_break_them() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    {
+        let mut m = e.mock.lock().unwrap();
+        m.schedule = vec![
+            scheduled(11, "Low Weight", Some(5001), 10, "<p>Plain.</p>"),
+            scheduled(372, "Slow Horses", Some(372264), 90, "<p>Spies.</p>"),
+            scheduled(13, "No Tvdb Show", None, 99, "<p>Plain.</p>"),
+            scheduled(14, "Imdb Only Show", None, 98, "<p>Plain.</p>"),
+        ];
+        m.schedule[3]["_embedded"]["show"]["externals"]["imdb"] = json!("tt9200001");
+        m.schedule[1]["_embedded"]["show"]["rating"] = json!({ "average": 8.26 });
+    }
+    let get = |path: String| {
+        let (site, cookie) = (&site, &cookie);
+        async move {
+            let (s, v) = site.json(site.app(Method::GET, &path, Some(cookie))).await;
+            assert_eq!(s, 200, "{v}");
+            v
+        }
+    };
+    // Ideas: scores from Plex's show match with the TVmaze rating still there; a show with no
+    // TVDB id has none.
+    let v = get("/app/api/v1/ideas".into()).await;
+    let by = |t: &str| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["title"] == t)
+            .unwrap_or_else(|| panic!("{t} in {v}"))
+            .clone()
+    };
+    assert_eq!(
+        by("Slow Horses")["scores"],
+        json!({ "imdb": 8.1, "critics": 96, "audience": 87, "verdict": "likely_good" })
+    );
+    assert_eq!(by("Slow Horses")["rating"], 8.3);
+    // Only the Rotten Tomatoes pair: no imdb key, and a verdict.
+    assert_eq!(
+        by("Low Weight")["scores"],
+        json!({ "critics": 31, "audience": 40, "verdict": "probably_skip" })
+    );
+    assert!(by("No Tvdb Show")["scores"].is_null(), "{v}");
+    // No TVDB id but an IMDb id: matched by that instead.
+    assert_eq!(
+        by("Imdb Only Show")["scores"],
+        json!({ "imdb": 6.4, "verdict": null })
+    );
+    // Show page, by TVDB id.
+    let v = get("/app/api/v1/show/series:tvdb:372264".into()).await;
+    assert_eq!(v["scores"]["verdict"], "likely_good", "{v}");
+    assert_eq!(v["scores"]["imdb"], 8.1);
+    // Movie page: from Plex's answer; a movie with a junk Rating, or none, has null.
+    let v = get(format!("/app/api/v1/movie/movie:tmdb:{PLEX_RELEASED}")).await;
+    assert_eq!(
+        v["scores"],
+        json!({ "imdb": 7.8, "critics": 96, "audience": 87, "verdict": "likely_good" }),
+        "{v}"
+    );
+    for id in [PLEX_FOREIGN, PLEX_UNRELEASED] {
+        let v = get(format!("/app/api/v1/movie/movie:tmdb:{id}")).await;
+        assert!(v["scores"].is_null(), "{id}: {v}");
+        assert!(v["title"].is_string());
+    }
+    // Movie and show search results.
+    let v = get("/app/api/v1/discover?kind=movie&q=plex%20released".into()).await;
+    let hit = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["external_ids"]["tmdb"] == PLEX_RELEASED)
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(hit["scores"]["critics"], 96, "{v}");
+    assert_eq!(hit["scores"]["verdict"], "likely_good");
+    let v = get("/app/api/v1/discover?kind=series&q=slow%20horses".into()).await;
+    let hit = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["external_ids"]["tvdb"] == 372264)
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(hit["scores"]["audience"], 87, "{v}");
+    // Plex failing leaves the scores out and everything else as it was.
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    {
+        let mut m = e.mock.lock().unwrap();
+        m.plex_meta_fail = true;
+        m.schedule = vec![scheduled(
+            372,
+            "Slow Horses",
+            Some(372264),
+            90,
+            "<p>Spies.</p>",
+        )];
+    }
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/ideas", Some(&cookie)))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["items"][0]["title"], "Slow Horses");
+    assert!(v["items"][0]["scores"].is_null(), "{v}");
+}
+
+#[tokio::test]
 async fn ideas_say_when_they_are_unavailable_or_off() {
     let e = exec().await;
     e.mock.lock().unwrap().schedule_fail = true;

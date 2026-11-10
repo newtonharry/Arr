@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -2340,6 +2340,8 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
     };
     let index = st.index();
     let catalog = st.current().map(|_| index.as_ref());
+    // Plex's review scores for movie hits, by TMDB id.
+    let mut movie_scores: HashMap<u32, metadata::Scores> = HashMap::new();
     match (catalog, q.kind) {
         (None, _) => providers.push(json!({ "name": "catalog", "status": "not_imported" })),
         (Some(c), DiscoverKind::Movie) => {
@@ -2406,13 +2408,16 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
                     });
                 }
                 for m in found.iter().take(25) {
+                    if let Some(s) = m.scores {
+                        movie_scores.insert(m.id, s);
+                    }
                     let in_catalog = catalog.is_some_and(|c| c.movie(m.id).is_some());
                     add(MediaId::Movie { tmdb: m.id }, json!({ "kind": "movie", "title": m.title, "original_title": m.original_title, "year": metadata::year_of(m.release_date.as_deref()), "in_catalog": in_catalog, "external_ids": { "tmdb": m.id } }), source);
                 }
             }
         },
     }
-    let list: Vec<Value> = order
+    let mut list: Vec<Value> = order
         .into_iter()
         .filter_map(|k| results.remove(&k))
         .filter(|r| {
@@ -2420,6 +2425,36 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
                 .is_none_or(|y| r["year"].as_u64().is_none_or(|ry| ry == u64::from(y)))
         })
         .collect();
+    match q.kind {
+        DiscoverKind::Movie => {
+            for r in &mut list {
+                let s = r["external_ids"]["tmdb"]
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .and_then(|id| movie_scores.get(&id).copied());
+                r["scores"] = metadata::scores_json(s);
+            }
+        }
+        DiscoverKind::Series => {
+            let refs: Vec<(Option<u32>, Option<String>)> = list
+                .iter()
+                .map(|r| {
+                    let ids = &r["external_ids"];
+                    (
+                        ids["tvdb"].as_u64().and_then(|n| u32::try_from(n).ok()),
+                        ids["imdb"].as_str().map(str::to_owned),
+                    )
+                })
+                .collect();
+            let scores = match &st.movies {
+                Some(m) => m.show_scores(&refs, SCORES_BUDGET).await,
+                None => vec![None; list.len()],
+            };
+            for (r, s) in list.iter_mut().zip(scores) {
+                r["scores"] = metadata::scores_json(s);
+            }
+        }
+    }
     ok(
         json!({ "query": text, "kind": match q.kind { DiscoverKind::Movie => "movie", DiscoverKind::Series => "series" }, "results": list, "providers": providers }),
     )
@@ -4234,6 +4269,9 @@ async fn feed(State(st): St) -> ApiResult {
     }))
 }
 
+/// The longest a page waits for review scores; whatever is ready by then is shown.
+pub(crate) const SCORES_BUDGET: Duration = Duration::from_millis(1500);
+
 /// Popular shows with new episodes this week (TVmaze web schedule).
 async fn ideas(State(st): St) -> ApiResult {
     let Some(tv) = &st.tvmaze else {
@@ -4243,9 +4281,16 @@ async fn ideas(State(st): St) -> ApiResult {
         return ok(json!({ "status": "unavailable", "items": [] }));
     };
     let index = st.index();
+    let refs: Vec<(Option<u32>, Option<String>)> =
+        shows.iter().map(|s| (s.tvdb, s.imdb.clone())).collect();
+    let scores = match &st.movies {
+        Some(m) => m.show_scores(&refs, SCORES_BUDGET).await,
+        None => vec![None; shows.len()],
+    };
     let items: Vec<Value> = shows
         .iter()
-        .map(|s| {
+        .zip(scores)
+        .map(|(s, scores)| {
             let key = s.tvdb.map_or(SeriesKey::Tvmaze(s.id), SeriesKey::Tvdb);
             let in_library = [
                 SeriesKey::Tvdb(s.tvdb.unwrap_or(0)),
@@ -4257,7 +4302,7 @@ async fn ideas(State(st): St) -> ApiResult {
             json!({
                 "media_id": MediaId::Series(key), "title": s.name, "year": s.year,
                 "network": s.network, "in_library": in_library, "summary": s.summary,
-                "rating": s.rating,
+                "rating": s.rating, "scores": metadata::scores_json(scores),
             })
         })
         .collect();

@@ -198,6 +198,20 @@ response bodies or credentials.
   status: `ok`, `failed` (with `error`), `disabled`, `not_configured` or `not_imported`. When
   neither Plex nor TMDB can answer, the `plex` provider is `not_configured` and its message says
   the install needs to sign in to Plex.
+- **Review scores.** Plex's metadata service (needs the Plex sign-in) gives IMDb and Rotten
+  Tomatoes scores. `scores` is present on `/discover` results, the web app's `/ideas` items,
+  `/show/{media_id}` and `/movie/{media_id}`, and is `null` when Plex has none (no sign-in, an
+  unknown title, a slow or failed lookup; a show lookup never delays an answer by more than
+  1.5 seconds). Existing keys such as `rating` are unchanged.
+  ```json
+  "scores": {"imdb": 7.8, "critics": 96, "audience": 87, "verdict": "likely_good"}
+  ```
+  `imdb` is out of 10 (one decimal); `critics` and `audience` are Rotten Tomatoes percents.
+  Unknown scores are left out. `verdict` is `null` unless both Rotten Tomatoes scores are known;
+  otherwise the first rule that fits: both 70 or more `likely_good`, both under 50
+  `probably_skip`, critics 15 or more above the audience `critics_pick`, audience 15 or more
+  above critics `crowd_pleaser`, else `mixed`. Movies in `/discover` get scores only from
+  Plex's own search hits.
 - **`GET /api/v1/media/{media_id}`** resolves a target. For a season or episode it returns the
   episode list with `aired` and `ownership` (`owned` / `missing` / `unknown`), plus
   `ownership_source` and `episode_list_source`.
