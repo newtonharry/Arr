@@ -498,6 +498,13 @@ mod tests {
         assert_eq!(parse_status(&fresh, now).unwrap().state, "updating");
     }
 
+    /// The updater's file name on this platform (the PowerShell one on Windows).
+    const UPDATER: &str = if cfg!(windows) {
+        "arr-update.ps1"
+    } else {
+        "arr-update"
+    };
+
     fn install(dir: &Path, marker: bool, watcher: bool) -> Updates {
         let bin = dir.join("bin");
         let svc = dir.join("svc");
@@ -510,7 +517,7 @@ mod tests {
         } else {
             "#!/bin/sh\n".into()
         };
-        std::fs::write(bin.join("arr-update"), script).unwrap();
+        std::fs::write(bin.join(UPDATER), script).unwrap();
         if watcher {
             std::fs::write(svc.join("arr-update.path"), "[Path]\n").unwrap();
         }
@@ -529,7 +536,7 @@ mod tests {
         assert!(u.can_update().await);
         assert!(u.auto_updates());
         // No updater, no auto-updates.
-        std::fs::remove_file(d.path().join("bin/arr-update")).unwrap();
+        std::fs::remove_file(d.path().join("bin").join(UPDATER)).unwrap();
         assert!(!u.auto_updates());
         assert!(!u.can_update().await);
     }
@@ -605,7 +612,7 @@ mod tests {
         }
         assert_eq!(hits.load(Ordering::SeqCst), 1, "answered from the cache");
         // Nothing is asked when auto-updates are off.
-        std::fs::remove_file(d.path().join("bin/arr-update")).unwrap();
+        std::fs::remove_file(d.path().join("bin").join(UPDATER)).unwrap();
         assert_eq!(u.latest().await, None);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // An unreachable GitHub is unknown, and remembered for a short while only.
