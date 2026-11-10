@@ -1724,6 +1724,11 @@ impl Exec {
             .seeded(hash, ratio, seeding_secs, stopped);
     }
 
+    /// Managed: sets the client's download speed (bytes per second) for `hash`.
+    pub fn set_speed(&self, hash: &str, bytes_per_sec: i64) {
+        self.fake.lock().unwrap().set_speed(hash, bytes_per_sec);
+    }
+
     /// Managed: forces the client's state and progress for `hash`.
     pub fn set_state(&self, hash: &str, state: &str, progress: f64) {
         self.fake.lock().unwrap().set_state(hash, state, progress);

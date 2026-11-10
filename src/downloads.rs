@@ -1611,6 +1611,8 @@ pub async fn poll(
         .store
         .with(|c| select(c, "active = 1 AND state IN ('downloading', 'completed', 'import_blocked') ORDER BY created_at", &[]))
         .await?;
+    let ids: Vec<String> = grabs.iter().map(|g| g.id.clone()).collect();
+    st.worker.keep_rates(&ids);
     if grabs.is_empty() {
         return Ok(report);
     }
@@ -1688,6 +1690,12 @@ pub async fn poll(
             continue;
         }
         let state = t.state();
+        // The time left on a download is worked out from its rate, only while it is moving.
+        if state == ClientState::Downloading && !g.user_paused && t.dlspeed > 0 {
+            st.worker.note_rate(&g.id, t.dlspeed, t.amount_left);
+        } else {
+            st.worker.clear_rate(&g.id);
+        }
         // Progress since the previous poll (the first observation has no baseline).
         let progressed = g.last_progress.is_some_and(|p| t.progress > p + 1e-9);
         let mut stalled_since = g.stalled_since.clone();

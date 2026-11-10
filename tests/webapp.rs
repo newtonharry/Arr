@@ -242,6 +242,24 @@ async fn pages_and_assets_carry_the_security_headers() {
         let dim = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
         assert_eq!((dim(16), dim(20)), (side, side), "{i}");
     }
+    // Browsers that ask for /favicon.ico are sent to the mascot; the page names it too.
+    let r = site
+        .plain(Method::GET, "/favicon.ico")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 307);
+    assert_eq!(r.headers()["location"], "/app/mascot.svg");
+    assert_eq!(r.headers()["content-security-policy"], csp);
+    assert!(html.contains("rel=\"icon\" href=\"/app/mascot.svg\" type=\"image/svg+xml\""));
+    let link = site.plain(Method::GET, "/app/link").send().await.unwrap();
+    assert!(
+        link.text()
+            .await
+            .unwrap()
+            .contains("rel=\"icon\" href=\"/app/mascot.svg\""),
+        "the sign-in page has the icon too"
+    );
     // The API keeps answering where it always did.
     let (s, v) = site.json(site.plain(Method::GET, "/api/v1/health")).await;
     assert_eq!((s, v["status"].as_str()), (200, Some("ok")), "{v}");
@@ -562,6 +580,44 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     assert_eq!(v["on_its_way"][0]["stage"], "downloading");
     assert_eq!(v["on_its_way"][0]["progress"], 0.5, "{v}");
     assert!(!v.to_string().contains("1080p"), "no release names: {v}");
+    assert_eq!(
+        v["on_its_way"][0]["eta_seconds"],
+        Value::Null,
+        "no rate yet: {v}"
+    );
+
+    // Time left comes from the download rate: the bytes still to come over the speed.
+    let size: usize = matrix_files().iter().map(|f| f.1.len()).sum();
+    // A moving download makes progress between polls (one that does not is stalled).
+    let left = |p: f64| ((1.0 - p) * size as f64) as i64;
+    e.set_state(&hash, "downloading", 0.51);
+    e.set_speed(&hash, left(0.51) / 600);
+    e.tick().await;
+    let v = feed().await;
+    let eta = v["on_its_way"][0]["eta_seconds"].as_u64();
+    let eta = eta.unwrap_or_else(|| panic!("no time left: {v}"));
+    assert!((590..=640).contains(&eta), "about ten minutes left: {v}");
+    // A faster reading moves the estimate part of the way, not all of it.
+    e.set_state(&hash, "downloading", 0.52);
+    e.set_speed(&hash, left(0.52) / 300);
+    e.tick().await;
+    let v = feed().await;
+    let eta = v["on_its_way"][0]["eta_seconds"].as_u64().unwrap();
+    assert!(
+        (400..=500).contains(&eta),
+        "smoothed, not jumping to 300: {v}"
+    );
+    // Paused or stalled, nothing is promised.
+    e.set_state(&hash, "pausedDL", 0.53);
+    e.tick().await;
+    let v = feed().await;
+    assert_eq!(v["on_its_way"][0]["eta_seconds"], Value::Null, "{v}");
+    assert_eq!(v["on_its_way"][0]["paused"], true, "{v}");
+    e.set_speed(&hash, 0);
+    e.set_state(&hash, "downloading", 0.54);
+    e.tick().await;
+    let v = feed().await;
+    assert_eq!(v["on_its_way"][0]["eta_seconds"], Value::Null, "{v}");
 
     // A download that failed needs the person.
     let title = "Slow.Horses.S01E02.1080p.WEB-DL.x264-ERR";
@@ -592,6 +648,11 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     let need = &v["needs_you"][0];
     assert_eq!(need["problem"], "The download didn't work", "{v}");
     assert_eq!(need["grab_id"], failed.as_str());
+    assert_eq!(
+        (need["kind"].clone(), need["failure"].clone()),
+        (json!("download_failed"), json!("client_error")),
+        "the kind and the reason travel with the plain sentence: {v}"
+    );
     assert_eq!(need["title"], "Slow Horses");
     assert!(need["detail"].as_str().unwrap().starts_with("S1 E2"), "{v}");
     assert!(need["key"].as_str().unwrap().contains(&failed));

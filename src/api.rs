@@ -4314,11 +4314,17 @@ async fn feed(State(st): St) -> ApiResult {
             };
             let targets = targets_of(g);
             let (title, year, detail) = entry(targets[0], &targets);
+            let paused = g.user_paused || g.client_state.as_deref() == Some("paused");
+            // Time left, from the download rate; none when unknown, paused or stalled.
+            let eta = (stage == "downloading" && !paused && g.client_state.as_deref() == Some("downloading") && g.stalled_since.is_none())
+                .then(|| st.worker.eta_seconds(&g.id))
+                .flatten();
             Some(json!({
                 "grab_id": g.id, "media_id": targets[0], "title": title, "year": year, "detail": detail,
                 "stage": stage,
                 "progress": (stage == "downloading").then_some(g.progress).flatten().map(|p| p.clamp(0.0, 1.0)),
-                "paused": g.user_paused || g.client_state.as_deref() == Some("paused"),
+                "paused": paused,
+                "eta_seconds": eta,
             }))
         })
         .collect();
@@ -4356,6 +4362,7 @@ async fn feed(State(st): St) -> ApiResult {
                 "key": format!("{kind}:{}", grab_id.map_or_else(|| target.to_string(), str::to_string)),
                 "media_id": media_id, "target": target, "title": title, "year": year, "detail": detail,
                 "problem": problem, "grab_id": grab_id,
+                "kind": kind, "failure": a.get("failure").cloned().unwrap_or(Value::Null),
                 "at": a.get("at").or_else(|| a.get("since")).cloned().unwrap_or(Value::Null),
             }))
         })

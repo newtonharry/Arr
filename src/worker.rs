@@ -63,7 +63,21 @@ pub struct Worker {
     /// Set while the download client's answers are missing: until its first answered poll
     /// in this process, and again after any unanswered one.
     unanswered: std::sync::atomic::AtomicBool,
+    /// Smoothed download rate of each grab that is moving, kept in memory only (never stored).
+    rates: std::sync::Mutex<std::collections::HashMap<String, Rate>>,
 }
+
+/// A grab's smoothed download rate and the bytes it still had left when last measured.
+struct Rate {
+    bytes_per_sec: f64,
+    left: f64,
+    at: std::time::Instant,
+}
+
+/// Each new reading counts for this much of the smoothed rate, so the estimate does not jump.
+const RATE_WEIGHT: f64 = 0.3;
+/// A reading older than this is not used: the grab is no longer being polled as moving.
+const RATE_FRESH: Duration = Duration::from_secs(120);
 
 impl Worker {
     pub fn new() -> Self {
@@ -77,7 +91,54 @@ impl Worker {
             stopping: std::sync::atomic::AtomicBool::new(false),
             stop: Notify::new(),
             unanswered: std::sync::atomic::AtomicBool::new(true),
+            rates: Default::default(),
         }
+    }
+
+    fn rates(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Rate>> {
+        self.rates.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records a poll's reading for a grab that is downloading: bytes per second and bytes left.
+    pub fn note_rate(&self, grab: &str, bytes_per_sec: i64, left: i64) {
+        let sample = bytes_per_sec.max(0) as f64;
+        let mut rates = self.rates();
+        let smoothed = match rates.get(grab) {
+            Some(prev) if prev.at.elapsed() < RATE_FRESH => {
+                prev.bytes_per_sec * (1.0 - RATE_WEIGHT) + sample * RATE_WEIGHT
+            }
+            _ => sample,
+        };
+        rates.insert(
+            grab.to_string(),
+            Rate {
+                bytes_per_sec: smoothed,
+                left: left.max(0) as f64,
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Forgets a grab's rate (paused, stalled, finished) so no time left is shown for it.
+    pub fn clear_rate(&self, grab: &str) {
+        self.rates().remove(grab);
+    }
+
+    /// Forgets the rates of grabs that are no longer being polled.
+    pub fn keep_rates(&self, polled: &[String]) {
+        self.rates().retain(|id, _| polled.contains(id));
+    }
+
+    /// Seconds a moving download has left at its smoothed rate; none when it is not moving.
+    pub fn eta_seconds(&self, grab: &str) -> Option<u64> {
+        let rates = self.rates();
+        let r = rates.get(grab)?;
+        let age = r.at.elapsed();
+        if age >= RATE_FRESH || r.bytes_per_sec < 1.0 || r.left <= 0.0 {
+            return None;
+        }
+        let left = (r.left / r.bytes_per_sec - age.as_secs_f64()).max(0.0);
+        Some(left.round() as u64)
     }
 
     /// Asks the spawned loop to exit after its current pass.
