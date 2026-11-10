@@ -98,8 +98,13 @@ start_job() { # domain plist
 	case "$key" in *.io.github.newtonharry.arr) ;; *) return 0 ;; esac
 	bin=$(strings_of "$2" | sed -n 2p) cfg=$(strings_of "$2" | sed -n 5p)
 	# Its own session, like a job of launchd's: it outlives the terminal that loaded it.
-	setsid sh -c 'while [ -e "$1/job.$2" ]; do "$3" serve --config "$4" >>"$1/$2.log" 2>&1 </dev/null; sleep 1; done' \
-		sh "$L" "$key" "$bin" "$cfg" >/dev/null 2>&1 </dev/null &
+	# With $L/slow present, Arr is the stand-in in $L/slow.d: same command line, but on SIGTERM it
+	# stops answering at once and takes (cat slow) seconds to exit, like a busy Arr finishing a pass.
+	setsid bash -c 'while [ -e "$1/job.$2" ]; do
+		if [ -e "$1/slow" ]; then (cd "$1/slow.d" && exec -a "$3" python3 serve --config "$4") >>"$1/$2.log" 2>&1 </dev/null
+		else "$3" serve --config "$4" >>"$1/$2.log" 2>&1 </dev/null; fi
+		sleep 1; done' \
+		bash "$L" "$key" "$bin" "$cfg" >/dev/null 2>&1 </dev/null &
 	echo $! >"$L/job.$key"
 }
 stop_job() { # domain.label
@@ -122,6 +127,10 @@ kickstart)
 *) ;;
 esac
 EOF
+# chown root:wheel: the stand-in "root" is you, and Linux has no wheel.
+printf '#!/bin/sh\nexit 0\n' >"$w/fake/bin/chown"
+mkdir -p "$w/fake/state/slow.d"
+cp "$repo/tests/installer/slowarr.py" "$w/fake/state/slow.d/serve"
 chmod +x "$w/fake/bin"/*
 PATH="$w/fake/bin:$PATH"
 export PATH FAKE_STATE="$w/fake/state" ARR_LAUNCH_DAEMONS_DIR="$daemons"
@@ -177,7 +186,7 @@ grep -q "<key>HOME</key><string>$HOME</string>" "$daemons/$label.plist" || fail 
 grep -q "<string>$bin/arr</string><string>serve</string><string>--config</string><string>$state/config.toml</string>" "$daemons/$label.plist" ||
 	fail "the daemon doesn't run the same command"
 grep -q '<key>KeepAlive</key><true/>' "$daemons/$label.plist" && grep -q '<key>RunAtLoad</key><true/>' "$daemons/$label.plist" || fail "no RunAtLoad/KeepAlive"
-[ "$(grep -c '^sudo sh ' "$calls")" = 1 ] || { cat "$calls"; fail "sudo should run one script"; }
+[ "$(grep -c '^sudo /bin/sh -s' "$calls")" = 1 ] || { cat "$calls"; fail "sudo should run one script"; }
 grep -q 'root=1 launchctl bootstrap system' "$calls" || fail "the daemon wasn't bootstrapped as root"
 retry 30 healthy || fail "Arr doesn't answer after --at-boot"
 new=$(arr_pid)
@@ -230,7 +239,7 @@ python3 "$repo/tests/installer/fakepty.py" sh "$w/install.sh" --no-auto-update >
 grep -q 'Start Arr when this computer starts' "$w/out" || { cat "$w/out"; fail "the question wasn't asked"; }
 [ -f "$daemons/$label.plist" ] || { cat "$w/out"; fail "the default answer should be yes (start at boot)"; }
 no_agents "after answering the question"
-[ "$(grep -c '^sudo sh ' "$calls")" = 1 ] || fail "sudo should run one script"
+[ "$(grep -c '^sudo /bin/sh -s' "$calls")" = 1 ] || fail "sudo should run one script"
 retry 30 healthy || fail "Arr doesn't answer after the terminal install"
 : >"$calls"
 python3 "$repo/tests/installer/fakepty.py" sh "$w/install.sh" --no-auto-update --no-at-boot >"$w/out" 2>&1 || { cat "$w/out"; fail "the terminal --no-at-boot failed"; }
@@ -288,6 +297,30 @@ cmp -s "$bin/arr" "$w/arr.before" || fail "the old binary wasn't put back"
 retry 30 healthy || fail "Arr was left stopped by the rollback"
 new=$(arr_pid)
 [ -n "$new" ] && [ "$new" != "$old" ] || fail "the updater never restarted Arr"
+
+echo "== a busy Arr: SIGTERM returns long before it exits; the restarts must wait for it"
+# The stand-in answers as the old version, then stops answering on SIGTERM and exits 33 s later
+# (longer than the 30 s health check). Without the wait, the health check would end before
+# launchd has even started the replacement.
+"$arr" --version | awk '{print $2}' >"$w/fake/state/version"
+echo 33 >"$w/fake/state/slow"
+kill "$(arr_pid)"
+retry 60 healthy || fail "the stand-in Arr didn't start"
+# The updater: the "new" release reports itself as v99.0.0 (the stand-in reads its version at start).
+echo 99.0.0 >"$w/fake/state/version"
+old=$(arr_pid)
+sh "$bin/arr-update" >"$w/upd" 2>&1 || { cat "$w/upd"; fail "an update of a busy Arr was rolled back"; }
+grep -q 'now running v99.0.0' "$w/upd" || { cat "$w/upd"; fail "the updater didn't report the new version"; }
+new=$(arr_pid)
+[ -n "$new" ] && [ "$new" != "$old" ] || fail "the updater didn't restart the busy Arr"
+# The installer's own restart.
+old=$new
+install_sh --yes --no-auto-update >"$w/out" 2>&1 || { cat "$w/out"; fail "a rerun on a busy Arr failed"; }
+new=$(arr_pid)
+[ -n "$new" ] && [ "$new" != "$old" ] || fail "the rerun didn't restart the busy Arr"
+rm -f "$w/fake/state/slow"
+kill "$(arr_pid)"
+retry 60 healthy || fail "Arr didn't come back after the busy test"
 
 echo "== unattended, without an administrator, the update job falls back to a login item"
 FAKE_ROOT=1 launchctl bootout system/io.github.newtonharry.arr-update 2>/dev/null || true

@@ -97,7 +97,9 @@ in, with its tunnel (and the daily update job), on every system:
   **Arr tunnel** and **Arr update** tasks to also start at boot and to run whether or not you're
   logged on (no password stored; they still run as you, not as an administrator). Windows asks
   permission once (a UAC prompt), or run the installer from a PowerShell opened as
-  administrator. Windows gives a task like that no network credentials, so media on a network
+  administrator. It has to be your own account that is an administrator: a standard user who
+  approves the prompt with another administrator's password stays on start-at-log-in, and the
+  installer says so. Windows gives a task like that no network credentials, so media on a network
   drive mapped to a letter (`Z:`) isn't reachable until you log in: use a local drive.
 
 For scripts: `--at-boot` or `--no-at-boot` (`install.sh`), `$env:ARR_AT_BOOT = '1'` or `'0'`

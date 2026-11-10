@@ -438,7 +438,8 @@ function Install-Arr {
 			$why = Set-TaskMode $user $true
 			if ($why) {
 				# Nothing to undo if Windows never let the step run; Arr keeps running as it was.
-				Write-Warning "Arr still starts when you log in, not at boot: $why"
+				if ($why -like 'Start at boot needs an administrator account*') { Write-Warning $why }
+				else { Write-Warning "Arr still starts when you log in, not at boot: $why" }
 				$bootFailure = $why
 			} else {
 				# Arr and its tunnel restart under the new tasks: the ones running now were started at log-on.
@@ -760,8 +761,9 @@ function Start-ArrTask($name) {
 # (and there is no prompt), else in a PowerShell Windows asks permission for. Returns $null
 # when it worked, else why not. The text runs the way it was written: the elevated PowerShell
 # gets only a short command that reads it from a file, checks its SHA-256 against the one
-# given on the command line, and runs what it read, so another program can't swap it in the
-# moment between writing and running.
+# given on the command line, and runs that same string (the file is read once; what was
+# checked is what runs, never a second read), so another program can't swap it in between
+# writing and running.
 function Invoke-Elevated($body) {
 	$result = Join-Path ([IO.Path]::GetTempPath()) ('arr-elevated-' + [guid]::NewGuid().ToString('N') + '.txt')
 	$text = "`$ErrorActionPreference = 'Stop'`ntry {`n$body`n'ok' | Set-Content -LiteralPath $(Quote-Ps $result)`n} catch { ('error: ' + `$_.Exception.Message) | Set-Content -LiteralPath $(Quote-Ps $result) }`n"
@@ -816,6 +818,12 @@ $updateSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWh
 $logon = if ($boot) { 'S4U' } else { 'Interactive' }
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType $logon -RunLevel Limited
 $sid = (New-Object Security.Principal.NTAccount($user)).Translate([Security.Principal.SecurityIdentifier]).Value
+# Windows registers a task that runs without a logon (S4U) for another account only with that
+# account's password. If this PowerShell is a different administrator's (a standard user
+# approved the prompt with someone else's credentials), stay at log-on.
+if ($boot -and [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne $sid) {
+	throw 'Start at boot needs an administrator account; Arr will start when you log in.'
+}
 foreach ($t in $tasks) {
 	if ($t.At) { $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]$t.At); $set = $updateSettings }
 	else {

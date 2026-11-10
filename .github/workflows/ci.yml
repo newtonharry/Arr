@@ -356,10 +356,13 @@ jobs:
           Get-Content uninstall.ps1 -Raw | Invoke-Expression
           foreach ($n in 'Arr', 'Arr update') { if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) { Fail "uninstall left the $n task" } }
           'start at boot: all checks passed'
-      # What an administrator's registration must give an ordinary user: the boot task runs as
-      # that user with nobody logged on (S4U), and the user can stop and start it without
-      # administrator rights. (A stand-in program, not Arr: only the task is under test.)
-      - name: Start at boot, restarted by an ordinary user
+      # Two claims about a standard user. (1) Set-TaskMode refuses to register boot tasks for an
+      # account other than the administrator's own (Windows wants that account's password for
+      # S4U), and leaves the task at log-on. (2) A task an administrator registered for a user
+      # with the full-control entry the installer adds can be stopped and started by that user
+      # without administrator rights. The task here is registered at log-on (no S4U, no password)
+      # for the other account; a stand-in program, not Arr, since only the task's rights are tested.
+      - name: Start at boot, rights of an ordinary user
         shell: powershell
         run: |
           function Fail($m) { "FAIL: $m"; exit 1 }
@@ -379,20 +382,15 @@ jobs:
               -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c ping -n 600 127.0.0.1 >nul') `
               -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) `
               -Principal (New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited) | Out-Null
+            # (1) Another account's boot task is refused, and nothing changes.
             $why = Set-TaskMode $user $true
-            if ($why) { Fail "registering as an administrator: $why" }
-            $t = Get-ScheduledTask -TaskName 'Arr tunnel'
-            if ("$($t.Principal.LogonType)" -ne 'S4U') { Fail "logon type $($t.Principal.LogonType)" }
-            if (-not ($t.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })) { Fail 'no boot trigger' }
-            function Pinger { Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq 'arrtest' } }
-            function WaitFor($what, [scriptblock]$cond) {
-              for ($n = 0; $n -lt 30; $n++) { if (& $cond) { return }; Start-Sleep 1 }
-              Fail "$what (the task's last result: $((Get-ScheduledTaskInfo -TaskName 'Arr tunnel').LastTaskResult))"
-            }
-            # S4U for an ordinary user works with nobody logged on: the task runs as that user.
-            Start-ScheduledTask -TaskName 'Arr tunnel'
-            WaitFor 'the boot task never ran as arrtest' { Pinger }
-            # Now as arrtest, without administrator rights: stop it, start it again.
+            if ($why -ne 'Start at boot needs an administrator account; Arr will start when you log in.') { Fail "expected the refusal, got: $why" }
+            if ("$((Get-ScheduledTask -TaskName 'Arr tunnel').Principal.LogonType)" -eq 'S4U') { Fail 'the refused step registered an S4U task' }
+            # (2) The entry the installer adds, then the ordinary user stops and starts the task.
+            $sid = (New-Object Security.Principal.NTAccount($user)).Translate([Security.Principal.SecurityIdentifier]).Value
+            $svc = New-Object -ComObject Schedule.Service; $svc.Connect()
+            $rt = $svc.GetFolder('\').GetTask('Arr tunnel')
+            $rt.SetSecurityDescriptor($rt.GetSecurityDescriptor(4) + "(A;;FA;;;$sid)", 0)
             $script = "$dir\control.ps1"
             @(
               'try { Stop-ScheduledTask -TaskName "Arr tunnel" -ErrorAction Stop; "stopped" } catch { "stop failed: $_"; exit 3 }',
@@ -405,12 +403,6 @@ jobs:
               -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script
             Get-Content "$dir\control.out", "$dir\control.err" -ErrorAction SilentlyContinue
             if ($p.ExitCode -ne 0) { Fail "arrtest could not stop and start the task (exit code $($p.ExitCode))" }
-            WaitFor 'the task did not run again after arrtest restarted it' { Pinger }
-            # And back to starting at log-on only.
-            $why = Set-TaskMode $user $false
-            if ($why) { Fail "going back to log-on: $why" }
-            $t = Get-ScheduledTask -TaskName 'Arr tunnel'
-            if ("$($t.Principal.LogonType)" -eq 'S4U' -or ($t.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })) { Fail 'still a boot task' }
             'start at boot, ordinary user: all checks passed'
           } finally {
             Unregister-ScheduledTask -TaskName 'Arr tunnel' -Confirm:$false -ErrorAction SilentlyContinue

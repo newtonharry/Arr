@@ -1198,7 +1198,6 @@ L_ARR=io.github.newtonharry.arr L_TUN=io.github.newtonharry.arr-tunnel L_UPD=io.
 LA_DIR="$HOME/Library/LaunchAgents"
 BOOT_NOW=$CUR_BOOT # how Arr runs when this script is done
 ELEV_OK=0          # may this run ask for an administrator's password?
-EL="$tmp/elevated.sh"
 # mac_plist LABEL BOOT ARGUMENTS_XML OTHER_KEYS_XML. Label and ProgramArguments come first,
 # in this order: install.sh and uninstall.sh (this version's and older ones) read them back.
 mac_plist() {
@@ -1234,28 +1233,40 @@ agent_load() { # agent_load LABEL PLIST_FILE
 	agent_stop "$1"
 	svc launchctl load "$LA_DIR/$1.plist"
 }
-# Administrator work goes into one script ($EL) run by one sudo, so the password is asked once.
+# Administrator work is one script, kept in this shell's memory ($EL) and handed to
+# `sudo /bin/sh -s` on its standard input: nothing is read from disk as root, so no other
+# process of yours can swap in a file between the checks and the commands. The daemons' plists
+# are written by that script itself (here-documents), root-owned; your folders are not used.
 mac_sudo() {
 	sudo -n true 2>/dev/null && return 0
 	have_tty || { say "Arr needs an administrator (sudo) to start at boot, and there is no terminal to ask on."; return 1; }
 	say "Arr needs your administrator password once to start when the computer does."
 	sudo -v </dev/null
 }
+EL=""
 el_start() {
-	cat >"$EL" <<'ELEOF'
-set -e
+	EL='set -e
+umask 022
 # launchctl bootstrap can fail for a moment right after a bootout of the same job.
-bs() { i=0; while ! launchctl bootstrap system "$1"; do i=$((i + 1)); [ "$i" -lt 8 ] || return 1; sleep 1; done; }
-ELEOF
+bs() { i=0; while ! launchctl bootstrap system "$1" </dev/null; do i=$((i + 1)); [ "$i" -lt 8 ] || return 1; sleep 1; done; }'
 }
-el_add() { # el_add LABEL PLIST_FILE: install the daemon and start it
-	printf 'install -m 644 -o root -g wheel %s %s\nlaunchctl bootout system/%s 2>/dev/null || true\nbs %s\n' \
-		"$(sq "$2")" "$(sq "$LD_DIR/$1.plist")" "$1" "$(sq "$LD_DIR/$1.plist")" >>"$EL"
+el_add() { # el_add LABEL PLIST_TEXT: write the daemon, root-owned, and start it
+	EL="$EL
+cat >$(sq "$LD_DIR/$1.plist.new") <<'ARR_PLIST_EOF'
+$2
+ARR_PLIST_EOF
+chown root:wheel $(sq "$LD_DIR/$1.plist.new")
+chmod 644 $(sq "$LD_DIR/$1.plist.new")
+mv -f $(sq "$LD_DIR/$1.plist.new") $(sq "$LD_DIR/$1.plist")
+launchctl bootout system/$1 </dev/null 2>/dev/null || true
+bs $(sq "$LD_DIR/$1.plist")"
 }
 el_remove() { # el_remove LABEL: stop the daemon and delete it
-	printf 'launchctl bootout system/%s 2>/dev/null || true\nrm -f %s\n' "$1" "$(sq "$LD_DIR/$1.plist")" >>"$EL"
+	EL="$EL
+launchctl bootout system/$1 </dev/null 2>/dev/null || true
+rm -f $(sq "$LD_DIR/$1.plist")"
 }
-elevate() { sudo sh "$EL" </dev/null; }
+elevate() { printf '%s\n' "$EL" | sudo /bin/sh -s; }
 # Your own `arr serve` for this config (not `arr mcp`, which Claude Desktop may be running).
 arr_pids() {
 	ps -u "$(id -u)" -o pid= -o command= | awk -v want="$ARR serve --config $CONFIG" '
@@ -1266,8 +1277,20 @@ arr_pids() {
 # kickstart or unload a system daemon.)
 boot_restart() {
 	pids=$(arr_pids)
+	[ -n "$pids" ] || return 0
 	# shellcheck disable=SC2086 # process numbers
-	[ -z "$pids" ] || kill $pids 2>/dev/null || true
+	kill $pids 2>/dev/null || true
+	# SIGTERM returns before Arr has exited (a busy one finishes its worker pass first, up to
+	# two minutes), and launchd starts the replacement only then: wait for the old one (at most
+	# 150 s) so the health check's 30 s don't start counting before that.
+	i=0
+	while [ "$i" -lt 150 ]; do
+		alive=0
+		for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+		[ "$alive" = 1 ] || break
+		i=$((i + 1))
+		sleep 1
+	done
 }
 # Once unloaded, a login item can't be kickstarted: a rollback loads it again instead.
 launchd_restart() { agent_stop "$L_ARR"; launchctl load "$LA_DIR/$L_ARR.plist"; }
@@ -1294,20 +1317,20 @@ mac_service() {
 	if [ "$BOOT_NOW" = 1 ]; then
 		# launchd opens the logs as root: create them as you first, so they stay yours.
 		for f in arr.log tunnel.log update.log; do [ -e "$STATE_DIR/$f" ] || : >"$STATE_DIR/$f"; done
-		mac_arr_plist 1 >"$tmp/arr.d.plist"
+		arr_d=$(mac_arr_plist 1)
 		need=0
-		cmp -s "$tmp/arr.d.plist" "$D_ARR" 2>/dev/null || need=1
+		printf '%s\n' "$arr_d" | cmp -s - "$D_ARR" 2>/dev/null || need=1
 		if [ -n "$PUBLIC_URL" ]; then
-			mac_tunnel_plist 1 >"$tmp/tun.d.plist"
-			cmp -s "$tmp/tun.d.plist" "$D_TUN" 2>/dev/null || need=1
+			tun_d=$(mac_tunnel_plist 1)
+			printf '%s\n' "$tun_d" | cmp -s - "$D_TUN" 2>/dev/null || need=1
 		elif [ -f "$D_TUN" ]; then need=1; fi
 		if [ "$need" = 1 ] && [ "$ELEV_OK" = 1 ]; then
 			ok=0
 			if mac_sudo; then
 				# The login items stop first, so the daemons get the port.
 				if [ "$CUR_BOOT" = 0 ]; then agent_stop "$L_ARR"; agent_stop "$L_TUN"; fi
-				el_start; el_add "$L_ARR" "$tmp/arr.d.plist"
-				if [ -n "$PUBLIC_URL" ]; then el_add "$L_TUN" "$tmp/tun.d.plist"; elif [ -f "$D_TUN" ]; then el_remove "$L_TUN"; fi
+				el_start; el_add "$L_ARR" "$arr_d"
+				if [ -n "$PUBLIC_URL" ]; then el_add "$L_TUN" "$tun_d"; elif [ -f "$D_TUN" ]; then el_remove "$L_TUN"; fi
 				if elevate; then ok=1; fi
 			fi
 			if [ "$ok" = 1 ]; then ELEVATED=1; CUR_BOOT=1
@@ -1315,7 +1338,7 @@ mac_service() {
 				say "Warning: couldn't update Arr's start-at-boot services; they stay as they were."
 			else
 				# Nothing may be left half-installed, and Arr must run: the login items come back.
-				el_start; el_remove "$L_ARR"; el_remove "$L_TUN"; sudo -n sh "$EL" </dev/null 2>/dev/null || true
+				el_start; el_remove "$L_ARR"; el_remove "$L_TUN"; { sudo -n true && elevate; } >/dev/null 2>&1 || true
 				RESTART=launchd_restart
 				for l in "$L_ARR" "$L_TUN"; do
 					[ ! -f "$LA_DIR/$l.plist" ] || launchctl load "$LA_DIR/$l.plist" 2>/dev/null || true
@@ -1551,9 +1574,20 @@ restart() {
 			# Started at boot: Arr is a daemon that runs as you, and a user can't launchctl a
 			# system daemon. Ending your own arr makes launchd (KeepAlive) start it again from
 			# the binary now on disk.
-			ps -u "$(id -u)" -o pid= -o command= | awk -v want="$ARR serve --config $CONFIG" '
-				{ p = $1; sub(/^[ ]*[0-9]+[ ]+/, ""); if ($0 == want) print p }' |
-				while read -r p; do kill "$p" 2>/dev/null || true; done
+			pids=$(ps -u "$(id -u)" -o pid= -o command= | awk -v want="$ARR serve --config $CONFIG" '
+				{ p = $1; sub(/^[ ]*[0-9]+[ ]+/, ""); if ($0 == want) print p }')
+			for p in $pids; do kill "$p" 2>/dev/null || true; done
+			# SIGTERM returns before Arr has exited (a busy one finishes its worker pass first, up
+			# to two minutes), and launchd starts the replacement only then: wait for the old one
+			# (at most 150 s) before the health check's 30 s begin.
+			i=0
+			while [ "$i" -lt 150 ]; do
+				alive=0
+				for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+				[ "$alive" = 1 ] || break
+				i=$((i + 1))
+				sleep 1
+			done
 		else
 			launchctl kickstart -k "gui/$(id -u)/io.github.newtonharry.arr" || true
 		fi ;;
@@ -1671,12 +1705,12 @@ EOF
   <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/update.log")</string>"
 		# At boot the daily job is a daemon too: it runs as you, so it needs no password to
 		# run, and it still runs when nobody is logged in. Otherwise it is a login item.
-		mac_plist "$L_UPD" 1 "$upd_args" "$upd_keys" >"$tmp/upd.d.plist"
+		upd_d=$(mac_plist "$L_UPD" 1 "$upd_args" "$upd_keys")
 		mac_plist "$L_UPD" 0 "$upd_args" "$upd_keys" >"$tmp/upd.a.plist"
 		if [ "$BOOT_NOW" = 1 ] && [ -f "$udplist" ]; then
 			# Already a daemon; it stays (changing it would take an administrator).
 			agent_remove "$L_UPD"
-		elif [ "$BOOT_NOW" = 1 ] && [ "$ELEV_OK" = 1 ] && mac_sudo && { el_start; el_add "$L_UPD" "$tmp/upd.d.plist"; elevate; }; then
+		elif [ "$BOOT_NOW" = 1 ] && [ "$ELEV_OK" = 1 ] && mac_sudo && { el_start; el_add "$L_UPD" "$upd_d"; elevate; }; then
 			agent_remove "$L_UPD"
 		else
 			[ "$BOOT_NOW" != 1 ] ||
