@@ -522,8 +522,8 @@ impl Embedded {
         self.reset_pending_verification().await?;
         // Dual-stack when the configured address is 0.0.0.0 and this host has IPv6; a host
         // without it starts on IPv4 as before.
-        let mut plan = listen_plan(c.listen, ipv6_available());
-        let session = loop {
+        let plan = listen_plan(c.listen, ipv6_available());
+        let session = {
             let dht = c.dht.then(|| DhtSessionConfig {
                 bootstrap_addrs: None,
                 port: None,
@@ -537,7 +537,7 @@ impl Embedded {
                 disable_trackers: !c.trackers,
                 fastresume: true,
                 persistence: Some(SessionPersistenceConfig::Json {
-                    folder: Some(persistence.clone()),
+                    folder: Some(persistence),
                 }),
                 listen: Some(ListenerOptions {
                     mode: ListenerMode::TcpAndUtp,
@@ -555,12 +555,9 @@ impl Embedded {
                 ipv4_only: !plan.dual_stack,
                 ..Default::default()
             };
-            match Session::new_with_opts(c.download_dir.clone(), opts).await {
-                Ok(s) => break s,
-                // Never fail startup over IPv6: try again on IPv4 only.
-                Err(_) if plan.addr != c.listen => plan = listen_plan(c.listen, false),
-                Err(e) => return Err(engine_failure("starting the engine session", &e)),
-            }
+            Session::new_with_opts(c.download_dir.clone(), opts)
+                .await
+                .map_err(|e| engine_failure("starting the engine session", &e))?
         };
         let _ = self.dual_stack.set(plan.dual_stack);
         if let Err(e) = self.after_restore(&session).await {
