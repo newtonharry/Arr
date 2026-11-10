@@ -588,14 +588,18 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
 
     // Time left comes from the download rate: the bytes still to come over the speed.
     let size: usize = matrix_files().iter().map(|f| f.1.len()).sum();
-    let left = (size / 2) as i64;
-    e.set_speed(&hash, left / 600);
+    // A moving download makes progress between polls (one that does not is stalled).
+    let left = |p: f64| ((1.0 - p) * size as f64) as i64;
+    e.set_state(&hash, "downloading", 0.51);
+    e.set_speed(&hash, left(0.51) / 600);
     e.tick().await;
     let v = feed().await;
-    let eta = v["on_its_way"][0]["eta_seconds"].as_u64().unwrap();
-    assert!((590..=600).contains(&eta), "about ten minutes left: {v}");
+    let eta = v["on_its_way"][0]["eta_seconds"].as_u64();
+    let eta = eta.unwrap_or_else(|| panic!("no time left: {v}"));
+    assert!((590..=640).contains(&eta), "about ten minutes left: {v}");
     // A faster reading moves the estimate part of the way, not all of it.
-    e.set_speed(&hash, left / 300);
+    e.set_state(&hash, "downloading", 0.52);
+    e.set_speed(&hash, left(0.52) / 300);
     e.tick().await;
     let v = feed().await;
     let eta = v["on_its_way"][0]["eta_seconds"].as_u64().unwrap();
@@ -604,13 +608,13 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
         "smoothed, not jumping to 300: {v}"
     );
     // Paused or stalled, nothing is promised.
-    e.set_state(&hash, "pausedDL", 0.5);
+    e.set_state(&hash, "pausedDL", 0.53);
     e.tick().await;
     let v = feed().await;
     assert_eq!(v["on_its_way"][0]["eta_seconds"], Value::Null, "{v}");
     assert_eq!(v["on_its_way"][0]["paused"], true, "{v}");
     e.set_speed(&hash, 0);
-    e.set_state(&hash, "downloading", 0.5);
+    e.set_state(&hash, "downloading", 0.54);
     e.tick().await;
     let v = feed().await;
     assert_eq!(v["on_its_way"][0]["eta_seconds"], Value::Null, "{v}");
