@@ -41,6 +41,7 @@ GOOGLE_SECRET="${ARR_GOOGLE_CLIENT_SECRET:-}"
 ALLOW_EMAILS="${ARR_ALLOW_EMAILS:-}"
 AUTO_UPDATE="${ARR_AUTO_UPDATE:-}"
 ERROR_REPORTS="${ARR_ERROR_REPORTS:-}"
+AT_BOOT="${ARR_AT_BOOT:-}"
 SETUP=1
 FIRST_INSTALL=0
 TERMINAL=0
@@ -75,6 +76,11 @@ are; a setting you give is applied, or refused before anything changes.
   --upload-limit-kib N   upload limit in KiB/s for all torrents (default: 0 = none)
   --search-only          don't let Arr download anything (turns downloading off)
   --no-service           don't install a background service
+  --at-boot              start Arr when the computer starts, before anyone logs in. On a Mac
+                         that is a launch daemon and needs your admin password once; on Linux
+                         a system-wide install always does, and a per-user install turns on
+                         lingering (sudo loginctl enable-linger). Asked at a terminal if not given.
+  --no-at-boot           start Arr when you log in instead (it stays so until you run this again)
   --auto-update          install new releases automatically (a daily check); asked if not given
   --no-auto-update       don't, and turn automatic updates off if they were on
   --error-reports        send error reports, scrubbed of personal data (docs/PRIVACY.md);
@@ -102,6 +108,8 @@ while [ $# -gt 0 ]; do
 	--install-only) SETUP=0 ;;
 	--terminal) TERMINAL=1 ;;
 	--no-service) SERVICE=0 ;;
+	--at-boot) AT_BOOT=1 ;;
+	--no-at-boot) AT_BOOT=0 ;;
 	--search-only) DOWNLOADING=0 ;;
 	--version) VERSION="$2"; shift ;;
 	--bin-dir) BIN_DIR="$2"; shift ;;
@@ -132,6 +140,7 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
+case "$AT_BOOT" in "" | 0 | 1) ;; *) echo "ARR_AT_BOOT must be 1 or 0, not '$AT_BOOT'" >&2; exit 2 ;; esac
 # Remote settings from environment variables turn remote setup on, as their flags do.
 [ -z "$NGROK_TOKEN$NGROK_DOMAIN$GOOGLE_ID$GOOGLE_SECRET$ALLOW_EMAILS" ] || REMOTE=1
 
@@ -391,9 +400,20 @@ from_plist() {
 sys_unit=/etc/systemd/system/arr.service
 user_unit="$U_HOME/.config/systemd/user/arr.service"
 plist="$U_HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
+# At boot on a Mac, Arr is a launch daemon that runs as the installing user (UserName).
+LD_DIR="${ARR_LAUNCH_DAEMONS_DIR:-/Library/LaunchDaemons}" # (the variable is for tests)
+dplist="$LD_DIR/io.github.newtonharry.arr.plist"
+CUR_BOOT=0
 found_file=""
 if [ "$os" = Darwin ]; then
-	[ ! -f "$plist" ] || { from_plist "$plist"; FOUND=launchd; found_file=$plist; }
+	if [ -f "$dplist" ]; then
+		from_plist "$dplist"; FOUND=launchd; found_file=$dplist; CUR_BOOT=1
+		FOUND_USER=$(sed -n 's#.*<key>UserName</key><string>\([^<]*\)</string>.*#\1#p' "$dplist" | head -n1)
+		[ "$FOUND_USER" = "$(id -un)" ] ||
+			die "Arr is installed to start at boot for ${FOUND_USER:-another user} ($dplist); run this as that user"
+	elif [ -f "$plist" ]; then
+		from_plist "$plist"; FOUND=launchd; found_file=$plist
+	fi
 elif [ "$(id -u)" = 0 ]; then
 	if [ -f "$sys_unit" ]; then
 		from_unit "$sys_unit"; FOUND=system; found_file=$sys_unit
@@ -549,7 +569,12 @@ if [ "$SETUP" != 1 ]; then
 	case "$FOUND" in
 	system) say "Restart Arr to use the new version: sudo systemctl restart arr" ;;
 	user) say "Restart Arr to use the new version: systemctl --user restart arr" ;;
-	launchd) say "Restart Arr to use the new version: launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr" ;;
+	launchd)
+		if [ "$CUR_BOOT" = 1 ]; then
+			say "Restart Arr to use the new version: sudo launchctl kickstart -k system/io.github.newtonharry.arr"
+		else
+			say "Restart Arr to use the new version: launchctl kickstart -k gui/$(id -u)/io.github.newtonharry.arr"
+		fi ;;
 	esac
 	exit 0
 fi
@@ -1137,6 +1162,204 @@ xml() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&qu
 svc() {
 	"$@" >"$tmp/svc.out" 2>&1 || { cat "$tmp/svc.out" >&2; die "'$*' failed; see: $logs"; }
 }
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# Is there a terminal to ask for an administrator's password on?
+have_tty() { [ -r /dev/tty ] && (: </dev/tty) 2>/dev/null; }
+# A per-user systemd service runs while you're logged out, and starts at boot, only with
+# lingering on. Many systems leave that to an administrator (over SSH, polkit says no), so:
+# try without a password; then, at a terminal or with --at-boot, ask sudo once; otherwise
+# say how.
+enable_linger() {
+	me=$(id -un)
+	lingering() { loginctl show-user "$me" -p Linger 2>/dev/null | grep -q '=yes'; }
+	if [ "$AT_BOOT" = 0 ]; then
+		lingering || say "Not turning on lingering (--no-at-boot): Arr starts when you log in and stops when you log out."
+		return 0
+	fi
+	have loginctl && loginctl --no-ask-password enable-linger "$me" >/dev/null 2>&1 || true
+	lingering && return 0
+	if have loginctl && have sudo && { [ "$AT_BOOT" = 1 ] || interactive; }; then
+		say "Arr needs your administrator password once to start when the computer does:"
+		say "  sudo loginctl enable-linger $me"
+		# With --at-boot and nobody at a terminal, sudo must fail instead of waiting.
+		if have_tty; then sudo loginctl enable-linger "$me" </dev/null || true
+		else sudo -n loginctl enable-linger "$me" </dev/null || true; fi
+	fi
+	lingering && return 0
+	say "Warning: Arr stops when you log out and won't start after a reboot. Fix it with:"
+	say "  sudo loginctl enable-linger $me"
+}
+# ---- macOS. Arr (and its tunnel and updater) is a login item (a LaunchAgent in your
+# ~/Library/LaunchAgents) or, to start when the Mac does, a launch daemon in /Library/LaunchDaemons
+# with the same label that runs as you (UserName): the same process, files and log either way.
+# Writing /Library takes an administrator, so only a run at a terminal, or --at-boot, does it.
+# Every other run keeps whichever kind is installed and never asks for a password.
+L_ARR=io.github.newtonharry.arr L_TUN=io.github.newtonharry.arr-tunnel L_UPD=io.github.newtonharry.arr-update
+LA_DIR="$HOME/Library/LaunchAgents"
+BOOT_NOW=$CUR_BOOT # how Arr runs when this script is done
+ELEV_OK=0          # may this run ask for an administrator's password?
+EL="$tmp/elevated.sh"
+# mac_plist LABEL BOOT ARGUMENTS_XML OTHER_KEYS_XML. Label and ProgramArguments come first,
+# in this order: install.sh and uninstall.sh (this version's and older ones) read them back.
+mac_plist() {
+	printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+	printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+	printf '<plist version="1.0"><dict>\n  <key>Label</key><string>%s</string>\n' "$1"
+	printf '  <key>ProgramArguments</key><array>\n%s\n  </array>\n' "$3"
+	# As a daemon it runs as you, with your home, not as root.
+	[ "$2" != 1 ] || printf '  <key>UserName</key><string>%s</string>\n  <key>EnvironmentVariables</key><dict><key>HOME</key><string>%s</string></dict>\n' \
+		"$(xml "$(id -un)")" "$(xml "$HOME")"
+	printf '%s\n</dict></plist>\n' "$4"
+}
+mac_arr_plist() { # mac_arr_plist BOOT
+	mac_plist "$L_ARR" "$1" "    <string>$(xml "$ARR")</string><string>serve</string><string>--config</string><string>$(xml "$CONFIG")</string>" \
+		"  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/arr.log")</string>"
+}
+mac_tunnel_plist() { # mac_tunnel_plist BOOT
+	mac_plist "$L_TUN" "$1" "    <string>$(xml "$NGROK")</string><string>http</string><string>127.0.0.1:$PORT</string>
+    <string>--url=$(xml "$PUBLIC_URL")</string><string>--config</string><string>$(xml "$STATE_DIR/ngrok.yml")</string>
+    <string>--log=stdout</string><string>--log-level=warn</string>" \
+		"  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$(xml "$STATE_DIR/tunnel.log")</string>"
+}
+# Your login items: stop one, or stop it and delete it, or install one from a file.
+agent_stop() { launchctl unload "$LA_DIR/$1.plist" 2>/dev/null || true; }
+agent_remove() { [ ! -f "$LA_DIR/$1.plist" ] || { agent_stop "$1"; rm -f "$LA_DIR/$1.plist"; }; }
+agent_load() { # agent_load LABEL PLIST_FILE
+	mkdir -p "$LA_DIR"
+	cp "$2" "$LA_DIR/$1.plist"
+	agent_stop "$1"
+	svc launchctl load "$LA_DIR/$1.plist"
+}
+# Administrator work goes into one script ($EL) run by one sudo, so the password is asked once.
+mac_sudo() {
+	sudo -n true 2>/dev/null && return 0
+	have_tty || { say "Arr needs an administrator (sudo) to start at boot, and there is no terminal to ask on."; return 1; }
+	say "Arr needs your administrator password once to start when the computer does."
+	sudo -v </dev/null
+}
+el_start() {
+	cat >"$EL" <<'ELEOF'
+set -e
+# launchctl bootstrap can fail for a moment right after a bootout of the same job.
+bs() { i=0; while ! launchctl bootstrap system "$1"; do i=$((i + 1)); [ "$i" -lt 8 ] || return 1; sleep 1; done; }
+ELEOF
+}
+el_add() { # el_add LABEL PLIST_FILE: install the daemon and start it
+	printf 'install -m 644 -o root -g wheel %s %s\nlaunchctl bootout system/%s 2>/dev/null || true\nbs %s\n' \
+		"$(sq "$2")" "$(sq "$LD_DIR/$1.plist")" "$1" "$(sq "$LD_DIR/$1.plist")" >>"$EL"
+}
+el_remove() { # el_remove LABEL: stop the daemon and delete it
+	printf 'launchctl bootout system/%s 2>/dev/null || true\nrm -f %s\n' "$1" "$(sq "$LD_DIR/$1.plist")" >>"$EL"
+}
+elevate() { sudo sh "$EL" </dev/null; }
+# Your own `arr serve` for this config (not `arr mcp`, which Claude Desktop may be running).
+arr_pids() {
+	ps -u "$(id -u)" -o pid= -o command= | awk -v want="$ARR serve --config $CONFIG" '
+		{ p = $1; sub(/^[ ]*[0-9]+[ ]+/, ""); if ($0 == want) print p }'
+}
+# Restarts Arr without an administrator: the daemon runs as you with KeepAlive, so ending your
+# own process makes launchd start it again from the binary on disk. (A user can't launchctl
+# kickstart or unload a system daemon.)
+boot_restart() {
+	pids=$(arr_pids)
+	# shellcheck disable=SC2086 # process numbers
+	[ -z "$pids" ] || kill $pids 2>/dev/null || true
+}
+# Once unloaded, a login item can't be kickstarted: a rollback loads it again instead.
+launchd_restart() { agent_stop "$L_ARR"; launchctl load "$LA_DIR/$L_ARR.plist"; }
+mac_service() {
+	ELEVATED=0
+	if [ -n "$AT_BOOT" ]; then BOOT_NOW=$AT_BOOT
+	elif [ "$CUR_BOOT" = 1 ]; then BOOT_NOW=1
+	elif interactive && confirm "Start Arr when this computer starts, even before anyone logs in? It needs your admin password once." y; then BOOT_NOW=1
+	else BOOT_NOW=0; fi
+	if [ "$AT_BOOT" = 1 ] || interactive; then ELEV_OK=1; fi
+	D_ARR="$LD_DIR/$L_ARR.plist" D_TUN="$LD_DIR/$L_TUN.plist"
+
+	# Back to a login item (--no-at-boot on a start-at-boot install): removing daemons takes an administrator.
+	if [ "$BOOT_NOW" = 0 ] && [ "$CUR_BOOT" = 1 ]; then
+		if [ "$ELEV_OK" = 1 ] && mac_sudo; then
+			el_start; el_remove "$L_ARR"; el_remove "$L_TUN"; el_remove "$L_UPD"
+			if elevate; then CUR_BOOT=0; else say "Warning: couldn't remove Arr's start-at-boot services; Arr keeps starting at boot."; BOOT_NOW=1; fi
+		else
+			say "Arr starts at boot, and taking that away needs an administrator: run this again at a terminal with --no-at-boot."
+			BOOT_NOW=1
+		fi
+	fi
+
+	if [ "$BOOT_NOW" = 1 ]; then
+		# launchd opens the logs as root: create them as you first, so they stay yours.
+		for f in arr.log tunnel.log update.log; do [ -e "$STATE_DIR/$f" ] || : >"$STATE_DIR/$f"; done
+		mac_arr_plist 1 >"$tmp/arr.d.plist"
+		need=0
+		cmp -s "$tmp/arr.d.plist" "$D_ARR" 2>/dev/null || need=1
+		if [ -n "$PUBLIC_URL" ]; then
+			mac_tunnel_plist 1 >"$tmp/tun.d.plist"
+			cmp -s "$tmp/tun.d.plist" "$D_TUN" 2>/dev/null || need=1
+		elif [ -f "$D_TUN" ]; then need=1; fi
+		if [ "$need" = 1 ] && [ "$ELEV_OK" = 1 ]; then
+			ok=0
+			if mac_sudo; then
+				# The login items stop first, so the daemons get the port.
+				if [ "$CUR_BOOT" = 0 ]; then agent_stop "$L_ARR"; agent_stop "$L_TUN"; fi
+				el_start; el_add "$L_ARR" "$tmp/arr.d.plist"
+				if [ -n "$PUBLIC_URL" ]; then el_add "$L_TUN" "$tmp/tun.d.plist"; elif [ -f "$D_TUN" ]; then el_remove "$L_TUN"; fi
+				if elevate; then ok=1; fi
+			fi
+			if [ "$ok" = 1 ]; then ELEVATED=1; CUR_BOOT=1
+			elif [ "$CUR_BOOT" = 1 ]; then
+				say "Warning: couldn't update Arr's start-at-boot services; they stay as they were."
+			else
+				# Nothing may be left half-installed, and Arr must run: the login items come back.
+				el_start; el_remove "$L_ARR"; el_remove "$L_TUN"; sudo -n sh "$EL" </dev/null 2>/dev/null || true
+				RESTART=launchd_restart
+				for l in "$L_ARR" "$L_TUN"; do
+					[ ! -f "$LA_DIR/$l.plist" ] || launchctl load "$LA_DIR/$l.plist" 2>/dev/null || true
+				done
+				[ "$AT_BOOT" != 1 ] || die "couldn't set up start at boot; Arr keeps starting when you log in"
+				say "Warning: couldn't set up start at boot (it needs an administrator); Arr starts when you log in."
+				BOOT_NOW=0
+			fi
+		fi
+	fi
+
+	if [ "$BOOT_NOW" = 1 ]; then
+		# The daemons are Arr's now: two copies would fight over the port.
+		agent_remove "$L_ARR"
+		RESTART=boot_restart
+		# A daemon just started already runs the new binary; otherwise end Arr so launchd starts it again.
+		[ "$ELEVATED" = 1 ] || boot_restart
+		if [ -n "$PUBLIC_URL" ] && [ ! -f "$D_TUN" ]; then
+			say "Note: the tunnel starts when you log in; to start it at boot, run this again at a terminal (it needs an administrator)."
+			mac_tunnel_plist 0 >"$tmp/tun.a.plist"
+			agent_load "$L_TUN" "$tmp/tun.a.plist"
+		elif [ -n "$PUBLIC_URL" ]; then agent_remove "$L_TUN"
+		else
+			agent_remove "$L_TUN"
+			[ ! -f "$D_TUN" ] || say "Warning: Arr's tunnel service ($D_TUN) is still installed; run this again at a terminal to remove it."
+		fi
+		return 0
+	fi
+
+	mkdir -p "$LA_DIR"
+	mac_arr_plist 0 >"$tmp/arr.a.plist"
+	cp "$tmp/arr.a.plist" "$LA_DIR/$L_ARR.plist"
+	RESTART=launchd_restart
+	agent_stop "$L_ARR"
+	svc launchctl load "$LA_DIR/$L_ARR.plist"
+	if [ -n "$PUBLIC_URL" ]; then
+		mac_tunnel_plist 0 >"$tmp/tun.a.plist"
+		agent_load "$L_TUN" "$tmp/tun.a.plist"
+	else
+		# Remote access is gone from the config, so its tunnel goes too.
+		agent_remove "$L_TUN"
+	fi
+}
+
 if [ "$SERVICE" = 1 ] && [ "$os" = Linux ] && have systemctl && [ -d /run/systemd/system ]; then
 	unit="[Unit]
 Description=Arr media manager
@@ -1196,63 +1419,12 @@ User=$RUN_AS"
 		fi
 	}
 	started=1
-	if [ "$(id -u)" != 0 ]; then
-		# Keeps the user services running after you log out and starts them at boot. Over SSH
-		# this often needs an administrator; say so instead of failing quietly.
-		have loginctl && loginctl --no-ask-password enable-linger "$(id -un)" >/dev/null 2>&1 || true
-		if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q '=yes'; then
-			say "Warning: Arr stops when you log out and won't start after a reboot. Fix it with:"
-			say "  sudo loginctl enable-linger $(id -un)"
-		fi
-	fi
+	[ "$(id -u)" = 0 ] || enable_linger
 elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
-	plist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr.plist"
 	logs="tail -f \"$STATE_DIR/arr.log\""
 	logs_tunnel="$STATE_DIR/tunnel.log"
-	mkdir -p "$(dirname "$plist")"
-	cat >"$plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>io.github.newtonharry.arr</string>
-  <key>ProgramArguments</key><array>
-    <string>$(xml "$ARR")</string><string>serve</string><string>--config</string><string>$(xml "$CONFIG")</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/arr.log")</string>
-</dict></plist>
-PLIST
-	# Once unloaded, the job can't be kickstarted: a rollback loads it again instead.
-	launchd_restart() { launchctl unload "$plist" 2>/dev/null; launchctl load "$plist"; }
-	RESTART=launchd_restart
-	launchctl unload "$plist" 2>/dev/null || true
-	svc launchctl load "$plist"
+	mac_service
 	started=1
-	tplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-tunnel.plist"
-	if [ -n "$PUBLIC_URL" ]; then
-		cat >"$tplist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>io.github.newtonharry.arr-tunnel</string>
-  <key>ProgramArguments</key><array>
-    <string>$(xml "$NGROK")</string><string>http</string><string>127.0.0.1:$PORT</string>
-    <string>--url=$(xml "$PUBLIC_URL")</string><string>--config</string><string>$(xml "$STATE_DIR/ngrok.yml")</string>
-    <string>--log=stdout</string><string>--log-level=warn</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$(xml "$STATE_DIR/tunnel.log")</string>
-</dict></plist>
-PLIST
-		launchctl unload "$tplist" 2>/dev/null || true
-		svc launchctl load "$tplist"
-	elif [ -f "$tplist" ]; then
-		# Remote access is gone from the config, so its tunnel goes too.
-		launchctl unload "$tplist" 2>/dev/null || true
-		rm -f "$tplist"
-	fi
 fi
 if [ "$started" != 1 ]; then
 	UNDO_BIN=0 SNAP=""
@@ -1296,6 +1468,7 @@ system) udir=/etc/systemd/system sctl="systemctl" ;;
 *) udir="$HOME/.config/systemd/user" sctl="systemctl --user" ;;
 esac
 uplist="$HOME/Library/LaunchAgents/io.github.newtonharry.arr-update.plist"
+udplist="$LD_DIR/io.github.newtonharry.arr-update.plist"
 if [ -z "$AUTO_UPDATE" ]; then
 	if [ -f "$UPDATER" ]; then
 		AUTO_UPDATE=1
@@ -1309,7 +1482,6 @@ if [ -z "$AUTO_UPDATE" ]; then
 		AUTO_UPDATE=0
 	fi
 fi
-sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # For a system-wide install root runs the updater and the binary, so no other account may
 # be able to replace them: the binary and every folder from its own up to / must be owned
 # by root and not writable by group or others.
@@ -1343,9 +1515,9 @@ if [ "$AUTO_UPDATE" = 1 ]; then
 	step "Turning on automatic updates"
 	{
 		printf '#!/bin/sh\n# Arr updater, written by install.sh. A daily job runs it; you can run it by hand too.\n'
-		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\nCONFIG=%s\n' \
+		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\nCONFIG=%s\nLD_DIR=%s\n' \
 			"$(sq "$REPO")" "$(sq "$ARR")" "$(sq "$target")" "$(sq "$kind")" "$(sq "$PORT")" \
-			"$(sq "$lock_kind")" "$(sq "$lock_tool")" "$(sq "$CONFIG")"
+			"$(sq "$lock_kind")" "$(sq "$lock_tool")" "$(sq "$CONFIG")" "$(sq "$LD_DIR")"
 		cat <<'EOF'
 set -eu
 log() { printf 'arr-update: %s\n' "$*"; }
@@ -1374,7 +1546,17 @@ restart() {
 	case "$KIND" in
 	system) systemctl restart arr || true ;;
 	user) systemctl --user restart arr || true ;;
-	launchd) launchctl kickstart -k "gui/$(id -u)/io.github.newtonharry.arr" || true ;;
+	launchd)
+		if [ -f "$LD_DIR/io.github.newtonharry.arr.plist" ]; then
+			# Started at boot: Arr is a daemon that runs as you, and a user can't launchctl a
+			# system daemon. Ending your own arr makes launchd (KeepAlive) start it again from
+			# the binary now on disk.
+			ps -u "$(id -u)" -o pid= -o command= | awk -v want="$ARR serve --config $CONFIG" '
+				{ p = $1; sub(/^[ ]*[0-9]+[ ]+/, ""); if ($0 == want) print p }' |
+				while read -r p; do kill "$p" 2>/dev/null || true; done
+		else
+			launchctl kickstart -k "gui/$(id -u)/io.github.newtonharry.arr" || true
+		fi ;;
 	esac
 }
 # Waits up to 30 seconds for Arr to answer its health check as version $1. Each request
@@ -1483,23 +1665,28 @@ EOF
 			die "couldn't start the update timer"
 		;;
 	launchd)
-		cat >"$uplist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>io.github.newtonharry.arr-update</string>
-  <key>ProgramArguments</key><array><string>/bin/sh</string><string>$(xml "$UPDATER")</string></array>
-  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>$(($(od -An -N1 -tu1 /dev/urandom) % 60))</integer></dict>
+		upd_args="    <string>/bin/sh</string><string>$(xml "$UPDATER")</string>"
+		upd_keys="  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>$(($(od -An -N1 -tu1 /dev/urandom) % 60))</integer></dict>
   <key>StandardOutPath</key><string>$(xml "$STATE_DIR/update.log")</string>
-  <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/update.log")</string>
-</dict></plist>
-EOF
-		launchctl unload "$uplist" 2>/dev/null || true
-		launchctl load "$uplist" || die "couldn't schedule automatic updates"
+  <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/update.log")</string>"
+		# At boot the daily job is a daemon too: it runs as you, so it needs no password to
+		# run, and it still runs when nobody is logged in. Otherwise it is a login item.
+		mac_plist "$L_UPD" 1 "$upd_args" "$upd_keys" >"$tmp/upd.d.plist"
+		mac_plist "$L_UPD" 0 "$upd_args" "$upd_keys" >"$tmp/upd.a.plist"
+		if [ "$BOOT_NOW" = 1 ] && [ -f "$udplist" ]; then
+			# Already a daemon; it stays (changing it would take an administrator).
+			agent_remove "$L_UPD"
+		elif [ "$BOOT_NOW" = 1 ] && [ "$ELEV_OK" = 1 ] && mac_sudo && { el_start; el_add "$L_UPD" "$tmp/upd.d.plist"; elevate; }; then
+			agent_remove "$L_UPD"
+		else
+			[ "$BOOT_NOW" != 1 ] ||
+				say "Note: automatic updates run while you're logged in; to run them at boot too, run this again at a terminal (it needs an administrator)."
+			agent_load "$L_UPD" "$tmp/upd.a.plist"
+		fi
 		;;
 	esac
 	say "Arr checks for a new release once a day and installs it. Turn this off with --no-auto-update."
-elif [ -f "$UPDATER" ] || [ -f "$udir/arr-update.timer" ] || [ -f "$uplist" ]; then
+elif [ -f "$UPDATER" ] || [ -f "$udir/arr-update.timer" ] || [ -f "$uplist" ] || [ -f "$udplist" ]; then
 	# Whatever is left of them: the daily job without its updater would only fail.
 	step "Turning off automatic updates"
 	case "$kind" in
@@ -1509,8 +1696,13 @@ elif [ -f "$UPDATER" ] || [ -f "$udir/arr-update.timer" ] || [ -f "$uplist" ]; t
 		$sctl daemon-reload || true
 		;;
 	launchd)
-		launchctl unload "$uplist" 2>/dev/null || true
-		rm -f "$uplist"
+		agent_remove "$L_UPD"
+		if [ -f "$udplist" ]; then
+			# A daemon: removing it takes an administrator. Without one it stays, and finds
+			# no updater to run.
+			if [ "$ELEV_OK" = 1 ] && mac_sudo && { el_start; el_remove "$L_UPD"; elevate; }; then :
+			else say "Note: the daily update job ($udplist) is still installed but does nothing; run this again at a terminal to remove it."; fi
+		fi
 		;;
 	esac
 	rm -f "$UPDATER"

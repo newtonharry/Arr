@@ -65,7 +65,9 @@ client ID and secret, and the Google accounts allowed in. Then it:
   old config if the check fails;
 - starts the tunnel next to Arr, and again whenever the computer starts or you log in:
   `arr-tunnel` on Linux, a launchd agent on macOS, and on Windows an **Arr tunnel** task that
-  runs at log-on without a window and restarts ngrok if it stops;
+  runs at log-on without a window and restarts ngrok if it stops. If you chose to start Arr when
+  the computer starts, the tunnel starts then too (a launch daemon, or the task also set to run at
+  boot; see the README);
 - confirms that `https://YOUR-NGROK-DOMAIN` reaches Arr.
 
 Running the installer again keeps your remote access as it is. Once it's set up, the installer

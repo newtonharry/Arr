@@ -33,6 +33,14 @@ jobs:
         run: |
           cargo build --release --locked
           sh tests/installer/linux.sh
+      # Starting at boot, with stand-ins for what only a Mac or an administrator has (launchd,
+      # sudo, loginctl): which kind of install is chosen, when a password may be asked for, and
+      # that the updater restarts and rolls back without one. The real thing runs in the macos
+      # and windows jobs.
+      - name: Installer, start at boot (with stand-ins)
+        run: |
+          sh tests/installer/macos-boot.sh target/release/arr
+          sh tests/installer/linger.sh target/release/arr
       # Auto-update rolls back to the previous binary when the new one is not healthy, so the
       # latest published release must still start on what this build (its install.sh, its setup
       # page, its API) wrote, and back.
@@ -274,3 +282,138 @@ jobs:
           if (Test-Path $bin) { Fail 'the program folder is still there' }
           if (Test-Path $state) { Fail 'the state folder is still there' }
           'remote access: all checks passed'
+      # Starting at boot: the tasks are registered to run whether or not anyone is logged on, the
+      # way a person gets them (ARR_AT_BOOT=1; this runner is an administrator, so the
+      # elevation step runs in place), then a rerun with nobody to ask keeps them, restarts Arr
+      # through the task, and the updater restarts Arr and rolls back the same way.
+      - name: Start at boot
+        shell: powershell
+        run: |
+          function Fail($m) { "FAIL: $m"; exit 1 }
+          Start-Process python -ArgumentList '-m', 'http.server', '8996', '--bind', '127.0.0.1', '--directory', 'dist'
+          # "v99.0.0" is served, but holds this build: Arr answers as the old version, so the
+          # updater must put the old programs back and start them again.
+          Start-Process python -ArgumentList 'tests\installer\relserver.py', '8995', 'dist'
+          Start-Sleep -Seconds 3
+          $state = "$env:RUNNER_TEMP\arr boot state"
+          $bin = "$env:RUNNER_TEMP\arr boot bin"
+          & target\release\arr.exe init --state-dir $state --listen 127.0.0.1:8790 | Out-Null
+          $env:ARR_DOWNLOAD_BASE = 'http://127.0.0.1:8996'
+          $env:ARR_BIN_DIR = $bin; $env:ARR_STATE_DIR = $state
+          $env:ARR_YES = '1'; $env:ARR_AUTO_UPDATE = '1'; $env:ARR_INSTALL_STRICT = '1'; $env:ARR_AT_BOOT = '1'
+          function Healthy { try { [bool](Invoke-RestMethod http://127.0.0.1:8790/api/v1/health -TimeoutSec 5) } catch { $false } }
+          function ArrPid {
+            Get-CimInstance Win32_Process -Filter "Name LIKE 'arr-background%'" |
+              Where-Object { "$($_.CommandLine)".Contains("$state\config.toml") -and $_.CommandLine -notlike '*--hidden*' } | ForEach-Object { $_.ProcessId }
+          }
+          function CheckBootTasks($when) {
+            foreach ($n in 'Arr', 'Arr update') {
+              $t = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue
+              if (-not $t) { Fail "no $n task $when" }
+              if ("$($t.Principal.LogonType)" -ne 'S4U') { Fail "the $n task is $($t.Principal.LogonType), not S4U $when" }
+              if ("$($t.Principal.RunLevel)" -ne 'Limited') { Fail "the $n task isn't limited $when" }
+            }
+            $kinds = @((Get-ScheduledTask -TaskName 'Arr').Triggers | ForEach-Object { $_.CimClass.CimClassName })
+            if ($kinds -notcontains 'MSFT_TaskBootTrigger' -or $kinds -notcontains 'MSFT_TaskLogonTrigger') { Fail "Arr's triggers $when are: $kinds" }
+          }
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          CheckBootTasks 'after ARR_AT_BOOT=1'
+          if (-not (Healthy) -or -not (ArrPid)) { Fail 'Arr is not running from the boot task' }
+          # Its own user may start and stop it (the updater and a rerun do, without administrator rights).
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $svc = New-Object -ComObject Schedule.Service; $svc.Connect()
+          if ($svc.GetFolder('\').GetTask('Arr').GetSecurityDescriptor(4) -notlike "*(A;;FA;;;$sid)*") { Fail 'the user has no rights over the Arr task' }
+          # A rerun with nobody to ask leaves the tasks as they are and restarts Arr through the task.
+          $registered = (Get-ScheduledTask -TaskName 'Arr').Date
+          $before = ArrPid
+          $env:ARR_AT_BOOT = $null
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          CheckBootTasks 'after an unattended rerun'
+          if ((Get-ScheduledTask -TaskName 'Arr').Date -ne $registered) { Fail 'an unattended rerun registered the Arr task again' }
+          if (-not (Healthy)) { Fail 'Arr does not answer after the unattended rerun' }
+          if ("$(ArrPid)" -eq "$before" -or -not (ArrPid)) { Fail 'the unattended rerun did not restart Arr' }
+          # The updater: swaps in v99.0.0, restarts Arr through the task, sees the old version answer, goes back.
+          $hash = (Get-FileHash "$bin\arr.exe").Hash
+          $before = ArrPid
+          $env:ARR_RELEASES_URL = 'http://127.0.0.1:8995/releases'
+          $out = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$bin\arr-update.ps1" 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          $out
+          if ($code -ne 1) { Fail "the updater exited with $code, not 1 (a version that never answered)" }
+          if ($out -notmatch "v99\.0\.0 didn't start; going back") { Fail 'the updater did not roll back' }
+          if ($out -match "didn't start either") { Fail 'the old version did not come back' }
+          if ((Get-FileHash "$bin\arr.exe").Hash -ne $hash) { Fail 'the old arr.exe was not put back' }
+          if (-not (Healthy)) { Fail 'Arr was left stopped by the rollback' }
+          if ("$(ArrPid)" -eq "$before" -or -not (ArrPid)) { Fail 'the updater did not restart Arr' }
+          CheckBootTasks 'after the updater'
+          # ARR_AT_BOOT=0 with nobody to ask can't take the boot tasks away (that needs an administrator): they stay.
+          $env:ARR_RELEASES_URL = $null; $env:ARR_AT_BOOT = '0'
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          CheckBootTasks 'after ARR_AT_BOOT=0 without a prompt'
+          if (-not (Healthy)) { Fail 'Arr does not answer after ARR_AT_BOOT=0' }
+          $env:ARR_AT_BOOT = $null
+          $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '1'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          foreach ($n in 'Arr', 'Arr update') { if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) { Fail "uninstall left the $n task" } }
+          'start at boot: all checks passed'
+      # What an administrator's registration must give an ordinary user: the boot task runs as
+      # that user with nobody logged on (S4U), and the user can stop and start it without
+      # administrator rights. (A stand-in program, not Arr: only the task is under test.)
+      - name: Start at boot, restarted by an ordinary user
+        shell: powershell
+        run: |
+          function Fail($m) { "FAIL: $m"; exit 1 }
+          $text = Get-Content install.ps1 -Raw
+          $i = $text.IndexOf("`ntry {`n`tInstall-Arr")
+          if ($i -lt 0) { Fail 'cannot find the end of install.ps1' }
+          Invoke-Expression $text.Substring(0, $i) # its functions, without running the installer
+          $pw = 'Arr-ci-' + [guid]::NewGuid().ToString('N')
+          net user arrtest $pw /add | Out-Null
+          if ($LASTEXITCODE) { Fail 'cannot create the test user' }
+          $user = "$env:COMPUTERNAME\arrtest"
+          $dir = 'C:\ProgramData\arr-ci'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          icacls $dir /grant 'arrtest:(OI)(CI)F' | Out-Null
+          try {
+            Register-ScheduledTask -TaskName 'Arr tunnel' -Force -Description 'test' `
+              -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c ping -n 600 127.0.0.1 >nul') `
+              -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) `
+              -Principal (New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited) | Out-Null
+            $why = Set-TaskMode $user $true
+            if ($why) { Fail "registering as an administrator: $why" }
+            $t = Get-ScheduledTask -TaskName 'Arr tunnel'
+            if ("$($t.Principal.LogonType)" -ne 'S4U') { Fail "logon type $($t.Principal.LogonType)" }
+            if (-not ($t.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })) { Fail 'no boot trigger' }
+            function Pinger { Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq 'arrtest' } }
+            function WaitFor($what, [scriptblock]$cond) {
+              for ($n = 0; $n -lt 30; $n++) { if (& $cond) { return }; Start-Sleep 1 }
+              Fail "$what (the task's last result: $((Get-ScheduledTaskInfo -TaskName 'Arr tunnel').LastTaskResult))"
+            }
+            # S4U for an ordinary user works with nobody logged on: the task runs as that user.
+            Start-ScheduledTask -TaskName 'Arr tunnel'
+            WaitFor 'the boot task never ran as arrtest' { Pinger }
+            # Now as arrtest, without administrator rights: stop it, start it again.
+            $script = "$dir\control.ps1"
+            @(
+              'try { Stop-ScheduledTask -TaskName "Arr tunnel" -ErrorAction Stop; "stopped" } catch { "stop failed: $_"; exit 3 }',
+              'Start-Sleep -Seconds 2',
+              'try { Start-ScheduledTask -TaskName "Arr tunnel" -ErrorAction Stop; "started" } catch { "start failed: $_"; exit 4 }'
+            ) | Set-Content $script
+            $cred = New-Object Management.Automation.PSCredential($user, (ConvertTo-SecureString $pw -AsPlainText -Force))
+            $p = Start-Process powershell.exe -Credential $cred -WorkingDirectory $dir -Wait -PassThru -WindowStyle Hidden `
+              -RedirectStandardOutput "$dir\control.out" -RedirectStandardError "$dir\control.err" `
+              -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script
+            Get-Content "$dir\control.out", "$dir\control.err" -ErrorAction SilentlyContinue
+            if ($p.ExitCode -ne 0) { Fail "arrtest could not stop and start the task (exit code $($p.ExitCode))" }
+            WaitFor 'the task did not run again after arrtest restarted it' { Pinger }
+            # And back to starting at log-on only.
+            $why = Set-TaskMode $user $false
+            if ($why) { Fail "going back to log-on: $why" }
+            $t = Get-ScheduledTask -TaskName 'Arr tunnel'
+            if ("$($t.Principal.LogonType)" -eq 'S4U' -or ($t.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })) { Fail 'still a boot task' }
+            'start at boot, ordinary user: all checks passed'
+          } finally {
+            Unregister-ScheduledTask -TaskName 'Arr tunnel' -Confirm:$false -ErrorAction SilentlyContinue
+            Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            net user arrtest /delete | Out-Null
+          }

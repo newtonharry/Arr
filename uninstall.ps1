@@ -105,7 +105,9 @@ function Uninstall-Arr {
 		foreach ($t in @($arrTask, $updateTask, $tunnelTask) | Where-Object { $_ }) {
 			Do-It "remove the task `"$($t.TaskName)`"" {
 				Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue
-				Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false
+				# An install that starts at boot gave you control of its tasks; if Windows still says no, an administrator is needed.
+				try { Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false }
+				catch { throw "couldn't remove the task `"$($t.TaskName)`" ($($_.Exception.Message)); run this again in a PowerShell opened as administrator" }
 			}
 		}
 		# Arr's programs, ngrok installed beside them, and an ngrok running Arr's tunnel.

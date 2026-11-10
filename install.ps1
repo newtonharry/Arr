@@ -3,10 +3,16 @@
 #
 #   irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex
 #
-# Nothing here needs administrator rights. `irm | iex` can't pass options, so they come
-# from environment variables, for example: $env:ARR_VERSION = "v0.4.0"; irm ... | iex
+# Nothing here needs administrator rights, except starting Arr when the computer starts (see
+# ARR_AT_BOOT). `irm | iex` can't pass options, so they come from environment variables, for
+# example: $env:ARR_VERSION = "v0.4.0"; irm ... | iex
 #
 #   ARR_VERSION          a release tag such as v0.4.0 (default: the latest release)
+#   ARR_AT_BOOT          1 to start Arr when the computer starts, even before anyone logs in; 0 to
+#                        start it at log-on only. Asked at a PowerShell prompt if not given. It is
+#                        set up once with administrator rights (Windows shows a permission prompt,
+#                        or run this from an administrator PowerShell). Without a prompt and
+#                        without ARR_AT_BOOT=1, a re-run keeps whichever kind is installed.
 #   ARR_AUTO_UPDATE      1 to install new versions automatically, 0 to turn that off
 #   ARR_ERROR_REPORTS    1 to send error reports, 0 not to (docs/PRIVACY.md)
 #   ARR_TMDB_KEY         an optional backup TMDB key (movies come from Plex)
@@ -86,7 +92,7 @@ function Install-Arr {
 	$BinDir, $StateDir = Get-ArrDirs
 	# A given option is checked before anything changes, so it either applies or stops here.
 	foreach ($o in @(@('ARR_PORT', 1, 65535), @('ARR_TORRENT_PORT', 1, 65535), @('ARR_UPLOAD_LIMIT_KIB', 0, 4194303),
-			@('ARR_ERROR_REPORTS', 0, 1), @('ARR_AUTO_UPDATE', 0, 1))) {
+			@('ARR_ERROR_REPORTS', 0, 1), @('ARR_AUTO_UPDATE', 0, 1), @('ARR_AT_BOOT', 0, 1))) {
 		$v = [Environment]::GetEnvironmentVariable($o[0])
 		if ($v -and -not ($v -match '^\d{1,7}$' -and [int]$v -ge $o[1] -and [int]$v -le $o[2])) {
 			$what = if ($o[2] -eq 1) { '0 or 1' } else { "a number from $($o[1]) to $($o[2])" }
@@ -320,24 +326,39 @@ function Install-Arr {
 		-ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
 		-StartWhenAvailable -MultipleInstances IgnoreNew
 	$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+	# Starting when the computer does means the tasks run whether or not you're logged on
+	# (S4U, no password stored). Registering that takes an administrator, so only a run at a
+	# prompt, or ARR_AT_BOOT=1, does it; any other run keeps whichever kind is installed and
+	# leaves the tasks as they are.
+	$bootNow = Test-S4U 'Arr'
+	$atBoot = $env:ARR_AT_BOOT
+	if ($atBoot) { $wantBoot = $atBoot -eq '1' }
+	elseif ($bootNow) { $wantBoot = $true }
+	else { $wantBoot = (Interactive) -and (Confirm 'Start Arr when this computer starts, even before anyone logs in? It needs administrator rights once (Windows asks permission).' 'y') }
+	$canElevate = $atBoot -eq '1' -or (Interactive)
 	# Only now is Arr stopped: everything that could fail without it running is done.
 	Stop-Arr $Background
-	Register-ScheduledTask -TaskName 'Arr' -Description 'Arr media manager (installed by install.ps1)' -Force `
-		-Action (New-ScheduledTaskAction -Execute $Background -Argument "--config `"$Config`"") `
-		-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
-	Start-ScheduledTask -TaskName 'Arr'
+	if (-not $bootNow) {
+		Register-ScheduledTask -TaskName 'Arr' -Description 'Arr media manager (installed by install.ps1)' -Force `
+			-Action (New-ScheduledTaskAction -Execute $Background -Argument "--config `"$Config`"") `
+			-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
+	}
+	# An administrator's task lets you start it (see Set-TaskMode); if Windows won't, it starts
+	# the task again by itself within a minute, so wait longer.
+	$started = if ($bootNow) { Start-ArrTask 'Arr' } else { Start-ScheduledTask -TaskName 'Arr'; $true }
 	$script:ArrStopped = $false
+	$wait = if ($started) { 30 } else { 150 }
 	$api = "http://127.0.0.1:$Port"
 	$log = Join-Path $StateDir 'arr.log'
-	if (-not (Wait-Healthy $api '' 30)) {
+	if (-not (Wait-Healthy $api '' $wait)) {
 		if (-not $script:Swapped -and -not $script:Snapshot) { throw "Arr didn't start; see $log" }
 		$what = if ($script:Swapped) { 'the new version of Arr didn''t start, so the previous version and settings are back' }
 		else { 'Arr didn''t start with the new settings, so the previous ones are back' }
 		Stop-Arr $Background
 		Undo-Run
-		Start-ScheduledTask -TaskName 'Arr'
+		$started = if ($bootNow) { Start-ArrTask 'Arr' } else { Start-ScheduledTask -TaskName 'Arr'; $true }
 		$script:ArrStopped = $false
-		$back = if (Wait-Healthy $api '' 30) { 'and it is running' } else { 'but it didn''t start either' }
+		$back = if (Wait-Healthy $api '' $(if ($started) { 30 } else { 150 })) { 'and it is running' } else { 'but it didn''t start either' }
 		throw "$what, $back; see $log"
 	}
 	$script:Healthy = $true
@@ -354,10 +375,14 @@ function Install-Arr {
 		Step "Starting the tunnel for $PublicUrl"
 		Stop-Tunnel $NgrokYml
 		$tunnelArgs = "--hidden `"$ngrok`" http 127.0.0.1:$Port `"--url=$PublicUrl`" --config `"$NgrokYml`" `"--log=$TunnelLog`" --log-level=warn"
-		Register-ScheduledTask -TaskName 'Arr tunnel' -Description 'Public HTTPS address for Arr, ngrok (installed by install.ps1)' -Force `
-			-Action (New-ScheduledTaskAction -Execute $Background -Argument $tunnelArgs) `
-			-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
-		Start-ScheduledTask -TaskName 'Arr tunnel'
+		# A tunnel task already set to start at boot stays as it is (re-registering it takes an administrator).
+		if (Test-S4U 'Arr tunnel') { $null = Start-ArrTask 'Arr tunnel' }
+		else {
+			Register-ScheduledTask -TaskName 'Arr tunnel' -Description 'Public HTTPS address for Arr, ngrok (installed by install.ps1)' -Force `
+				-Action (New-ScheduledTaskAction -Execute $Background -Argument $tunnelArgs) `
+				-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
+			Start-ScheduledTask -TaskName 'Arr tunnel'
+		}
 	} elseif (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) {
 		Step 'Removing the tunnel (remote access isn''t set up any more)'
 		Stop-Tunnel $NgrokYml
@@ -377,19 +402,83 @@ function Install-Arr {
 	if ($AutoUpdate -eq '1') {
 		Step 'Turning on automatic updates'
 		Write-Updater $Updater $Repo $Target $BinDir $StateDir $Port
-		$at = (Get-Date).Date.AddHours(4).AddMinutes((Get-Random -Maximum 60))
-		$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-		$taskArgs = "--hidden `"$ps`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Updater`""
-		Register-ScheduledTask -TaskName 'Arr update' -Description 'Installs new Arr releases (installed by install.ps1)' -Force `
-			-Action (New-ScheduledTaskAction -Execute $Background -Argument $taskArgs) `
-			-Trigger (New-ScheduledTaskTrigger -Daily -At $at) `
-			-Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew) `
-			-Principal $principal | Out-Null
+		# A task already set to run at boot stays as it is: it runs the same script.
+		if (-not (Test-S4U 'Arr update')) {
+			$at = (Get-Date).Date.AddHours(4).AddMinutes((Get-Random -Maximum 60))
+			$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+			$taskArgs = "--hidden `"$ps`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Updater`""
+			Register-ScheduledTask -TaskName 'Arr update' -Description 'Installs new Arr releases (installed by install.ps1)' -Force `
+				-Action (New-ScheduledTaskAction -Execute $Background -Argument $taskArgs) `
+				-Trigger (New-ScheduledTaskTrigger -Daily -At $at) `
+				-Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew) `
+				-Principal $principal | Out-Null
+		}
 		Say 'Arr checks for a new release once a day and installs it. Turn this off with $env:ARR_AUTO_UPDATE = "0" and running this again.'
 	} elseif ((Test-Path $Updater) -or $updateTask) {
 		Step 'Turning off automatic updates'
 		Unregister-ScheduledTask -TaskName 'Arr update' -Confirm:$false -ErrorAction SilentlyContinue
 		Remove-Item $Updater -Force -ErrorAction SilentlyContinue
+	}
+
+	# ------------------------------------------------------------ start at boot
+
+	# The tasks above are at log-on, unless they were already set to run at boot; now the
+	# administrator step switches all of Arr's tasks to the kind that was chosen.
+	$arrTasks = @('Arr', 'Arr tunnel', 'Arr update' | Where-Object { Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue })
+	$logonTasks = @($arrTasks | Where-Object { -not (Test-S4U $_) })
+	$bootTasks = @($arrTasks | Where-Object { Test-S4U $_ })
+	$bootFailure = $null
+	if ($wantBoot -and $logonTasks) {
+		if (-not $canElevate) {
+			Say 'Note: Arr''s new tasks start when you log in. To start them at boot, run this again at a PowerShell prompt (it needs administrator rights).'
+		} else {
+			Step 'Starting Arr when the computer starts'
+			Say 'Arr will start at boot and keep running when nobody is logged in. Windows gives it no network credentials then,'
+			Say 'so media on a network drive mapped to a letter (Z:) is not reachable until you log in: use a local drive.'
+			$why = Set-TaskMode $user $true
+			if ($why) {
+				# Nothing to undo if Windows never let the step run; Arr keeps running as it was.
+				Write-Warning "Arr still starts when you log in, not at boot: $why"
+				$bootFailure = $why
+			} else {
+				# Arr and its tunnel restart under the new tasks: the ones running now were started at log-on.
+				Stop-Arr $Background
+				$started = Start-ArrTask 'Arr'
+				$script:ArrStopped = $false
+				if (Wait-Healthy $api '' $(if ($started) { 60 } else { 150 })) {
+					if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) {
+						Stop-Tunnel $NgrokYml
+						$null = Start-ArrTask 'Arr tunnel'
+					}
+				} else {
+					# The boot task can't run Arr (for example, Windows won't let this account log on
+					# as a batch job): back to starting at log-on, with Arr running.
+					$bootFailure = "Arr didn't start from the boot task; see $log"
+					Write-Warning "Arr starts when you log in, not at boot: $bootFailure"
+					$null = Set-TaskMode $user $false
+					Stop-Arr $Background
+					$null = Start-ArrTask 'Arr'
+					$script:ArrStopped = $false
+					if (-not (Wait-Healthy $api '' 150)) { throw "Arr didn't start after going back to log-on; see $log" }
+					if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) { Stop-Tunnel $NgrokYml; $null = Start-ArrTask 'Arr tunnel' }
+				}
+			}
+		}
+	} elseif (-not $wantBoot -and $bootTasks) {
+		if (-not $canElevate) {
+			Say 'Arr starts at boot, and taking that away needs administrator rights: run this again at a PowerShell prompt with $env:ARR_AT_BOOT = "0".'
+		} else {
+			Step 'Starting Arr when you log in'
+			$why = Set-TaskMode $user $false
+			if ($why) { Write-Warning "Arr keeps starting at boot: $why" }
+			else {
+				Stop-Arr $Background
+				$null = Start-ArrTask 'Arr'
+				$script:ArrStopped = $false
+				if (-not (Wait-Healthy $api '' 60)) { throw "Arr didn't start after the change; see $log" }
+				if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) { Stop-Tunnel $NgrokYml; $null = Start-ArrTask 'Arr tunnel' }
+			}
+		}
 	}
 
 	# ------------------------------------------------------------ what you already own
@@ -413,6 +502,9 @@ function Install-Arr {
 		if ($failed) { throw "the Plex import failed: $($failed.last_error); run this again to retry" }
 		Say 'Done. Titles you already have are marked owned, and nothing was downloaded.'
 	}
+
+	# Asked for with ARR_AT_BOOT=1 and not possible: Arr runs (it starts at log-on), but a script must be told.
+	if ($bootFailure -and $atBoot -eq '1') { throw "Arr could not be set to start at boot, so it starts when you log in: $bootFailure" }
 
 	$mcp = @{ mcpServers = @{ arr = @{ command = $Arr; args = @('mcp', '--api-url', "$api/", '--token-file', (Join-Path $StateDir 'secrets\api_token')) } } } |
 		ConvertTo-Json -Depth 5
@@ -643,6 +735,110 @@ function Stop-Tunnel($ngrokYml) {
 		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
+# Does the task run whether or not you're logged on (S4U: no password stored)? That is how
+# the tasks of an install that starts at boot are registered; at log-on they are Interactive.
+function Test-S4U($name) {
+	$t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+	return [bool]($t -and "$($t.Principal.LogonType)" -eq 'S4U')
+}
+
+function Test-Admin {
+	return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# A PowerShell single-quoted string holding $s.
+function Quote-Ps($s) { return "'" + ("$s" -replace "'", "''") + "'" }
+
+# Starts a task of Arr's. A task an administrator registered to run at boot can be started by
+# its own user (Set-TaskMode sees to that); if Windows still refuses, this says so and Windows
+# starts it again by itself within a minute, as it does for any task that stopped.
+function Start-ArrTask($name) {
+	try { Start-ScheduledTask -TaskName $name -ErrorAction Stop; return $true } catch { return $false }
+}
+
+# Runs PowerShell text with administrator rights: here if this already is an administrator
+# (and there is no prompt), else in a PowerShell Windows asks permission for. Returns $null
+# when it worked, else why not. The text runs the way it was written: the elevated PowerShell
+# gets only a short command that reads it from a file, checks its SHA-256 against the one
+# given on the command line, and runs what it read, so another program can't swap it in the
+# moment between writing and running.
+function Invoke-Elevated($body) {
+	$result = Join-Path ([IO.Path]::GetTempPath()) ('arr-elevated-' + [guid]::NewGuid().ToString('N') + '.txt')
+	$text = "`$ErrorActionPreference = 'Stop'`ntry {`n$body`n'ok' | Set-Content -LiteralPath $(Quote-Ps $result)`n} catch { ('error: ' + `$_.Exception.Message) | Set-Content -LiteralPath $(Quote-Ps $result) }`n"
+	$file = $null
+	try {
+		if (Test-Admin) {
+			Invoke-Expression $text | Out-Null
+		} else {
+			$bytes = [Text.Encoding]::UTF8.GetBytes($text)
+			$hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-', '')
+			$file = Join-Path ([IO.Path]::GetTempPath()) ('arr-elevated-' + [guid]::NewGuid().ToString('N') + '.ps1')
+			[IO.File]::WriteAllText($file, $text, (New-Object Text.UTF8Encoding $false))
+			$cmd = "`$t = [IO.File]::ReadAllText($(Quote-Ps $file)); if (([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes(`$t))).Replace('-', '')) -ne '$hash') { exit 9 }; Invoke-Expression `$t"
+			$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+			try {
+				$p = Start-Process $ps -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"$cmd`"")
+			} catch {
+				return "Windows didn't give administrator rights ($($_.Exception.Message))"
+			}
+			if ($p.ExitCode -eq 9) { return 'the administrator step was changed after it was written, so it did not run' }
+		}
+		$out = if (Test-Path -LiteralPath $result) { ([string](Get-Content -LiteralPath $result -Raw)).Trim() } else { '' }
+		if ($out -eq 'ok') { return $null }
+		if ($out) { return ($out -replace '^error: ', '') }
+		return 'the administrator step did not finish'
+	} finally {
+		foreach ($f in @($result, $file) | Where-Object { $_ }) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+	}
+}
+
+# Registers Arr's tasks again, all in one administrator step: to start at boot (S4U, so they run
+# whether or not you're logged on and no password is stored; an AtStartup trigger next to
+# AtLogOn) or back at log-on only (Interactive). They keep their programs, arguments and the
+# update task its time. At boot, the task's own user gets full control of it, so Arr's updater
+# and this installer restart Arr without administrator rights. Returns $null, or why not.
+function Set-TaskMode($user, [bool]$boot) {
+	$specs = @()
+	foreach ($n in 'Arr', 'Arr tunnel', 'Arr update') {
+		$t = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue
+		if (-not $t) { continue }
+		$a = $t.Actions | Select-Object -First 1
+		$at = if ($n -eq 'Arr update') { [string]($t.Triggers | Select-Object -First 1).StartBoundary } else { '' }
+		$specs += "@{ Name = $(Quote-Ps $n); Description = $(Quote-Ps $t.Description); Exe = $(Quote-Ps $a.Execute); Args = $(Quote-Ps $a.Arguments); At = $(Quote-Ps $at) }"
+	}
+	if (-not $specs) { return 'there are no Arr tasks' }
+	$body = @'
+$user = __USER__
+$boot = __BOOT__
+$tasks = @(__TASKS__)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -MultipleInstances IgnoreNew
+$updateSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
+$logon = if ($boot) { 'S4U' } else { 'Interactive' }
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType $logon -RunLevel Limited
+$sid = (New-Object Security.Principal.NTAccount($user)).Translate([Security.Principal.SecurityIdentifier]).Value
+foreach ($t in $tasks) {
+	if ($t.At) { $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]$t.At); $set = $updateSettings }
+	else {
+		$trigger = @(New-ScheduledTaskTrigger -AtLogOn -User $user)
+		if ($boot) { $trigger += New-ScheduledTaskTrigger -AtStartup }
+		$set = $settings
+	}
+	Register-ScheduledTask -TaskName $t.Name -Description $t.Description -Force `
+		-Action (New-ScheduledTaskAction -Execute $t.Exe -Argument $t.Args) -Trigger $trigger -Settings $set -Principal $principal | Out-Null
+	if ($boot) {
+		$svc = New-Object -ComObject Schedule.Service
+		$svc.Connect()
+		$rt = $svc.GetFolder('\').GetTask($t.Name)
+		$sd = $rt.GetSecurityDescriptor(4)
+		if ($sd -notlike "*(A;;FA;;;$sid)*") { $rt.SetSecurityDescriptor($sd + "(A;;FA;;;$sid)", 0) }
+		if ($rt.GetSecurityDescriptor(4) -notlike "*(A;;FA;;;$sid)*") { throw "could not let $user start and stop the task $($t.Name)" }
+	}
+}
+'@
+	$body = $body.Replace('__USER__', (Quote-Ps $user)).Replace('__BOOT__', $(if ($boot) { '$true' } else { '$false' })).Replace('__TASKS__', ($specs -join ",`n"))
+	return Invoke-Elevated $body
+}
+
 # Stops the running Arr (the log-on task and its program), to restart it on the new version.
 function Stop-Arr($background) {
 	$script:ArrStopped = $true
@@ -855,15 +1051,21 @@ function Get-ArrAsset($url, $out, $name, $repo, $release, $fallback) {
 }
 $arr = Join-Path $BinDir 'arr.exe'
 $api = "http://127.0.0.1:$Port"
+# An install that starts at boot has its tasks registered by an administrator, who let you start
+# and stop them. This needs no administrator rights: if Windows still refuses to start the
+# task, ending Arr (as you, it's your process) makes Windows start it again within a minute,
+# and Healthy waits that long.
+$script:SlowStart = $false
 function Restart-Arr {
 	Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
 	Get-CimInstance Win32_Process -Filter "Name = 'arr-background.exe'" -ErrorAction SilentlyContinue |
 		Where-Object { $_.CommandLine -like '*--config*' -and $_.CommandLine -notlike '*--hidden*' } |
 		ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-	Start-ScheduledTask -TaskName 'Arr'
+	try { Start-ScheduledTask -TaskName 'Arr' -ErrorAction Stop }
+	catch { $script:SlowStart = $true; Log "couldn't start the Arr task ($($_.Exception.Message)); Windows starts it again within a minute" }
 }
 function Healthy($version) {
-	$deadline = (Get-Date).AddSeconds(30)
+	$deadline = (Get-Date).AddSeconds($(if ($script:SlowStart) { 150 } else { 30 }))
 	while ((Get-Date) -lt $deadline) {
 		try { if ((Invoke-RestMethod "$api/api/v1/health" -TimeoutSec 3).version -eq $version.TrimStart('v')) { return $true } } catch {}
 		Start-Sleep -Seconds 1
