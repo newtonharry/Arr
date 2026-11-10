@@ -22,7 +22,6 @@ let token = 0, pollT = 0, retryT = 0, feedBusy = false, searchSeq = 0, searchAbo
 // ---------- drawing ----------
 let rerender = () => {}, pendingFk = null;
 const I = { genre: '', own: false }; // Ideas: the genre picked, and whether shows already here are listed
-let toastT = 0;
 const later = [];
 // Focus that a redraw takes away (a button swapped for another) goes to the element with the same data-fk.
 function focusKey() {
