@@ -2158,6 +2158,25 @@ async fn app_settings_show_no_secret_and_a_change_applies_or_is_rejected() {
             "{name}"
         );
     }
+    // A port that something else holds, or that is Arr's own, would stop Arr starting again.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = held.local_addr().unwrap().port().to_string();
+    let (s, v) = site.json(post("torrent-port", &busy)).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v.to_string().contains("already in use"), "{v}");
+    if e.state.cfg.listen.port() != 0 {
+        let (s, v) = site
+            .json(post("torrent-port", &e.state.cfg.listen.port().to_string()))
+            .await;
+        assert_eq!(s, 400, "{v}");
+        assert!(v.to_string().contains("Arr itself uses"), "{v}");
+    }
+    drop(held);
+    // A TMDB token may be long: the limit is the key check's own (1024), not a blanket 200.
+    let (s, v) = site.json(post("tmdb-key", &"k".repeat(1100))).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v.to_string().contains("look like a TMDB key"), "{v}");
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
     assert!(!e.state.restart.requested());
     // A value already in place changes nothing and restarts nothing.
     let (s, v) = site.json(post("downloading", "on")).await;

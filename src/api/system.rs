@@ -140,6 +140,37 @@ fn say(name: &str, value: &str) -> String {
     }
 }
 
+/// A new torrent port must not be Arr's own HTTP port and must be free to bind where the
+/// engine listens (TCP, the only transport it uses). Otherwise Arr would exit to restart and
+/// fail to start again, with nobody able to reach the app to undo it. Bad numbers are left to
+/// `arr set`, which says what is wrong with them.
+async fn check_port(st: &AppState, value: &str) -> Result<(), ApiError> {
+    let (Ok(port), Some(e)) = (value.parse::<u16>(), st.cfg.embedded.as_ref()) else {
+        return Ok(());
+    };
+    if port == 0 || port == e.listen.port() {
+        return Ok(());
+    }
+    let refuse = |why: &str| {
+        Err(ApiError::bad_request(
+            ErrorCode::InvalidRequest,
+            format!("port {port} {why}; pick another"),
+        ))
+    };
+    if port == st.cfg.listen.port() {
+        return refuse("is the port Arr itself uses");
+    }
+    let mut addr = e.listen;
+    addr.set_port(port);
+    let free = tokio::task::spawn_blocking(move || std::net::TcpListener::bind(addr).is_ok())
+        .await
+        .unwrap_or(false);
+    if !free {
+        return refuse("is already in use or can't be opened");
+    }
+    Ok(())
+}
+
 /// `POST /settings/app`: changes one setting the way `arr set` does (same checks, and every file
 /// is put back if anything fails), then restarts Arr so it takes effect. A value that is
 /// already in place changes nothing and restarts nothing.
@@ -154,7 +185,9 @@ pub(super) async fn app_settings_post(
         ));
     }
     let value = body.value.trim();
-    if value.len() > 200 {
+    // A TMDB read-access token is long: its own limit is the one `arr set` applies (the key
+    // check, 1024), and the request body is capped well below anything else.
+    if body.name != "tmdb-key" && value.len() > 200 {
         return Err(ApiError::bad_request(
             ErrorCode::InvalidRequest,
             "that value is too long",
@@ -177,6 +210,9 @@ pub(super) async fn app_settings_post(
             ErrorCode::InvalidRequest,
             "Arr isn't running as a service here, so it can't restart itself; use `arr set` on the computer",
         ));
+    }
+    if body.name == "torrent-port" {
+        check_port(&st, value).await?;
     }
     let _one_at_a_time = st.settings_lock.lock().await;
     let path = crate::lifecycle::config_path(&st.cfg.state_dir);

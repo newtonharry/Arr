@@ -96,20 +96,41 @@ struct Text {
     fields: String,
 }
 
+/// The only structured fields kept: numbers about what happened. Everything else a log line
+/// carries (a search query, a title, a provider's name, a path, an address, an error's text)
+/// can be private and isn't recognisable by the scrubber once it is unquoted, so it is dropped.
+const SAFE_FIELDS: [&str; 7] = [
+    "status",
+    "code",
+    "count",
+    "attempt",
+    "pages",
+    "elapsed_ms",
+    "port",
+];
+
+impl Text {
+    fn field(&mut self, name: &str, value: String) {
+        let plain =
+            !value.is_empty() && value.len() <= 12 && value.bytes().all(|b| b.is_ascii_digit());
+        if SAFE_FIELDS.contains(&name) && plain {
+            let _ = write!(self.fields, " {name}={value}");
+        }
+    }
+}
+
 impl Visit for Text {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             let _ = write!(self.message, "{value:?}");
         } else {
-            let _ = write!(self.fields, " {}={:?}", field.name(), value);
+            self.field(field.name(), format!("{value:?}"));
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
             self.message.push_str(value);
-        } else {
-            let _ = write!(self.fields, " {}={}", field.name(), value);
         }
     }
 }
@@ -168,6 +189,35 @@ mod tests {
             "/home",
         ] {
             assert!(!warn.message.contains(leak), "{leak} in {}", warn.message);
+        }
+    }
+
+    #[test]
+    fn structured_fields_other_than_counts_never_reach_the_list() {
+        let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let sub = tracing_subscriber::registry().with(layer());
+        tracing::subscriber::with_default(sub, || {
+            // The shape of the search warnings in search.rs.
+            let (label, query, failure) = ("My Private Indexer", "Secret Film", "timed out");
+            tracing::warn!(target: "arr::search", provider = %label, query = %query, failure = %failure, pages = 3u32, "search query partially failed");
+            tracing::error!(target: "arr::worker", path = ?std::path::Path::new("/srv/Secret Film"), status = 502u16, "import failed");
+        });
+        let got = recent();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].message, "search query partially failed pages=3");
+        assert_eq!(got[0].message, "import failed status=502");
+        for p in &got {
+            for leak in [
+                "Secret",
+                "Private",
+                "query=",
+                "provider=",
+                "timed out",
+                "/srv",
+            ] {
+                assert!(!p.message.contains(leak), "{leak} in {}", p.message);
+            }
         }
     }
 

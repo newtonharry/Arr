@@ -121,34 +121,49 @@ sudo systemctl set-environment ARR_RELEASES_URL=http://127.0.0.1:8995/releases
 if sudo -E sh install.sh --yes --auto-update >auto.out 2>&1; then cat auto.out; fail "the public check passed on a rerun"; fi
 ends_at_public_check auto.out "a rerun turning automatic updates on"
 unit=/etc/systemd/system/arr-update.path
-sudo test -f "$unit" || fail "no arr-update.path"
-sudo grep -qx "PathExists=$state/update-requested" "$unit" || { sudo cat "$unit"; fail "the path unit watches the wrong file"; }
-sudo grep -qx 'Unit=arr-update.service' "$unit" || fail "the path unit starts the wrong service"
-systemctl is-active arr-update.path >/dev/null || fail "arr-update.path isn't active"
-systemctl is-enabled arr-update.path >/dev/null || fail "arr-update.path isn't enabled"
-if command -v systemd-analyze >/dev/null 2>&1; then
-	sudo systemd-analyze verify "$unit" /etc/systemd/system/arr-update.service || fail "systemd finds a problem with the path unit"
+# The install carries on without automatic updates when the machine can't take them safely
+# (root_safe, a lock tool); then there is nothing to test here, and update-now.sh covers it.
+update_now=1
+if ! sudo test -f "$unit"; then
+	cat auto.out
+	if grep -q 'Automatic updates stay off' auto.out; then
+		echo "(skipped: the installer left automatic updates off on this machine)"
+		update_now=0
+	else
+		fail "no arr-update.path; the install output is above"
+	fi
 fi
-sudo grep -q 'arr-update-trigger' /usr/local/bin/arr-update || fail "the updater doesn't know the request file"
-# What Arr does: it makes the file (as the user that runs it, not root) and nothing else.
-rm -f "$state/update-status.json"
-touch "$state/update-requested"
-i=0
-until grep -q '"state":"up_to_date"' "$state/update-status.json" 2>/dev/null; do
-	i=$((i + 1))
-	[ "$i" -lt 60 ] || { sudo journalctl -u arr-update --no-pager | tail -n 20; fail "the updater didn't run after the request"; }
-	sleep 1
-done
-[ ! -e "$state/update-requested" ] || fail "the updater left the request file"
-python3 - "$state/update-status.json" <<'PY' || fail "update-status.json isn't what Arr reads"
-import json, sys
-s = json.load(open(sys.argv[1]))
-assert s["state"] == "up_to_date" and s["to"] == "0.0.1" and s["from"].count(".") == 2 and s["at"].endswith("Z"), s
-PY
-# One request, one run: the file is gone, so systemd does not start it again.
-sleep 3
-[ "$(sudo journalctl -u arr-update --no-pager | grep -c 'arr-update: up to date')" = 1 ] || fail "one request ran the updater more than once"
-still_running "an update request"
+if [ "$update_now" = 1 ]; then
+	sudo grep -qx "PathExists=$state/update-requested" "$unit" || { sudo cat "$unit"; fail "the path unit watches the wrong file"; }
+	sudo grep -qx 'Unit=arr-update.service' "$unit" || fail "the path unit starts the wrong service"
+	systemctl is-active arr-update.path >/dev/null || fail "arr-update.path isn't active"
+	systemctl is-enabled arr-update.path >/dev/null || fail "arr-update.path isn't enabled"
+	if command -v systemd-analyze >/dev/null 2>&1; then
+		sudo systemd-analyze verify "$unit" /etc/systemd/system/arr-update.service || fail "systemd finds a problem with the path unit"
+	fi
+	sudo grep -q 'arr-update-trigger' /usr/local/bin/arr-update || fail "the updater doesn't know the request file"
+	# What Arr does: it makes the file (as the user that runs it, not root) and nothing else.
+	rm -f "$state/update-status.json"
+	touch "$state/update-requested"
+	i=0
+	until grep -q '"state":"up_to_date"' "$state/update-status.json" 2>/dev/null; do
+		i=$((i + 1))
+		[ "$i" -lt 60 ] || { sudo journalctl -u arr-update --no-pager | tail -n 20; fail "the updater didn't run after the request"; }
+		sleep 1
+	done
+	[ ! -e "$state/update-requested" ] || fail "the updater left the request file"
+	# The updater runs as root; its status file is made by the state folder's owner, not by root.
+	[ "$(stat -c %U "$state/update-status.json")" = "$(id -un)" ] || fail "the status file belongs to $(stat -c %U "$state/update-status.json"), not the state folder's owner"
+	python3 - "$state/update-status.json" <<-'PY' || fail "update-status.json isn't what Arr reads"
+	import json, sys
+	s = json.load(open(sys.argv[1]))
+	assert s["state"] == "up_to_date" and s["to"] == "0.0.1" and s["from"].count(".") == 2 and s["at"].endswith("Z"), s
+	PY
+	# One request, one run: the file is gone, so systemd does not start it again.
+	sleep 3
+	[ "$(sudo journalctl -u arr-update --no-pager | grep -c 'arr-update: up to date')" = 1 ] || fail "one request ran the updater more than once"
+	still_running "an update request"
+fi
 kill $relsrv 2>/dev/null || true
 sudo systemctl unset-environment ARR_RELEASES_URL
 

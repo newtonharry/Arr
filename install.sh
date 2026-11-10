@@ -1546,20 +1546,31 @@ log() { printf 'arr-update: %s\n' "$*"; }
 # state folder (a systemd path unit, or the launchd job's QueueDirectories, watches for it). The
 # file goes first thing, so a run that fails can't start itself again, and update-status.json
 # says how it went.
-STATUS="$STATE_DIR/update-status.json"
-for f in "$STATE_DIR/update-requested" "$STATE_DIR"/update-queue/*; do
-	[ ! -e "$f" ] || rm -f "$f" 2>/dev/null || true
-done
-# status STATE FROM TO: written to a new file and renamed over the old one, so Arr never reads
-# half of it and a link left at that name is replaced, not followed (this may run as root in a
-# folder another account owns).
+#
+# The state folder belongs to the account that runs Arr, and this may run as root (a system
+# install), so nothing here trusts what is in it: the request is removed by its one fixed name
+# (no globbing, no walking a folder), and only if it is a file or a link (a folder in its
+# place is left alone); and the status file is written by that account, never by root.
+if [ "$KIND" = launchd ]; then TRIGGER="$STATE_DIR/update-queue/requested"; else TRIGGER="$STATE_DIR/update-requested"; fi
+# (A link is unlinked, never followed: left in place it would start this again and again.)
+if [ -f "$TRIGGER" ] || [ -L "$TRIGGER" ]; then rm -f "$TRIGGER" 2>/dev/null || true; fi
+# status STATE FROM TO: a new file renamed over the old one, so Arr never reads half of it. As
+# root it is made as the state folder's owner (setpriv or runuser), so a link swapped in by that
+# account could only reach files it could already write; with neither tool there is no status.
 status() {
-	[ -d "$STATE_DIR" ] || return 0
-	f=$(mktemp "$STATE_DIR/.update-status.XXXXXX" 2>/dev/null) || return 0
-	{
-		printf '{"state":"%s","from":"%s","to":"%s","at":"%s"}\n' "$1" "${2#v}" "${3#v}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$f" &&
-			chmod 644 "$f" && mv -f "$f" "$STATUS"
-	} 2>/dev/null || rm -f "$f"
+	[ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || return 0
+	json=$(printf '{"state":"%s","from":"%s","to":"%s","at":"%s"}' "$1" "${2#v}" "${3#v}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+	if [ "$(id -u)" = 0 ]; then
+		owner=$(stat -c %u "$STATE_DIR" 2>/dev/null) && group=$(stat -c %g "$STATE_DIR" 2>/dev/null) || return 0
+		if [ "$owner" = 0 ]; then drop=""
+		elif command -v setpriv >/dev/null 2>&1; then drop="setpriv --reuid=$owner --regid=$group --clear-groups"
+		elif command -v runuser >/dev/null 2>&1 && name=$(getent passwd "$owner" | cut -d: -f1) && [ -n "$name" ]; then drop="runuser -u $name --"
+		else return 0; fi
+	else
+		drop=""
+	fi
+	# shellcheck disable=SC2086 # $drop is a command and its arguments
+	printf '%s\n' "$json" | $drop sh -c 'f=$(mktemp "$1/.update-status.XXXXXX") || exit 0; cat >"$f" && chmod 644 "$f" && mv -f "$f" "$1/update-status.json" || rm -f "$f"' sh "$STATE_DIR" 2>/dev/null || true
 	return 0
 }
 # Whatever ends the run without saying how it went was a failure.

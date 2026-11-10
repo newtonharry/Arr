@@ -121,6 +121,18 @@ run_updater "http://127.0.0.1:$oldport/releases" || { cat "$w/upd"; fail "the up
 [ ! -L "$state/update-status.json" ] || fail "the link is still there"
 status_is up_to_date || fail "no status after replacing the link"
 
+echo "== the updater only removes the request's own name: it never follows or walks links in the state folder"
+mkdir -p "$w/outside"
+echo keep >"$w/outside/precious"
+echo keep >"$w/victim2"
+ln -s "$w/outside" "$state/update-queue"
+ln -s "$w/victim2" "$state/update-requested"
+run_updater "http://127.0.0.1:$oldport/releases" || { cat "$w/upd"; fail "the updater failed with links in the way"; }
+[ "$(cat "$w/outside/precious")" = keep ] || fail "the updater reached through a link to a folder"
+[ "$(cat "$w/victim2")" = keep ] || fail "the updater reached through the request's link"
+[ ! -e "$state/update-requested" ] && [ ! -L "$state/update-requested" ] || fail "a link left as the request would start the updater again and again"
+rm -f "$state/update-queue"
+
 echo "== no request, no leftover: a daily run leaves no request file behind"
 run_updater "http://127.0.0.1:$oldport/releases" || fail "the daily run failed"
 [ ! -e "$state/update-requested" ] || fail "a daily run made a request file"
