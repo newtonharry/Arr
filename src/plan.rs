@@ -773,7 +773,9 @@ async fn season_plan(
     let mut remaining: BTreeSet<u16> = wanted.iter().chain(&replaceable).copied().collect();
     let wanted_set: BTreeSet<u16> = wanted.iter().copied().collect();
     let mut chosen: Vec<&Candidate> = vec![];
-    pick(&season_run, &mut remaining, &wanted_set, &mut chosen);
+    // Weak-swarm singles from the season query don't close their episodes yet: the episode
+    // searches below may find healthier copies. They are the fallback after those searches.
+    pick(&season_run, &mut remaining, &wanted_set, &mut chosen, false);
     let to_query: Vec<u16> = remaining
         .iter()
         .copied()
@@ -830,7 +832,10 @@ async fn season_plan(
         }
     };
     if let Some(run) = &episode_run {
-        pick(run, &mut remaining, &wanted_set, &mut chosen);
+        pick(run, &mut remaining, &wanted_set, &mut chosen, true);
+    }
+    pick(&season_run, &mut remaining, &wanted_set, &mut chosen, true);
+    if let Some(run) = &episode_run {
         for n in to_query
             .iter()
             .filter(|n| remaining.contains(n) && wanted_set.contains(n))
@@ -1012,18 +1017,19 @@ fn take_pack(
 }
 
 /// Greedy selection in rank order: approved releases whose episodes are all still open and
-/// that cover a wanted episode (or are revision replacements).
+/// that cover a wanted episode (or are revision replacements); weak-swarm ones only if `weak`.
 fn pick<'a>(
     run: &'a SearchRun,
     remaining: &mut BTreeSet<u16>,
     wanted: &BTreeSet<u16>,
     chosen: &mut Vec<&'a Candidate>,
+    weak: bool,
 ) {
-    for c in run
-        .candidates
-        .iter()
-        .filter(|c| c.decision.approved && !c.decision.full_season)
-    {
+    for c in run.candidates.iter().filter(|c| {
+        c.decision.approved
+            && !c.decision.full_season
+            && (weak || c.decision.health != Health::Weak)
+    }) {
         let eps = &c.decision.covered_episodes;
         let useful = eps.iter().any(|e| wanted.contains(e)) || c.decision.replacement;
         if useful && !eps.is_empty() && eps.iter().all(|e| remaining.contains(e)) {

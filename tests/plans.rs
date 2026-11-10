@@ -1215,9 +1215,31 @@ async fn a_weak_season_pack_gives_way_to_healthy_episodes_but_still_beats_nothin
             )],
         ));
     }
-    let plan = fargo_s05_plan(v).await;
+    let plan = fargo_s05_plan(v.clone()).await;
     assert_eq!(plan["selection"], "episodes", "{plan}");
     assert_eq!(plan["state"], "shadow_planned", "{plan}");
+    // A weak E01 in the season query's results doesn't stop E01's own search from finding
+    // the healthy copy, and doesn't hand the season to the weak pack.
+    let mut v2 = v.clone();
+    v2[0]
+        .1
+        .push(release("Fargo.S05E01.1080p.WEB-DL.H.264-WEAK", 2.5, 1));
+    let plan = fargo_s05_plan(v2).await;
+    assert_eq!(plan["selection"], "episodes", "{plan}");
+    let titles: Vec<&str> = plan["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.contains(&"Fargo.S05E01.1080p.WEB-DL.H.264-GRP"),
+        "{plan}"
+    );
+    assert!(
+        !titles.contains(&"Fargo.S05E01.1080p.WEB-DL.H.264-WEAK"),
+        "{plan}"
+    );
     // Weak pack and nothing else: the pack is still used.
     let plan = fargo_s05_plan(vec![pack(2)]).await;
     assert_eq!(plan["selection"], "season_pack", "{plan}");
