@@ -6,6 +6,11 @@
 //! `/app/api/v1/*` is an allow-listed, in-process proxy to the API router that adds the API
 //! bearer token, so the token never reaches a browser. Posters come from `/app/art/{media_id}`
 //! (see `art.rs`), so the browser never contacts TMDB or TVmaze.
+//!
+//! The page is written in Preact, with no JSX and no build step: `webapp/app.js` is plain ES
+//! modules built from `h(...)` calls, and Preact itself is vendored under `webapp/vendor/` and
+//! served from `/app/vendor/`, so the binary stays self-contained and the content security
+//! policy stays `default-src 'self'`.
 
 use crate::api::AppState;
 use crate::art::Art;
@@ -192,6 +197,18 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             get(|| async { asset("text/javascript; charset=utf-8", APP_JS) }),
         )
         .route(
+            "/app/vendor/preact.mjs",
+            get(|| async { asset("text/javascript; charset=utf-8", PREACT_JS) }),
+        )
+        .route(
+            "/app/vendor/hooks.mjs",
+            get(|| async { asset("text/javascript; charset=utf-8", PREACT_HOOKS_JS) }),
+        )
+        .route(
+            "/app/vendor/LICENSE-preact",
+            get(|| async { asset("text/plain; charset=utf-8", PREACT_LICENSE) }),
+        )
+        .route(
             "/app/app.css",
             get(|| async { asset("text/css; charset=utf-8", APP_CSS) }),
         )
@@ -244,7 +261,13 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
 }
 
 const INDEX: &str = include_str!("webapp/index.html");
+/// The app is Preact components written with `h` (no JSX, no build step); Preact itself is
+/// vendored, unmodified but for one import path (see `webapp/vendor/README.md`), so the
+/// binary stays self-contained and the CSP stays `default-src 'self'`.
 const APP_JS: &str = include_str!("webapp/app.js");
+const PREACT_JS: &str = include_str!("webapp/vendor/preact.mjs");
+const PREACT_HOOKS_JS: &str = include_str!("webapp/vendor/hooks.mjs");
+const PREACT_LICENSE: &str = include_str!("webapp/vendor/LICENSE-preact");
 const APP_CSS: &str = include_str!("webapp/app.css");
 const MASCOT: &str = include_str!("webapp/mascot.svg");
 const TMDB_LOGO: &str = include_str!("webapp/tmdb.svg");

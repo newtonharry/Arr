@@ -250,6 +250,45 @@ async fn pages_and_assets_carry_the_security_headers() {
 }
 
 #[tokio::test]
+async fn vendored_preact_is_served_as_committed() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    for (path, kind, committed) in [
+        (
+            "/app/vendor/preact.mjs",
+            "text/javascript",
+            &include_bytes!("../src/webapp/vendor/preact.mjs")[..],
+        ),
+        (
+            "/app/vendor/hooks.mjs",
+            "text/javascript",
+            &include_bytes!("../src/webapp/vendor/hooks.mjs")[..],
+        ),
+        (
+            "/app/vendor/LICENSE-preact",
+            "text/plain",
+            &include_bytes!("../src/webapp/vendor/LICENSE-preact")[..],
+        ),
+    ] {
+        let r = site.plain(Method::GET, path).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        assert!(
+            r.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with(kind),
+            "{path}"
+        );
+        assert_eq!(r.headers()["cache-control"], "no-cache", "{path}");
+        assert_eq!(&r.bytes().await.unwrap()[..], committed, "{path}");
+    }
+    // The hooks build imports Preact by the served path, not the bare name the CSP cannot map.
+    let hooks = include_str!("../src/webapp/vendor/hooks.mjs");
+    assert!(hooks.contains("from\"/app/vendor/preact.mjs\""));
+    assert!(!hooks.contains("from\"preact\""));
+}
+
+#[tokio::test]
 async fn app_requests_need_the_marker_and_the_same_origin() {
     let e = exec().await;
     let site = serve(e.state.clone()).await;

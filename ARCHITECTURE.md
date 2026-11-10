@@ -8,6 +8,8 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
 
 - The project is one Rust binary, `arr`. It serves the JSON API, a small web app for Plex
   users (sign in with Plex; `webapp.rs`) and remote MCP; it needs no other application but Plex.
+  The web app is Preact components written with `h` (no JSX, no build step); Preact is vendored
+  in `src/webapp/vendor/` and served by the binary, so nothing is fetched from a CDN.
 - **Modes.** With `[execution] enabled = false` (the config default; the installers and the
   wizard turn it on) it runs in **shadow mode**: the
   outbound calls are read-only searches and metadata lookups. Plans are shadow plans, and no

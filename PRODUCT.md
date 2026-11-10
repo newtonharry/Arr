@@ -56,7 +56,8 @@ Arr's interface exposes the wish and the outcome.
 - Existing JSON API covers search/discover, add to library, wanted, calendar, queue
   (pause/resume/cancel/retry), history, attention and library listing.
 - Shipped as a single Rust binary with embedded static assets (like the setup page); no
-  separate web server, no build toolchain for users.
+  separate web server, no build toolchain for users. The web app is Preact, vendored in the
+  repository and written without JSX, so there is no build step for developers either.
 - **Undecided**: where artwork (posters) comes from, given TMDB's terms; what source feeds
   "ideas to browse"; whether household members get any restrictions compared with the owner.
 
