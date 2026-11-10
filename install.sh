@@ -938,7 +938,7 @@ setup_choices() {
 # set_conf NAME [VALUE]: one setting through arr set, which checks it first and changes
 # nothing if it's refused.
 set_conf() {
-	if out=$(as_run "$ARR" set --config "$CONFIG" "$@" 2>&1); then say "$out"; else reject "${out#Error: }"; fi
+	if out=$(as_run "$ARR" set --config "$CONFIG" --installer "$@" 2>&1); then say "$out"; else reject "${out#Error: }"; fi
 }
 # set_secret NAME VALUE: the value goes to arr on stdin, never on a command line.
 set_secret() {
@@ -1034,7 +1034,7 @@ if [ -f "$CONFIG" ]; then
 	# profiles and goals already there. Until Arr answers, a failed run puts the config, the
 	# settings pointer and the note that Knaben was offered back as the snapshot above has them.
 	cp -p "$CONFIG" "$tmp/config.before-indexers"
-	if out=$(as_run "$ARR" set --config "$CONFIG" default-indexers 2>&1); then
+	if out=$(as_run "$ARR" set --config "$CONFIG" --installer default-indexers 2>&1); then
 		say "$out"
 		if ! cmp -s "$tmp/config.before-indexers" "$CONFIG" && ! as_run "$ARR" setup --config "$CONFIG" --add-default-indexers >/dev/null 2>&1; then
 			cp -p "$tmp/config.before-indexers" "$CONFIG"

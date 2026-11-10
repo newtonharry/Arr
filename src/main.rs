@@ -178,6 +178,10 @@ enum Command {
         name: String,
         /// Its new value.
         value: Option<String>,
+        /// Called by the installer, which restarts Arr afterwards: only changes what the
+        /// messages say.
+        #[arg(long, hide = true)]
+        installer: bool,
     },
     /// Prints a sign-in link for the web app: valid for 15 minutes, works once. Anyone who has
     /// the link can sign in, so send it only to the person it is for.
@@ -667,6 +671,7 @@ async fn run() -> Result<std::process::ExitCode> {
             config,
             name,
             value,
+            installer,
         } => {
             let value = match arr::set::secret(&name)? {
                 Some(what) if value.is_some() => {
@@ -675,7 +680,15 @@ async fn run() -> Result<std::process::ExitCode> {
                 Some(what) => Some(read_secret(what)?),
                 None => value,
             };
-            println!("{}", arr::set::run(&config, &name, value.as_deref()).await?);
+            let caller = if installer {
+                arr::set::Caller::Installer
+            } else {
+                arr::set::Caller::Person
+            };
+            println!(
+                "{}",
+                arr::set::run_as(&config, &name, value.as_deref(), caller).await?
+            );
             Ok(())
         }
         Command::AppLink { config } => {

@@ -45,9 +45,38 @@ enum Check {
     PlexUrl,
 }
 
+/// Who is changing the setting, which decides what the line shown afterwards tells them to do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    /// A person (or the web app): they restart Arr themselves.
+    Person,
+    /// The installer or updater, which restarts Arr when it is done.
+    Installer,
+}
+
+impl Caller {
+    /// What to say about the change taking effect.
+    fn restart(self) -> &'static str {
+        match self {
+            Caller::Person => "Restart Arr to use it.",
+            Caller::Installer => "The installer restarts Arr to use it.",
+        }
+    }
+}
+
 /// Changes `name` to `value` in the install configured by `config_path` and returns the line
 /// to show. Anything that fails leaves every file as it was.
 pub async fn run(config_path: &Path, name: &str, value: Option<&str>) -> Result<String> {
+    run_as(config_path, name, value, Caller::Person).await
+}
+
+/// As [`run`], with the line fitted to who asked.
+pub async fn run_as(
+    config_path: &Path,
+    name: &str,
+    value: Option<&str>,
+    caller: Caller,
+) -> Result<String> {
     // Absolute, so a bare `config.toml` has a folder to write beside.
     let config_path = &std::path::absolute(config_path)?;
     let old = std::fs::read_to_string(config_path)
@@ -59,9 +88,9 @@ pub async fn run(config_path: &Path, name: &str, value: Option<&str>) -> Result<
         if value.is_some_and(|v| !v.trim().is_empty()) {
             bail!("`arr set default-indexers` takes no value");
         }
-        return default_indexers(config_path, &old, &table, dir).await;
+        return default_indexers(config_path, &old, &table, dir, caller).await;
     }
-    let plan = plan(&table, dir, name, value)?;
+    let plan = plan(&table, dir, name, value, caller)?;
     // The line editor can't handle every way TOML can say a key (dotted or quoted keys,
     // values over several lines), so the result must say exactly what was meant.
     let edited = match &plan.edit {
@@ -144,6 +173,7 @@ async fn default_indexers(
     old: &str,
     table: &toml::Table,
     dir: &Path,
+    caller: Caller,
 ) -> Result<String> {
     let marker = dir.join(INDEXER_MARKER);
     let remember = || fsutil::atomic_replace_private(&marker, b"knaben\n");
@@ -193,9 +223,15 @@ async fn default_indexers(
         bail!(e);
     }
     remember()?;
-    Ok(format!(
-        "Added Knaben as search source {id}, next to The Pirate Bay. Run `arr setup` and restart Arr to use it."
-    ))
+    Ok(match caller {
+        Caller::Person => format!(
+            "Added Knaben as search source {id}, next to The Pirate Bay. Run `arr setup` and restart Arr to use it."
+        ),
+        // The installer runs `arr setup` next and restarts Arr itself.
+        Caller::Installer => format!(
+            "Added Knaben as search source {id}, next to The Pirate Bay. Arr uses it once it restarts, which the installer does."
+        ),
+    })
 }
 
 /// The first of `keys` that `text` doesn't set to the intended value under `[section]` (or
@@ -221,7 +257,13 @@ fn mismatch<'k>(text: &str, section: &str, keys: &[(&'k str, Option<String>)]) -
         .map(|(k, _)| *k)
 }
 
-fn plan(table: &toml::Table, dir: &Path, name: &str, value: Option<&str>) -> Result<Plan> {
+fn plan(
+    table: &toml::Table,
+    dir: &Path,
+    name: &str,
+    value: Option<&str>,
+    caller: Caller,
+) -> Result<Plan> {
     let secret = secret(name)?;
     let value = match (secret, value) {
         (_, Some(v)) => v.trim(),
@@ -239,7 +281,7 @@ fn plan(table: &toml::Table, dir: &Path, name: &str, value: Option<&str>) -> Res
             .and_then(toml::Value::as_str)
             .map(|f| dir.join(f))
     };
-    let restart = "Restart Arr to use it.";
+    let restart = caller.restart();
     let simple = |section: &'static str, key: &'static str, v: String, done: String| Plan {
         edit: Some((section, vec![(key, Some(v))])),
         file: None,
