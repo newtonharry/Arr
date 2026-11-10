@@ -1252,9 +1252,7 @@ bs() { i=0; while ! launchctl bootstrap system "$1" </dev/null; do i=$((i + 1));
 }
 el_add() { # el_add LABEL PLIST_TEXT: write the daemon, root-owned, and start it
 	EL="$EL
-cat >$(sq "$LD_DIR/$1.plist.new") <<'ARR_PLIST_EOF'
-$2
-ARR_PLIST_EOF
+printf '%s\n' $(sq "$2") >$(sq "$LD_DIR/$1.plist.new")
 chown root:wheel $(sq "$LD_DIR/$1.plist.new")
 chmod 644 $(sq "$LD_DIR/$1.plist.new")
 mv -f $(sq "$LD_DIR/$1.plist.new") $(sq "$LD_DIR/$1.plist")
