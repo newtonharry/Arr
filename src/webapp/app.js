@@ -904,9 +904,9 @@ function stateOf(scope) {
 }
 // Undo for a Get on the page: only when Arr did not track the title at all before (the page said
 // removable: false, meaning Arr does not manage it). It removes the whole title (a movie, or the show a season or episode belongs to).
-// Unsure means no Undo.
-function undoGet(tk) {
-  const id = P.data.media_id;
+// Unsure means no Undo. `id` is the title's, read before the request: the page may show another
+// title by the time the answer comes back.
+function undoGet(tk, id) {
   return async () => {
     const m = await removeTitle(id);
     if (m.ok && tk === P.token && P.shown) loadTitle(true);
@@ -914,7 +914,7 @@ function undoGet(tk) {
   };
 }
 async function act(key, kind, scope) {
-  const tk = P.token, title = P.data ? P.data.title : '', was = kind === 'get' && P.data && P.data.removable === false ? stateOf(scope) : null;
+  const tk = P.token, id = P.data ? P.data.media_id : '', title = P.data ? P.data.title : '', was = kind === 'get' && P.data && P.data.removable === false ? stateOf(scope) : null;
   P.seq++; // an older read must not overwrite what this changes
   P.busy.add(key); P.ask = ''; P.msg.delete(key); bump();
   let res, got = null;
@@ -928,7 +928,7 @@ async function act(key, kind, scope) {
     else if (r.data.finishing > 0) res = { text: 'Stopped looking. A download that is nearly done will still finish.' };
     else res = { text: 'Stopped. Arr will not look for it.' };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
-  if (got && !res.err) toastAdded(got.title || title, got.outcome, got.detail, was === 'none' ? undoGet(tk) : null);
+  if (got && !res.err) toastAdded(got.title || title, got.outcome, got.detail, was === 'none' && id ? undoGet(tk, id) : null);
   if (tk !== P.token) return;
   P.busy.delete(key); P.msg.set(key, res); say(res.text);
   // Reads the action made stale are issued again (also after a failure), so nothing stays loading.
@@ -1095,7 +1095,7 @@ async function pickCopy(c) {
   if (o.picking) return;
   const tk = P.token;
   o.picking = c.id; P.msg.delete('copy'); P.seq++; bump();
-  const scope = o.copies.data.media_id, was = P.data.removable === false ? stateOf(scope) : null, title = P.data.title;
+  const scope = o.copies.data.media_id, was = P.data.removable === false ? stateOf(scope) : null, title = P.data.title, id = P.data.media_id;
   let res;
   try {
     const r = await api(`/v1/copies/${enc(scope)}/get`, { method: 'POST', body: { id: c.id, ...(pickedLevel() ? { level: pickedLevel() } : {}) } });
@@ -1106,7 +1106,7 @@ async function pickCopy(c) {
   o.picking = '';
   if (!res.err) {
     const season = /^season:[a-z]+:\d+:(\d+)$/.exec(scope);
-    toastAdded(title, 'on_its_way', season ? 'Season ' + season[1] : '', was === 'none' ? undoGet(tk) : null);
+    toastAdded(title, 'on_its_way', season ? 'Season ' + season[1] : '', was === 'none' ? undoGet(tk, id) : null);
   }
   P.msg.set('copy', res); say(res.text);
   if (!res.err) { o.copiesOpen = false; o.copies = { st: 'idle' }; }
