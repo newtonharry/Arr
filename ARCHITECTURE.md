@@ -216,9 +216,16 @@ qBittorrent confirms), `download_started` (confirmed), `download_failed` (every 
 before confirmation) and `imported`. A movie that is not available is blocked
 (`not_available`) without searching.
 
-- Plan building is unchanged, except that units covered by active downloads are `queued`, and
-  season packs are not eligible while any episode is queued or owned (unless it is a revision
-  search).
+- Plan building is unchanged, except that units covered by active downloads are `queued`.
+  With qBittorrent, season packs are not eligible while any episode is queued or owned (unless
+  it is a revision search). With the embedded engine a full-season pack may leave out owned
+  episodes and ones whose download is making progress, and takes over idle, unconfirmed or
+  unsent single-episode downloads (`decision.skips_owned`, `skips_active`, `supersedes`): the
+  grab covers only the episodes it gets, and the engine fetches only their files. The
+  replaced downloads are cancelled in the transaction that records the pack's grab, without a
+  blocklist entry, and their torrents and incomplete data are removed through the journaled
+  cleanup. A pack on a weak swarm replaces nothing. The plan lists the replaced grabs in
+  `execution.superseded_grabs`.
 - Executing a plan (`execute: true`, or `POST /plans/{id}/execute`) sends every planned
   candidate through the outbox. The plan records `execution.grabs`/`refused` and
   `execution.outcome` (`queued`, `partially_queued` or `nothing_queued`). It then moves to

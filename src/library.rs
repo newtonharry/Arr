@@ -118,6 +118,12 @@ fn queued_targets(c: &Connection) -> Result<HashSet<String>> {
 pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
     let files = file_evidence_by_target(c)?;
     let queued = queued_targets(c)?;
+    let replaceable: HashSet<String> =
+        crate::downloads::active_covers(c, time::OffsetDateTime::now_utc(), None)?
+            .into_iter()
+            .filter(|a| a.replaceable)
+            .map(|a| a.target)
+            .collect();
     let (import_id, observed_at): (String, String) = c
         .query_row(
             "SELECT import_id, seeded_at FROM seeded_imports ORDER BY seeded_at DESC LIMIT 1",
@@ -178,6 +184,7 @@ pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
                 file: None,
                 ownership_unknown: false,
                 queued: false,
+                replaceable: false,
             },
             r.get::<_, Option<bool>>(7)?,
         ))
@@ -252,6 +259,7 @@ pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
                         e.file_quality = ev.as_ref().and_then(|x| x.quality);
                         e.file = ev;
                         e.queued = queued.contains(&eid);
+                        e.replaceable = replaceable.contains(&eid);
                         e
                     })
                     .collect();

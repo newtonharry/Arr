@@ -309,6 +309,34 @@ curl -s -H "Authorization: Bearer $(cat STATE/secrets/api_token)" \
 }
 ```
 
+Season packs with the embedded engine (qBittorrent is unchanged: a pack must cover every
+episode there, and `covers_owned` / `covers_queued` apply as before):
+
+- A full-season pack of the right title, quality and size is approved when something in it is
+  still wanted. `decision.covered_episodes` lists the episodes the grab would get, and the rest
+  is explained, not rejected:
+  - `skips_owned`: owned episodes that are not a revision upgrade. They are left out and not
+    downloaded (note: "E02 won't be downloaded: already owned").
+  - `skips_active`: episodes whose download is making progress (or finishing or importing).
+    That download keeps its episode.
+  - `supersedes`: episodes whose single-episode download is idle (no progress for 5 minutes),
+    waiting for magnet metadata, or still in the outbox. The pack takes them over, and those
+    downloads are cancelled when it is grabbed, with their incomplete data removed and no
+    blocklist entry. The history says "replaced by a healthier season pack <title>". A download
+    the user paused or chose, another pack, or any download when the pack itself
+    (a weak pack replaces nothing) is never replaced. The health of a queued download's release
+    is not recorded, so unsent and unconfirmed downloads are replaceable whatever their swarm
+    was.
+- Size limits are judged over the whole pack, as before. A pack whose every wanted episode is
+  owned or already downloading is still rejected (`covers_owned` or `covers_queued`), and so
+  is a single or multi-episode release of owned episodes.
+- The ranking counts the episodes the grab would get.
+- If a download starts moving between the plan and the grab, the grab keeps it and leaves its
+  episode out. The plan's `execution.superseded_grabs` lists the downloads the pack replaced.
+- The engine downloads only the video files of the episodes the grab is for (not subtitles or
+  nfo files). Unselected files are created empty, with at most the edges of the pieces they
+  share with a selected file written into them.
+
 How the response separates observation from completeness:
 
 - If every query fails, the response is an upstream error (`502`/`504`).

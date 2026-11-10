@@ -102,6 +102,7 @@ async fn download_parent_symlink_is_refused_before_engine_writes() {
             sequential: false,
             first_last_piece: false,
             content_layout: Some("Original"),
+            select: None,
         })
         .await;
     engine.shutdown().await;
@@ -158,6 +159,7 @@ async fn changing_download_mapping_cannot_resume_persisted_torrents_at_old_paths
             sequential: false,
             first_last_piece: false,
             content_layout: Some("Original"),
+            select: None,
         })
         .await
         .unwrap();
@@ -200,6 +202,7 @@ async fn tampered_persisted_output_folder_is_refused_before_restoration_writes()
             sequential: false,
             first_last_piece: false,
             content_layout: Some("Original"),
+            select: None,
         })
         .await
         .unwrap();

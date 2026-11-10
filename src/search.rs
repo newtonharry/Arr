@@ -338,6 +338,8 @@ pub struct SearchInputs<'a> {
     pub refresh: bool,
     /// Blocklisted release refs and `hash:<info hash>` entries for the target's media.
     pub blocked: Option<&'a std::collections::HashSet<String>>,
+    /// The download client can select files (see `decision::EvalContext::partial_packs`).
+    pub partial_packs: bool,
 }
 
 /// Chooses the quality profile: the catalog item's own, an explicit one for items outside
@@ -651,6 +653,7 @@ pub async fn run(
         now: inputs.now,
         catalog_observed_at: inputs.catalog_observed_at.clone(),
         blocked: inputs.blocked,
+        partial_packs: inputs.partial_packs,
     };
     let blockers = ctx.target_blockers();
     let mut candidates: Vec<Candidate> = found
@@ -780,8 +783,19 @@ pub struct CandidateSummary {
     pub quality: String,
     pub revision: crate::release::Revision,
     pub published_at: Option<String>,
+    /// The episodes the grab would get (a season pack may leave some out).
     pub covers_episodes: Vec<u16>,
     pub full_season: bool,
+    /// Owned episodes a season pack leaves out.
+    #[serde(default)]
+    pub skips_owned: Vec<u16>,
+    /// Episodes a season pack leaves out because a download making progress has them.
+    #[serde(default)]
+    pub skips_active: Vec<u16>,
+    /// Episodes a season pack takes over from idle, unconfirmed or unsent downloads, which
+    /// are cancelled (not blocklisted) when the pack is grabbed.
+    #[serde(default)]
+    pub supersedes: Vec<u16>,
 }
 
 fn clip(s: &str) -> String {
@@ -801,6 +815,9 @@ pub fn summary(c: &Candidate) -> CandidateSummary {
         published_at: c.release.publish_date.clone(),
         covers_episodes: c.decision.covered_episodes.clone(),
         full_season: c.decision.full_season,
+        skips_owned: c.decision.skips_owned.clone(),
+        skips_active: c.decision.skips_active.clone(),
+        supersedes: c.decision.supersedes.clone(),
     }
 }
 
@@ -876,6 +893,9 @@ mod tests {
                 tier: Some(tier),
                 preferred_distance: 0,
                 uncertainty: 0,
+                skips_owned: vec![],
+                skips_active: vec![],
+                supersedes: vec![],
             },
             release,
             found_by: vec![],

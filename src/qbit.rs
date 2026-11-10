@@ -223,6 +223,19 @@ pub struct AddRequest {
     pub first_last_piece: bool,
     /// `Original` or `Subfolder`; `None` = the client's default.
     pub content_layout: Option<&'static str>,
+    /// For a season pack: the episodes this grab is for. The embedded engine then downloads
+    /// only the files of those episodes (the other client ignores it; a pack that leaves
+    /// episodes out is never sent to it).
+    pub select: Option<FileSelection>,
+}
+
+/// The episodes of a season pack a grab was made for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSelection {
+    /// The series the episodes belong to.
+    pub series: crate::ids::MediaId,
+    /// The episodes (as `MediaId::Episode`) the grab covers.
+    pub targets: Vec<crate::ids::MediaId>,
 }
 
 struct Session {

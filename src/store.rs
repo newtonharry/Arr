@@ -510,6 +510,14 @@ impl Store {
         // restored it from its own persistence). Only an admitted record may resume over
         // existing files; a record alone proves nothing.
         ensure_column(&conn, "embedded_torrents", "admitted_at", "TEXT")?;
+        // Episodes whose idle or unstarted single-episode downloads a season pack takes over
+        // when it is grabbed (JSON list of ids; older rows have none).
+        ensure_column(
+            &conn,
+            "release_links",
+            "supersedes",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
         })

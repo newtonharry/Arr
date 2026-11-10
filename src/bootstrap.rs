@@ -773,6 +773,7 @@ async fn plan_show(
                         file: None,
                         ownership_unknown: false,
                         queued: false,
+                        replaceable: false,
                     })
                 })
                 .collect();

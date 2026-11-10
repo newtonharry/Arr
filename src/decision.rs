@@ -202,6 +202,19 @@ pub struct Decision {
     pub replacement: bool,
     /// Swarm health band (`weak`, `ok`, `healthy`); ranks above the quality tier.
     pub health: Health,
+    /// A full-season pack leaves these owned episodes out: they are not a revision upgrade,
+    /// so the grab does not include them (`covered_episodes` lists only what it gets).
+    #[serde(default)]
+    pub skips_owned: Vec<u16>,
+    /// A full-season pack leaves these episodes out because a download that is making
+    /// progress already has them.
+    #[serde(default)]
+    pub skips_active: Vec<u16>,
+    /// A full-season pack takes these episodes over from downloads that are idle, waiting for
+    /// metadata or not yet submitted; those downloads are cancelled (not blocklisted) when
+    /// the pack is grabbed. They are part of `covered_episodes`.
+    #[serde(default)]
+    pub supersedes: Vec<u16>,
     #[serde(skip)]
     pub tier: Option<usize>,
     #[serde(skip)]
@@ -229,6 +242,10 @@ pub struct EvalContext<'a> {
     pub catalog_observed_at: Option<String>,
     /// Blocklisted release refs and `hash:<info hash>` entries for this media.
     pub blocked: Option<&'a std::collections::HashSet<String>>,
+    /// The download client can fetch only some files of a torrent (the embedded engine). A
+    /// full-season pack may then leave out owned or already-downloading episodes; without
+    /// it a pack must cover every episode, as before.
+    pub partial_packs: bool,
 }
 
 impl EvalContext<'_> {
@@ -448,8 +465,108 @@ fn check_title(
 }
 
 struct Coverage {
+    /// Every episode the release holds (what size limits are judged over).
     episodes: Vec<u16>,
     full_season: bool,
+    /// For a full-season pack with file selection: what the grab would actually get.
+    pack: Option<PackSplit>,
+}
+
+/// How a full-season pack divides the season when the client can select files.
+#[derive(Default)]
+struct PackSplit {
+    /// Episodes the grab gets: missing ones, ones taken over from replaceable downloads,
+    /// and owned ones that are a revision upgrade.
+    get: Vec<u16>,
+    skips_owned: Vec<u16>,
+    skips_active: Vec<u16>,
+    supersedes: Vec<u16>,
+}
+
+fn ep_list(eps: &[u16]) -> String {
+    eps.iter()
+        .map(|e| format!("E{e:02}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The episode checks of a full-season pack whose file selection leaves episodes out.
+/// Owned episodes that are not a revision upgrade, and episodes a download that is making
+/// progress already has, are left out of the grab. Episodes whose download is replaceable
+/// (see `catalog::Episode::replaceable`) are taken over, unless the pack's own swarm is weak:
+/// a weak pack never displaces a download. The pack is rejected when nothing is left for it.
+fn pack_checks(
+    ctx: &EvalContext,
+    p: &ParsedRelease,
+    s: &SeasonTarget,
+    pack_health: Health,
+    out: &mut Vec<Rejection>,
+    owned: &mut Vec<u16>,
+) -> PackSplit {
+    let mut split = PackSplit::default();
+    let mut unknown_own = vec![];
+    for x in s.episodes.iter().flatten() {
+        let n = x.number;
+        let upgrade = x.ownership == Ownership::Owned
+            && revision_upgrade(ctx, x.existing.as_ref(), p).is_ok();
+        match x.ownership {
+            Ownership::Unknown => {
+                unknown_own.push(n);
+                continue;
+            }
+            Ownership::Owned if !upgrade => {
+                split.skips_owned.push(n);
+                continue;
+            }
+            _ => {}
+        }
+        if x.queued {
+            if x.replaceable && pack_health != Health::Weak {
+                split.supersedes.push(n);
+            } else {
+                split.skips_active.push(n);
+                continue;
+            }
+        }
+        if upgrade {
+            owned.push(n);
+        }
+        split.get.push(n);
+    }
+    if !unknown_own.is_empty() {
+        out.push(rej(
+            "ownership_unknown",
+            format!(
+                "ownership of episodes {unknown_own:?} is unknown ({})",
+                s.ownership_source
+            ),
+        ));
+    }
+    if split.get.is_empty() && unknown_own.is_empty() {
+        out.push(if split.skips_active.is_empty() {
+            rej(
+                "covers_owned",
+                format!(
+                    "every episode of the season is already owned ({}) and none is a revision upgrade",
+                    ep_list(&split.skips_owned)
+                ),
+            )
+        } else {
+            rej(
+                "covers_queued",
+                format!(
+                    "nothing is left for this pack: {} already downloading, {}",
+                    ep_list(&split.skips_active),
+                    if split.skips_owned.is_empty() {
+                        "no other episode is missing".to_string()
+                    } else {
+                        format!("{} owned", ep_list(&split.skips_owned))
+                    }
+                ),
+            )
+        });
+    }
+    split
 }
 
 /// Why an owned item is never re-planned.
@@ -611,12 +728,14 @@ fn episode_checks(
 fn check_scope(
     ctx: &EvalContext,
     p: &ParsedRelease,
+    pack_health: Health,
     out: &mut Vec<Rejection>,
     owned: &mut Vec<u16>,
 ) -> Coverage {
     let none = Coverage {
         episodes: vec![],
         full_season: false,
+        pack: None,
     };
     let n = &p.numbering;
     let (s, target_season) = match (ctx.scope, ctx.season_target()) {
@@ -682,11 +801,17 @@ fn check_scope(
                     out.push(rej("season_not_fully_aired", format!("{unaired} episode(s) of season {target_season} have not aired; a full-season pack cannot be complete")));
                 }
                 let mut sub = vec![];
-                episode_checks(ctx, p, s, &all, &mut sub, owned);
+                let pack = if ctx.partial_packs {
+                    Some(pack_checks(ctx, p, s, pack_health, &mut sub, owned))
+                } else {
+                    episode_checks(ctx, p, s, &all, &mut sub, owned);
+                    None
+                };
                 out.extend(sub.into_iter().filter(|r| r.code != "episode_not_aired"));
                 return Coverage {
                     episodes: all,
                     full_season: true,
+                    pack,
                 };
             }
         },
@@ -703,6 +828,7 @@ fn check_scope(
             return Coverage {
                 episodes: episodes.clone(),
                 full_season: false,
+                pack: None,
             };
         }
     }
@@ -905,8 +1031,36 @@ pub fn evaluate(
     let mut owned = vec![];
     let media = ctx.media();
 
+    let swarm = health(r.seeders, r.leechers);
     check_title(ctx, p, &mut out, &mut notes);
-    let cov = check_scope(ctx, p, &mut out, &mut owned);
+    let cov = check_scope(ctx, p, swarm, &mut out, &mut owned);
+    let (skips_owned, skips_active, supersedes, grab_episodes) = match &cov.pack {
+        Some(sp) => (
+            sp.skips_owned.clone(),
+            sp.skips_active.clone(),
+            sp.supersedes.clone(),
+            Some(sp.get.clone()),
+        ),
+        None => (vec![], vec![], vec![], None),
+    };
+    if !skips_owned.is_empty() {
+        notes.push(format!(
+            "{} won't be downloaded: already owned",
+            ep_list(&skips_owned)
+        ));
+    }
+    if !skips_active.is_empty() {
+        notes.push(format!(
+            "{} stay as they are: already downloading",
+            ep_list(&skips_active)
+        ));
+    }
+    if !supersedes.is_empty() {
+        notes.push(format!(
+            "{} would be taken over from downloads that are idle or not started; those are cancelled",
+            ep_list(&supersedes)
+        ));
+    }
 
     if let Target::Movie(MovieTarget {
         ownership,
@@ -1149,11 +1303,14 @@ pub fn evaluate(
         approved: out.is_empty(),
         rejections: out,
         notes,
-        covered_episodes: cov.episodes,
+        covered_episodes: grab_episodes.unwrap_or(cov.episodes),
         owned_overlap: owned,
         full_season: cov.full_season,
         tier,
-        health: health(r.seeders, r.leechers),
+        health: swarm,
+        skips_owned,
+        skips_active,
+        supersedes,
         preferred_distance,
     }
 }

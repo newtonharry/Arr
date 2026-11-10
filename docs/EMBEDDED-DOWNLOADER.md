@@ -192,6 +192,35 @@ backends: a torrent being checked, or in error, waits even at 100 %.
 - Library files are hardlinks or copies and stay, with both forget-only and
   torrent-and-data removal.
 
+## Season packs: only some of the files
+
+A season pack grabbed for fewer episodes than it holds (some are owned, or have a download of
+their own) is added with librqbit's `only_files`: the video files whose names parse to episodes
+that are all in the grab's targets, by the same rule the import uses (`ingest::pack_files`).
+Subtitles, nfo files and samples are not fetched. A pack that covers every episode in it is
+added whole, as before. If no file maps to a wanted episode the add is refused as an invalid
+torrent, so the grab fails and the release is blocklisted.
+
+- **Sizes and progress.** The engine's size, progress and "amount left" count the selected
+  files, so a partial pack completes and imports like any other. The import takes only files
+  the engine reports as wanted.
+- **Unselected files on disk.** librqbit 9.0.1 still creates every file of the torrent, but
+  sets the length only of selected ones. An unselected file is therefore an empty file, except
+  for the bytes of a piece it shares with a selected neighbour: such a piece is fetched whole
+  and written across both files, so the neighbour holds that edge as sparse data.
+- **Verification.** The full piece check of a completed download covers the pieces of the
+  selected files. Selected files must be exactly their length; unselected ones only need to
+  exist.
+- **Restart.** librqbit keeps `only_files` in its session file, and a restore applies it.
+  When `initial_peers` are configured, the incomplete torrents are re-added at start, and
+  that re-add carries the selection over.
+- **Rollback.** The older build starts with such a session. It would flag the finished,
+  partial download as failing its full piece check; nothing is deleted.
+- **qBittorrent.** Not supported: the WebUI API cannot select files at add time, and
+  setting priorities afterwards needs the torrent paused with its metadata (a magnet has none
+  yet), which would add states to the outbox. With qBittorrent a pack must still cover every
+  episode.
+
 ## Engine versus app durability, and the metrics reported
 
 | what | where | across restarts |
