@@ -17,8 +17,9 @@ use crate::art::Art;
 use crate::config::{OAuthConfig, RuntimeConfig};
 use crate::fsutil;
 use crate::ids::MediaId;
+use crate::push::{self, Push};
 use anyhow::{Context, Result};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Form, Path as UrlPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -60,6 +61,53 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
+/// `web.sqlite`, private, with its tables (sessions, links, and the ideas people hid).
+fn open_db(state_dir: &Path) -> Result<rusqlite::Connection> {
+    let path = state_dir.join("web.sqlite");
+    if path.exists() {
+        fsutil::check_private_file(&path)?;
+    } else {
+        fsutil::write_new_private_file(&path, b"")?;
+    }
+    let db = rusqlite::Connection::open(&path).context("open web.sqlite")?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            hash TEXT PRIMARY KEY, kind TEXT NOT NULL, email TEXT,
+            created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS links (
+            hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS hidden_ideas (
+            media_id TEXT PRIMARY KEY, at INTEGER);
+         CREATE TABLE IF NOT EXISTS requested_by (
+            media_id TEXT PRIMARY KEY, name TEXT NOT NULL, at INTEGER NOT NULL);",
+    )?;
+    Ok(db)
+}
+
+/// The shows hidden from Ideas ("Not interested"), for everyone using this Arr.
+pub fn hidden_ideas(state_dir: &Path) -> Result<std::collections::HashSet<String>> {
+    let db = open_db(state_dir)?;
+    let mut q = db.prepare("SELECT media_id FROM hidden_ideas")?;
+    let ids = q.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(ids.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Hides a show from Ideas (again is fine). Nothing else changes: no file, no download.
+pub fn hide_idea(state_dir: &Path, media_id: &str) -> Result<()> {
+    open_db(state_dir)?.execute(
+        "INSERT OR REPLACE INTO hidden_ideas (media_id, at) VALUES (?1, ?2)",
+        rusqlite::params![media_id, now()],
+    )?;
+    Ok(())
+}
+
+/// Shows a hidden show in Ideas again.
+pub fn unhide_idea(state_dir: &Path, media_id: &str) -> Result<()> {
+    open_db(state_dir)?.execute("DELETE FROM hidden_ideas WHERE media_id = ?1", [media_id])?;
+    Ok(())
+}
+
 /// Web sessions and one-time sign-in links (`<state_dir>/web.sqlite`).
 pub struct Sessions {
     db: Mutex<rusqlite::Connection>,
@@ -67,22 +115,9 @@ pub struct Sessions {
 
 impl Sessions {
     pub fn open(state_dir: &Path) -> Result<Arc<Self>> {
-        let path = state_dir.join("web.sqlite");
-        if path.exists() {
-            fsutil::check_private_file(&path)?;
-        } else {
-            fsutil::write_new_private_file(&path, b"")?;
-        }
-        let db = rusqlite::Connection::open(&path).context("open web.sqlite")?;
-        db.busy_timeout(Duration::from_secs(5))?;
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                hash TEXT PRIMARY KEY, kind TEXT NOT NULL, email TEXT,
-                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS links (
-                hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);",
-        )?;
-        Ok(Arc::new(Self { db: Mutex::new(db) }))
+        Ok(Arc::new(Self {
+            db: Mutex::new(open_db(state_dir)?),
+        }))
     }
 
     /// A new one-time link token, valid for `LINK_TTL`.
@@ -134,6 +169,25 @@ impl Sessions {
         .ok()
     }
 
+    /// Remembers who first added a title (a movie or a show). Later adds keep the first name.
+    fn record_requester(&self, media_id: &str, name: &str) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT OR IGNORE INTO requested_by (media_id, name, at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![media_id, name, now()],
+        );
+    }
+
+    fn requester(&self, media_id: &str) -> Option<String> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT name FROM requested_by WHERE media_id = ?1",
+            [media_id],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
     fn delete(&self, id: &str) {
         let db = self.db.lock().unwrap();
         let _ = db.execute("DELETE FROM sessions WHERE hash = ?1", [sha256_hex(id)]);
@@ -173,12 +227,14 @@ struct Web {
     api: Router,
     token: String,
     oauth: Option<OAuthConfig>,
+    push: Arc<Push>,
 }
 
 type Wa = State<Arc<Web>>;
 
 /// The web app's routes. Has no fallback of its own (the API router's serves unknown paths).
 pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
+    let push = Arc::new(Push::open(&state.cfg.state_dir)?);
     let web = Arc::new(Web {
         state: state.clone(),
         art: Art::new(&state.cfg.state_dir)?,
@@ -186,7 +242,12 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
         api,
         token: state.cfg.api_token.expose().to_string(),
         oauth: state.cfg.mcp.as_ref().and_then(|m| m.oauth.clone()),
+        push: push.clone(),
     });
+    // The notification pass; there is nothing to run it on outside a runtime.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(push::run(push, web.api.clone(), web.token.clone()));
+    }
     Ok(Router::new()
         .route(
             "/",
@@ -216,6 +277,8 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             "/app/mascot.svg",
             get(|| async { asset("image/svg+xml", MASCOT) }),
         )
+        // Browsers ask for /favicon.ico whatever the page says: send them to the mascot.
+        .route("/favicon.ico", get(favicon))
         .route(
             "/app/tmdb.svg",
             get(|| async { asset("image/svg+xml", TMDB_LOGO) }),
@@ -223,6 +286,10 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
         .route(
             "/app/qrcodegen.js",
             get(|| async { asset("text/javascript; charset=utf-8", QRCODEGEN_JS) }),
+        )
+        .route(
+            "/app/sw.js",
+            get(|| async { asset("text/javascript; charset=utf-8", SERVICE_WORKER) }),
         )
         .route(
             "/app/manifest.webmanifest",
@@ -256,6 +323,11 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
         .route("/app/art/{media_id}", get(art))
         .route("/app/api/me", get(me))
         .route("/app/api/signout", post(signout))
+        .route("/app/api/v1/notifications/key", get(notifications_key))
+        .route(
+            "/app/api/v1/notifications/subscribe",
+            post(notifications_subscribe).delete(notifications_unsubscribe),
+        )
         .route("/app/api/v1/{*rest}", any(proxy))
         .with_state(web))
 }
@@ -273,6 +345,8 @@ const MASCOT: &str = include_str!("webapp/mascot.svg");
 const TMDB_LOGO: &str = include_str!("webapp/tmdb.svg");
 /// Nayuki's QR Code generator (MIT), unmodified; the header of the file says where from.
 pub(crate) const QRCODEGEN_JS: &str = include_str!("webapp/qrcodegen.js");
+/// Shows notifications and opens the app when one is tapped; it caches and intercepts nothing.
+const SERVICE_WORKER: &str = include_str!("webapp/sw.js");
 const MANIFEST: &str = include_str!("webapp/manifest.webmanifest");
 // The icons are webapp/mascot.svg on the cream background (#fff8ef), rendered once with
 // headless Chrome at 180, 192 and 512 pixels; the maskable one has extra padding so a
@@ -283,6 +357,21 @@ const ICON_512: &[u8] = include_bytes!("webapp/icons/icon-512.png");
 const ICON_MASKABLE: &[u8] = include_bytes!("webapp/icons/icon-maskable-512.png");
 const FONT_LATIN: &[u8] = include_bytes!("webapp/fonts/nunito-latin.woff2");
 const FONT_LATIN_EXT: &[u8] = include_bytes!("webapp/fonts/nunito-latin-ext.woff2");
+
+async fn favicon() -> Response {
+    let mut r = Response::new(Body::empty());
+    *r.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+    r.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_static("/app/mascot.svg"),
+    );
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    secure_headers(&mut r);
+    r
+}
 
 fn secure_headers(r: &mut Response) {
     let h = r.headers_mut();
@@ -325,7 +414,7 @@ fn font(content_type: &'static str, body: &'static [u8]) -> Response {
 /// A small HTML page (the link pages), styled by the app's stylesheet.
 fn page(status: StatusCode, body: &str) -> Response {
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arr</title><link rel=\"stylesheet\" href=\"/app/app.css\"></head><body><main class=\"link-page\"><img src=\"/app/mascot.svg\" alt=\"\" width=\"64\" height=\"64\">{body}</main></body></html>"
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Arr</title><link rel=\"icon\" href=\"/app/mascot.svg\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/app/app.css\"></head><body><main class=\"link-page\"><img src=\"/app/mascot.svg\" alt=\"\" width=\"64\" height=\"64\">{body}</main></body></html>"
     );
     let mut r = (
         status,
@@ -520,6 +609,106 @@ async fn signout(State(w): Wa, headers: HeaderMap) -> Response {
     r
 }
 
+fn no_store(mut r: Response) -> Response {
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+/// The public key a browser needs to subscribe to this Arr's notifications.
+async fn notifications_key(State(w): Wa, headers: HeaderMap) -> Response {
+    if let Some(r) = w.check_app(&headers) {
+        return r;
+    }
+    if w.session(&headers).is_none() {
+        return w.unauthorized();
+    }
+    no_store(Json(json!({ "key": w.push.public_key() })).into_response())
+}
+
+#[derive(Deserialize)]
+struct SubKeys {
+    p256dh: String,
+    auth: String,
+}
+
+/// A browser's `PushSubscription.toJSON()`.
+#[derive(Deserialize)]
+struct SubBody {
+    endpoint: String,
+    #[serde(default)]
+    keys: Option<SubKeys>,
+}
+
+async fn notifications_subscribe(State(w): Wa, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(r) = w.check_app(&headers) {
+        return r;
+    }
+    let Some((session, _)) = w.session(&headers) else {
+        return w.unauthorized();
+    };
+    let bad = |m: &str| json_error(StatusCode::BAD_REQUEST, "invalid_request", m);
+    let Ok(b) = serde_json::from_slice::<SubBody>(&body) else {
+        return bad("send the subscription as {endpoint, keys: {p256dh, auth}}");
+    };
+    let Some(keys) = b.keys else {
+        return bad("the subscription has no keys");
+    };
+    if let Err(m) = push::validate_endpoint(&b.endpoint) {
+        return bad(m);
+    }
+    if let Err(m) = push::check_keys(&keys.p256dh, &keys.auth) {
+        return bad(m);
+    }
+    let sub = push::Sub {
+        endpoint: b.endpoint,
+        p256dh: keys.p256dh,
+        auth: keys.auth,
+    };
+    match w.push.subscribe(&sub, Some(&sha256_hex(&session))) {
+        Ok(true) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Ok(false) => json_error(
+            StatusCode::CONFLICT,
+            "too_many_devices",
+            "too many devices get notifications already",
+        ),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not save the subscription",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct UnsubBody {
+    endpoint: String,
+}
+
+async fn notifications_unsubscribe(State(w): Wa, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(r) = w.check_app(&headers) {
+        return r;
+    }
+    if w.session(&headers).is_none() {
+        return w.unauthorized();
+    }
+    let Ok(b) = serde_json::from_slice::<UnsubBody>(&body) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "send {endpoint}",
+        );
+    };
+    match w.push.unsubscribe(&b.endpoint) {
+        Ok(()) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not remove the subscription",
+        ),
+    }
+}
+
 #[derive(Deserialize)]
 struct LinkQuery {
     t: Option<String>,
@@ -588,6 +777,7 @@ fn allowed(method: &Method, path: &str) -> bool {
         Method::GET => matches!(
             parts.as_slice(),
             ["feed"]
+                | ["storage"]
                 | ["ideas"]
                 | ["discover"]
                 | ["library", "movies" | "series"]
@@ -597,13 +787,106 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | ["copies", _]
         ),
         Method::POST => match parts.as_slice() {
-            ["quick-add" | "follow" | "stop" | "quality"] => true,
+            ["quick-add" | "follow" | "stop" | "quality" | "remove"] => true,
+            ["ideas", "hide"] => true,
             ["copies", id, "get"] => !id.is_empty(),
             ["queue", id, "retry"] => !id.is_empty(),
             _ => false,
         },
+        Method::DELETE => matches!(parts.as_slice(), ["ideas", "hide", id] if !id.is_empty()),
         _ => false,
     }
+}
+
+/// A name to show for a signed-in person: the part of their address before the `@`, with
+/// words split on `.`, `_` and `-` and capitalised ("harry.newton" is "Harry Newton"). A
+/// sign-in link carries no identity, so it has no name.
+fn display_name(email: Option<&str>) -> Option<String> {
+    let local = email?.split('@').next()?;
+    let name: Vec<String> = local
+        .split(['.', '_', '-', '+'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map_or(String::new(), |f| {
+                f.to_uppercase()
+                    .chain(c.flat_map(char::to_lowercase))
+                    .collect()
+            })
+        })
+        .collect();
+    let name: String = name.join(" ").chars().take(60).collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The id a requester is kept under: a movie, or the show for a season or episode.
+fn title_key(id: &str) -> Option<String> {
+    Some(match id.parse::<MediaId>().ok()? {
+        m @ MediaId::Movie { .. } => m.to_string(),
+        MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
+            MediaId::Series(k).to_string()
+        }
+    })
+}
+
+/// Who added what, on the way through the proxy. A successful add made by a signed-in person
+/// is remembered by the server (the name never comes from the page), and the title reads
+/// carry `requested_by`: the first person who added the title, or null.
+fn annotate(
+    sessions: &Sessions,
+    method: &Method,
+    path: &str,
+    email: Option<&str>,
+    status: StatusCode,
+    raw: axum::body::Bytes,
+) -> axum::body::Bytes {
+    if !status.is_success() {
+        return raw;
+    }
+    let rest = path.strip_prefix("/api/v1/").unwrap_or("");
+    let parts: Vec<&str> = rest.split('/').collect();
+    let adds = *method == Method::POST
+        && matches!(
+            parts.as_slice(),
+            ["quick-add"] | ["follow"] | ["copies", _, "get"]
+        );
+    let reads_list =
+        *method == Method::GET && matches!(parts.as_slice(), ["library", "movies" | "series"]);
+    let reads_one =
+        *method == Method::GET && matches!(parts.as_slice(), ["movie", _] | ["show", _]);
+    if !(adds || reads_list || reads_one) {
+        return raw;
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    if adds {
+        // Turning following off is not an add.
+        if v["following"] != serde_json::Value::Bool(false)
+            && let (Some(name), Some(key)) = (
+                display_name(email),
+                v["media_id"].as_str().and_then(title_key),
+            )
+        {
+            sessions.record_requester(&key, &name);
+        }
+        return raw;
+    }
+    let lookup = |id: Option<&str>| {
+        id.and_then(title_key)
+            .and_then(|k| sessions.requester(&k))
+            .map_or(serde_json::Value::Null, serde_json::Value::String)
+    };
+    if reads_one {
+        let who = lookup(v["media_id"].as_str());
+        v["requested_by"] = who;
+    } else if let Some(items) = v["items"].as_array_mut() {
+        for item in items {
+            let who = lookup(item["id"].as_str());
+            item["requested_by"] = who;
+        }
+    }
+    serde_json::to_vec(&v).map_or(raw, Into::into)
 }
 
 async fn proxy(State(w): Wa, req: Request) -> Response {
@@ -611,9 +894,9 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     if let Some(r) = w.check_app(&parts.headers) {
         return r;
     }
-    if w.session(&parts.headers).is_none() {
+    let Some((_, email)) = w.session(&parts.headers) else {
         return w.unauthorized();
-    }
+    };
     let path = parts
         .uri
         .path()
@@ -630,6 +913,7 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
             "request body too large",
         );
     };
+    let parts_path = path.clone();
     let uri = match parts.uri.query() {
         Some(q) => format!("{path}?{q}"),
         None => path,
@@ -654,6 +938,14 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     let Ok(raw) = axum::body::to_bytes(rbody, MAX_PROXY_REPLY).await else {
         return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "reply too large");
     };
+    let raw = annotate(
+        &w.sessions,
+        &parts.method,
+        &parts_path,
+        email.as_deref(),
+        rp.status,
+        raw,
+    );
     let mut out = Response::new(Body::from(raw));
     *out.status_mut() = rp.status;
     for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
@@ -664,4 +956,116 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     out.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+
+    fn call(
+        s: &Sessions,
+        method: Method,
+        path: &str,
+        email: Option<&str>,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let out = annotate(
+            s,
+            &method,
+            path,
+            email,
+            StatusCode::OK,
+            Bytes::from(body.to_string()),
+        );
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn names_come_from_the_address() {
+        assert_eq!(
+            display_name(Some("harry.newton@example.com")).as_deref(),
+            Some("Harry Newton")
+        );
+        assert_eq!(display_name(Some("SAM_o@x.org")).as_deref(), Some("Sam O"));
+        assert_eq!(display_name(Some("@x.org")), None);
+        assert_eq!(display_name(None), None);
+    }
+
+    #[test]
+    fn the_first_person_to_add_a_title_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let s = Sessions::open(dir.path()).unwrap();
+        let add = json!({ "media_id": "movie:tmdb:603", "title": "The Matrix" });
+        // A sign-in link has no name: nothing is recorded.
+        call(&s, Method::POST, "/api/v1/quick-add", None, add.clone());
+        assert_eq!(s.requester("movie:tmdb:603"), None);
+        call(
+            &s,
+            Method::POST,
+            "/api/v1/quick-add",
+            Some("ann@x.org"),
+            add.clone(),
+        );
+        call(
+            &s,
+            Method::POST,
+            "/api/v1/quick-add",
+            Some("bob@x.org"),
+            add,
+        );
+        assert_eq!(s.requester("movie:tmdb:603").as_deref(), Some("Ann"));
+        // An episode or season add counts for its show; turning following off does not.
+        call(
+            &s,
+            Method::POST,
+            "/api/v1/copies/season:tvdb:5:2/get",
+            Some("bob@x.org"),
+            json!({ "media_id": "season:tvdb:5:2" }),
+        );
+        assert_eq!(s.requester("series:tvdb:5").as_deref(), Some("Bob"));
+        call(
+            &s,
+            Method::POST,
+            "/api/v1/follow",
+            Some("ann@x.org"),
+            json!({ "media_id": "series:tvdb:6", "following": false }),
+        );
+        assert_eq!(s.requester("series:tvdb:6"), None);
+        // Reads carry the name, or null.
+        let v = call(
+            &s,
+            Method::GET,
+            "/api/v1/library/movies",
+            None,
+            json!({ "items": [{ "id": "movie:tmdb:603" }, { "id": "movie:tmdb:1" }] }),
+        );
+        assert_eq!(v["items"][0]["requested_by"], "Ann");
+        assert!(v["items"][1]["requested_by"].is_null());
+        let v = call(
+            &s,
+            Method::GET,
+            "/api/v1/show/series:tvdb:5",
+            None,
+            json!({ "media_id": "series:tvdb:5" }),
+        );
+        assert_eq!(v["requested_by"], "Bob");
+        // A failed add records nothing.
+        let out = annotate(
+            &s,
+            &Method::POST,
+            "/api/v1/quick-add",
+            Some("cy@x.org"),
+            StatusCode::CONFLICT,
+            Bytes::from(json!({ "media_id": "movie:tmdb:9" }).to_string()),
+        );
+        assert!(!out.is_empty());
+        assert_eq!(s.requester("movie:tmdb:9"), None);
+    }
 }

@@ -134,12 +134,29 @@ response bodies or credentials.
 - **`DELETE /api/v1/library/{media_id}`** stops managing a movie or series. Files, history and
   ownership evidence are kept. It answers `409 active_downloads` while downloads for the item
   are active. In coexistence mode every grab (manual, plan, request, RSS, worker search) re-reads adoption from the stored rows in the transaction that records it, so a release or unmonitoring committed while its torrent was being fetched wins: the grab is refused (`409 not_adopted`) and nothing is recorded or submitted. A grab recorded first makes a later release answer `409 active_downloads`.
+- **`POST /api/v1/remove`** with `{"media_id"}` (a movie or series) is `DELETE /library/{media_id}`
+  for people: it first cancels the title's downloads that have not finished (with their
+  download data) and ends its retrying request, then stops managing it. Answers
+  `{media_id, managed: false, cancelled}`. A download whose data is all there and that is being
+  added to Plex is left to finish, and the call answers `409 active_downloads` until it is done.
+  Files in the library are never touched. The web app's "Remove from Arr" uses it.
 - **`GET /api/v1/library/roots`** shows each root's status from the last rescan.
+- **`GET /api/v1/storage`** returns `{drives: [{label, free_bytes, total_bytes}]}`: the drive
+  holding the movie folder and the one holding the TV folder, or a single `Movies and TV` entry
+  when both are on the same drive. Labels are `Movies`, `TV` or `Movies and TV`; paths are never
+  returned. A folder that cannot be read is left out.
 - **`GET /api/v1/wanted?media_id=&limit=&offset=`** lists monitored, aired, missing items
   that are not being downloaded, with their search schedule. These are searched only on
   request (`search_missing`); routine acquisition is RSS.
 - **`GET /api/v1/calendar?start=&end=`** lists episodes in a window (at most 92 days), each
   with `owned`, `queued`, `missing`, `unknown` or `upcoming`.
+
+The web app's proxy (`/app/api/v1/...`, signed-in browsers only) adds one key to these replies:
+`requested_by`, the name of the person who first added the title from the web app, or `null`
+(on library items and on the movie and show pages). The name is the part of a Google account's
+address before the `@`; a sign-in link carries no name, and adds made through this API or MCP
+have none. The plain API does not return it. The movie and show pages also carry `removable`
+(Arr manages the title, so it can stop tracking it).
 
 ### Ownership, live status and attention
 
@@ -180,21 +197,33 @@ response bodies or credentials.
   - requests that expired in the last 14 days.
 
   No notifications are sent.
+- **`GET /api/v1/feed`** is what the web app's home shows, in plain words: `needs_you`,
+  `on_its_way`, `arrived`, `looking` and `coming_up`. Catalog and state only, no network
+  calls. Two things in it help a client explain itself:
+  - each `needs_you` item has `problem` (a short sentence), plus `kind` (`download_failed`,
+    `import_blocked` or `request_expired`) and `failure` (why a download failed, for example
+    `stalled` or `wrong_quality`; null otherwise);
+  - each `on_its_way` item has `eta_seconds`, the time left at the download's recent rate
+    (smoothed over polls, kept in memory), or null when unknown, paused or stalled.
 - Season counts in `/library/series`, `/discover` and `/media/{series}` come from the live
   episode list (`source: live`), not from the snapshot's statistics.
 
 ### Catalog and discovery
 
-- **`GET /api/v1/library/movies?q=&limit=&offset=`** and
-  **`GET /api/v1/library/series?q=&limit=&offset=`** return the managed catalog (seeded from
+- **`GET /api/v1/library/movies?q=&sort=&limit=&offset=`** and
+  **`GET /api/v1/library/series?q=&sort=&limit=&offset=`** return the managed catalog (seeded from
   the import, then updated by this server; removed items are hidden). Series include
-  `episode_counts`.
+  `episode_counts`. Every item carries `added_at` (when the title entered the catalog, RFC 3339)
+  and `size_bytes` (the file, or the sum of a series' episode files, as far as Arr knows them).
+  `sort` is `title` (A to Z), `added` (newest first) or `size` (largest first); without it the
+  list is A to Z, with `q` in match order.
   `q` is a folded title/alias search: accents and case are ignored, and an exact key match is
   listed first. Responses are `{total, items, observation: {import_id, observed_at, note}}`.
 - **`GET /api/v1/discover?kind=movie|series&q=&year=`** merges catalog hits with TVmaze (for
   series, when enabled) and Plex's metadata service, then TMDB as the backup (for movies, when
   configured). Each result carries
-  `media_id`, `in_catalog`, `sources` and `external_ids`. `providers[]` gives each provider's
+  `media_id`, `in_catalog`, `library_state` (`in_plex`, `on_its_way`, `tracking` or `null`),
+  `sources` and `external_ids`. `providers[]` gives each provider's
   status: `ok`, `failed` (with `error`), `disabled`, `not_configured` or `not_imported`. When
   neither Plex nor TMDB can answer, the `plex` provider is `not_configured` and its message says
   the install needs to sign in to Plex.
@@ -212,6 +241,18 @@ response bodies or credentials.
   `probably_skip`, critics 15 or more above the audience `critics_pick`, audience 15 or more
   above critics `crowd_pleaser`, else `mixed`. Movies in `/discover` get scores only from
   Plex's own search hits.
+- **`GET /api/v1/ideas`** lists popular shows with a new episode in the last 7 days (TVmaze
+  web schedule, cached 6 hours): `{status: ok|unavailable|disabled, items}`. Each item has
+  `media_id`, `title`, `year`, `network`, `summary`, `rating`, `genres` (up to four),
+  `in_library`, `owned` (already in the library or in Plex) and `library_state` (as in
+  discover). Shows hidden with `hide` are left out.
+- **`POST /api/v1/ideas/hide`** with `{media_id}` (a series id) is "Not interested": the show
+  stops appearing in Ideas for everyone using this Arr. The list is kept in the private
+  `web.sqlite` (table `hidden_ideas`). It changes no download, file or library entry.
+  **`DELETE /api/v1/ideas/hide/{media_id}`** undoes it. Both are idempotent.
+- **`GET /api/v1/show/{media_id}`** and **`GET /api/v1/movie/{media_id}`** carry the title page:
+  `summary`, `runtime_minutes`, `genres`, and `cast` (up to six `{name, character}`, from Plex or
+  TVmaze, or TMDB for a movie when it has a key). Any of them can be empty or null.
 - **`GET /api/v1/media/{media_id}`** resolves a target. For a season or episode it returns the
   episode list with `aired` and `ownership` (`owned` / `missing` / `unknown`), plus
   `ownership_source` and `episode_list_source`.
@@ -510,6 +551,30 @@ Queue actions:
 (embedded engine: `ok`, or `blocked` when trackerless magnets meet DHT off and no initial
 peers). `GET /api/v1/diagnostics` adds `search_backend` with each native indexer's origin,
 limits, caps and health.
+
+### Web app notifications (signed-in browser routes)
+
+These belong to the web app, not the bearer-token API, so they are not in the OpenAPI
+document. They take the web app's session cookie and the `X-Arr-App: 1` header, like every
+`/app/api` route, and answer `401` without a sign-in.
+
+- `GET /app/api/v1/notifications/key`: `{"key": "<base64url>"}`, the server's VAPID public
+  key (the browser's `applicationServerKey`). The key pair is made on first use and kept in
+  `STATE/secrets/vapid_key`.
+- `POST /app/api/v1/notifications/subscribe`: a browser's `PushSubscription.toJSON()`,
+  `{"endpoint", "keys": {"p256dh", "auth"}}`. `204` when stored (sending the same endpoint
+  again updates it), `400 invalid_request` for a bad body, keys or endpoint, `409
+  too_many_devices` past 100 devices. The endpoint must be `https`, on the default port, at
+  a public host (never a private, loopback or link-local address), and at most 2048
+  characters.
+- `DELETE /app/api/v1/notifications/subscribe`: `{"endpoint"}`; `204`.
+
+Arr checks the web app's feed once a minute and pushes "*Title* is ready to watch" for each
+new item in Arrived and "*Title* needs you" for each new item in Needs you, as an encrypted
+(RFC 8291 `aes128gcm`) message with a VAPID (RFC 8292) `Authorization` header. The message is
+`{"title", "body", "url"}`. The first pass after the feature is first used only records what
+is there. A subscription the push service answers `404` or `410` for is dropped. The service
+worker is served at `/app/sw.js` (scope `/app/`).
 
 ### Remote MCP
 

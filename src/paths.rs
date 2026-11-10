@@ -139,36 +139,59 @@ pub fn ensure_dirs(root: &Path, rel: &Path) -> Result<PathBuf, String> {
     Ok(p)
 }
 
-/// Free bytes available to this process on the filesystem holding `path`.
+/// `(free, total)` bytes of the filesystem holding `path`; free is what this process may use.
 #[cfg(unix)]
-pub fn free_bytes(path: &Path) -> Option<u64> {
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid NUL-terminated path and a zeroed out-parameter of the right type.
     let rc = unsafe { libc::statvfs(c.as_ptr(), &mut s) };
     #[allow(clippy::unnecessary_cast)] // c_ulong/fsblkcnt_t widths differ across targets
-    let free = (s.f_bavail as u64).saturating_mul(s.f_frsize as u64);
-    (rc == 0).then_some(free)
+    let (free, total) = (
+        (s.f_bavail as u64).saturating_mul(s.f_frsize as u64),
+        (s.f_blocks as u64).saturating_mul(s.f_frsize as u64),
+    );
+    (rc == 0).then_some((free, total))
 }
 
-/// Free bytes available to this process on the drive holding `path`.
+/// `(free, total)` bytes of the drive holding `path`; free is what this process may use.
 #[cfg(windows)]
-pub fn free_bytes(path: &Path) -> Option<u64> {
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut free = 0u64;
-    // SAFETY: a NUL-terminated wide path and a valid out-parameter; the others may be null.
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut free,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    (ok != 0).then_some(free)
+    let (mut free, mut total) = (0u64, 0u64);
+    // SAFETY: a NUL-terminated wide path and valid out-parameters; the last may be null.
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut()) };
+    (ok != 0).then_some((free, total))
+}
+
+/// Free bytes available to this process on the filesystem holding `path`.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    disk_space(path).map(|(free, _)| free)
+}
+
+/// Whether two existing paths are on the same drive (filesystem).
+pub fn same_drive(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        let prefix = |p: &Path| match p.components().next() {
+            Some(Component::Prefix(x)) => Some(x.as_os_str().to_ascii_lowercase()),
+            _ => None,
+        };
+        let (x, y) = (prefix(a), prefix(b));
+        x.is_some() && x == y
+    }
 }
 
 #[cfg(test)]

@@ -25,7 +25,10 @@ replaces the usual Sonarr, Radarr, Prowlarr and qBittorrent stack.
 
 Until now the only ways in were an AI assistant over MCP ("add season 2 of Severance") and the
 JSON API. The web interface adds a direct way to find and add movies and shows, see what's on
-its way, see what's coming up, and browse ideas and the library, without an assistant.
+its way, see what's coming up, and browse ideas and the library, without an assistant. Ideas leave out what the household already has and can drop a show with "Not interested" (for everyone using that Arr); search shows recent and popular titles before typing and marks what is already in Plex; show and movie pages carry the summary, genres and top cast. The library sorts by recently added, title or
+size, shows how much space the drive has left (and says so when it runs low), shows who added
+each title, and lets a person make Arr stop tracking a title. That last one never deletes files:
+anything already in Plex stays, and deleting is left to Plex.
 
 Success: someone who has never seen Arr finds a film, taps once, and later finds it in Plex,
 without learning any media-server vocabulary.
@@ -52,7 +55,11 @@ Arr's interface exposes the wish and the outcome.
   is off). TV uses TVmaze (no key). TMDB's API terms apply: attribution with the TMDB logo,
   no caching TMDB data longer than 6 months, and an open question about §1.C (AI-connected
   apps) that TMDB has not answered.
-- One tap to add: Arr chooses release and quality. No release picking in the interface.
+- One tap to add: Arr chooses release and quality. No release picking in the interface (a
+  person who wants to can choose a copy under Download options, or from a Needs-you item).
+- Every add says what happened: a short "Added Title" note with Undo when Undo is safe. A
+  download that needs the person says what went wrong in one plain sentence and offers the one
+  button that helps. Downloads on their way say how long is left, when Arr can tell.
 - Existing JSON API covers search/discover, add to library, wanted, calendar, queue
   (pause/resume/cancel/retry), history, attention and library listing.
 - Shipped as a single Rust binary with embedded static assets (like the setup page); no
@@ -68,6 +75,10 @@ Arr's interface exposes the wish and the outcome.
 - Existing setup page and website exist (src/wizard/, site/); their look is evidence for the
   visual world, not yet a documented design system.
 - Opt-in only for anything that phones home (error reports, auto-updates).
+- Phone notifications are opt-in on each device. They use standard Web Push, so a message
+  goes through the browser maker's push service (Google, Apple or Mozilla); it is encrypted
+  for the device and carries only a title ("*Title* is ready to watch" or "*Title* needs
+  you"). On iPhone they work only once Arr is added to the Home Screen (iOS 16.4 or later).
 
 ## Evidence on Hand
 

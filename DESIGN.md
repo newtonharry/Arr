@@ -221,7 +221,7 @@ Title-tile gradients (eight fixed pairs, `.t0` to `.t7`: teal, coral-red, ochre,
 
 ## Layout
 
-A single centred column, `max-width: 680px`, 20px side gutters, on every viewport. Page structure: brand row, search field, banner (only when non-empty), then the feed in `main`, then a quiet footer with who is signed in and Sign out. Sections stack with 22px between them; rows in a list are 10px apart and each row is a full-width card. The ideas section is the one horizontal scroller: 132px-wide cards with proximity snap, bleeding to the page edge (`margin: 0 -20px`).
+A single centred column, `max-width: 680px`, 20px side gutters, on every viewport. Page structure: brand row, search field, banner (only when non-empty: "Can't reach Arr right now" or "Arr is still being set up"; Arr asks again every 5s on any screen and the banner goes as soon as the answer is good), then the feed in `main`, then a quiet footer with who is signed in and Sign out. Sections stack with 22px between them; rows in a list are 10px apart and each row is a full-width card. The ideas section is the one horizontal scroller: 132px-wide cards with proximity snap, bleeding to the page edge (`margin: 0 -20px`).
 
 Responsive: under 760px the tab bar is fixed to the bottom (68px plus safe-area inset, 56px tall targets, icon over 12px label) and the page pads for it. From 760px the same nav moves to the top right on the brand row as 44px pills; the current tab fills teal. Under 420px the coral button in a Needs-you row collapses to its icon. Under 360px journey labels drop to 11px. Safe-area insets are respected top and bottom.
 
@@ -246,8 +246,8 @@ Full width, 56px tall, white, 2px warm border, 18px radius, the solid 5px drop, 
 ### Item Rows
 White card, 2px warm border, 18px radius, 12px padding, 12px gap: lead tile or date chip, a text column (title, one meta line), and a trailing action when needed.
 - **Arrived:** teal border, an "In Plex" tag (teal ink, check glyph, 12px/800) above the title. There is no Watch button: people watch on their TV, so Arrived rows and the movie page just say "In Plex" and "Ready to watch".
-- **On its way:** title, status line ("42% downloaded", "Paused"), then the journey line.
-- **Needs you:** neutral border (the card stays calm), a coral-ink problem line with an alert glyph, and the coral outline button.
+- **On its way:** title, status line ("42% downloaded", "Paused"; with a rate, "42% · about 12 min left", "less than a minute left", "about 2 h left"; nothing about time when it is unknown, paused or stalled), then the journey line.
+- **Needs you:** neutral border (the card stays calm), a coral-ink problem line with an alert glyph saying in one plain sentence what went wrong, and one coral outline button under it that fixes it ("Try again", or "Choose a copy yourself", which opens the title with its copy list showing). A kind the app does not know keeps the server's own sentence and "Try again".
 - **Coming up / looking:** a sun date chip as the lead, "Out 14 Nov. Arr will get it then."
 
 ### Scores
@@ -264,8 +264,14 @@ A calm line of plain-text labels, "IMDb 7.8 · Critics 96% · Audience 87%" (14p
 - **Link button:** no fill, teal-ink, 800, underlined, 44px tall (Sign out, "see all").
 - Busy is 70% opacity with progress cursor.
 
+### Switch
+- **Notifications:** a 52x32px pill (2px warm border, cream fill) with a 22px knob. On, it fills teal and the knob turns on-teal and slides right. It sits in the footer beside its plain state in muted text ("On", "Off", "Blocked in your browser settings", "Add Arr to your Home Screen first"), with a 13px muted privacy line below. Disabled is 50% opacity. The tap target is padded to 44px.
+
 ### Journey Line
 The signature. A 36px-tall four-stop track under any item on its way: Found, Downloading, Checking, In Plex. A 3px warm-line rail with a teal fill that scales from the left (`scaleX`, 0.9s `cubic-bezier(0.16, 1, 0.3, 1)`) as Arr works; stops are 11px circles, hollow until reached, solid teal when on; stop one is left-aligned, stop four right-aligned, two and three centred at one third and two thirds. The current stop's label is ink 800, others muted 600 at 12px. Paused turns the fill muted grey. The last stop, In Plex, is reached only when the row moves to Arrived.
+
+### Toast
+The note after Add or Get ("Added **Title**", "Following **Title**", and "Undone. ..." after Undo). Inverse of the page (ink fill with cream text; cream fill with ink text in dark mode), 14px radius, no border and no shadow, one line, with a 44px "Undo" link button when an existing route fully reverses the add (only for a title Arr did not track at all before: Undo removes it from Arr, which cancels downloads that have not finished and never touches files already in Plex; if a download is nearly done it says "Too late to undo: it's nearly downloaded." and changes nothing). No Undo when the title was already tracked or in Plex. It sits at the bottom, centred, above the tab bar on phones, over a title sheet. It is an `aria-live="polite"` region, lasts about 6s, waits while hovered or focused, is reachable by Tab (it is after the list, before the footer, and inside the sheet's focus loop), Z undoes, Escape closes it.
 
 ### Tabs
 Home / Ideas / Library, icon plus label. Phone: bottom bar, white, 2px warm top border, inactive muted 12px/800, current teal ink. Desktop: top-right pills, inactive muted with teal on hover, current filled teal with on-teal text.
@@ -274,10 +280,21 @@ Home / Ideas / Library, icon plus label. Phone: bottom bar, white, 2px warm top 
 46x52px, 12px radius, sun tint with sun ink text: a 12px uppercase month or day name over a 20px day number. Used as the lead for anything with a date.
 
 ### Segmented Pills and Filter
-Pill buttons (999px, 2px warm border, 44px tall, 800) for choices like Movies / Shows; selected is teal filled with on-teal text. The library filter input is 44px, white, 2px warm border, 14px radius.
+Pill buttons (999px, 2px warm border, 44px tall, 800) for choices like Movies / Shows; selected is teal filled with on-teal text. The library filter input is 44px, white, 2px warm border, 14px radius; the sort select next to it matches it and wraps below on a phone.
+
+### Drive Meter and Confirm Dialog
+The drive meter is a text line ("Movies drive: 1.2 TB free of 4 TB") over a 10px pill track, teal fill. Under 10% free the line and fill turn coral ink and add "Running low on space"; it is the warning colour, not sun. A destructive question (Remove from Arr) is a centred white card with a 2px warm border over the scrim, inside the sheet; Cancel is first and holds the focus when it opens, Remove is a filled coral-ink button. Tab stays in the card and Escape closes it.
+
+### Ideas, Search and Title-page Extras
+- **Genre chips:** the segmented pill style above, one row that scrolls sideways on a phone: "All" plus the six genres most ideas share. One is selected at a time and nothing is saved.
+- **Not interested:** a quiet 13px/700 muted link button under an idea; it hides the show for everyone using this Arr and raises the toast. Shows already in the library or Plex are left out of Ideas unless "Show ones I have" (a link button with a pressed state) is on.
+- **Toast:** one small pill above the tab bar, ink fill with page-coloured text and a link-button action ("Hidden · Undo"), gone after seven seconds. No shadow.
+- **Search before typing:** tapping the search field opens Search with "Recent" (the last eight searches on this device, each removable, plus "Clear") and "Popular now" (the same ideas row as Home).
+- **Owned badge:** the "In Plex" tag style (teal ink, check glyph) under a search result's meta line: "In Plex", "On its way" or "Tracking". A movie already in Plex shows the Done button instead of a second badge.
+- **Title pages:** under the summary (four lines, then "More"), genres as small pills (999px, 2px warm border, 13px/800 muted); at the end of the page a "Cast" section of up to six names with the character in muted text, two columns on a phone. Names only, no photos.
 
 ### Empty and Sign-in
-Centred mascot (96px empty, 120px sign-in), a heading, one muted line (max 30ch) and at most one teal button. The mascot (`src/webapp/mascot.svg`) is the brand mark at 34px beside "Arr" and as the favicon.
+Centred mascot (96px empty, 120px sign-in), a heading, one muted line (max 30ch) and at most one teal button. The mascot (`src/webapp/mascot.svg`) is the brand mark at 34px beside "Arr" and as the favicon (a `<link rel="icon">` on every page, and `/favicon.ico` redirects to it for browsers that ask anyway).
 
 ### Motion
 Short and meaningful only: the journey fill (0.9s expo-out), 0.2s opacity on busy lists, 1px press. Everything is disabled under `prefers-reduced-motion`. The website's mascot bob is not in the app.

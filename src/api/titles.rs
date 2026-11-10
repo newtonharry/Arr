@@ -1,5 +1,5 @@
 //! The pages of one show or one movie in the web app: what is in Plex, what is on its way,
-//! and the three safe actions (get, stop, follow new episodes). Nothing here deletes a file:
+//! and the safe actions (get, stop, follow new episodes, remove). Nothing here deletes a file:
 //! a stop unmonitors and cancels downloads that have not finished, never an imported file.
 
 use super::*;
@@ -73,6 +73,16 @@ struct Show {
     /// The ids Plex can look the show up by, for its review scores.
     tvdb: Option<u32>,
     imdb: Option<String>,
+    genres: Vec<String>,
+    cast: Vec<metadata::CastName>,
+    /// Arr manages it, so it can stop tracking it.
+    removable: bool,
+}
+
+fn cast_json(cast: &[metadata::CastName]) -> Vec<Value> {
+    cast.iter()
+        .map(|c| json!({ "name": c.name, "character": c.character }))
+        .collect()
 }
 
 fn status_word(raw: Option<&str>) -> Option<&'static str> {
@@ -210,12 +220,33 @@ async fn load_show(st: &Arc<AppState>, key: SeriesKey) -> Result<Show, ApiError>
         .as_ref()
         .and_then(|s| s.imdb_id.clone())
         .or_else(|| show.as_ref().and_then(|s| s.externals.imdb.clone()));
+    let mut cast = show.as_ref().map(|s| s.cast()).unwrap_or_default();
+    if let (true, Some(tv), Some(sh)) = (
+        cast.is_empty(),
+        &st.tvmaze,
+        show.as_ref().filter(|s| s.embedded.is_none()),
+    ) {
+        // A show found by its TVDB id comes without its cast: one cached lookup by TVmaze id.
+        if let Ok(Some(full)) = tv.by_id(sh.id).await {
+            cast = full.cast();
+        }
+    }
+    let genres = metadata::clean_genres(
+        show.iter()
+            .flat_map(|s| s.genres.iter().map(String::as_str)),
+        6,
+    );
     Ok(Show {
         tvdb,
         imdb,
+        genres,
+        cast,
         runtime,
         profile: catalog.as_ref().and_then(|s| s.quality_profile.clone()),
         tracked: catalog.is_some(),
+        removable: catalog
+            .as_ref()
+            .is_some_and(|s| managed(&s.provenance.source_app)),
         id,
         title,
         year,
@@ -355,6 +386,8 @@ pub(super) async fn show(State(st): St, p: Result<Path<String>, PathRejection>) 
         "media_id": s.id, "title": s.title, "year": s.year, "network": s.network,
         "summary": s.summary, "status": s.status, "following": s.following, "seasons": seasons,
         "scores": metadata::scores_json(scores),
+        "runtime_minutes": s.runtime, "genres": s.genres, "cast": cast_json(&s.cast),
+        "removable": s.removable,
     });
     let l = st.loaded()?;
     options::page_fields(
@@ -460,6 +493,8 @@ pub(super) async fn movie(State(st): St, p: Result<Path<String>, PathRejection>)
         }
     }
     let scores = meta.as_ref().and_then(|m| m.scores);
+    let genres = meta.as_ref().map(|m| m.genre_names()).unwrap_or_default();
+    let cast = meta.as_ref().map(|m| m.cast()).unwrap_or_default();
     let summary = meta
         .and_then(|m| m.overview)
         .map(|t| cut(t.trim(), 400))
@@ -468,6 +503,8 @@ pub(super) async fn movie(State(st): St, p: Result<Path<String>, PathRejection>)
         "media_id": id, "title": title, "year": year, "runtime_minutes": runtime,
         "summary": summary, "state": state, "progress": progress, "until": until,
         "scores": metadata::scores_json(scores),
+        "genres": genres, "cast": cast_json(&cast),
+        "removable": catalog.as_ref().is_some_and(|m| managed(&m.provenance.source_app)),
     });
     let l = st.loaded()?;
     options::page_fields(
@@ -567,6 +604,52 @@ fn within(scope: MediaId, t: MediaId) -> bool {
     }
 }
 
+/// Cancels the given active downloads that lie entirely inside a scope and have not finished
+/// (a season pack that also holds other episodes is left to finish). Returns how many were
+/// cancelled and how many were left because their data is all there and they are being added.
+async fn cancel_unfinished(
+    st: &Arc<AppState>,
+    grabs: Vec<downloads::Grab>,
+    inside: impl Fn(MediaId) -> bool,
+) -> Result<(usize, usize), ApiError> {
+    let (mut cancelled, mut finishing) = (0, 0);
+    for g in grabs {
+        let targets: Vec<MediaId> = if g.targets.is_empty() {
+            vec![g.target]
+        } else {
+            g.targets.iter().map(|t| t.target).collect()
+        };
+        if !targets.iter().all(|t| inside(*t)) {
+            continue;
+        }
+        // One that already has all its data is being added to Plex: it is left to finish.
+        // That is decided under the grab lock, inside the cancel.
+        let r = downloads::cancel(
+            st,
+            &g.id,
+            CancelOptions {
+                blocklist: false,
+                removal: Removal::TorrentAndData,
+                ignore_seed_criteria: true,
+                research: false,
+                only_unfinished: true,
+            },
+        )
+        .await;
+        match r {
+            Ok(_) => cancelled += 1,
+            Err(downloads::ActionError::Conflict("finishing", _)) => finishing += 1,
+            Err(e) => {
+                return Err(action_error(
+                    e,
+                    st.cfg.download_backend().unwrap_or("download_client"),
+                ));
+            }
+        }
+    }
+    Ok((cancelled, finishing))
+}
+
 /// `POST /stop`: Arr stops looking for a movie, season or episode, and cancels its
 /// downloads that have not finished. Files already in the library are never touched.
 pub(super) async fn stop(State(st): St, ApiJson(body): ApiJson<StopBody>) -> ApiResult {
@@ -624,43 +707,7 @@ pub(super) async fn stop(State(st): St, ApiJson(body): ApiJson<StopBody>) -> Api
         .with(move |c| downloads::select(c, "media_id = ?1 AND active = 1", &[&pid]))
         .await
         .map_err(internal("downloads"))?;
-    let (mut cancelled, mut finishing) = (0, 0);
-    for g in grabs {
-        let targets: Vec<MediaId> = if g.targets.is_empty() {
-            vec![g.target]
-        } else {
-            g.targets.iter().map(|t| t.target).collect()
-        };
-        // Only a download that lies entirely inside the scope: a season pack that also holds
-        // other episodes is left to finish.
-        if !targets.iter().all(|t| within(scope, *t)) {
-            continue;
-        }
-        // One that already has all its data is being added to Plex: it is left to finish.
-        // That is decided under the grab lock, inside the cancel.
-        let r = downloads::cancel(
-            &st,
-            &g.id,
-            CancelOptions {
-                blocklist: false,
-                removal: Removal::TorrentAndData,
-                ignore_seed_criteria: true,
-                research: false,
-                only_unfinished: true,
-            },
-        )
-        .await;
-        match r {
-            Ok(_) => cancelled += 1,
-            Err(downloads::ActionError::Conflict("finishing", _)) => finishing += 1,
-            Err(e) => {
-                return Err(action_error(
-                    e,
-                    st.cfg.download_backend().unwrap_or("download_client"),
-                ));
-            }
-        }
-    }
+    let (cancelled, finishing) = cancel_unfinished(&st, grabs, |t| within(scope, t)).await?;
     ok(
         json!({ "media_id": scope, "stopped": true, "cancelled": cancelled, "finishing": finishing }),
     )
@@ -684,4 +731,78 @@ pub(super) async fn quick_scope(
         "media_id": scope, "title": title, "detail": feed_detail(&index, &[scope]),
         "outcome": outcome, "until": until, "message": message,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RemoveBody {
+    media_id: String,
+}
+
+/// `POST /remove`: Arr stops tracking a movie or show. Downloads that have not finished are
+/// cancelled and a retrying request ends; then the title leaves management exactly as
+/// `DELETE /library/{media_id}` does it. Files already in the library are never touched.
+pub(super) async fn remove(State(st): St, ApiJson(body): ApiJson<RemoveBody>) -> ApiResult {
+    st.loaded()?;
+    let id = parse_media_id(&body.media_id)?;
+    if !matches!(id, MediaId::Movie { .. } | MediaId::Series(_)) {
+        return Err(ApiError::bad_request(
+            ErrorCode::InvalidMediaId,
+            "remove a movie or a show",
+        ));
+    }
+    // Stored ids use the series key the catalog knows the show by.
+    let id = match id {
+        MediaId::Series(k) => st.index().series(k).map_or(id, |s| s.id),
+        other => other,
+    };
+    let now = OffsetDateTime::now_utc();
+    let mine = move |t: MediaId| match id {
+        MediaId::Series(k) => t.series_key() == Some(k),
+        other => t == other,
+    };
+    let managed_now = {
+        let sid = id.to_string();
+        st.store
+            .with(move |c| library::is_managed(c, &sid))
+            .await
+            .map_err(internal("remove"))?
+            == Some(true)
+    };
+    if !managed_now {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotManaged,
+            format!("{id} is not something Arr is tracking"),
+        ));
+    }
+    st.store
+        .with(move |c| {
+            for r in worker::list_requests(c, true)? {
+                if let Some(t) = r["target"].as_str().and_then(|t| t.parse::<MediaId>().ok())
+                    && mine(t)
+                {
+                    worker::settle_request(c, t, "cancelled", "removed by a person", now)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal("requests"))?;
+    let pid = id.to_string();
+    let grabs = st
+        .store
+        .with(move |c| downloads::select(c, "media_id = ?1 AND active = 1", &[&pid]))
+        .await
+        .map_err(internal("downloads"))?;
+    let (cancelled, finishing) = cancel_unfinished(&st, grabs, mine).await?;
+    if finishing > 0 {
+        return Err(ApiError::conflict(
+            ErrorCode::ActiveDownloads,
+            "A download is nearly done and is being added to Plex. Try again in a minute.",
+        ));
+    }
+    let resp = super::library_remove(State(st.clone()), Ok(Path(id.to_string()))).await?;
+    let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await;
+    ok(json!({ "media_id": id, "managed": false, "cancelled": cancelled }))
 }

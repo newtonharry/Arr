@@ -123,6 +123,15 @@ async fn the_show_page_of_a_catalog_show_says_what_is_in_plex() {
     assert_eq!(v["network"], "Apple TV+");
     assert_eq!(v["status"], "Running");
     assert_eq!(v["summary"], "About Slow Horses & its people.");
+    assert_eq!(v["runtime_minutes"], 60, "{v}");
+    assert_eq!(v["genres"], json!(["Drama", "Thriller"]));
+    let cast = v["cast"].as_array().unwrap();
+    assert_eq!(cast.len(), 6, "the top six only: {v}");
+    assert_eq!(
+        cast[0],
+        json!({ "name": "Gary Oldman", "character": "Role 1" })
+    );
+    assert_eq!(cast[5]["name"], "Rosalind Eleazar");
     assert_eq!(
         v["following"], true,
         "an imported, monitored show follows new episodes"
@@ -607,6 +616,17 @@ async fn the_movie_page_follows_the_movie_through_its_states() {
         )
     );
     assert_eq!(v["runtime_minutes"], 100);
+    assert_eq!(v["genres"], json!(["Drama", "Thriller"]));
+    let cast = v["cast"].as_array().unwrap();
+    assert_eq!(cast.len(), 6, "{v}");
+    assert_eq!(
+        cast[0],
+        json!({ "name": "Actor 1", "character": "Character 1" })
+    );
+    // A show or movie without a cast has an empty list, never a missing key.
+    let v = site.show("series:tvdb:999005").await;
+    assert_eq!(v["cast"], json!([]), "{v}");
+    assert_eq!(v["genres"], json!(["Drama", "Thriller"]));
     // Added before it is out: waiting, with the date.
     site.post("/quick-add", json!({ "media_id": "movie:tmdb:900002" }))
         .await;
@@ -1479,4 +1499,218 @@ async fn a_stale_release_id_is_refused_by_the_grab_route_too() {
     );
     let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
     assert_eq!(q["items"], json!([]), "{q}");
+}
+
+// ------------------------------------------------------------------ the library: sort, space, remove
+
+#[tokio::test]
+async fn the_library_sorts_by_title_when_added_and_size() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = signed_in(e.state.clone()).await;
+    for kind in ["movies", "series"] {
+        let (s, v) = site.get(&format!("/library/{kind}?sort=title")).await;
+        assert_eq!(s, 200, "{v}");
+        let items = v["items"].as_array().unwrap();
+        assert!(items.len() >= 2, "{kind}: {v}");
+        let titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
+        let mut sorted = titles.clone();
+        sorted.sort();
+        assert_eq!(titles, sorted, "{kind}");
+        for (sort, key) in [("added", "added_at"), ("size", "size_bytes")] {
+            let (s, v) = site.get(&format!("/library/{kind}?sort={sort}")).await;
+            assert_eq!(s, 200, "{v}");
+            let keys: Vec<String> = v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| match &i[key] {
+                    Value::Number(n) => format!("{:020}", n.as_u64().unwrap()),
+                    Value::String(t) => t.clone(),
+                    other => panic!("{kind} {key}: {other}"),
+                })
+                .collect();
+            assert!(
+                keys.windows(2).all(|w| w[0] >= w[1]),
+                "{kind} by {sort}, largest and newest first: {keys:?}"
+            );
+        }
+    }
+    // Without a sort the list is A to Z as before; a bad one is refused.
+    let (s, _) = site.get("/library/movies").await;
+    assert_eq!(s, 200);
+    let (s, v) = site.get("/library/movies?sort=oldest").await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (400, Some("invalid_query"))
+    );
+}
+
+#[tokio::test]
+async fn the_storage_route_names_drives_and_never_a_path() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = signed_in(e.state.clone()).await;
+    let (s, v) = site.get("/storage").await;
+    assert_eq!(s, 200, "{v}");
+    // Both folders of the test library share a drive: one meter.
+    let drives = v["drives"].as_array().unwrap();
+    assert_eq!(drives.len(), 1, "{v}");
+    assert_eq!(drives[0]["label"], "Movies and TV");
+    let (free, total) = (
+        drives[0]["free_bytes"].as_u64().unwrap(),
+        drives[0]["total_bytes"].as_u64().unwrap(),
+    );
+    assert!(total > 0 && free <= total, "{v}");
+    let text = v.to_string();
+    assert!(!text.contains(e.movies.to_str().unwrap()) && !text.contains(e.tv.to_str().unwrap()));
+    // It needs the same sign-in as the rest.
+    let r = site
+        .http
+        .get(format!("{}/app/api/v1/storage", site.base))
+        .header("x-arr-app", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+}
+
+#[tokio::test]
+async fn removing_a_show_cancels_its_downloads_and_keeps_every_file() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = signed_in(e.state.clone()).await;
+    let done = "Slow.Horses.S01E04.1080p.WEB-DL.x264-UM";
+    let (hash4, r) = e.publish(
+        done,
+        done,
+        vec![(format!("{done}.mkv"), mkv(2))],
+        1.5,
+        false,
+    );
+    e.search_results("Slow Horses S01E04", vec![r]);
+    let (_, v, _) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "episode:tvdb:372264:1:4", "execute": true })),
+        )
+        .await;
+    let g4 = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    e.fake.lock().unwrap().complete(&hash4);
+    e.tick().await;
+    assert_eq!(e.grab_row(&g4).state, "imported");
+    let library = e.tv.join(format!("Slow Horses/Season 1/{done}.mkv"));
+    assert!(library.is_file());
+    let now = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
+    let (hash2, r) = e.publish(now, now, vec![(format!("{now}.mkv"), mkv(1))], 1.5, false);
+    e.search_results("Slow Horses S01E02", vec![r]);
+    let (_, v, _) = e
+        .json(e.post("/api/v1/plans").json(
+            &json!({ "media_id": "episode:tvdb:372264:1:2", "execute": true, "replan": true }),
+        ))
+        .await;
+    let g2 = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    assert_eq!(e.grab_row(&g2).state, "downloading");
+    // The plain delete refuses while a download is active; the app's remove cancels it first.
+    let del = e
+        .client
+        .delete(format!("{}/api/v1/library/series:tvdb:372264", e.base))
+        .bearer_auth(TOKEN);
+    let (s, v, _) = e.json(del).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("active_downloads"))
+    );
+    let (s, v) = site
+        .post("/remove", json!({ "media_id": "series:tvdb:372264" }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["managed"].clone(), v["cancelled"].clone()),
+        (json!(false), json!(1))
+    );
+    assert_eq!(e.grab_row(&g2).state, "cancelled");
+    assert!(!e.fake.lock().unwrap().torrents.contains_key(&hash2));
+    // Nothing in the library is touched, and Arr no longer lists the show.
+    assert!(library.is_file() && playable(&library).await);
+    assert_eq!(e.grab_row(&g4).state, "imported");
+    let (_, lib) = site.get("/library/series?q=slow").await;
+    assert_eq!(lib["total"], 0, "{lib}");
+    // Removing it again, or something that is not a title, is refused.
+    let (s, v) = site
+        .post("/remove", json!({ "media_id": "series:tvdb:372264" }))
+        .await;
+    assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_managed")));
+    let (s, _) = site
+        .post("/remove", json!({ "media_id": "season:tvdb:372264:1" }))
+        .await;
+    assert_eq!(s, 400);
+}
+
+#[tokio::test]
+async fn removing_a_title_waits_for_a_download_that_is_being_added() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = signed_in(e.state.clone()).await;
+    let t = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(t, t, vec![(format!("{t}.mkv"), mkv(1))], 1.5, false);
+    e.search_results("Slow Horses S01E02", vec![r]);
+    let (_, v, _) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "episode:tvdb:372264:1:2", "execute": true })),
+        )
+        .await;
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    let g = id.clone();
+    e.state
+        .store
+        .blocking(move |c| {
+            Ok(c.execute("UPDATE grabs SET state = 'completed' WHERE id = ?1", [&g])?)
+        })
+        .unwrap();
+    let (s, v) = site
+        .post("/remove", json!({ "media_id": "series:tvdb:372264" }))
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("active_downloads")),
+        "{v}"
+    );
+    assert_eq!(e.grab_row(&id).state, "completed");
+    assert!(e.fake.lock().unwrap().torrents.contains_key(&hash));
+    let (_, lib) = site.get("/library/series?q=slow").await;
+    assert_eq!(lib["total"], 1, "still tracked: {lib}");
+}
+
+#[tokio::test]
+async fn titles_added_with_a_sign_in_link_have_no_requester() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = signed_in(e.state.clone()).await;
+    let (s, v) = site
+        .post("/quick-add", json!({ "media_id": "movie:tmdb:603" }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let (_, lib) = site.get("/library/movies").await;
+    assert!(
+        lib["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["requested_by"].is_null()),
+        "{lib}"
+    );
+    let (_, page) = site.get("/movie/movie:tmdb:603").await;
+    assert!(
+        page.get("requested_by").is_some_and(Value::is_null),
+        "{page}"
+    );
 }

@@ -242,6 +242,24 @@ async fn pages_and_assets_carry_the_security_headers() {
         let dim = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
         assert_eq!((dim(16), dim(20)), (side, side), "{i}");
     }
+    // Browsers that ask for /favicon.ico are sent to the mascot; the page names it too.
+    let r = site
+        .plain(Method::GET, "/favicon.ico")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 307);
+    assert_eq!(r.headers()["location"], "/app/mascot.svg");
+    assert_eq!(r.headers()["content-security-policy"], csp);
+    assert!(html.contains("rel=\"icon\" href=\"/app/mascot.svg\" type=\"image/svg+xml\""));
+    let link = site.plain(Method::GET, "/app/link").send().await.unwrap();
+    assert!(
+        link.text()
+            .await
+            .unwrap()
+            .contains("rel=\"icon\" href=\"/app/mascot.svg\""),
+        "the sign-in page has the icon too"
+    );
     // The API keeps answering where it always did.
     let (s, v) = site.json(site.plain(Method::GET, "/api/v1/health")).await;
     assert_eq!((s, v["status"].as_str()), (200, Some("ok")), "{v}");
@@ -562,6 +580,44 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     assert_eq!(v["on_its_way"][0]["stage"], "downloading");
     assert_eq!(v["on_its_way"][0]["progress"], 0.5, "{v}");
     assert!(!v.to_string().contains("1080p"), "no release names: {v}");
+    assert_eq!(
+        v["on_its_way"][0]["eta_seconds"],
+        Value::Null,
+        "no rate yet: {v}"
+    );
+
+    // Time left comes from the download rate: the bytes still to come over the speed.
+    let size: usize = matrix_files().iter().map(|f| f.1.len()).sum();
+    // A moving download makes progress between polls (one that does not is stalled).
+    let left = |p: f64| ((1.0 - p) * size as f64) as i64;
+    e.set_state(&hash, "downloading", 0.51);
+    e.set_speed(&hash, left(0.51) / 600);
+    e.tick().await;
+    let v = feed().await;
+    let eta = v["on_its_way"][0]["eta_seconds"].as_u64();
+    let eta = eta.unwrap_or_else(|| panic!("no time left: {v}"));
+    assert!((590..=640).contains(&eta), "about ten minutes left: {v}");
+    // A faster reading moves the estimate part of the way, not all of it.
+    e.set_state(&hash, "downloading", 0.52);
+    e.set_speed(&hash, left(0.52) / 300);
+    e.tick().await;
+    let v = feed().await;
+    let eta = v["on_its_way"][0]["eta_seconds"].as_u64().unwrap();
+    assert!(
+        (400..=500).contains(&eta),
+        "smoothed, not jumping to 300: {v}"
+    );
+    // Paused or stalled, nothing is promised.
+    e.set_state(&hash, "pausedDL", 0.53);
+    e.tick().await;
+    let v = feed().await;
+    assert_eq!(v["on_its_way"][0]["eta_seconds"], Value::Null, "{v}");
+    assert_eq!(v["on_its_way"][0]["paused"], true, "{v}");
+    e.set_speed(&hash, 0);
+    e.set_state(&hash, "downloading", 0.54);
+    e.tick().await;
+    let v = feed().await;
+    assert_eq!(v["on_its_way"][0]["eta_seconds"], Value::Null, "{v}");
 
     // A download that failed needs the person.
     let title = "Slow.Horses.S01E02.1080p.WEB-DL.x264-ERR";
@@ -592,6 +648,11 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     let need = &v["needs_you"][0];
     assert_eq!(need["problem"], "The download didn't work", "{v}");
     assert_eq!(need["grab_id"], failed.as_str());
+    assert_eq!(
+        (need["kind"].clone(), need["failure"].clone()),
+        (json!("download_failed"), json!("client_error")),
+        "the kind and the reason travel with the plain sentence: {v}"
+    );
     assert_eq!(need["title"], "Slow Horses");
     assert!(need["detail"].as_str().unwrap().starts_with("S1 E2"), "{v}");
     assert!(need["key"].as_str().unwrap().contains(&failed));
@@ -932,6 +993,148 @@ async fn plex_scores_reach_ideas_pages_and_search_and_never_break_them() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["items"][0]["title"], "Slow Horses");
     assert!(v["items"][0]["scores"].is_null(), "{v}");
+}
+
+#[tokio::test]
+async fn ideas_can_be_hidden_for_everyone_and_unhidden() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    {
+        let mut m = e.mock.lock().unwrap();
+        m.schedule = vec![
+            scheduled(
+                372,
+                "Slow Horses",
+                Some(372264),
+                90,
+                "<p>In the library.</p>",
+            ),
+            scheduled(21, "Fresh Show", Some(5021), 80, "<p>New.</p>"),
+            scheduled(22, "Other Show", None, 70, "<p>New.</p>"),
+        ];
+        m.schedule[1]["_embedded"]["show"]["genres"] = json!(["Comedy", " Drama ", "Comedy"]);
+    }
+    let get = |cookie: &str| site.json(site.app(Method::GET, "/app/api/v1/ideas", Some(cookie)));
+    let ids = |v: &Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["media_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (s, v) = get(&cookie).await;
+    assert_eq!(s, 200, "{v}");
+    // Owned shows say so (the page hides them by default); genres are cleaned.
+    assert_eq!(v["items"][0]["owned"], true, "{v}");
+    assert_eq!(v["items"][1]["owned"], false, "{v}");
+    assert_eq!(v["items"][1]["genres"], json!(["Comedy", "Drama"]), "{v}");
+    assert_eq!(v["items"][2]["genres"], json!([]), "{v}");
+    assert_eq!(ids(&v).len(), 3);
+    // Not interested: gone from the list; a non-series or junk id is refused.
+    let hide = |id: &str| {
+        site.json(
+            site.app(Method::POST, "/app/api/v1/ideas/hide", Some(&cookie))
+                .json(&json!({ "media_id": id })),
+        )
+    };
+    let (s, v) = hide("series:tvdb:5021").await;
+    assert_eq!((s, v["hidden"].clone()), (200, json!(true)), "{v}");
+    assert_eq!(hide("series:tvdb:5021").await.0, 200, "twice is fine");
+    assert_eq!(hide("movie:tmdb:603").await.0, 400);
+    assert_eq!(hide("nonsense").await.0, 400);
+    let (_, v) = get(&cookie).await;
+    assert_eq!(
+        ids(&v),
+        ["series:tvdb:372264", "series:tvmaze:22"],
+        "only the hidden show is gone"
+    );
+    // It is kept for everyone: another session, and the bearer API, see the same list.
+    let other = site.sign_in(&e).await;
+    let (_, v) = get(&other).await;
+    assert_eq!(ids(&v).len(), 2);
+    let (s, v, _) = e.json(e.get("/api/v1/ideas")).await;
+    assert_eq!((s, ids(&v).len()), (200, 2));
+    let (s, v, _) = e
+        .json(
+            e.post("/api/v1/ideas/hide")
+                .json(&json!({ "media_id": "series:tvmaze:22" })),
+        )
+        .await;
+    assert_eq!((s, v["media_id"].clone()), (200, json!("series:tvmaze:22")));
+    let (_, v) = get(&cookie).await;
+    assert_eq!(ids(&v), ["series:tvdb:372264"]);
+    // Undo.
+    for id in ["series:tvdb:5021", "series:tvmaze:22"] {
+        let (s, v) = site
+            .json(site.app(
+                Method::DELETE,
+                &format!("/app/api/v1/ideas/hide/{id}"),
+                Some(&cookie),
+            ))
+            .await;
+        assert_eq!((s, v["hidden"].clone()), (200, json!(false)), "{v}");
+    }
+    let (_, v) = get(&cookie).await;
+    assert_eq!(ids(&v).len(), 3);
+    // The app can reach these two routes and nothing broader.
+    for (method, path) in [
+        (Method::GET, "/app/api/v1/ideas/hide"),
+        (Method::DELETE, "/app/api/v1/ideas/hide"),
+        (Method::DELETE, "/app/api/v1/ideas"),
+        (Method::PUT, "/app/api/v1/ideas/hide/series:tvdb:1"),
+    ] {
+        let (s, v) = site
+            .json(site.app(method.clone(), path, Some(&cookie)))
+            .await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (404, Some("not_found")),
+            "{method} {path}"
+        );
+    }
+    // Without the session they are refused like the other app routes.
+    let r = site
+        .plain(Method::POST, "/app/api/v1/ideas/hide")
+        .header("x-arr-app", "1")
+        .json(&json!({ "media_id": "series:tvdb:1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+}
+
+#[tokio::test]
+async fn search_results_say_what_arr_already_has() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let find = |kind: &'static str, q: &'static str| {
+        let (site, cookie) = (&site, &cookie);
+        async move {
+            let path = format!("/app/api/v1/discover?kind={kind}&q={q}");
+            let (s, v) = site.json(site.app(Method::GET, &path, Some(cookie))).await;
+            assert_eq!(s, 200, "{v}");
+            v["results"].as_array().unwrap().clone()
+        }
+    };
+    // A show with episodes in Plex, and a show Arr does not have.
+    let rows = find("series", "slow").await;
+    assert_eq!(rows[0]["library_state"], "in_plex", "{rows:?}");
+    let rows = find("series", "coming soon").await;
+    assert!(rows[0]["library_state"].is_null(), "{rows:?}");
+    // A movie in Plex, and a movie Arr does not have.
+    let rows = find("movie", "matrix").await;
+    assert!(
+        rows.iter().any(|r| r["library_state"] == "in_plex"),
+        "{rows:?}"
+    );
+    let rows = find("movie", "plex").await;
+    assert!(
+        rows.iter().all(|r| r["library_state"].is_null()),
+        "{rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -1530,4 +1733,301 @@ async fn a_movie_plex_has_no_poster_for_falls_back_to_tmdb() {
         200
     );
     assert_eq!(image_fetches(&e), ["/t/p/w342/leviticus.jpg"]);
+}
+
+// ------------------------------------------------------------------ notifications
+
+/// What a mock push service received.
+#[derive(Clone, Debug)]
+struct Pushed {
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// A push service on loopback: `/ok/..` accepts, `/gone/..` answers 410.
+async fn push_service() -> (String, Arc<Mutex<Vec<Pushed>>>) {
+    let log = Arc::new(Mutex::new(vec![]));
+    let app = axum::Router::new()
+        .route(
+            "/{kind}/{id}",
+            post(
+                |State(log): State<Arc<Mutex<Vec<Pushed>>>>,
+                 axum::extract::Path((kind, id)): axum::extract::Path<(String, String)>,
+                 headers: axum::http::HeaderMap,
+                 body: axum::body::Bytes| async move {
+                    log.lock().unwrap().push(Pushed {
+                        path: format!("/{kind}/{id}"),
+                        headers: headers
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                            .collect(),
+                        body: body.to_vec(),
+                    });
+                    if kind == "gone" {
+                        axum::http::StatusCode::GONE
+                    } else {
+                        axum::http::StatusCode::CREATED
+                    }
+                },
+            ),
+        )
+        .with_state(log.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, log)
+}
+
+/// A browser's subscription keys: a P-256 public key and a 16-byte secret.
+fn browser_keys() -> (String, String) {
+    use ring::{agreement, rand};
+    let k =
+        agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rand::SystemRandom::new())
+            .unwrap();
+    (
+        B64.encode(k.compute_public_key().unwrap().as_ref()),
+        B64.encode([9u8; 16]),
+    )
+}
+
+fn subscription(endpoint: &str) -> Value {
+    let (p256dh, auth) = browser_keys();
+    json!({ "endpoint": endpoint, "keys": { "p256dh": p256dh, "auth": auth } })
+}
+
+#[tokio::test]
+async fn notification_routes_need_a_sign_in_and_check_their_input() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let good = subscription("https://fcm.googleapis.com/fcm/send/abc");
+
+    // Signed out: every route refuses.
+    for (m, p) in [
+        (Method::GET, "/app/api/v1/notifications/key"),
+        (Method::POST, "/app/api/v1/notifications/subscribe"),
+        (Method::DELETE, "/app/api/v1/notifications/subscribe"),
+    ] {
+        let (s, _) = site.json(site.app(m.clone(), p, None).json(&good)).await;
+        assert_eq!(s, 401, "{m} {p}");
+    }
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+
+    // The key is a base64url P-256 point, the same every time, and kept in the secrets folder.
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/notifications/key", c))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let key = v["key"].as_str().unwrap();
+    assert_eq!(B64.decode(key).unwrap().len(), 65);
+    let (_, again) = site
+        .json(site.app(Method::GET, "/app/api/v1/notifications/key", c))
+        .await;
+    assert_eq!(again["key"], key);
+    fsutil::check_private_file(&e.state.cfg.state_dir.join("secrets/vapid_key")).unwrap();
+
+    // Needs the app marker like every app route.
+    let r = site
+        .plain(Method::GET, "/app/api/v1/notifications/key")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // Bad input is a 400.
+    let (p256dh, auth) = browser_keys();
+    let keys = json!({ "p256dh": p256dh, "auth": auth });
+    let ep = |e: &str| json!({ "endpoint": e, "keys": keys });
+    for (what, body) in [
+        ("not json", json!("x")),
+        (
+            "no keys",
+            json!({ "endpoint": "https://fcm.googleapis.com/x" }),
+        ),
+        ("http", ep("http://fcm.googleapis.com/x")),
+        // (Loopback is refused too; the unit tests cover it, since another test here
+        // switches the test-only loopback allowance on for the whole binary.)
+        ("private", ep("https://192.168.1.10/x")),
+        ("link-local", ep("https://169.254.169.254/x")),
+        (
+            "bad key",
+            json!({ "endpoint": "https://fcm.googleapis.com/x", "keys": { "p256dh": "AAAA", "auth": auth } }),
+        ),
+        (
+            "bad auth",
+            json!({ "endpoint": "https://fcm.googleapis.com/x", "keys": { "p256dh": p256dh, "auth": "AAAA" } }),
+        ),
+    ] {
+        let (s, v) = site
+            .json(
+                site.app(Method::POST, "/app/api/v1/notifications/subscribe", c)
+                    .json(&body),
+            )
+            .await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{what}: {v}"
+        );
+    }
+
+    // A good one is stored (once, however often it is sent), and removed again.
+    let count = || -> i64 {
+        rusqlite::Connection::open(e.state.cfg.state_dir.join("web.sqlite"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM push_subs", [], |r| r.get(0))
+            .unwrap()
+    };
+    for _ in 0..2 {
+        let (s, _) = site
+            .json(
+                site.app(Method::POST, "/app/api/v1/notifications/subscribe", c)
+                    .json(&good),
+            )
+            .await;
+        assert_eq!(s, 204);
+    }
+    assert_eq!(count(), 1);
+    let (s, _) = site
+        .json(
+            site.app(Method::DELETE, "/app/api/v1/notifications/subscribe", c)
+                .json(&json!({ "endpoint": good["endpoint"] })),
+        )
+        .await;
+    assert_eq!(s, 204);
+    assert_eq!(count(), 0);
+}
+
+#[tokio::test]
+async fn the_service_worker_is_served_to_the_app_scope() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let r = site.plain(Method::GET, "/app/sw.js").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(
+        r.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript")
+    );
+    let text = r.text().await.unwrap();
+    assert!(text.contains("showNotification") && text.contains("notificationclick"));
+    assert!(
+        !text.contains("addEventListener('fetch'"),
+        "no fetch handler"
+    );
+}
+
+#[tokio::test]
+async fn a_new_arrival_is_pushed_once_to_each_device_and_a_gone_device_is_forgotten() {
+    arr::push::allow_loopback_for_tests();
+    arr::push::set_tick_for_tests(150);
+    let e = exec().await;
+    let (push, log) = push_service().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    // The first pass has recorded what exists (nothing) by now.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    for path in ["ok/one", "gone/two"] {
+        let (s, v) = site
+            .json(
+                site.app(Method::POST, "/app/api/v1/notifications/subscribe", c)
+                    .json(&subscription(&format!("{push}/{path}"))),
+            )
+            .await;
+        assert_eq!(s, 204, "{v}");
+    }
+
+    // A movie arrives.
+    let (hash, r) = e.publish(
+        "The.Matrix.1999.1080p.WEB-DL.x264-UM",
+        "The.Matrix.1999.1080p.WEB-DL.x264-UM",
+        matrix_files(),
+        8.0,
+        false,
+    );
+    e.search_results("The Matrix 1999", vec![r]);
+    let (s, _, text) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "movie:tmdb:603", "execute": true })),
+        )
+        .await;
+    assert_eq!(s, 201, "{text}");
+    e.tick().await;
+    e.complete(&hash);
+    e.tick().await;
+
+    let mut seen = vec![];
+    for _ in 0..60 {
+        seen = log.lock().unwrap().clone();
+        if seen.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Let a few more passes run: nothing may be sent twice.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let all = log.lock().unwrap().clone();
+    assert_eq!(all.len(), seen.len(), "sent again: {all:?}");
+    assert_eq!(all.len(), 2, "one push per device: {all:?}");
+    let one = all.iter().find(|p| p.path == "/ok/one").unwrap();
+    assert_eq!(one.headers["ttl"], "86400");
+    assert_eq!(one.headers["content-encoding"], "aes128gcm");
+    assert_eq!(one.headers["content-type"], "application/octet-stream");
+    let auth = &one.headers["authorization"];
+    let key = site
+        .json(site.app(Method::GET, "/app/api/v1/notifications/key", c))
+        .await
+        .1["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(auth.starts_with("vapid t="), "{auth}");
+    assert!(auth.ends_with(&format!(",k={key}")), "{auth}");
+    let jwt = auth
+        .strip_prefix("vapid t=")
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap();
+    let claims: Value =
+        serde_json::from_slice(&B64.decode(jwt.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    assert_eq!(
+        claims["aud"],
+        push.as_str(),
+        "the audience is the push service's origin"
+    );
+    // The encrypted record: header (salt, record size 4096, 65-byte sender key), then ciphertext.
+    let b = &one.body;
+    assert_eq!(&b[16..20], &4096u32.to_be_bytes());
+    assert_eq!(b[20], 65);
+    assert_eq!(b[21], 4, "uncompressed P-256 point");
+    assert!(b.len() > 86 + 16, "{}", b.len());
+    assert!(
+        !String::from_utf8_lossy(b).contains("Matrix"),
+        "the message is encrypted"
+    );
+
+    // The 410 device was dropped; the other stays.
+    let db = rusqlite::Connection::open(e.state.cfg.state_dir.join("web.sqlite")).unwrap();
+    let left: Vec<String> = db
+        .prepare("SELECT endpoint FROM push_subs")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(left, vec![format!("{push}/ok/one")]);
+    let sent: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM push_sent WHERE item LIKE 'arrived:movie:tmdb:603:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sent, 1);
 }
