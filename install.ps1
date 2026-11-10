@@ -1048,6 +1048,19 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $log = Join-Path $StateDir 'update.log'
 function Log($m) { $l = '{0} arr-update: {1}' -f (Get-Date -Format s), $m; Add-Content $log $l; Write-Output $l }
+# arr-update-trigger: the web app's "Update now" runs the "Arr update" task, which runs this.
+# update-status.json says how the run went (the app shows it); it is written to a new file and
+# moved over the old one, so Arr never reads half of it.
+function Set-Status($state, $from, $to) {
+	try {
+		$f = Join-Path $StateDir 'update-status.json'
+		$j = [ordered]@{ state = $state; from = "$from".TrimStart('v'); to = "$to".TrimStart('v'); at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } | ConvertTo-Json -Compress
+		Set-Content -Path "$f.new" -Value $j -Encoding ASCII
+		Move-Item "$f.new" $f -Force
+	} catch {}
+}
+# Whatever ends the run without saying how it went was a failure.
+$script:Final = $false
 # GitHub's downloads sometimes time out (504) for a while: retry what can clear up (no answer,
 # 5xx, 408, 429), 6 tries 10 s apart; anything else (a 404) fails at once.
 function Get-Download($url, $out) {
@@ -1103,6 +1116,7 @@ try { $lock = [IO.File]::Open((Join-Path $BinDir 'arr-update.lock'), 'OpenOrCrea
 catch { Log 'another update is running'; exit 0 }
 $tmp = $null
 try {
+	Set-Status 'checking' '' ''
 	$releases = if ($env:ARR_RELEASES_URL) { $env:ARR_RELEASES_URL } else { "https://github.com/$Repo/releases" }
 	$ApiFallback = -not $env:ARR_RELEASES_URL # only GitHub's own address falls back to its API
 	$latest = ''
@@ -1120,8 +1134,9 @@ try {
 	}
 	if ($latest -notmatch '^v\d+\.\d+\.\d+$') { Log "couldn't find the latest release"; exit 1 }
 	$current = 'v' + ((& $arr --version) -split ' ')[1]
-	if ([version]$latest.TrimStart('v') -le [version]$current.TrimStart('v')) { Log "up to date ($current)"; exit 0 }
+	if ([version]$latest.TrimStart('v') -le [version]$current.TrimStart('v')) { Log "up to date ($current)"; Set-Status 'up_to_date' $current $latest; $script:Final = $true; exit 0 }
 	Log "updating $current to $latest"
+	Set-Status 'updating' $current $latest
 	$tmp = Join-Path ([IO.Path]::GetTempPath()) ('arr-update-' + [guid]::NewGuid().ToString('N'))
 	New-Item -ItemType Directory $tmp | Out-Null
 	$asset = "arr-$Target.zip"
@@ -1160,7 +1175,7 @@ try {
 		exit 1
 	}
 	Restart-Arr
-	if (Healthy $latest) { Log "now running $latest"; exit 0 }
+	if (Healthy $latest) { Log "now running $latest"; Set-Status 'done' $current $latest; $script:Final = $true; exit 0 }
 	Log "$latest didn't start; going back to $current"
 	Roll-Back
 	if (-not (Healthy $current)) { Log "$current didn't start either; check $(Join-Path $StateDir 'arr.log')" }
@@ -1171,6 +1186,7 @@ try {
 	Log "update failed: $($_.Exception.Message)"
 	exit 1
 } finally {
+	if (-not $script:Final) { Set-Status 'failed' $current $latest }
 	if ($tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
 	$lock.Close()
 }

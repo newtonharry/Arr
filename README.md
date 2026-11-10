@@ -135,6 +135,26 @@ both keep your config. To stop automatic updates, run the installer with `--no-a
 Update logs go to `journalctl -u arr-update` (`--user` for a user install), or `update.log` in
 the state folder on macOS.
 
+#### Updating and changing settings from the web app
+
+With automatic updates on, the web app (Settings, and a line at the bottom of every screen) shows
+"Arr X is available · Update now". Arr checks GitHub's latest release at most every six hours
+(only when automatic updates are installed) and, when you tap, asks the same updater to run:
+it never installs anything itself. On Linux it creates `update-requested` in its state folder
+and a systemd `arr-update.path` unit starts the updater; on macOS it creates a file in
+`update-queue` that the update job's `QueueDirectories` watches; on Windows it starts the
+"Arr update" task. The updater removes the request first, and writes `update-status.json` for
+the app to show. **Installs from before this existed** keep working as they were, and show no
+Update now button until you run the installer once more (the daily updater doesn't rewrite
+itself); the Settings screen says so.
+
+Settings also changes downloading, the upload limit, the torrent port, error reports and the TMDB
+key, the way `arr set` does, then restarts Arr (it exits and the service starts it again, so
+this is only offered when Arr runs as a service). The Plex token and address and the API and MCP
+tokens stay with `arr set`. Health shows Plex, folders, downloads, search sites, disk space and
+updates in plain words, and the last 50 warnings and errors (kept in memory, with names, paths,
+addresses and tokens removed).
+
 ### Something's wrong, or you want to change a setting
 
 Run the install command again. It updates Arr, checks and repairs it, and keeps your setup.

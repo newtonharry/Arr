@@ -1536,12 +1536,48 @@ if [ "$AUTO_UPDATE" = 1 ]; then
 	step "Turning on automatic updates"
 	{
 		printf '#!/bin/sh\n# Arr updater, written by install.sh. A daily job runs it; you can run it by hand too.\n'
-		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\nCONFIG=%s\nLD_DIR=%s\n' \
+		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\nCONFIG=%s\nLD_DIR=%s\nSTATE_DIR=%s\nOWNER=%s\n' \
 			"$(sq "$REPO")" "$(sq "$ARR")" "$(sq "$target")" "$(sq "$kind")" "$(sq "$PORT")" \
-			"$(sq "$lock_kind")" "$(sq "$lock_tool")" "$(sq "$CONFIG")" "$(sq "$LD_DIR")"
+			"$(sq "$lock_kind")" "$(sq "$lock_tool")" "$(sq "$CONFIG")" "$(sq "$LD_DIR")" "$(sq "$STATE_DIR")" \
+			"$(sq "$({ [ "$(id -u)" = 0 ] && printf '%s' "$RUN_AS"; } || id -un)")"
 		cat <<'EOF'
 set -eu
 log() { printf 'arr-update: %s\n' "$*"; }
+# arr-update-trigger: the web app's "Update now" starts this by creating a request file in the
+# state folder (a systemd path unit, or the launchd job's QueueDirectories, watches for it). The
+# file goes first thing, so a run that fails can't start itself again, and update-status.json
+# says how it went.
+#
+# The state folder belongs to the account that runs Arr (OWNER, fixed when this was written, never
+# looked up from the folder), and this may run as root (a system install). Root therefore touches
+# nothing in that folder: whatever is done there is done as OWNER, through setpriv or runuser, so a
+# link or a swapped folder could only reach what that account could already change anyway. With
+# neither tool, or with no OWNER, nothing is done: no status (the page treats it as unknown).
+# owner_sh SCRIPT ARG: runs `sh -c SCRIPT sh ARG` as OWNER.
+owner_sh() {
+	if [ "$(id -u)" != 0 ]; then sh -c "$1" sh "$2"
+	elif [ -z "$OWNER" ]; then return 1
+	elif [ "$OWNER" = root ]; then sh -c "$1" sh "$2"
+	elif command -v setpriv >/dev/null 2>&1; then
+		setpriv --reuid="$OWNER" --regid="$(id -g "$OWNER")" --init-groups sh -c "$1" sh "$2"
+	elif command -v runuser >/dev/null 2>&1; then runuser -u "$OWNER" -- sh -c "$1" sh "$2"
+	else return 1; fi
+}
+STATUS_FILE="$STATE_DIR/update-status.json"
+# The request goes by its one fixed name: no globbing, no walking a folder, a link is unlinked and
+# never followed (left in place it would start this again and again).
+if [ "$KIND" = launchd ]; then TRIGGER="$STATE_DIR/update-queue/requested"; else TRIGGER="$STATE_DIR/update-requested"; fi
+owner_sh 'if [ -f "$1" ] || [ -L "$1" ]; then rm -f "$1"; fi' "$TRIGGER" 2>/dev/null || true
+# status STATE FROM TO: a new file renamed over the old one, so Arr never reads half of it.
+status() {
+	[ "$(id -u)" != 0 ] || { [ -n "$OWNER" ] && [ "$OWNER" != root ]; } || return 0
+	json=$(printf '{"state":"%s","from":"%s","to":"%s","at":"%s"}' "$1" "${2#v}" "${3#v}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+	printf '%s\n' "$json" | owner_sh 'd=$(dirname "$1"); f=$(mktemp "$d/.update-status.XXXXXX") || exit 0; cat >"$f" && chmod 644 "$f" && mv -f "$f" "$1" || rm -f "$f"' "$STATUS_FILE" 2>/dev/null || true
+	return 0
+}
+# Whatever ends the run without saying how it went was a failure.
+FINAL=0
+finish() { [ "$FINAL" = 1 ] || status failed "${current:-}" "${latest:-}"; }
 rfetch() { curl -fsSL --retry 6 --retry-delay 10 "$@"; }
 # GitHub's download pages sometimes answer 504 for a long while; its API stays up. Parsed with
 # tr and awk, as there is no jq.
@@ -1613,17 +1649,18 @@ case "$LOCK_KIND" in
 flock)
 	exec 9>"$lock"
 	"$LOCK_TOOL" -n 9 || { log "another update is running"; exit 0; }
-	trap 'rm -rf ${tmp:+"$tmp"}' EXIT
+	trap 'finish; rm -rf ${tmp:+"$tmp"}' EXIT
 	;;
 shlock)
 	"$LOCK_TOOL" -f "$lock" -p $$ || { log "another update is running"; exit 0; }
-	trap 'rm -f "$lock"; rm -rf ${tmp:+"$tmp"}' EXIT
+	trap 'finish; rm -f "$lock"; rm -rf ${tmp:+"$tmp"}' EXIT
 	;;
 *)
 	log "unknown lock kind $LOCK_KIND; not updating"
 	exit 1
 	;;
 esac
+status checking "" ""
 
 GH_DEFAULT=0 VIA_API=0
 [ -n "${ARR_RELEASES_URL:-}" ] || GH_DEFAULT=1
@@ -1640,9 +1677,12 @@ case "$latest" in v[0-9]*) ;; *) log "couldn't find the latest release"; exit 1 
 current="v$("$ARR" --version | awk '{print $2}')"
 if ! newer "$latest" "$current"; then
 	log "up to date ($current)"
+	status up_to_date "$current" "$latest"
+	FINAL=1
 	exit 0
 fi
 log "updating $current to $latest"
+status updating "$current" "$latest"
 tmp=$(mktemp -d)
 asset="arr-$TARGET.tar.gz"
 base="$RELEASES/download/$latest"
@@ -1675,12 +1715,16 @@ mv -f "$ARR.new" "$ARR"
 restart
 if healthy "$latest"; then
 	log "now running $latest"
+	status done "$current" "$latest"
+	FINAL=1
 	exit 0
 fi
 log "$latest didn't start; going back to $current"
 mv -f "$ARR.previous" "$ARR"
 restart
 healthy "$current" || log "$current didn't start either; check Arr's logs"
+status failed "$current" "$latest"
+FINAL=1
 # Told to Arr's developer only if the config says so (docs/PRIVACY.md).
 "$ARR" report --config "$CONFIG" --component updater --message "$latest didn't start, so Arr went back to $current" >/dev/null 2>&1 || true
 exit 1
@@ -1695,12 +1739,26 @@ EOF
 			>"$udir/arr-update.timer"
 		$sctl daemon-reload && $sctl enable --now arr-update.timer >/dev/null 2>&1 ||
 			die "couldn't start the update timer"
+		# "Update now" in the web app: Arr creates this file (it can't start the updater itself;
+		# for a system install the updater runs as root and Arr doesn't), and systemd starts the
+		# updater when it appears.
+		printf '[Unit]\nDescription=Start the Arr update when the web app asks for it\n\n[Path]\nPathExists=%s/update-requested\nUnit=arr-update.service\n\n[Install]\nWantedBy=paths.target\n' \
+			"$(printf '%s' "$STATE_DIR" | sed 's/%/%%/g')" >"$udir/arr-update.path"
+		if ! { $sctl daemon-reload && $sctl enable --now arr-update.path >/dev/null 2>&1; }; then
+			rm -f "$udir/arr-update.path"
+			$sctl daemon-reload || true
+			say "Note: the web app's \"Update now\" isn't available (systemd wouldn't start its watcher); updates still run once a day."
+		fi
 		;;
 	launchd)
 		upd_args="    <string>/bin/sh</string><string>$(xml "$UPDATER")</string>"
 		upd_keys="  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>$(($(od -An -N1 -tu1 /dev/urandom) % 60))</integer></dict>
   <key>StandardOutPath</key><string>$(xml "$STATE_DIR/update.log")</string>
-  <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/update.log")</string>"
+  <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/update.log")</string>
+  <key>QueueDirectories</key><array><string>$(xml "$STATE_DIR/update-queue")</string></array>"
+		# The web app's "Update now" puts a file in this folder; launchd starts the job while
+		# there is one.
+		mkdir -p "$STATE_DIR/update-queue"
 		# At boot the daily job is a daemon too: it runs as you, so it needs no password to
 		# run, and it still runs when nobody is logged in. Otherwise it is a login item.
 		upd_d=$(mac_plist "$L_UPD" 1 "$upd_args" "$upd_keys")
@@ -1723,8 +1781,9 @@ elif [ -f "$UPDATER" ] || [ -f "$udir/arr-update.timer" ] || [ -f "$uplist" ] ||
 	step "Turning off automatic updates"
 	case "$kind" in
 	system | user)
+		$sctl disable --now arr-update.path >/dev/null 2>&1 || true
 		$sctl disable --now arr-update.timer >/dev/null 2>&1 || true
-		rm -f "$udir/arr-update.timer" "$udir/arr-update.service"
+		rm -f "$udir/arr-update.path" "$udir/arr-update.timer" "$udir/arr-update.service"
 		$sctl daemon-reload || true
 		;;
 	launchd)

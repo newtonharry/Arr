@@ -2031,3 +2031,345 @@ async fn a_new_arrival_is_pushed_once_to_each_device_and_a_gone_device_is_forgot
         .unwrap();
     assert_eq!(sent, 1);
 }
+
+// ------------------------------------------------------------------ update, settings and health
+
+const NEW_ROUTES: [(&str, &str); 5] = [
+    ("GET", "/app/api/v1/update"),
+    ("POST", "/app/api/v1/update"),
+    ("GET", "/app/api/v1/settings/app"),
+    ("POST", "/app/api/v1/settings/app"),
+    ("GET", "/app/api/v1/system/health"),
+];
+
+fn assert_nothing_private(e: &Exec, body: &str) {
+    for secret in [
+        TOKEN,
+        TMDB_V3_KEY,
+        PLEX_TOKEN,
+        e.dir.to_str().unwrap(),
+        "secrets/",
+    ] {
+        assert!(!body.contains(secret), "{secret} in {body}");
+    }
+}
+
+#[tokio::test]
+async fn update_settings_and_health_need_a_sign_in_and_the_app_header() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    for (method, path) in NEW_ROUTES {
+        let m = Method::from_bytes(method.as_bytes()).unwrap();
+        let (s, v) = site.json(site.app(m.clone(), path, None)).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (401, Some("unauthorized")),
+            "{method} {path}"
+        );
+        // The bearer token is not a sign-in on the app's side.
+        let (s, _) = site
+            .json(site.app(m.clone(), path, None).bearer_auth(TOKEN))
+            .await;
+        assert_eq!(s, 401, "{method} {path}");
+        // Without the marker header, or from another origin, nothing gets as far as a sign-in.
+        let (s, _) = site.json(site.plain(m.clone(), path)).await;
+        assert_eq!(s, 403, "{method} {path}");
+        let (s, _) = site
+            .json(
+                site.app(m, path, None)
+                    .header("origin", "https://evil.example"),
+            )
+            .await;
+        assert_eq!(s, 403, "{method} {path}");
+    }
+    // Other methods are not routes.
+    let cookie = site.sign_in(&e).await;
+    for path in ["/app/api/v1/update", "/app/api/v1/settings/app"] {
+        let (s, _) = site
+            .json(site.app(Method::DELETE, path, Some(&cookie)))
+            .await;
+        assert_eq!(s, 404, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn app_settings_show_no_secret_and_a_change_applies_or_is_rejected() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/settings/app", c))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["downloading"], true);
+    assert_eq!(v["tmdb_key_set"], true);
+    assert_eq!(v["error_reports"], false);
+    assert_eq!(v["embedded"], true);
+    assert_nothing_private(&e, &v.to_string());
+
+    let config_path = e.dir.join("config.toml");
+    let before = std::fs::read_to_string(&config_path).unwrap();
+    let post = |name: &str, value: &str| {
+        site.app(Method::POST, "/app/api/v1/settings/app", c)
+            .json(&json!({ "name": name, "value": value }))
+    };
+    // Settings that are not the app's to change, and names that do not exist.
+    for name in [
+        "plex-token",
+        "plex-url",
+        "api-token",
+        "mcp-token",
+        "nope",
+        "",
+    ] {
+        let (s, v) = site.json(post(name, "x")).await;
+        assert_eq!(s, 400, "{name}: {v}");
+    }
+    let (s, _) = site
+        .json(
+            site.app(Method::POST, "/app/api/v1/settings/app", c)
+                .json(&json!({ "name": "downloading", "value": "off", "extra": 1 })),
+        )
+        .await;
+    assert_eq!(s, 422);
+    if !arr::lifecycle::supervised() {
+        // Not run by a service manager: nothing would start Arr again, so nothing is changed.
+        let (s, v) = site.json(post("downloading", "off")).await;
+        assert_eq!(s, 409, "{v}");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
+        arr::lifecycle::mark_supervised();
+    }
+    // Bad values are refused by `arr set`'s own checks, and the config is untouched.
+    for (name, value) in [
+        ("downloading", "maybe"),
+        ("torrent-port", "0"),
+        ("torrent-port", "99999"),
+        ("upload-limit-kib", "-5"),
+        ("tmdb-key", "not a key with spaces"),
+    ] {
+        let (s, v) = site.json(post(name, value)).await;
+        assert_eq!(s, 400, "{name} {value}: {v}");
+        assert_nothing_private(&e, &v.to_string());
+        assert!(!v.to_string().contains("not a key with spaces"), "{v}");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "{name}"
+        );
+    }
+    // A port that something else holds, or that is Arr's own, would stop Arr starting again.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = held.local_addr().unwrap().port().to_string();
+    let (s, v) = site.json(post("torrent-port", &busy)).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v.to_string().contains("already in use"), "{v}");
+    if e.state.cfg.listen.port() != 0 {
+        let (s, v) = site
+            .json(post("torrent-port", &e.state.cfg.listen.port().to_string()))
+            .await;
+        assert_eq!(s, 400, "{v}");
+        assert!(v.to_string().contains("Arr itself uses"), "{v}");
+    }
+    drop(held);
+    // A TMDB token may be long: the limit is the key check's own (1024), not a blanket 200.
+    let (s, v) = site.json(post("tmdb-key", &"k".repeat(1100))).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v.to_string().contains("look like a TMDB key"), "{v}");
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
+    assert!(!e.state.restart.requested());
+    // A value already in place changes nothing and restarts nothing.
+    let (s, v) = site.json(post("downloading", "on")).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (&v["changed"], &v["restarting"]),
+        (&json!(false), &json!(false))
+    );
+    assert!(!e.state.restart.requested());
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
+
+    // A real change is written like `arr set` writes it, then Arr asks to restart.
+    let (s, v) = site.json(post("torrent-port", "6881")).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (&v["changed"], &v["restarting"]),
+        (&json!(true), &json!(true))
+    );
+    let after = std::fs::read_to_string(&config_path).unwrap();
+    assert!(after.contains("listen = \"127.0.0.1:6881\""), "{after}");
+    let (s, v) = site.json(post("error-reports", "on")).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("enabled = true")
+    );
+    let (s, v) = site.json(post("upload-limit-kib", "")).await;
+    assert_eq!(s, 200, "{v}");
+    assert_nothing_private(&e, &v.to_string());
+    let mut waited = 0;
+    while !e.state.restart.requested() && waited < 50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        waited += 1;
+    }
+    assert!(e.state.restart.requested(), "Arr asked to restart");
+    // The running config is the one it started with until the service manager starts it again.
+    let (_, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/settings/app", c))
+        .await;
+    assert_eq!(v["error_reports"], false);
+}
+
+#[tokio::test]
+async fn update_now_only_triggers_the_installed_updater() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/update", c))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let current = env!("CARGO_PKG_VERSION");
+    assert_eq!(v["current"], current);
+    // No automatic updates here: nothing is checked on GitHub, and nothing can be started.
+    assert_eq!(
+        (
+            &v["latest"],
+            &v["available"],
+            &v["can_update"],
+            &v["auto_updates"]
+        ),
+        (&Value::Null, &json!(false), &json!(false), &json!(false)),
+        "{v}"
+    );
+    assert_eq!(v["status"]["state"], "idle");
+    let (s, v) = site
+        .json(site.app(Method::POST, "/app/api/v1/update", c))
+        .await;
+    assert_eq!(s, 409, "{v}");
+    assert!(!e.dir.join("update-requested").exists());
+    if !cfg!(target_os = "linux") {
+        return; // the watcher check is per platform; see the installer tests
+    }
+
+    // A new release, a new-style updater and the service manager's watcher.
+    let release = axum::Router::new().route(
+        "/latest",
+        axum::routing::get(|| async {
+            r#"{"tag_name":"v99.1.0","html_url":"https://evil.example/"}"#
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, release).await.unwrap() });
+    let tools = tempfile::tempdir().unwrap();
+    let (bin, svc) = (tools.path().join("bin"), tools.path().join("svc"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&svc).unwrap();
+    std::fs::write(bin.join("arr-update"), "#!/bin/sh\n# arr-update-trigger\n").unwrap();
+    std::fs::write(svc.join("arr-update.path"), "[Path]\n").unwrap();
+    e.state.updates.set_paths(&bin, vec![svc]);
+    e.state
+        .updates
+        .set_api_url(&format!("http://{addr}/latest"));
+    let (_, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/update", c))
+        .await;
+    assert_eq!(
+        (&v["latest"], &v["available"], &v["can_update"]),
+        (&json!("99.1.0"), &json!(true), &json!(true)),
+        "{v}"
+    );
+    // The link is built by Arr, never taken from GitHub's answer.
+    assert_eq!(
+        v["release_url"],
+        "https://github.com/newtonharry/Arr/releases/tag/v99.1.0"
+    );
+    // Whatever the page sends, only the trigger is written.
+    let (s, v) = site
+        .json(
+            site.app(Method::POST, "/app/api/v1/update", c)
+                .json(&json!({ "version": "v0.0.1", "url": "http://evil.example/arr" })),
+        )
+        .await;
+    assert_eq!(s, 202, "{v}");
+    assert_eq!(v["status"]["state"], "requested");
+    let trigger = e.dir.join("update-requested");
+    assert!(trigger.is_file());
+    let text = std::fs::read_to_string(&trigger).unwrap();
+    assert!(!text.contains("evil") && !text.contains("0.0.1"), "{text}");
+    // A second tap while one is pending does nothing more.
+    let (s, _) = site
+        .json(site.app(Method::POST, "/app/api/v1/update", c))
+        .await;
+    assert_eq!(s, 409);
+    // The updater deletes the trigger and says how it went.
+    std::fs::remove_file(&trigger).unwrap();
+    let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+    std::fs::write(
+        e.dir.join("update-status.json"),
+        format!(r#"{{"state":"failed","from":"{current}","to":"99.1.0","at":"{now}"}}"#),
+    )
+    .unwrap();
+    let (_, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/update", c))
+        .await;
+    assert_eq!(v["status"]["state"], "failed", "{v}");
+    assert_eq!(v["status"]["to"], "99.1.0");
+}
+
+#[tokio::test]
+async fn health_is_plain_words_with_recent_problems_scrubbed() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    arr::logbuf::record(
+        OffsetDateTime::now_utc().unix_timestamp(),
+        &tracing::Level::WARN,
+        "arr::worker",
+        "couldn't import /srv/media/Secret Film (2020)/a.mkv for harry@example.com via http://10.1.2.3:32400/x?X-Plex-Token=abcdef0123456789",
+    );
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/system/health", c))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let items = v["items"].as_array().unwrap();
+    let ids: Vec<&str> = items.iter().filter_map(|i| i["id"].as_str()).collect();
+    for want in [
+        "plex",
+        "folders",
+        "downloads",
+        "search",
+        "updates",
+        "remote",
+    ] {
+        assert!(ids.contains(&want), "{want} in {ids:?}");
+    }
+    for i in items {
+        assert!(
+            ["ok", "warn", "bad"].contains(&i["level"].as_str().unwrap()),
+            "{i}"
+        );
+        assert!(!i["text"].as_str().unwrap().is_empty());
+    }
+    assert_nothing_private(&e, &v.to_string());
+    let problems = v["problems"].as_array().unwrap();
+    let ours = problems
+        .iter()
+        .find(|p| p["component"] == "worker")
+        .unwrap_or_else(|| panic!("{problems:?}"));
+    assert_eq!(ours["level"], "warning");
+    let msg = ours["message"].as_str().unwrap();
+    for leak in [
+        "Secret Film",
+        "/srv",
+        "harry@",
+        "10.1.2.3",
+        "abcdef0123456789",
+    ] {
+        assert!(!msg.contains(leak), "{leak} in {msg}");
+    }
+    assert!(OffsetDateTime::parse(ours["at"].as_str().unwrap(), &Rfc3339).is_ok());
+}

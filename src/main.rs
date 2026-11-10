@@ -468,13 +468,22 @@ async fn run() -> Result<std::process::ExitCode> {
         | Command::PlexSignin { .. } => "warn",
         _ => "info,arr=info",
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        let env = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| default_filter.into());
+        // The last warnings and errors are also kept in memory for the web app's Health screen.
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(env),
+            )
+            .with(arr::logbuf::layer().with_filter(tracing_subscriber::filter::LevelFilter::WARN))
+            .init();
+    }
     let result = match cli.command {
         Command::Init { state_dir, listen } => init(state_dir, listen),
         Command::Setup {
@@ -616,6 +625,7 @@ async fn run() -> Result<std::process::ExitCode> {
             Ok(())
         }
         Command::Serve { config } => {
+            arr::lifecycle::set_config_path(&config);
             let cfg = config::load(&config)?;
             let _reporting = arr::report::start(cfg.reporting, "server");
             let result = api::serve(cfg).await;

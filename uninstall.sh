@@ -329,7 +329,7 @@ if interactive && ! confirm "Go ahead?" n; then die "nothing was changed"; fi
 if [ "$DO_ARR" = 1 ]; then
 	step "Removing Arr"
 	if [ -f "$SYSTEM_UNIT" ]; then
-		for u in arr-update.timer arr-update.service arr-tunnel.service arr.service; do
+		for u in arr-update.path arr-update.timer arr-update.service arr-tunnel.service arr.service; do
 			run $SUDO systemctl disable --now "$u" >/dev/null 2>&1 || true
 			remove_file "/etc/systemd/system/$u"
 		done
@@ -337,7 +337,7 @@ if [ "$DO_ARR" = 1 ]; then
 	fi
 	udir=$(dirname "$USER_UNIT")
 	if [ -f "$USER_UNIT" ]; then
-		for u in arr-update.timer arr-update.service arr-tunnel.service arr.service; do
+		for u in arr-update.path arr-update.timer arr-update.service arr-tunnel.service arr.service; do
 			run $AS_USER systemctl --user disable --now "$u" >/dev/null 2>&1 || true
 			remove_file "$udir/$u"
 		done

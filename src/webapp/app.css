@@ -315,3 +315,27 @@ h2 .link .ic{width:16px;height:16px;stroke-width:3}
 .toast-undo{min-height:44px;min-width:44px;padding:0 14px;border:0;border-radius:10px;background:none;color:var(--toast-act);font-weight:800;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 .toast-undo[data-s=busy]{opacity:.7;cursor:progress}
 @media (min-width:760px){.toast-region{bottom:20px}}
+/* update now, settings, health */
+.upd{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:0 8px;padding:6px 14px;border:2px solid var(--teal);border-radius:12px;background:var(--card);color:var(--ink);font-weight:700}
+.upd.bad{border-color:var(--coral);color:var(--coral-ink)}
+.upd .link{min-height:44px;padding:0}
+a.link{display:inline-flex;align-items:center;padding:0 6px}
+.rows>*+*{margin-top:10px}
+.field-row{display:flex;gap:10px;margin-top:10px}
+.field-row .filter{flex:1 1 120px;min-width:0}
+.item.setting .what{display:grid;gap:2px}
+.item.setting .btn{justify-self:start;margin-top:8px}
+.item.setting .field-row .btn{margin-top:0}
+.health{align-items:flex-start}
+.health .dot{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--teal);color:var(--on-teal)}
+.health .dot .ic{width:16px;height:16px;stroke-width:3}
+.health[data-level=warn] .dot{background:var(--sun-bg);color:var(--sun-ink);box-shadow:inset 0 0 0 2px var(--sun-ink)}
+.health[data-level=bad] .dot{background:var(--coral-ink);color:var(--card)}
+.health h3{white-space:normal}
+.problems{margin-top:14px}
+.problems summary{min-height:44px;display:flex;align-items:center;cursor:pointer;font-weight:800;color:var(--teal-ink)}
+.plist{list-style:none;padding:0;display:grid;gap:8px;margin-top:6px}
+.plist li{display:grid;gap:2px;padding:8px 12px;background:var(--card);border:2px solid var(--line);border-radius:14px}
+.plist li[data-level=error]{border-color:var(--coral)}
+.p-meta{color:var(--muted);font-size:13px}
+.p-msg{font-size:14px;overflow-wrap:anywhere}

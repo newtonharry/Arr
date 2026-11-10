@@ -576,6 +576,34 @@ new item in Arrived and "*Title* needs you" for each new item in Needs you, as a
 is there. A subscription the push service answers `404` or `410` for is dropped. The service
 worker is served at `/app/sw.js` (scope `/app/`).
 
+### Update, app settings and health
+
+These take the bearer token on `/api/v1` (and the web app's session through `/app/api/v1`, which
+passes exactly these routes). All are in the OpenAPI document.
+
+- `GET /api/v1/update`: `{current, latest, available, can_update, auto_updates, release_url,
+  status}`. `latest` is GitHub's latest release, checked at most every six hours and only when
+  automatic updates are installed (`null` otherwise, or when GitHub didn't answer).
+  `can_update` is true only when the installed updater and the service manager's watcher can
+  be started from here; installs from before this existed report `false` until the installer
+  runs again. `status` is `{state, from, to, at}` from the updater's `update-status.json`
+  (`idle`, `requested`, `checking`, `up_to_date`, `updating`, `failed`, `done`).
+- `POST /api/v1/update`: no body; asks the installed updater to run. `202` with the same body
+  as `GET`; `409` when this install can't update from here, Arr is up to date, or a request is
+  already on its way. Nothing sent decides what is installed.
+- `GET /api/v1/settings/app`: `{downloading, embedded, upload_limit_kib, torrent_port,
+  error_reports, error_reports_available, tmdb_key_set, can_restart}`. Never a secret.
+- `POST /api/v1/settings/app`: `{"name", "value"}` where name is `downloading`,
+  `upload-limit-kib`, `torrent-port`, `error-reports` or `tmdb-key` (anything else is `400`).
+  It runs `arr set`'s checks and rolls every file back on failure, then restarts Arr. `409` when
+  Arr wasn't started by a service manager. A value already in place changes and restarts
+  nothing (`changed: false`).
+- `GET /api/v1/system/health`: `{items: [{id, label, level: ok|warn|bad, text}], problems:
+  [{at, level, component, message}]}`. Problems are the last 50 warnings and errors, newest
+  first, held in memory and scrubbed.
+
+(`/api/v1/settings` is unchanged: it is the imported settings document.)
+
 ### Remote MCP
 
 With `[mcp] enabled`, `POST /mcp` serves MCP over Streamable HTTP (stateless JSON) with its

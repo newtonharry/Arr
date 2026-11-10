@@ -1,9 +1,10 @@
 """A stand-in for GitHub's release pages, for the updaters in the installer tests.
 
-    python3 relserver.py PORT DIRECTORY
+    python3 relserver.py PORT DIRECTORY [VERSION]
 
-- GET or HEAD /releases/latest answers a redirect to /releases/tag/v99.0.0 (what the updaters read
-  the newest version from);
+- GET or HEAD /releases/latest answers a redirect to /releases/tag/vVERSION (what the updaters
+  read the newest version from; 99.0.0 unless VERSION is given, and an older one makes the updaters
+  find nothing to do);
 - /releases/download/<anything>/<file> serves <file> from DIRECTORY.
 
 The release in DIRECTORY holds this build, so the "new" version v99.0.0 never reports itself
@@ -15,6 +16,7 @@ import os
 import sys
 
 directory = sys.argv[2]
+version = sys.argv[3] if len(sys.argv) > 3 else "99.0.0"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -22,7 +24,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path
         if path.endswith("/releases/latest"):
             self.send_response(302)
-            self.send_header("Location", "/releases/tag/v99.0.0")
+            self.send_header("Location", "/releases/tag/v" + version)
             self.end_headers()
             return
         if path.startswith("/releases/tag/"):

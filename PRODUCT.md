@@ -62,6 +62,10 @@ Arr's interface exposes the wish and the outcome.
   button that helps. Downloads on their way say how long is left, when Arr can tell.
 - Existing JSON API covers search/discover, add to library, wanted, calendar, queue
   (pause/resume/cancel/retry), history, attention and library listing.
+- The owner can manage Arr from a phone: "Update now" when a release is out (only where
+  automatic updates are installed), a short Settings screen (downloading, upload limit, torrent
+  port, error reports, TMDB key) and a plain-words Health summary with recent problems. Secrets,
+  the Plex sign-in and the access tokens stay on the computer.
 - Shipped as a single Rust binary with embedded static assets (like the setup page); no
   separate web server, no build toolchain for users. The web app is Preact, vendored in the
   repository and written without JSX, so there is no build step for developers either.

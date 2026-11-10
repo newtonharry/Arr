@@ -34,14 +34,26 @@ fn serve(config: PathBuf) -> Result<()> {
         .append(true)
         .open(&log)
         .with_context(|| format!("cannot open {}", log.display()))?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,arr=info".into()),
-        )
-        .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(file))
-        .init();
+    {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        let env = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,arr=info".into());
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_filter(env),
+            )
+            .with(arr::logbuf::layer().with_filter(tracing_subscriber::filter::LevelFilter::WARN))
+            .init();
+    }
+    // Only a scheduled task starts this program, and it starts it again if it exits with an
+    // error (a changed setting from the web app ends it that way on purpose).
+    arr::lifecycle::mark_supervised();
+    arr::lifecycle::set_config_path(&config);
     let result = tokio::runtime::Runtime::new()?.block_on(async {
         let cfg = arr::config::load(&config)?;
         let _reporting = arr::report::start(cfg.reporting, "server");

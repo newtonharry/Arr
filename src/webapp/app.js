@@ -1297,7 +1297,7 @@ function parseHash(hash = location.hash) {
   const [path, qs] = (hash.slice(1) || '/').split('?');
   return { path, q: new URLSearchParams(qs || '').get('q') || '' };
 }
-const pageName = (path) => (path === '/search' ? 'Search' : path === '/ideas' ? 'Ideas' : path === '/library' ? 'Library' : 'Home');
+const pageName = (path) => (path === '/search' ? 'Search' : path === '/ideas' ? 'Ideas' : path === '/library' ? 'Library' : path === '/settings' ? 'Settings' : 'Home');
 const TABS = [['/', 'Home', 'home'], ['/ideas', 'Ideas', 'ideas'], ['/library', 'Library', 'library']];
 function route() {
   if (S.out) return;
@@ -1326,6 +1326,7 @@ function renderPath(path, q, hash) {
   if (path === '/search') renderSearch(q, t);
   else if (path === '/ideas') renderIdeas(t);
   else if (path === '/library') { setView({ t: 'library', tok: t }); }
+  else if (path === '/settings') renderSettings();
   else renderHome(t);
 }
 
@@ -1337,6 +1338,7 @@ function View() {
     case 'search': return h(SearchResults);
     case 'start': return h(SearchStart);
     case 'library': return h(Library, { key: V.tok, t: V.tok });
+    case 'settings': return h(Settings);
     case 'signin': return h(Signin, { google: V.google });
     default: return h(Hint, { text: V.text, role: V.role });
   }
@@ -1451,6 +1453,220 @@ function Notify() {
     err ? h('p', { class: 'notify-err', role: 'alert' }, err) : null,
     h('p', { class: 'notify-note' }, 'Get a message on this device when something is ready to watch or needs you. It goes through your browser maker’s push service (Google, Apple or Mozilla) and carries only a title. On iPhone this works from the Home Screen, on iOS 16.4 or later.'));
 }
+// ---------- updates, settings and health ----------
+const REPO = 'https://github.com/newtonharry/Arr';
+const PRIVACY = REPO + '/blob/main/docs/PRIVACY.md';
+// A read that never raises the "can't reach Arr" banner: Arr is meant to be away while it restarts.
+async function quietGet(path) {
+  try {
+    const r = await fetch('/app/api' + path, { credentials: 'same-origin', headers: { 'X-Arr-App': '1' } });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
+const errMsg = (r, fallback) => (r.data && r.data.error && r.data.error.message) || fallback;
+const whatsNew = (href) => h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, 'What’s new');
+
+// "Update now". U.phase: idle, waiting (the updater is working), done, failed.
+const U = { info: null, phase: 'idle', from: '', prevAt: null, err: '', pollT: 0, updated: '', seen: false, checkedAt: 0 };
+// The version this browser last saw, kept so a change (even a nightly one) is told once.
+function noteVersion(current) {
+  try {
+    const was = localStorage.getItem('arr.seenVersion');
+    localStorage.setItem('arr.seenVersion', current);
+    return was && was !== current ? current : '';
+  } catch { return ''; /* storage blocked: nothing to compare with */ }
+}
+async function loadUpdate() {
+  U.checkedAt = Date.now();
+  try {
+    const r = await api('/v1/update');
+    if (!r.ok) return;
+    U.info = r.data;
+    if (!U.seen) { U.seen = true; U.updated = noteVersion(r.data.current); }
+    bump();
+  } catch { /* the banner says Arr can't be reached */ }
+}
+async function startUpdate() {
+  if (U.phase === 'waiting' || !U.info) return;
+  U.err = '';
+  let r;
+  try { r = await api('/v1/update', { method: 'POST' }); } catch { return; }
+  if (!r.ok) { U.err = errMsg(r, 'Couldn’t start the update.'); bump(); return; }
+  U.phase = 'waiting'; U.from = U.info.current; U.prevAt = U.info.status ? U.info.status.at : null;
+  const since = Date.now();
+  bump(); say('Updating. Arr will be back in a minute.');
+  const poll = async () => {
+    const d = await quietGet('/v1/update');
+    if (d && d.current && d.current !== U.from) {
+      U.info = d; U.phase = 'done'; bump(); say(`Updated to ${d.current}.`);
+      setTimeout(() => location.reload(), 1800);
+      return;
+    }
+    // The updater says "failed" when the new version didn't start and the old one came back.
+    if ((d && d.status && d.status.state === 'failed' && d.status.at !== U.prevAt) || Date.now() - since > 10 * 60 * 1000) {
+      if (d) U.info = d;
+      U.phase = 'failed'; bump(); return;
+    }
+    U.pollT = setTimeout(poll, 3000);
+  };
+  U.pollT = setTimeout(poll, 3000);
+}
+function clearUpdate() { U.phase = 'idle'; U.updated = ''; U.err = ''; bump(); }
+function UpdateBar() {
+  const i = U.info;
+  const close = h('button', { type: 'button', class: 'link', onClick: clearUpdate }, 'Dismiss');
+  let line = null, bad = false;
+  if (U.phase === 'waiting') line = ['Updating… Arr will be back in a minute.'];
+  else if (U.phase === 'done') line = [`Updated to ${i.current} · `, whatsNew(`${REPO}/releases/tag/v${i.current}`)];
+  else if (U.phase === 'failed') { bad = true; line = [`The update didn’t work, so Arr is still on ${U.from}. `, close]; }
+  else if (U.err) { bad = true; line = [U.err + ' ', close]; }
+  else if (U.updated) line = [`Updated to ${U.updated} · `, whatsNew(`${REPO}/releases/tag/v${U.updated}`), ' ', close];
+  else if (i && i.available && i.can_update) line = [`Arr ${i.latest} is available · `, h('button', { type: 'button', class: 'link', id: 'update-now', onClick: startUpdate }, 'Update now')];
+  if (!line) return null;
+  return h('p', { class: 'upd' + (bad ? ' bad' : ''), id: 'update-bar', role: bad ? 'alert' : 'status' }, line);
+}
+
+// Settings: the few things a person may change from a phone. Every change restarts Arr.
+const G = { data: null, health: null, busy: '', msg: '', err: '', restarting: false, restartMsg: '', draft: { upload: '', port: '', key: '' } };
+async function loadSettings() {
+  try {
+    const r = await api('/v1/settings/app');
+    if (!r.ok) return;
+    G.data = r.data;
+    G.draft = { upload: r.data.upload_limit_kib == null ? '' : String(r.data.upload_limit_kib), port: r.data.torrent_port ? String(r.data.torrent_port) : '', key: '' };
+    bump();
+  } catch { /* the banner says Arr can't be reached */ }
+}
+async function loadHealth() {
+  try {
+    const r = await api('/v1/system/health');
+    if (r.ok) { G.health = r.data; bump(); }
+  } catch { /* the banner says Arr can't be reached */ }
+}
+async function renderSettings() {
+  G.msg = ''; G.err = '';
+  setView({ t: 'settings' });
+  await Promise.all([loadSettings(), loadHealth(), loadUpdate()]);
+}
+async function applySetting(name, value) {
+  if (G.busy || G.restarting) return;
+  G.busy = name; G.err = ''; G.msg = ''; bump();
+  let r;
+  try { r = await api('/v1/settings/app', { method: 'POST', body: { name, value } }); } catch { G.busy = ''; G.err = 'Couldn’t reach Arr. Try again.'; bump(); return; }
+  G.busy = '';
+  if (!r.ok) { G.err = errMsg(r, 'That didn’t work.'); bump(); return; }
+  if (!r.data.restarting) { G.msg = r.data.message; bump(); say(G.msg); return; }
+  G.restarting = true; G.restartMsg = r.data.message; bump(); say('Restarting. Arr will be back in a minute.');
+  waitForRestart();
+}
+// Arr ends itself and its service manager starts it again. Wait for it to go away and come back.
+function waitForRestart() {
+  const t0 = Date.now();
+  let down = false;
+  const tick = async () => {
+    const d = await quietGet('/v1/update');
+    if (!d) down = true;
+    if (d && (down || Date.now() - t0 > 25000)) {
+      G.restarting = false;
+      await Promise.all([loadSettings(), loadHealth()]);
+      G.msg = G.restartMsg; bump(); say(G.msg);
+      return;
+    }
+    if (Date.now() - t0 > 5 * 60 * 1000) { G.restarting = false; G.err = 'Arr hasn’t come back yet. Give it a minute, then reload this page.'; bump(); return; }
+    setTimeout(tick, 2000);
+  };
+  setTimeout(tick, 2500);
+}
+function SwitchRow({ id, title, meta, on, disabled, onToggle }) {
+  return h('div', null, h('button', { type: 'button', role: 'switch', class: 'switch', id, 'aria-checked': String(on), 'aria-labelledby': id + '-t', 'aria-describedby': id + '-m', disabled, 'data-fk': id, onClick: onToggle },
+    h('span', { class: 'what' }, h('span', { class: 'sw-t', id: id + '-t' }, title), h('span', { class: 'sw-m', id: id + '-m' }, meta)),
+    h('span', { class: 'track', 'aria-hidden': 'true' }, h('i'))));
+}
+function FieldRow({ id, title, meta, value, saveLabel, type, inputmode, disabled, placeholder, onInput, onSave }) {
+  return h('form', { class: 'item setting', onSubmit: (e) => { e.preventDefault(); onSave(); } },
+    h('div', { class: 'what' },
+      h('label', { class: 'sw-t', for: id }, title),
+      h('span', { class: 'sw-m', id: id + '-m' }, meta),
+      h('div', { class: 'field-row' },
+        h('input', { id, class: 'filter', type, inputmode, value, placeholder, disabled, autocomplete: 'off', autocapitalize: 'off', spellcheck: false, 'aria-describedby': id + '-m', onInput: (e) => onInput(e.target.value) }),
+        h('button', { type: 'submit', class: 'btn', disabled }, saveLabel))));
+}
+const HEALTH_WORD = { ok: 'OK', warn: 'Needs a look', bad: 'Problem' };
+function HealthRow({ it }) {
+  return h('li', { class: 'item health', 'data-level': it.level },
+    h('span', { class: 'dot', 'aria-hidden': 'true' }, ic(it.level === 'ok' ? 'check' : 'alert')),
+    h('div', { class: 'what' }, h('h3', null, it.label, h('span', { class: 'sr' }, ': ' + (HEALTH_WORD[it.level] || ''))), h('p', null, it.text)));
+}
+function when(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString(undefined, { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
+function HealthSection() {
+  const hd = G.health;
+  if (!hd) return h(Section, { id: 'health', title: 'Health' }, h(Hint, { text: 'Checking…' }));
+  const probs = hd.problems || [];
+  return h(Section, { id: 'health', title: 'Health', extra: h('button', { type: 'button', class: 'link', onClick: loadHealth }, 'Check again') },
+    h('ul', { class: 'list' }, hd.items.map((it) => h(HealthRow, { key: it.id, it }))),
+    h('details', { class: 'problems' },
+      h('summary', null, probs.length ? `Recent problems (${probs.length})` : 'Recent problems'),
+      probs.length
+        ? h('ul', { class: 'plist' }, probs.map((p, n) => h('li', { key: n + p.at, 'data-level': p.level },
+          h('span', { class: 'p-meta' }, when(p.at), ' · ', p.component, p.level === 'error' ? ' · error' : ''), h('span', { class: 'p-msg' }, p.message))))
+        : h('p', { class: 'hint' }, 'Nothing has gone wrong lately.')));
+}
+function UpdatesSection() {
+  const i = U.info;
+  if (!i) return null;
+  let line;
+  if (!i.auto_updates) line = 'Automatic updates are off. To update, run the installer again on the computer that runs Arr.';
+  else if (i.available && !i.can_update) line = `Arr ${i.latest} is available. To update from here, run the installer again on the computer that runs Arr.`;
+  else if (i.available) line = `Arr ${i.latest} is available.`;
+  else if (i.latest) line = 'Arr is up to date.';
+  else line = 'Couldn’t check for a newer version just now.';
+  return h(Section, { id: 'updates', title: 'Updates' },
+    h('div', { class: 'item setting' }, h('div', { class: 'what' },
+      h('span', { class: 'sw-t' }, `Arr ${i.current}`), h('span', { class: 'sw-m' }, line),
+      i.available && i.can_update && U.phase === 'idle' ? h('button', { type: 'button', class: 'btn', onClick: startUpdate }, 'Update now') : null,
+      i.available && i.release_url ? h('p', { class: 'sw-m' }, whatsNew(i.release_url)) : null)));
+}
+function Settings() {
+  if (G.restarting) {
+    return h('section', { class: 'empty', 'aria-labelledby': 'h-restart' }, h('img', { src: '/app/mascot.svg', alt: '' }),
+      h('h2', { id: 'h-restart' }, 'Restarting…'), h('p', { role: 'status' }, 'Arr will be back in a minute.'));
+  }
+  const d = G.data;
+  if (!d) return h(Hint, { text: 'Loading settings…' });
+  const lock = !d.can_restart || !!G.busy;
+  const busy = (n) => G.busy === n;
+  return h('div', { class: 'stack' },
+    !d.can_restart ? h('p', { class: 'hint', role: 'note' }, 'Arr isn’t running as a service on its computer, so it can’t restart itself. Change these there with “arr set”.') : null,
+    G.err ? h('p', { class: 'msg', role: 'alert', 'data-err': '' }, G.err) : null,
+    G.msg ? h('p', { class: 'msg', role: 'status' }, G.msg) : null,
+    h(Section, { id: 'dl', title: 'Downloads' }, h('div', { class: 'rows' },
+      h(SwitchRow, { id: 'set-dl', title: 'Downloading', on: d.downloading, disabled: lock,
+        meta: d.downloading ? 'On. Arr gets what you ask for and adds it to your library.' : 'Off. Arr keeps your list, but downloads nothing and adds nothing to your library.',
+        onToggle: () => applySetting('downloading', d.downloading ? 'off' : 'on') }),
+      d.embedded ? h(Fragment, null,
+        h(FieldRow, { id: 'set-up', title: 'Upload limit', meta: 'KiB per second. Leave it blank for no limit.', value: G.draft.upload, type: 'text', inputmode: 'numeric', placeholder: 'No limit', disabled: lock,
+          saveLabel: busy('upload-limit-kib') ? 'Saving…' : 'Save', onInput: (v) => { G.draft.upload = v; bump(); }, onSave: () => applySetting('upload-limit-kib', G.draft.upload.trim()) }),
+        h(FieldRow, { id: 'set-port', title: 'Torrent port', meta: 'The port Arr listens on for other people sharing the same file.', value: G.draft.port, type: 'text', inputmode: 'numeric', disabled: lock,
+          saveLabel: busy('torrent-port') ? 'Saving…' : 'Save', onInput: (v) => { G.draft.port = v; bump(); }, onSave: () => applySetting('torrent-port', G.draft.port.trim()) })) : null)),
+    h(Section, { id: 'privacy', title: 'Privacy' }, h('div', { class: 'rows' },
+      h(SwitchRow, { id: 'set-reports', title: 'Send error reports', on: d.error_reports, disabled: lock || !d.error_reports_available,
+        meta: !d.error_reports_available ? 'Off. This copy of Arr has nowhere to send reports.'
+          : d.error_reports ? 'On. When something breaks, Arr sends its developer a short note with names, files, addresses and keys taken out.' : 'Off. Nothing is sent. Turn it on to send its developer a short note, with names, files, addresses and keys taken out, when something breaks.',
+        onToggle: () => applySetting('error-reports', d.error_reports ? 'off' : 'on') }),
+      h('p', { class: 'hint' }, h('a', { href: PRIVACY, target: '_blank', rel: 'noopener noreferrer' }, 'What is and isn’t sent')))),
+    h(Section, { id: 'tmdb', title: 'Movie details' },
+      h(FieldRow, { id: 'set-tmdb', title: 'TMDB key', meta: d.tmdb_key_set ? 'Set. Paste a new key to replace it.' : 'Not set. Paste a key to add TMDB details and posters.', value: G.draft.key, type: 'password', disabled: lock,
+        placeholder: d.tmdb_key_set ? '••••••••' : 'Paste your key', saveLabel: busy('tmdb-key') ? 'Checking…' : d.tmdb_key_set ? 'Replace key' : 'Save key',
+        onInput: (v) => { G.draft.key = v; bump(); }, onSave: () => { if (G.draft.key.trim()) applySetting('tmdb-key', G.draft.key.trim()); } })),
+    d.can_restart ? h('p', { class: 'hint' }, 'Changing a setting restarts Arr. It’s back in about a minute.') : null,
+    h(UpdatesSection),
+    h(HealthSection));
+}
+
 function Footer() {
   const [open, setOpen] = useState(false);
   const shown = useRef(false);
@@ -1460,7 +1676,9 @@ function Footer() {
   }, [open]);
   const me = S.me || {};
   return h('footer', { class: 'foot', id: 'foot', hidden: !S.me || S.out, inert: P.shown },
+    h(UpdateBar),
     h('span', { id: 'who' }, S.me ? (me.email ? 'Signed in as ' + me.email : 'Signed in') : null),
+    h('a', { class: 'link', id: 'settings-link', href: '#/settings' }, 'Settings'),
     h('button', { type: 'button', class: 'link', id: 'phone-btn', 'aria-expanded': String(open), 'aria-controls': 'phone', onClick: () => setOpen(!open) }, 'Use Arr on your phone'),
     h('button', { type: 'button', class: 'link', id: 'signout', onClick: signOut }, 'Sign out'),
     h('section', { class: 'phone', id: 'phone', 'aria-label': 'Use Arr on your phone', hidden: !open }, open && S.me ? h(Phone, { url: me.public_url || null }) : null),
@@ -1536,6 +1754,8 @@ async function boot() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && onHome()) loadFeed(); else clearTimeout(pollT);
     if (!document.hidden && P.shown) loadTitle(true);
+    // The server remembers its release check for six hours; asking now and then is cheap.
+    if (!document.hidden && S.me && U.phase === 'idle' && Date.now() - U.checkedAt > 30 * 60 * 1000) loadUpdate();
   });
   window.addEventListener('hashchange', route);
   try {
@@ -1550,11 +1770,12 @@ async function boot() {
   route();
   // The feed also says whether TMDB is used, which the footer credit needs on every screen.
   if (!onHome()) loadFeed();
+  if (!U.checkedAt) loadUpdate();
 }
 async function boot2() {
   try {
     const r = await api('/me');
-    if (r.ok) { S.me = r.data; bump(); route(); if (!onHome()) loadFeed(); }
+    if (r.ok) { S.me = r.data; bump(); route(); if (!onHome()) loadFeed(); if (!U.checkedAt) loadUpdate(); }
   } catch { if (!S.out) setTimeout(boot2, 5000); }
 }
 document.body.replaceChildren();
