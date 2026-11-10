@@ -545,8 +545,13 @@ fn d_rescan_hours() -> u64 {
 fn d_poll() -> u64 {
     30
 }
+/// Minutes without any download progress before a grab is failed, blocklisted and searched
+/// again. Progress at any poll resets the clock, so a slow download that keeps moving is never
+/// failed; only one that does not move at all is. 90 minutes outlasts a torrent that is merely
+/// slow to find peers or fetch its metadata, yet a dead one is replaced the same evening
+/// instead of the next day.
 fn d_stall() -> u64 {
-    720
+    90
 }
 
 #[derive(Deserialize)]
@@ -2033,6 +2038,16 @@ pub fn template(listen: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stall_timeout_defaults_to_ninety_minutes_and_an_explicit_value_wins() {
+        assert_eq!(d_stall(), 90);
+        assert_eq!(AutomationSection::default().stall_timeout_minutes, 90);
+        let a: AutomationSection = toml::from_str("stall_timeout_minutes = 720\n").unwrap();
+        assert_eq!(a.stall_timeout_minutes, 720);
+        let a: AutomationSection = toml::from_str("poll_seconds = 30\n").unwrap();
+        assert_eq!(a.stall_timeout_minutes, 90);
+    }
 
     fn setup(config: &str) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();

@@ -421,7 +421,7 @@ fn matrix_releases() -> Vec<Value> {
     let mut v = vec![
         release("The.Matrix.1999.1080p.WEB-DL.DDP5.1.H.264-GRP", 8.0, 40),
         release("The.Matrix.1999.720p.BluRay.x264-GRP", 5.0, 90),
-        release("The.Matrix.1999.REPACK.1080p.WEB-DL.H.264-GRP", 8.1, 3),
+        release("The.Matrix.1999.REPACK.1080p.WEB-DL.H.264-GRP", 8.1, 40),
         release("The.Matrix.Reloaded.2003.1080p.WEB-DL.H.264", 8.0, 100),
         release("The.Matrix.Trilogy.1999-2003.1080p.WEB-DL", 25.0, 100),
         release("The.Matrix.1999.HDCAM.x264", 1.0, 100),
