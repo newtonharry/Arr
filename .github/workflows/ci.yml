@@ -41,6 +41,7 @@ jobs:
         run: |
           sh tests/installer/macos-boot.sh target/release/arr
           sh tests/installer/linger.sh target/release/arr
+          sh tests/installer/update-now.sh target/release/arr
       # Auto-update rolls back to the previous binary when the new one is not healthy, so the
       # latest published release must still start on what this build (its install.sh, its setup
       # page, its API) wrote, and back.
@@ -347,6 +348,18 @@ jobs:
           if (-not (Healthy)) { Fail 'Arr was left stopped by the rollback' }
           if ("$(ArrPid)" -eq "$before" -or -not (ArrPid)) { Fail 'the updater did not restart Arr' }
           CheckBootTasks 'after the updater'
+          # "Update now" in the web app: the status the updater wrote (what the app shows), and
+          # Arr's own way of starting the updater, which is to run its task as the task's user.
+          $status = Get-Content "$state\update-status.json" -Raw | ConvertFrom-Json
+          if ($status.state -ne 'failed' -or $status.to -ne '99.0.0') { Fail "update-status.json says: $($status | ConvertTo-Json -Compress)" }
+          if ((Get-Content "$bin\arr-update.ps1" -Raw) -notmatch 'arr-update-trigger') { Fail 'the updater does not know about Update now' }
+          $env:ARR_RELEASES_URL = $null
+          schtasks /Run /TN 'Arr update' | Out-Null
+          if ($LASTEXITCODE -ne 0) { Fail "schtasks /Run 'Arr update' failed ($LASTEXITCODE): the app could not start the updater" }
+          # (The task would contact GitHub; this only proves the right to start it.)
+          schtasks /End /TN 'Arr update' | Out-Null
+          Start-Sleep -Seconds 2
+          if (-not (Healthy)) { Fail 'Arr does not answer after starting the update task' }
           # ARR_AT_BOOT=0 with nobody to ask can't take the boot tasks away (that needs an administrator): they stay.
           $env:ARR_RELEASES_URL = $null; $env:ARR_AT_BOOT = '0'
           Get-Content install.ps1 -Raw | Invoke-Expression

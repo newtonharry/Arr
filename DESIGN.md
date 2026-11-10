@@ -267,6 +267,11 @@ A calm line of plain-text labels, "IMDb 7.8 · Critics 96% · Audience 87%" (14p
 ### Switch
 - **Notifications:** a 52x32px pill (2px warm border, cream fill) with a 22px knob. On, it fills teal and the knob turns on-teal and slides right. It sits in the footer beside its plain state in muted text ("On", "Off", "Blocked in your browser settings", "Add Arr to your Home Screen first"), with a 13px muted privacy line below. Disabled is 50% opacity. The tap target is padded to 44px.
 
+### Update Bar, Settings and Health
+- **Update bar:** one line at the top of the footer in a card with a 2px teal border ("Arr 0.12.1 is available · Update now"; coral border for "The update didn't work"). Its action is a link button; it is a polite status, or an alert when something failed.
+- **Settings:** sections as plain h2 labels over Item Rows. On/off settings use the Switch row (title, a muted line saying what the state means). Values are an Item Row with a label, a muted line, and a 44px input beside a teal Save button. Changing anything shows the mascot with "Restarting…" until Arr answers again.
+- **Health:** one Item Row per check with a 28px round mark: teal check for OK; sun-yellow ring with "!" for needs a look; coral with "!" for a problem. The word ("OK", "Needs a look", "Problem") is in the row for screen readers, so colour is never the only signal. "Recent problems" is a details list of cards: muted time and component, then the message.
+
 ### Journey Line
 The signature. A 36px-tall four-stop track under any item on its way: Found, Downloading, Checking, In Plex. A 3px warm-line rail with a teal fill that scales from the left (`scaleX`, 0.9s `cubic-bezier(0.16, 1, 0.3, 1)`) as Arr works; stops are 11px circles, hollow until reached, solid teal when on; stop one is left-aligned, stop four right-aligned, two and three centred at one third and two thirds. The current stop's label is ink 800, others muted 600 at 12px. Paused turns the fill muted grey. The last stop, In Plex, is reached only when the row moves to Arrived.
 

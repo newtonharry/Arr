@@ -45,6 +45,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
 mod options;
+mod system;
 mod titles;
 
 /// Every route, for the OpenAPI coverage test: (method, path).
@@ -106,6 +107,11 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/show/{media_id}/season/{n}"),
     ("get", "/api/v1/movie/{media_id}"),
     ("get", "/api/v1/rss"),
+    ("get", "/api/v1/update"),
+    ("post", "/api/v1/update"),
+    ("get", "/api/v1/settings/app"),
+    ("post", "/api/v1/settings/app"),
+    ("get", "/api/v1/system/health"),
     ("get", "/api/v1/setup"),
     ("post", "/api/v1/setup"),
     ("get", "/api/v1/setup/plex"),
@@ -165,6 +171,12 @@ pub struct AppState {
     pub(crate) setup_lock: tokio::sync::Mutex<()>,
     slots: Arc<Semaphore>,
     started_at: OffsetDateTime,
+    /// Release check and "Update now" (see `selfupdate.rs`).
+    pub updates: crate::selfupdate::Updates,
+    /// Ends the process so the service manager starts it again (a changed setting).
+    pub restart: crate::lifecycle::Restart,
+    /// One setting is changed at a time (each edits the config file).
+    settings_lock: tokio::sync::Mutex<()>,
 }
 
 type St = State<Arc<AppState>>;
@@ -280,6 +292,9 @@ impl AppState {
             setup_lock: tokio::sync::Mutex::new(()),
             slots: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
             started_at: now,
+            updates: crate::selfupdate::Updates::new(&cfg.state_dir),
+            restart: crate::lifecycle::Restart::default(),
+            settings_lock: tokio::sync::Mutex::new(()),
             active: RwLock::new(loaded),
             store,
             cfg,
@@ -801,6 +816,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/show/{media_id}/season/{n}", get(titles::season))
         .route("/api/v1/movie/{media_id}", get(titles::movie))
         .route("/api/v1/rss", get(rss_status))
+        .route(
+            "/api/v1/update",
+            get(system::update_get).post(system::update_post),
+        )
+        .route(
+            "/api/v1/settings/app",
+            get(system::app_settings_get).post(system::app_settings_post),
+        )
+        .route("/api/v1/system/health", get(system::system_health))
         .route("/api/v1/setup", get(setup_status).post(setup_apply))
         .route("/api/v1/setup/plex", get(setup_plex))
         .route(
@@ -3669,9 +3693,13 @@ pub async fn serve(cfg: RuntimeConfig) -> anyhow::Result<()> {
         );
     }
     let served = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown().await;
-            stop_mcp();
+        .with_graceful_shutdown({
+            let state = state.clone();
+            async move {
+                // A signal, or a changed setting that needs Arr to start again.
+                tokio::select! { () = shutdown() => {}, () = state.restart.wait() => {} }
+                stop_mcp();
+            }
         })
         .await;
     // The worker finishes its current pass and exits; then the engine records its counters,
@@ -3691,6 +3719,12 @@ pub async fn serve(cfg: RuntimeConfig) -> anyhow::Result<()> {
         e.shutdown().await;
     }
     served?;
+    if state.restart.requested() {
+        // Everything is stopped. A non-zero exit is what makes systemd and the Windows task
+        // start Arr again (launchd does after any exit); see `lifecycle.rs`.
+        tracing::info!("restarting to use a changed setting");
+        std::process::exit(crate::lifecycle::RESTART_EXIT);
+    }
     Ok(())
 }
 

@@ -108,9 +108,53 @@ sudo grep -A1 '^\[reporting\]$' "$state/config.toml" | grep -q '^enabled = false
 [ "$(arr_pid)" != "$pid" ] || fail "a rerun that changed a setting didn't restart Arr"
 still_running "a rerun with --no-error-reports"
 
+echo "== update now: systemd starts the updater when the web app's request file appears"
+# A stand-in for GitHub's release pages whose newest release is older than this one, so the
+# updater has nothing to install; the service manager passes it the address.
+relsrv_dir=$(mktemp -d)
+python3 tests/installer/relserver.py 8995 "$relsrv_dir" 0.0.1 &
+relsrv=$!
+trap 'kill $server $relsrv 2>/dev/null || true; sudo systemctl unset-environment ARR_RELEASES_URL 2>/dev/null || true' EXIT
+sleep 1
+sudo systemctl set-environment ARR_RELEASES_URL=http://127.0.0.1:8995/releases
+# shellcheck disable=SC2086
+if sudo -E sh install.sh --yes --auto-update >auto.out 2>&1; then cat auto.out; fail "the public check passed on a rerun"; fi
+ends_at_public_check auto.out "a rerun turning automatic updates on"
+unit=/etc/systemd/system/arr-update.path
+sudo test -f "$unit" || fail "no arr-update.path"
+sudo grep -qx "PathExists=$state/update-requested" "$unit" || { sudo cat "$unit"; fail "the path unit watches the wrong file"; }
+sudo grep -qx 'Unit=arr-update.service' "$unit" || fail "the path unit starts the wrong service"
+systemctl is-active arr-update.path >/dev/null || fail "arr-update.path isn't active"
+systemctl is-enabled arr-update.path >/dev/null || fail "arr-update.path isn't enabled"
+if command -v systemd-analyze >/dev/null 2>&1; then
+	sudo systemd-analyze verify "$unit" /etc/systemd/system/arr-update.service || fail "systemd finds a problem with the path unit"
+fi
+sudo grep -q 'arr-update-trigger' /usr/local/bin/arr-update || fail "the updater doesn't know the request file"
+# What Arr does: it makes the file (as the user that runs it, not root) and nothing else.
+rm -f "$state/update-status.json"
+touch "$state/update-requested"
+i=0
+until grep -q '"state":"up_to_date"' "$state/update-status.json" 2>/dev/null; do
+	i=$((i + 1))
+	[ "$i" -lt 60 ] || { sudo journalctl -u arr-update --no-pager | tail -n 20; fail "the updater didn't run after the request"; }
+	sleep 1
+done
+[ ! -e "$state/update-requested" ] || fail "the updater left the request file"
+python3 - "$state/update-status.json" <<'PY' || fail "update-status.json isn't what Arr reads"
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert s["state"] == "up_to_date" and s["to"] == "0.0.1" and s["from"].count(".") == 2 and s["at"].endswith("Z"), s
+PY
+# One request, one run: the file is gone, so systemd does not start it again.
+sleep 3
+[ "$(sudo journalctl -u arr-update --no-pager | grep -c 'arr-update: up to date')" = 1 ] || fail "one request ran the updater more than once"
+still_running "an update request"
+kill $relsrv 2>/dev/null || true
+sudo systemctl unset-environment ARR_RELEASES_URL
+
 echo "== uninstall Arr and its data"
 sudo sh uninstall.sh --yes --arr --delete-data
-for u in arr arr-tunnel arr-update.timer; do
+for u in arr arr-tunnel arr-update.timer arr-update.path; do
 	[ ! -e "/etc/systemd/system/$u.service" ] && [ ! -e "/etc/systemd/system/$u" ] || fail "$u is still installed"
 done
 [ ! -e /usr/local/bin/arr ] || fail "the arr program is still there"

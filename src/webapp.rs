@@ -777,6 +777,9 @@ fn allowed(method: &Method, path: &str) -> bool {
         Method::GET => matches!(
             parts.as_slice(),
             ["feed"]
+                | ["update"]
+                | ["settings", "app"]
+                | ["system", "health"]
                 | ["storage"]
                 | ["ideas"]
                 | ["discover"]
@@ -788,6 +791,8 @@ fn allowed(method: &Method, path: &str) -> bool {
         ),
         Method::POST => match parts.as_slice() {
             ["quick-add" | "follow" | "stop" | "quality" | "remove"] => true,
+            // Update now, and a changed setting: signed-in household members only, like the rest.
+            ["update"] | ["settings", "app"] => true,
             ["ideas", "hide"] => true,
             ["copies", id, "get"] => !id.is_empty(),
             ["queue", id, "retry"] => !id.is_empty(),

@@ -55,6 +55,15 @@ Reports never contain your config, your Plex token, your library, what you've se
 downloaded, or your logs. Messages are cut off after 2,000 characters. The cleaning rules are in
 [`src/report.rs`](../src/report.rs), with tests that check them.
 
+## The version check and the recent-problems list
+
+Two things that are not error reports. When automatic updates are on, Arr asks GitHub for the
+latest release (`api.github.com`, at most every six hours) to show "an update is available";
+GitHub sees your address, as any website would, and Arr sends nothing about you. And the Health
+screen shows the last 50 warnings and errors Arr logged: they are kept only in memory (gone at
+restart), pass through the same scrubber as reports before they are stored, and are shown only
+to people signed in to your Arr. They are never sent anywhere.
+
 ## Where reports go
 
 To Arr's project on [Sentry](https://sentry.io), stored in Sentry's EU region (Germany). Only

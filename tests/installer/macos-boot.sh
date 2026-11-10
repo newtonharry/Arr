@@ -281,6 +281,12 @@ install_sh --yes --at-boot --auto-update >"$w/out" 2>&1 || { cat "$w/out"; fail 
 grep -q "<key>UserName</key><string>$(id -un)</string>" "$daemons/io.github.newtonharry.arr-update.plist" || fail "the update daemon doesn't run as you"
 [ ! -e "$agents/io.github.newtonharry.arr-update.plist" ] || fail "an update login item is left next to the daemon"
 [ -x "$bin/arr-update" ] || fail "no updater"
+# "Update now" in the web app: it puts a file in update-queue, which launchd (QueueDirectories)
+# watches for; unlike WatchPaths that doesn't run the job again when the updater deletes it.
+grep -q "<key>QueueDirectories</key><array><string>$state/update-queue</string></array>" "$daemons/io.github.newtonharry.arr-update.plist" || fail "the update daemon doesn't watch the request folder"
+[ -d "$state/update-queue" ] || fail "no request folder"
+grep -q 'arr-update-trigger' "$bin/arr-update" || fail "the updater doesn't know the request file"
+touch "$state/update-queue/requested"
 # "v99.0.0" is served, but the binary in it is this one, so Arr answers as the old version:
 # the updater must see the new one never became healthy and put the old binary back.
 cp "$bin/arr" "$w/arr.before"
@@ -289,6 +295,8 @@ old=$(arr_pid)
 if sh "$bin/arr-update" >"$w/upd" 2>&1; then cat "$w/upd"; fail "the updater called a version that never answered a success"; fi
 cat "$w/upd"
 grep -q 'updating v.* to v99.0.0' "$w/upd" || fail "the updater didn't try the update"
+[ -z "$(ls "$state/update-queue")" ] || fail "the updater left the request in the folder (launchd would run it again)"
+grep -q '"state":"failed"' "$state/update-status.json" || { cat "$state/update-status.json"; fail "a rolled-back update isn't reported as failed"; }
 grep -q "v99.0.0 didn't start; going back" "$w/upd" || fail "the updater didn't roll back"
 ! grep -q "didn't start either" "$w/upd" || fail "the old version didn't come back"
 [ "$(sudo_calls)" = 0 ] || fail "the updater called sudo"

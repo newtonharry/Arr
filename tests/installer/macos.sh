@@ -161,6 +161,23 @@ curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "Arr was left s
 new=$(daemon_pid)
 [ -n "$new" ] && [ "$new" != "$pid" ] || fail "the updater never restarted the daemon"
 
+echo "== update now: launchd watches the request folder, and the updater empties it first"
+# The web app puts a file in update-queue; launchd runs the update job while the folder has one
+# (QueueDirectories, which unlike WatchPaths doesn't run again when the file is deleted).
+plist="$daemons/$label.arr-update.plist"
+plutil -lint "$plist" >/dev/null || fail "the update job's plist is not valid"
+grep -q "<key>QueueDirectories</key><array><string>$state/update-queue</string></array>" "$plist" || { cat "$plist"; fail "the update job doesn't watch the request folder"; }
+[ -d "$state/update-queue" ] || fail "no request folder"
+sudo launchctl print "system/$label.arr-update" 2>/dev/null | grep -q 'update-queue' || echo "(launchctl print doesn't list the queue directory here; not required)"
+grep -q 'arr-update-trigger' "$HOME/.local/bin/arr-update" || fail "the updater doesn't know the request file"
+# launchd cannot be handed this test's release server, so the request is answered by hand.
+touch "$state/update-queue/requested"
+ARR_RELEASES_URL=http://127.0.0.1:8996/releases PATH="$shim:$PATH" sh "$HOME/.local/bin/arr-update" >update2.out 2>&1 || true
+[ -z "$(ls "$state/update-queue")" ] || fail "the updater left the request in the folder (launchd would run it again)"
+[ -f "$state/update-status.json" ] || fail "no update-status.json"
+grep -q '"state":"failed"' "$state/update-status.json" || { cat "$state/update-status.json"; fail "the status after a rolled-back update isn't failed"; }
+curl -fsS http://127.0.0.1:8787/api/v1/health >/dev/null || fail "Arr was left stopped by the rollback"
+
 echo "== running as root on a Mac is refused"
 if sudo sh install.sh --yes >root.out 2>&1; then cat root.out; fail "install.sh ran as root on a Mac"; fi
 grep -q 'without sudo' root.out || { cat root.out; fail "the refusal doesn't say to run it without sudo"; }
