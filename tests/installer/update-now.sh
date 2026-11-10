@@ -133,6 +133,38 @@ run_updater "http://127.0.0.1:$oldport/releases" || { cat "$w/upd"; fail "the up
 [ ! -e "$state/update-requested" ] && [ ! -L "$state/update-requested" ] || fail "a link left as the request would start the updater again and again"
 rm -f "$state/update-queue"
 
+echo "== as root, everything in the state folder is done as the account Arr runs as (baked in), never by root"
+# Stand-ins: id says root, and setpriv records who it was asked to become, then runs the command.
+mkdir -p "$w/root/bin"
+cat >"$w/root/bin/id" <<'EOF'
+#!/bin/sh
+if [ "$1" = -u ]; then echo 0; else exec /usr/bin/id "$@"; fi
+EOF
+cat >"$w/root/bin/setpriv" <<'EOF'
+#!/bin/sh
+echo "$1" >>"$FAKE_DIR/setpriv.log"
+while [ "$1" != sh ]; do shift; done
+exec "$@"
+EOF
+chmod +x "$w/root/bin"/*
+grep -q "^OWNER='$(id -un)'$" "$bin/arr-update" || fail "the updater doesn't carry the account Arr runs as"
+touch "$state/update-requested"
+rm -f "$state/update-status.json" "$FAKE_DIR/setpriv.log"
+PATH="$w/root/bin:$PATH" run_updater "http://127.0.0.1:$oldport/releases" || { cat "$w/upd"; fail "the updater failed as 'root'"; }
+[ "$(sort -u "$FAKE_DIR/setpriv.log")" = "--reuid=$(id -un)" ] || { cat "$FAKE_DIR/setpriv.log"; fail "root wrote in the state folder without becoming the account Arr runs as"; }
+[ "$(grep -c . "$FAKE_DIR/setpriv.log")" -ge 2 ] || fail "the request removal and the status were not both done as that account"
+[ ! -e "$state/update-requested" ] || fail "the request wasn't removed"
+status_is up_to_date || fail "no status after the run as 'root'"
+# With neither tool, root does nothing there (and says nothing): no status.
+rm -f "$state/update-status.json"
+mkdir -p "$w/notools"
+for t in sh dirname mktemp cat chmod mv rm date printf curl sed awk tr cut grep ls head sort env flock uname mkdir stat; do
+	p=$(command -v "$t" 2>/dev/null) && [ -x "$p" ] && ln -sf "$p" "$w/notools/$t"
+done
+cp "$w/root/bin/id" "$w/notools/id"
+if PATH="$w/notools" ARR_RELEASES_URL="http://127.0.0.1:$oldport/releases" /bin/sh "$bin/arr-update" >"$w/upd" 2>&1; then :; fi
+[ ! -e "$state/update-status.json" ] || fail "root wrote the status itself with no way to become the account"
+
 echo "== no request, no leftover: a daily run leaves no request file behind"
 run_updater "http://127.0.0.1:$oldport/releases" || fail "the daily run failed"
 [ ! -e "$state/update-requested" ] || fail "a daily run made a request file"

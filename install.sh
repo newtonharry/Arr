@@ -1536,9 +1536,10 @@ if [ "$AUTO_UPDATE" = 1 ]; then
 	step "Turning on automatic updates"
 	{
 		printf '#!/bin/sh\n# Arr updater, written by install.sh. A daily job runs it; you can run it by hand too.\n'
-		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\nCONFIG=%s\nLD_DIR=%s\nSTATE_DIR=%s\n' \
+		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\nCONFIG=%s\nLD_DIR=%s\nSTATE_DIR=%s\nOWNER=%s\n' \
 			"$(sq "$REPO")" "$(sq "$ARR")" "$(sq "$target")" "$(sq "$kind")" "$(sq "$PORT")" \
-			"$(sq "$lock_kind")" "$(sq "$lock_tool")" "$(sq "$CONFIG")" "$(sq "$LD_DIR")" "$(sq "$STATE_DIR")"
+			"$(sq "$lock_kind")" "$(sq "$lock_tool")" "$(sq "$CONFIG")" "$(sq "$LD_DIR")" "$(sq "$STATE_DIR")" \
+			"$(sq "$({ [ "$(id -u)" = 0 ] && printf '%s' "$RUN_AS"; } || id -un)")"
 		cat <<'EOF'
 set -eu
 log() { printf 'arr-update: %s\n' "$*"; }
@@ -1547,30 +1548,31 @@ log() { printf 'arr-update: %s\n' "$*"; }
 # file goes first thing, so a run that fails can't start itself again, and update-status.json
 # says how it went.
 #
-# The state folder belongs to the account that runs Arr, and this may run as root (a system
-# install), so nothing here trusts what is in it: the request is removed by its one fixed name
-# (no globbing, no walking a folder), and only if it is a file or a link (a folder in its
-# place is left alone); and the status file is written by that account, never by root.
+# The state folder belongs to the account that runs Arr (OWNER, fixed when this was written, never
+# looked up from the folder), and this may run as root (a system install). Root therefore touches
+# nothing in that folder: whatever is done there is done as OWNER, through setpriv or runuser, so a
+# link or a swapped folder could only reach what that account could already change anyway. With
+# neither tool, or with no OWNER, nothing is done: no status (the page treats it as unknown).
+# owner_sh SCRIPT ARG: runs `sh -c SCRIPT sh ARG` as OWNER.
+owner_sh() {
+	if [ "$(id -u)" != 0 ]; then sh -c "$1" sh "$2"
+	elif [ -z "$OWNER" ]; then return 1
+	elif [ "$OWNER" = root ]; then sh -c "$1" sh "$2"
+	elif command -v setpriv >/dev/null 2>&1; then
+		setpriv --reuid="$OWNER" --regid="$(id -g "$OWNER")" --init-groups sh -c "$1" sh "$2"
+	elif command -v runuser >/dev/null 2>&1; then runuser -u "$OWNER" -- sh -c "$1" sh "$2"
+	else return 1; fi
+}
+STATUS_FILE="$STATE_DIR/update-status.json"
+# The request goes by its one fixed name: no globbing, no walking a folder, a link is unlinked and
+# never followed (left in place it would start this again and again).
 if [ "$KIND" = launchd ]; then TRIGGER="$STATE_DIR/update-queue/requested"; else TRIGGER="$STATE_DIR/update-requested"; fi
-# (A link is unlinked, never followed: left in place it would start this again and again.)
-if [ -f "$TRIGGER" ] || [ -L "$TRIGGER" ]; then rm -f "$TRIGGER" 2>/dev/null || true; fi
-# status STATE FROM TO: a new file renamed over the old one, so Arr never reads half of it. As
-# root it is made as the state folder's owner (setpriv or runuser), so a link swapped in by that
-# account could only reach files it could already write; with neither tool there is no status.
+owner_sh 'if [ -f "$1" ] || [ -L "$1" ]; then rm -f "$1"; fi' "$TRIGGER" 2>/dev/null || true
+# status STATE FROM TO: a new file renamed over the old one, so Arr never reads half of it.
 status() {
-	[ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || return 0
+	[ "$(id -u)" != 0 ] || { [ -n "$OWNER" ] && [ "$OWNER" != root ]; } || return 0
 	json=$(printf '{"state":"%s","from":"%s","to":"%s","at":"%s"}' "$1" "${2#v}" "${3#v}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
-	if [ "$(id -u)" = 0 ]; then
-		owner=$(stat -c %u "$STATE_DIR" 2>/dev/null) && group=$(stat -c %g "$STATE_DIR" 2>/dev/null) || return 0
-		if [ "$owner" = 0 ]; then drop=""
-		elif command -v setpriv >/dev/null 2>&1; then drop="setpriv --reuid=$owner --regid=$group --clear-groups"
-		elif command -v runuser >/dev/null 2>&1 && name=$(getent passwd "$owner" | cut -d: -f1) && [ -n "$name" ]; then drop="runuser -u $name --"
-		else return 0; fi
-	else
-		drop=""
-	fi
-	# shellcheck disable=SC2086 # $drop is a command and its arguments
-	printf '%s\n' "$json" | $drop sh -c 'f=$(mktemp "$1/.update-status.XXXXXX") || exit 0; cat >"$f" && chmod 644 "$f" && mv -f "$f" "$1/update-status.json" || rm -f "$f"' sh "$STATE_DIR" 2>/dev/null || true
+	printf '%s\n' "$json" | owner_sh 'd=$(dirname "$1"); f=$(mktemp "$d/.update-status.XXXXXX") || exit 0; cat >"$f" && chmod 644 "$f" && mv -f "$f" "$1" || rm -f "$f"' "$STATUS_FILE" 2>/dev/null || true
 	return 0
 }
 # Whatever ends the run without saying how it went was a failure.
