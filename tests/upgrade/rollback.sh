@@ -15,6 +15,22 @@
 # The setup page's config (src/wizard.rs, also current) is rendered by a unit test and checked
 # the same way: `arr setup`, `arr check` and `arr serve` of the latest release must accept it.
 #
+# Knaben (config `kind = "knaben"`) and the older release: a config that names knaben is only
+# ever paired with a binary that understands it. The daily updater never rewrites config.toml,
+# so a daily-updated install still has the config it had before, and the previous release
+# (which refuses kind = "knaben") is what runs on it after a rollback: that is check 2 and
+# the pre-Knaben runs below. Only an explicit re-run of install.sh writes the new kind, and its
+# own rollback restores the config and the settings pointer (check 4). The one other pairing is
+# a manual downgrade, which README documents as needing the knaben entry removed; so
+# wherever the old release runs on a config the new installer or setup page wrote, the knaben
+# entry is taken out first (`pre_knaben`).
+#
+#   4. an installer re-run that fails after it added Knaben leaves the config, the settings
+#      pointer and the "Knaben was offered" note as they were (sudo and systemd are not needed:
+#      a re-run that stops on missing remote-access details exercises the same restore). What
+#      this does not cover: the service restart and health-check rollback of install.sh, which
+#      need a real service manager (tests/installer/linux.sh).
+#
 # "Runs" is `arr check` and `arr serve` answering /api/v1/health. The old release is downloaded
 # and its .sha256 verified. A local mock stands in for Plex (install.sh reads the libraries from
 # it) and for TVmaze (the season's episodes); nothing else is contacted. Needs curl, python3,
@@ -124,6 +140,18 @@ install_with() { # release-folder state-dir bin-dir
 	sed -i 's#^\[tvmaze\]$#&\nbase_url = "http://127.0.0.1:'"$mockport"'/tvmaze"#' "$2/config.toml"
 }
 
+# What the previous release's installer left: the same install without Knaben (config, note
+# and settings), with the previous release's binary. (The current install.sh always writes
+# Knaben and installs the new binary, so this derives it; the previous release's `setup`
+# rewrites the settings from the config.)
+install_before_knaben() { # state-dir bin-dir
+	install_with "$work/newrel" "$1" "$2"
+	pre_knaben "$1/config.toml"
+	rm -f "$1/default-indexers"
+	"$old" setup --config "$1/config.toml" >/dev/null || fail "the previous release's arr setup refused the pre-Knaben config"
+	cp "$old" "$2/arr"
+}
+
 api() { # state method path [json-body]: the body on stdout; fails unless the status is 2xx
 	tok=$(cat "$1/secrets/api_token")
 	if [ -n "${4:-}" ]; then
@@ -131,6 +159,25 @@ api() { # state method path [json-body]: the body on stdout; fails unless the st
 	else
 		curl -fsS -X "$2" -H "Authorization: Bearer $tok" "http://127.0.0.1:$port$3"
 	fi
+}
+
+# The config as it was before Knaben: the same file without the [[indexer]] that has
+# kind = "knaben". Prints the new text on stdout.
+cat >"$work/pre_knaben.py" <<'EOF'
+import sys
+blocks, cur = [], []
+for line in open(sys.argv[1]).read().splitlines(keepends=True):
+    if line.lstrip().startswith("["):
+        blocks.append(cur)
+        cur = []
+    cur.append(line)
+blocks.append(cur)
+drop = lambda b: b and b[0].strip() == "[[indexer]]" and any(l.strip() == 'kind = "knaben"' for l in b)
+sys.stdout.write("".join("".join(b) for b in blocks if not drop(b)))
+EOF
+pre_knaben() { # config-file: rewrite it without the knaben indexer
+	python3 -I "$work/pre_knaben.py" "$1" >"$1.tmp" && cat "$1.tmp" >"$1" && rm -f "$1.tmp"
+	if grep -q knaben "$1"; then fail "could not take knaben out of $1"; fi
 }
 
 # `arr check`, then `arr serve` until /api/v1/health answers with this binary's version.
@@ -172,12 +219,19 @@ run() { # label binary state-dir mode
 s1="$work/state-new-first"
 install_with "$work/newrel" "$s1" "$work/bin-new-first"
 run "new installed, new runs and adds titles" "$new" "$s1" write
-run "new installed, OLD runs (rollback)" "$old" "$s1" read
+# The old release on a config the new installer wrote: a manual downgrade, which needs the
+# knaben entry removed (the state still holds the settings for it, which must not matter).
+grep -q 'kind = "knaben"' "$s1/config.toml" || fail "the installer didn't write Knaben"
+[ -f "$s1/default-indexers" ] || fail "a fresh install didn't note that Knaben was offered"
+cp -p "$s1/config.toml" "$work/s1.config"
+pre_knaben "$s1/config.toml"
+run "new installed, knaben taken out, OLD runs (rollback)" "$old" "$s1" read
+cp -p "$work/s1.config" "$s1/config.toml"
 run "then the new one again (the update retried)" "$new" "$s1" read
 
 # --- 2. installed by the old binary; the new one runs and adds titles; the old one runs again
 s2="$work/state-old-first"
-install_with "$work/release" "$s2" "$work/bin-old-first"
+install_before_knaben "$s2" "$work/bin-old-first"
 run "old installed, old runs" "$old" "$s2" plain
 run "old installed, NEW runs and adds titles (update)" "$new" "$s2" write
 run "old installed, new has run, OLD runs (rollback)" "$old" "$s2" read
@@ -200,7 +254,27 @@ for f in $(grep -o '"secrets/[^"]*"' "$w/config.toml" | tr -d '"'); do
 done
 # Only the sockets are changed: this machine's ports, nothing exposed.
 sed -i -e "s#^listen = \"127.0.0.1:8787\"#listen = \"127.0.0.1:$port\"#" -e 's#^listen = "0.0.0.0:[0-9]*"#listen = "127.0.0.1:0"#' "$w/config.toml"
+grep -q 'kind = "knaben"' "$w/config.toml" || fail "the setup page didn't write Knaben"
+pre_knaben "$w/config.toml"
 "$old" setup --config "$w/config.toml" >/dev/null || fail "the latest release's arr setup refused the setup page's config"
 run "setup page config, OLD runs" "$old" "$w" plain
+
+# --- 4. a re-run of the installer that fails after adding Knaben puts everything back
+s4="$work/state-rerun"
+install_before_knaben "$s4" "$work/bin-rerun"
+grep -q knaben "$s4/config.toml" && fail "the old installer wrote knaben"
+cp -p "$s4/config.toml" "$work/s4.config"
+cp -p "$s4/active-import.json" "$work/s4.pointer"
+[ ! -e "$s4/default-indexers" ] || fail "the old install has the Knaben note"
+ARR_DOWNLOAD_BASE="file://$work/newrel" sh "$repo/install.sh" --yes --no-service --no-auto-update \
+	--state-dir "$s4" --bin-dir "$work/bin-rerun" --ngrok-token fake-token --ngrok-domain rerun.ngrok-free.app \
+	>"$work/rerun.out" 2>&1 && { cat "$work/rerun.out" >&2; fail "the re-run was meant to stop on missing remote-access details"; }
+grep -q 'Added Knaben as search source 2' "$work/rerun.out" || { cat "$work/rerun.out" >&2; fail "the re-run stopped before it added Knaben"; }
+grep -q 'Put your previous settings back' "$work/rerun.out" || { cat "$work/rerun.out" >&2; fail "the failed re-run didn't put the settings back"; }
+cmp "$work/s4.config" "$s4/config.toml" || fail "the failed re-run left a different config.toml"
+cmp "$work/s4.pointer" "$s4/active-import.json" || fail "the failed re-run left a different settings pointer"
+[ ! -e "$s4/default-indexers" ] || fail "the failed re-run left the Knaben note"
+run "failed re-run, the previous config, OLD runs" "$old" "$s4" plain
+echo "ok: a failed installer re-run restored the config, the settings pointer and the note"
 
 echo "rollback: all checks passed"

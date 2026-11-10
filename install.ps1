@@ -286,7 +286,7 @@ function Install-Arr {
 		} else {
 			Say $out
 			if ((Get-FileHash $Config).Hash -ne (Get-FileHash $beforeIndexers).Hash) {
-				Run-Arr setup --config $Config | Out-Null
+				Run-Arr setup --config $Config --add-default-indexers | Out-Null
 				if ($LASTEXITCODE -ne 0) {
 					Copy-Item $beforeIndexers $Config -Force
 					Remove-Item (Join-Path $StateDir 'default-indexers') -Force -ErrorAction SilentlyContinue

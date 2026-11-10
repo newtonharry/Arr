@@ -1348,6 +1348,9 @@ async fn finish_setup(
         let _ = std::fs::rename(&config, dir.join("config.toml.failed"));
         return Err(e);
     }
+    // This config already has Knaben: note that it was offered, so taking it out sticks
+    // (`arr set default-indexers` never adds it back).
+    fsutil::atomic_replace_private(&dir.join(crate::set::INDEXER_MARKER), b"knaben\n")?;
     std::fs::rename(&config, dir.join("config.toml")).context("can't save config.toml")?;
     fsutil::fsync_dir(dir)
 }

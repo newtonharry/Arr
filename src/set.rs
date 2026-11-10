@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub const NAMES: &str = "tmdb-key, plex-token, plex-url, downloading, upload-limit-kib, torrent-port, error-reports, default-indexers, api-token, mcp-token";
 
 /// Remembers that Knaben was offered, so removing it later sticks (a file beside config.toml).
-const INDEXER_MARKER: &str = "default-indexers";
+pub const INDEXER_MARKER: &str = "default-indexers";
 
 /// What a secret setting is called when asking for it, or `None` when the value (if any)
 /// comes from the command line. Unknown names are an error.

@@ -172,6 +172,28 @@ pub struct IndexerDoc {
     pub season_pack_seed_time_minutes: Option<i64>,
 }
 
+impl IndexerDoc {
+    /// The policy of a configured indexer with every key left at its default.
+    pub fn defaults(id: u32) -> Self {
+        IndexerDoc {
+            id,
+            name: None,
+            movies: None,
+            tv: None,
+            movie_categories: None,
+            tv_categories: None,
+            priority: None,
+            minimum_seeders: None,
+            automatic_search: None,
+            interactive_search: None,
+            rss: None,
+            seed_ratio: None,
+            seed_time_minutes: None,
+            season_pack_seed_time_minutes: None,
+        }
+    }
+}
+
 fn qualities_named(tiers: &[(&str, &[Quality])]) -> Vec<Tier> {
     tiers
         .iter()
@@ -755,22 +777,7 @@ pub fn normalize(
         None => cfg
             .indexers
             .iter()
-            .map(|i| IndexerDoc {
-                id: i.id,
-                name: None,
-                movies: None,
-                tv: None,
-                movie_categories: None,
-                tv_categories: None,
-                priority: None,
-                minimum_seeders: None,
-                automatic_search: None,
-                interactive_search: None,
-                rss: None,
-                seed_ratio: None,
-                seed_time_minutes: None,
-                season_pack_seed_time_minutes: None,
-            })
+            .map(|i| IndexerDoc::defaults(i.id))
             .collect(),
     };
     if docs.is_empty() {

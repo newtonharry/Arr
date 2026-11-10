@@ -599,3 +599,64 @@ async fn default_indexers_picks_a_free_id_and_skips_other_setups() {
     assert_eq!(std::fs::read(&own).unwrap(), before);
     assert!(!own.with_file_name("default-indexers").exists());
 }
+
+fn arr_setup(config: &Path, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(["setup", "--config"])
+        .arg(config)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// The ids of the indexers in an `arr setup --dry-run` summary.
+fn setup_ids(out: &Output) -> Vec<i64> {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut ids: Vec<i64> = v["indexers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_i64().unwrap())
+        .collect();
+    ids.dedup();
+    ids
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_setup_document_with_an_explicit_indexer_list_gets_knaben_too() {
+    let (tmdb, plex) = (start_tmdb().await, start_plex("good").await);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = full_install(tmp.path(), tmdb, plex);
+    // The movies folder the config names must exist for setup.
+    std::fs::create_dir_all(tmp.path().join("movies")).unwrap();
+    let doc = tmp.path().join("setup.toml");
+    std::fs::write(&doc, "[[indexers]]\nid = 1\npriority = 10\n").unwrap();
+    let first = arr_setup(&config, &["--settings", doc.to_str().unwrap()]);
+    assert_eq!(setup_ids(&first), [1]);
+
+    says(
+        &set(&config, &["default-indexers"], None),
+        "Added Knaben as search source 2, next to The Pirate Bay. Run `arr setup` and restart Arr to use it.",
+    );
+    // Setup alone keeps the saved list as it is: Knaben would be configured but never searched.
+    assert_eq!(
+        setup_ids(&arr_setup(&config, &["--dry-run"])),
+        [1],
+        "the explicit list is used as it is"
+    );
+    // The installer asks for the default to be added; id 1 stays in the list as it was.
+    let out = arr_setup(&config, &["--add-default-indexers"]);
+    assert_eq!(setup_ids(&out), [1, 2]);
+    // And it sticks: the next plain setup (the saved document now lists both).
+    assert_eq!(setup_ids(&arr_setup(&config, &["--dry-run"])), [1, 2]);
+    // Running it again adds nothing twice.
+    assert_eq!(
+        setup_ids(&arr_setup(&config, &["--add-default-indexers"])),
+        [1, 2]
+    );
+}

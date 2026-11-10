@@ -858,6 +858,9 @@ failed() { mv "$CONFIG" "$CONFIG.failed"; die "$1 (the config is saved as $CONFI
 "$ARR" setup --config "$CONFIG" >/dev/null || failed "arr setup failed; see the message above"
 "$ARR" check --config "$CONFIG" >"$tmp/check.json" || { cat "$tmp/check.json"; failed "arr check failed"; }
 say "Config checked"
+# This config already has Knaben: note that it was offered, so taking it out sticks
+# (arr set default-indexers never adds it back).
+printf 'knaben\n' >"$STATE_DIR/default-indexers"
 }
 
 # The address this machine uses on its network.
@@ -1033,7 +1036,7 @@ if [ -f "$CONFIG" ]; then
 	cp -p "$CONFIG" "$tmp/config.before-indexers"
 	if out=$(as_run "$ARR" set --config "$CONFIG" default-indexers 2>&1); then
 		say "$out"
-		if ! cmp -s "$tmp/config.before-indexers" "$CONFIG" && ! as_run "$ARR" setup --config "$CONFIG" >/dev/null 2>&1; then
+		if ! cmp -s "$tmp/config.before-indexers" "$CONFIG" && ! as_run "$ARR" setup --config "$CONFIG" --add-default-indexers >/dev/null 2>&1; then
 			cp -p "$tmp/config.before-indexers" "$CONFIG"
 			rm -f "$STATE_DIR/default-indexers"
 			say "warning: arr setup didn't accept the new search source, so it was not added; Arr carries on as it was." >&2

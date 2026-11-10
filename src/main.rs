@@ -39,6 +39,10 @@ enum Command {
         /// Validate and summarise without changing the settings.
         #[arg(long)]
         dry_run: bool,
+        /// After `arr set default-indexers`: if the setup document lists its indexers
+        /// explicitly, add the configured Knaben indexer(s) it leaves out, with default policy.
+        #[arg(long, hide = true)]
+        add_default_indexers: bool,
     },
     /// Read-only bootstrap of an existing Plex library into the managed catalog (exact
     /// provider ids plus validated local files; nothing monitored or searched). Runs bounded
@@ -313,7 +317,12 @@ fn init(state_dir: PathBuf, listen: std::net::SocketAddr) -> Result<()> {
     Ok(())
 }
 
-async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: bool) -> Result<()> {
+async fn setup_cmd(
+    config_path: PathBuf,
+    settings: Option<PathBuf>,
+    dry_run: bool,
+    add_default_indexers: bool,
+) -> Result<()> {
     fsutil::check_private_file(&config_path)?;
     let text = String::from_utf8(fsutil::read_bounded(&config_path, 256 * 1024)?)
         .context("config is not UTF-8")?;
@@ -349,12 +358,21 @@ async fn setup_cmd(config_path: PathBuf, settings: Option<PathBuf>, dry_run: boo
             "native_snapshot"
         }
     });
-    let doc = match (&settings, managed) {
+    let mut doc = match (&settings, managed) {
         (Some(p), _) => setup::read_doc(p)?,
         // Running setup again (say, after adding an indexer) keeps custom profiles and goals.
         (None, Some(l)) => setup::stored_doc(&state_dir, &l.manifest.import_id)?,
         (None, None) => setup::SetupDoc::default(),
     };
+    // A document that lists its indexers uses that list as it is, so an indexer added to the
+    // config since is left out; the installer's default-indexers step asks for it to be added.
+    if add_default_indexers && let Some(list) = doc.indexers.as_mut() {
+        for ix in &cfg.indexers {
+            if ix.kind == config::IndexerKind::Knaben && !list.iter().any(|d| d.id == ix.id) {
+                list.push(setup::IndexerDoc::defaults(ix.id));
+            }
+        }
+    }
     let now = time::OffsetDateTime::now_utc();
     let prepared = setup::prepare(&doc, &cfg, now).map_err(|errs| {
         anyhow::anyhow!("the setup document is invalid:\n- {}", errs.join("\n- "))
@@ -491,7 +509,8 @@ async fn run() -> Result<std::process::ExitCode> {
             config,
             settings,
             dry_run,
-        } => setup_cmd(config, settings, dry_run).await,
+            add_default_indexers,
+        } => setup_cmd(config, settings, dry_run, add_default_indexers).await,
         Command::Bootstrap {
             config,
             media,

@@ -673,6 +673,8 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     ] {
         assert!(config.contains(&want), "missing {want:?} in:\n{config}");
     }
+    // Knaben came with this config, so it is noted as offered: taking it out sticks.
+    assert!(state_dir.join("default-indexers").exists());
     // Nothing a previous Arr version would refuse: no Plex metadata addresses, no TMDB key.
     for never in [
         "discover_url",
