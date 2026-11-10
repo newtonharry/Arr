@@ -181,7 +181,7 @@ pub fn document() -> Value {
         "info": {
             "title": "arr",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Movie/TV API. Policy from managed setup (POST /api/v1/setup). Release search and RSS through native indexers (The Pirate Bay's JSON API, Torznab) or, optionally, Prowlarr: one backend, never both, no fallback. Shadow by default; with [execution] enabled it uses the configured embedded BitTorrent engine or qBittorrent backend, imports completed downloads into the library and follows the cleanup policy.",
+            "description": "Movie/TV API. Policy from managed setup (POST /api/v1/setup). Release search and RSS through native indexers (The Pirate Bay's JSON API, Knaben's JSON API, Torznab) or, optionally, Prowlarr: one backend, never both, no fallback. Shadow by default; with [execution] enabled it uses the configured embedded BitTorrent engine or qBittorrent backend, imports completed downloads into the library and follows the cleanup policy.",
             "x-mcp": "with [mcp] enabled, POST /mcp serves MCP over Streamable HTTP (rmcp, stateless JSON responses) with its own static bearer token (not the API token), Host/Origin validation and bounded bodies; the six MCP tools wrap this API. No OAuth; see docs/MCP.md",
         },
         "servers": [{ "url": "http://127.0.0.1:8787" }],

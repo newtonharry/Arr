@@ -1,6 +1,7 @@
 # Privacy and error reports
 
-Arr runs on your computer and talks to Plex, your torrent sources and, only if you add a key, TMDB.
+Arr runs on your computer and talks to Plex, your torrent sources (by default The Pirate Bay's
+API and Knaben's search) and, only if you add a key, TMDB.
 Movie searches and lookups go to Plex's metadata service with your Plex sign-in; TV searches go to
 TVmaze; a movie's details go to TMDB only if you've added a TMDB key. It doesn't send
 anything about you or your library to its developer, with one optional exception: error reports.
@@ -23,6 +24,17 @@ line starts the setup page with the box ticked, and on an existing install turns
 
 Reports leave out other programs' output and the Plex import's own error details, since those
 can name titles and folders; you still see them on the setup page.
+
+## What the torrent sources see
+
+Each search goes to every source you have set up (by default `apibay.org` and
+`api.knaben.org`), as the title text of the thing you asked for, such as `Futurama S05`, and
+Knaben also gets the categories (TV or movies) and the safety filters. Nothing else is sent: no
+Plex data, library, token or account. Each source sees your IP address, as any website does,
+and the User-Agent `arr/<version>`. Knaben, or its host, can log the search text. Arr makes
+at most one request per source per search, caches answers for 15 minutes, and waits at least
+two seconds between requests to the same source. To stop using Knaben, delete its
+`[[indexer]]` entry from `config.toml` and restart Arr.
 
 ## What a report contains
 

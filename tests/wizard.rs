@@ -666,6 +666,10 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
         "[execution]\nenabled = true".into(),
         "[tmdb]\nenabled = false".into(),
         "[reporting]\nenabled = true".into(),
+        // Two public sources, at the same priority (the policy default).
+        "kind = \"thepiratebay\"".into(),
+        "id = 2\nname = \"Knaben\"\nkind = \"knaben\"\nbase_url = \"https://api.knaben.org/\""
+            .into(),
     ] {
         assert!(config.contains(&want), "missing {want:?} in:\n{config}");
     }

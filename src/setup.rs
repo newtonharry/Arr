@@ -902,7 +902,11 @@ pub fn normalize(
                 minimum_seeders: min_seeders,
                 enable_automatic_search: ix.automatic_search.unwrap_or(true),
                 enable_interactive_search: ix.interactive_search.unwrap_or(true),
-                enable_rss: ix.rss.unwrap_or(true),
+                // A native indexer that does not read a feed (recent_feed = false, the Knaben
+                // default) is not an RSS source unless the document says so.
+                enable_rss: ix
+                    .rss
+                    .unwrap_or_else(|| native.is_none_or(|n| n.recent_feed)),
                 seed_ratio: Some(ratio),
                 seed_time_minutes: Some(minutes),
                 season_pack_seed_time_minutes: Some(pack),
@@ -1267,6 +1271,30 @@ mod tests {
         let (c, _) =
             crate::config::parse_config(&text, &dir, "test", crate::config::Secrets::Read).unwrap();
         (tmp, c)
+    }
+
+    #[test]
+    fn a_second_default_source_gets_equal_policy_and_no_rss_unless_it_reads_a_feed() {
+        let knaben = "[[indexer]]\nid = 2\nname = \"Knaben\"\nkind = \"knaben\"\nbase_url = \"https://api.knaben.example/\"\n";
+        let (_t, c) = cfg(knaben);
+        let (s, _, warnings) = normalize(&SetupDoc::default(), &c).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let by = |id: u32, m: MediaKind| s.indexer(m, id).unwrap();
+        for m in [MediaKind::Movie, MediaKind::Series] {
+            let (tpb, kn) = (by(1, m), by(2, m));
+            assert_eq!(
+                (tpb.priority, tpb.minimum_seeders),
+                (kn.priority, kn.minimum_seeders)
+            );
+            assert!(tpb.enable_rss && !kn.enable_rss, "Knaben's feed is opt-in");
+            assert!(kn.enable_automatic_search && kn.enable_interactive_search);
+        }
+        let (_t, c) = cfg(&knaben.replace(
+            "https://api.knaben.example/\"\n",
+            "https://api.knaben.example/\"\nrecent_feed = true\n",
+        ));
+        let (s, _, _) = normalize(&SetupDoc::default(), &c).unwrap();
+        assert!(s.indexer(MediaKind::Series, 2).unwrap().enable_rss);
     }
 
     #[test]

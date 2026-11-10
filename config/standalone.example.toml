@@ -33,13 +33,23 @@ cache_ttl_secs = 900
 # grab_limit = 20
 # limits_unit = "day"
 
+# Knaben's JSON search API: one query across several public trackers (The Pirate Bay among
+# them). Same magnet rules as above. Only the search text is sent; nothing else.
+[[indexer]]
+id = 2
+name = "Knaben"
+kind = "knaben"
+base_url = "https://api.knaben.org/"
+# recent_feed = false                   # RSS: Knaben's latest releases (off by default)
+# magnet_trackers = ["udp://tracker.example:1337/announce"]   # public trackers only
+
 # A generic Torznab endpoint (spec 1.3), e.g. a self-hosted Jackett indexer.
 # [[indexer]]
-# id = 2
+# id = 3
 # name = "Torznab example"
 # kind = "torznab"
 # base_url = "http://127.0.0.1:9117/api/v2.0/indexers/example/results/torznab/"
-# api_key_file = "secrets/indexer_2_api_key"   # sent only to base_url's origin
+# api_key_file = "secrets/indexer_3_api_key"   # sent only to base_url's origin
 # api_path = "api"
 # download_origins = ["https://downloads.example"]   # .torrent links elsewhere (no key sent)
 # key_origins = ["https://tracker.example"]          # may receive the key in announce URLs

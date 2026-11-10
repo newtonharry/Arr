@@ -1510,6 +1510,12 @@ kind = "thepiratebay"
 base_url = "https://apibay.org/"
 recent_feed = true
 
+[[indexer]]
+id = 2
+name = "Knaben"
+kind = "knaben"
+base_url = "https://api.knaben.org/"
+
 [tvmaze]
 enabled = true
 

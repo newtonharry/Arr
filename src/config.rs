@@ -86,7 +86,7 @@ struct IndexerSection {
     /// the native indexer with the same id serves them, so imported ids never change.
     id: u32,
     name: String,
-    /// `thepiratebay` or `torznab`.
+    /// `thepiratebay`, `knaben` or `torznab`.
     kind: String,
     /// The exact trusted API base URL (TPB: the apibay-style JSON API; Torznab: the
     /// endpoint's base, `api_path` is appended). No credentials, query or fragment.
@@ -108,7 +108,8 @@ struct IndexerSection {
     magnet_trackers: Option<Vec<String>>,
     /// TPB: only results from these uploader names (default: all uploaders).
     uploaders: Option<Vec<String>>,
-    /// TPB: read `precompiled/data_top100_recent.json` for RSS (default true).
+    /// TPB: read `precompiled/data_top100_recent.json` for RSS (default true). Knaben: read
+    /// its latest releases for RSS (default false).
     recent_feed: Option<bool>,
     #[serde(default = "d_indexer_timeout")]
     timeout_secs: u64,
@@ -676,6 +677,8 @@ pub struct PlexConfig {
 pub enum IndexerKind {
     /// The Pirate Bay's JSON API (`q.php`, `precompiled/data_top100_recent.json`).
     ThePirateBay,
+    /// Knaben's JSON search API (`POST v1`), an aggregate of public trackers.
+    Knaben,
     /// A Torznab endpoint (caps, search, RSS; spec 1.3).
     Torznab,
 }
@@ -684,8 +687,14 @@ impl IndexerKind {
     pub fn as_str(self) -> &'static str {
         match self {
             IndexerKind::ThePirateBay => "thepiratebay",
+            IndexerKind::Knaben => "knaben",
             IndexerKind::Torznab => "torznab",
         }
+    }
+
+    /// Providers whose releases are magnets built from an info-hash (no download link).
+    pub fn builds_magnets(self) -> bool {
+        matches!(self, IndexerKind::ThePirateBay | IndexerKind::Knaben)
     }
 }
 
@@ -1697,56 +1706,47 @@ fn indexer_config(
     }
     let kind = match ix.kind.as_str() {
         "thepiratebay" => IndexerKind::ThePirateBay,
+        "knaben" => IndexerKind::Knaben,
         "torznab" => IndexerKind::Torznab,
         other => bail!(
-            "{} {other:?} is not supported natively: supported kinds are \"thepiratebay\" and \"torznab\" (other Prowlarr/Cardigann definitions are not reproduced; keep them behind a Torznab endpoint)",
+            "{} {other:?} is not supported natively: supported kinds are \"thepiratebay\", \"knaben\" and \"torznab\" (other Prowlarr/Cardigann definitions are not reproduced; keep them behind a Torznab endpoint)",
             what("kind")
         ),
     };
     let base_url = parse_base_url(&ix.base_url, &what("base_url"))?;
-    let only = |set: bool, key: &str, k: IndexerKind| -> Result<()> {
-        if set && kind != k {
-            bail!("{} applies only to kind = \"{}\"", what(key), k.as_str());
+    let only = |set: bool, key: &str, kinds: &[IndexerKind]| -> Result<()> {
+        if set && !kinds.contains(&kind) {
+            let names: Vec<String> = kinds
+                .iter()
+                .map(|k| format!("\"{}\"", k.as_str()))
+                .collect();
+            bail!(
+                "{} applies only to kind = {}",
+                what(key),
+                names.join(" or ")
+            );
         }
         Ok(())
     };
-    only(
-        ix.api_key_file.is_some(),
-        "api_key_file",
-        IndexerKind::Torznab,
-    )?;
-    only(ix.api_path.is_some(), "api_path", IndexerKind::Torznab)?;
-    only(
-        ix.download_origins.is_some(),
-        "download_origins",
-        IndexerKind::Torznab,
-    )?;
-    only(
-        ix.key_origins.is_some(),
-        "key_origins",
-        IndexerKind::Torznab,
-    )?;
+    let torznab = [IndexerKind::Torznab];
+    let magnets = [IndexerKind::ThePirateBay, IndexerKind::Knaben];
+    only(ix.api_key_file.is_some(), "api_key_file", &torznab)?;
+    only(ix.api_path.is_some(), "api_path", &torznab)?;
+    only(ix.download_origins.is_some(), "download_origins", &torznab)?;
+    only(ix.key_origins.is_some(), "key_origins", &torznab)?;
     only(
         ix.prowlarr_definition.is_some(),
         "prowlarr_definition",
-        IndexerKind::Torznab,
+        &torznab,
     )?;
-    only(ix.max_pages.is_some(), "max_pages", IndexerKind::Torznab)?;
-    only(ix.page_size.is_some(), "page_size", IndexerKind::Torznab)?;
-    only(
-        ix.magnet_trackers.is_some(),
-        "magnet_trackers",
-        IndexerKind::ThePirateBay,
-    )?;
+    only(ix.max_pages.is_some(), "max_pages", &torznab)?;
+    only(ix.page_size.is_some(), "page_size", &torznab)?;
+    only(ix.magnet_trackers.is_some(), "magnet_trackers", &magnets)?;
+    only(ix.recent_feed.is_some(), "recent_feed", &magnets)?;
     only(
         ix.uploaders.is_some(),
         "uploaders",
-        IndexerKind::ThePirateBay,
-    )?;
-    only(
-        ix.recent_feed.is_some(),
-        "recent_feed",
-        IndexerKind::ThePirateBay,
+        &[IndexerKind::ThePirateBay],
     )?;
     let api_key = ix
         .api_key_file
@@ -1893,7 +1893,9 @@ fn indexer_config(
             .into_iter()
             .map(|u| u.trim().to_string())
             .collect(),
-        recent_feed: ix.recent_feed.unwrap_or(true),
+        // The Pirate Bay: its top-100 recent list is a cheap static file. Knaben has no such
+        // file (a recent read is a query on a volunteer-run service), so it is opt-in.
+        recent_feed: ix.recent_feed.unwrap_or(kind != IndexerKind::Knaben),
         timeout: Duration::from_secs(within(&what("timeout_secs"), ix.timeout_secs, 1, 300)?),
         max_concurrent: within(&what("max_concurrent"), ix.max_concurrent as u64, 1, 8)? as usize,
         min_interval: Duration::from_millis(within(
@@ -1961,10 +1963,15 @@ dir = "."
 # recent_feed = true                     # RSS from precompiled/data_top100_recent.json
 # [[indexer]]
 # id = 2
+# name = "Knaben"
+# kind = "knaben"                        # public trackers in one search (JSON API)
+# base_url = "https://api.knaben.org/"
+# [[indexer]]
+# id = 3
 # name = "Torznab example"
 # kind = "torznab"
 # base_url = "http://127.0.0.1:9117/api/v2.0/indexers/example/results/torznab/"
-# api_key_file = "secrets/indexer_2_api_key"
+# api_key_file = "secrets/indexer_3_api_key"
 
 [tvmaze]
 # Free public TV metadata (no key): series discovery and full episode lists.
@@ -2254,11 +2261,7 @@ mod tests {
         assert!(c.tvmaze.is_some() && c.mcp.is_none());
         let fc: FileConfig =
             toml::from_str(&uncomment(&standalone_template("127.0.0.1:8787"))).unwrap();
-        assert_eq!(
-            fc.indexer.len(),
-            2,
-            "both documented indexers are real keys"
-        );
+        assert_eq!(fc.indexer.len(), 3, "all documented indexers are real keys");
         let e = fc.embedded.as_ref().unwrap();
         assert!(
             e.dht,
@@ -2326,6 +2329,32 @@ mod tests {
         ];
         for (text, needle) in cases {
             let (_t, cfg) = setup(&text);
+            let err = format!("{:#}", load(&cfg).unwrap_err());
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        // Knaben: the same magnet keys as The Pirate Bay, its own feed default, no uploaders.
+        let kn = "[[indexer]]\nid = 2\nname = \"Knaben\"\nkind = \"knaben\"\nbase_url = \"https://api.knaben.example/\"\n";
+        let (_t, cfg) = setup(&format!("{base}{tpb}{kn}"));
+        let c = load(&cfg).unwrap();
+        assert_eq!(c.indexers[1].kind, IndexerKind::Knaben);
+        assert!(c.indexers[0].recent_feed && !c.indexers[1].recent_feed);
+        assert_eq!(c.indexers[1].kind.as_str(), "knaben");
+        let (_t, cfg) = setup(&format!(
+            "{base}{kn}recent_feed = true\nmagnet_trackers = [\"udp://ok.example:1337/announce\"]\n"
+        ));
+        let c = load(&cfg).unwrap();
+        assert!(c.indexers[0].recent_feed && c.indexers[0].magnet_trackers.len() == 1);
+        for (extra, needle) in [
+            (
+                "uploaders = [\"x\"]\n",
+                "applies only to kind = \"thepiratebay\"",
+            ),
+            (
+                "api_key_file = \"secrets/k\"\n",
+                "applies only to kind = \"torznab\"",
+            ),
+        ] {
+            let (_t, cfg) = setup(&format!("{base}{kn}{extra}"));
             let err = format!("{:#}", load(&cfg).unwrap_err());
             assert!(err.contains(needle), "{needle}: {err}");
         }

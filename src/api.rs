@@ -1168,10 +1168,7 @@ fn peer_discovery_readiness(st: &AppState) -> Value {
         .and_then(Backend::native)
         .map(|r| {
             r.all()
-                .filter(|i| {
-                    i.cfg.kind == crate::config::IndexerKind::ThePirateBay
-                        && i.cfg.magnet_trackers.is_empty()
-                })
+                .filter(|i| i.cfg.kind.builds_magnets() && i.cfg.magnet_trackers.is_empty())
                 .map(|i| i.label())
                 .collect()
         })
@@ -1213,10 +1210,7 @@ fn search_readiness(st: &AppState) -> Value {
     let mut warnings: Vec<String> = vec![];
     let tpb_without_trackers: Vec<String> = r
         .all()
-        .filter(|i| {
-            i.cfg.kind == crate::config::IndexerKind::ThePirateBay
-                && i.cfg.magnet_trackers.is_empty()
-        })
+        .filter(|i| i.cfg.kind.builds_magnets() && i.cfg.magnet_trackers.is_empty())
         .map(|i| i.label())
         .collect();
     if let Some(e) = &st.cfg.embedded
@@ -3433,7 +3427,7 @@ async fn setup_status(State(st): St) -> ApiResult {
         next.push("POST /api/v1/setup with a managed settings document (or {} for the defaults) to create profiles, indexer, download and root policies and an empty catalog".into());
     }
     if st.search.is_none() {
-        next.push("add [[indexer]] entries (kind = \"thepiratebay\" or \"torznab\") to config.toml and restart".into());
+        next.push("add [[indexer]] entries (kind = \"thepiratebay\", \"knaben\" or \"torznab\") to config.toml and restart".into());
     }
     if st.cfg.library.is_none() {
         next.push("set [library] movies and/or tv in config.toml and restart".into());

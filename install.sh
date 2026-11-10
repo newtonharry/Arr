@@ -260,6 +260,11 @@ undo_bin() {
 				mv "$STATE_DIR/secrets.undo" "$STATE_DIR/secrets" || failed=1
 		fi
 		cp -p "$s/config.toml" "$CONFIG" || failed=1
+		# The managed settings pointer and the "Knaben was offered" note change with the config
+		# (a re-run may add a search source), so they go back with it.
+		for f in active-import.json default-indexers; do
+			if [ -f "$s/$f" ]; then cp -p "$s/$f" "$STATE_DIR/$f" || failed=1; else rm -f "$STATE_DIR/$f"; fi
+		done
 		if [ "$failed" = 0 ]; then
 			printf 'Put your previous settings back in %s.\n' "$CONFIG" >&2
 			undone=1
@@ -789,6 +794,12 @@ kind = "thepiratebay"
 base_url = "https://apibay.org/"
 recent_feed = true
 
+[[indexer]]
+id = 2
+name = "Knaben"
+kind = "knaben"
+base_url = "https://api.knaben.org/"
+
 [tvmaze]
 enabled = true
 
@@ -990,6 +1001,9 @@ if [ -f "$CONFIG" ]; then
 	# The temp folder is private (mktemp -d); cp -p keeps each file's owner and mode.
 	mkdir "$tmp/snap"
 	cp -p "$CONFIG" "$tmp/snap/config.toml"
+	for f in active-import.json default-indexers; do
+		[ ! -f "$STATE_DIR/$f" ] || cp -p "$STATE_DIR/$f" "$tmp/snap/$f"
+	done
 	[ ! -d "$STATE_DIR/secrets" ] || cp -Rp "$STATE_DIR/secrets" "$tmp/snap/secrets"
 	SNAP="$tmp/snap"
 	# The address first: Plex checks the token (and Arr's sign-in) at the address saved.
@@ -1011,6 +1025,22 @@ if [ -f "$CONFIG" ]; then
 	[ "$UPLOAD_SET" = 0 ] || set_conf upload-limit-kib "$UPLOAD_LIMIT_KIB"
 	[ "$TORRENT_PORT_SET" = 0 ] || set_conf torrent-port "$TORRENT_PORT"
 	case "$ERROR_REPORTS" in 1) set_conf error-reports on ;; 0) set_conf error-reports off ;; esac
+	# Knaben next to The Pirate Bay, once (arr set default-indexers adds it only to an install
+	# that still has the default source, and never again after it was taken out). Optional: a
+	# failure carries on without it. Running setup again gives it its policy and keeps the
+	# profiles and goals already there. Until Arr answers, a failed run puts the config, the
+	# settings pointer and the note that Knaben was offered back as the snapshot above has them.
+	cp -p "$CONFIG" "$tmp/config.before-indexers"
+	if out=$(as_run "$ARR" set --config "$CONFIG" default-indexers 2>&1); then
+		say "$out"
+		if ! cmp -s "$tmp/config.before-indexers" "$CONFIG" && ! as_run "$ARR" setup --config "$CONFIG" >/dev/null 2>&1; then
+			cp -p "$tmp/config.before-indexers" "$CONFIG"
+			rm -f "$STATE_DIR/default-indexers"
+			say "warning: arr setup didn't accept the new search source, so it was not added; Arr carries on as it was." >&2
+		fi
+	else
+		say "warning: ${out#Error: }; carrying on without the new search source." >&2
+	fi
 else
 	FIRST_INSTALL=1
 	[ ! -f "$CONFIG.failed" ] || say "Setting Arr up from the start ($CONFIG.failed holds the last attempt, which failed)."

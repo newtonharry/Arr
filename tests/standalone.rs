@@ -2435,3 +2435,147 @@ async fn bootstrap_keeps_plex_titles_and_attested_tvmaze_akas_of_the_same_show_o
     );
     app.stop().await;
 }
+
+#[tokio::test]
+async fn knaben_wire_request_answer_and_failures() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let seen: Arc<Mutex<Vec<(Value, String, String)>>> = Arc::default();
+    let status = Arc::new(AtomicUsize::new(200));
+    let (s, st) = (seen.clone(), status.clone());
+    let fixture = include_str!("fixtures/knaben/futurama-s05.json");
+    let app = Router::new().route(
+        "/kn/v1",
+        post(move |headers: HeaderMap, body: String| {
+            let (s, st) = (s.clone(), st.clone());
+            async move {
+                let ua = headers["user-agent"].to_str().unwrap().to_string();
+                let ct = headers["content-type"].to_str().unwrap().to_string();
+                s.lock()
+                    .unwrap()
+                    .push((serde_json::from_str(&body).unwrap(), ua, ct));
+                match st.load(Ordering::SeqCst) {
+                    200 => ([("content-type", "application/json")], fixture).into_response(),
+                    code => StatusCode::from_u16(code as u16).unwrap().into_response(),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let tmp = tempfile::tempdir().unwrap();
+    let store = arr::store::Store::open(&tmp.path().join("s.sqlite")).unwrap();
+    let cfg = arr::config::IndexerConfig {
+        id: 2,
+        name: "Knaben".into(),
+        kind: arr::config::IndexerKind::Knaben,
+        base_url: reqwest::Url::parse(&format!("http://{addr}/kn/")).unwrap(),
+        api_key: None,
+        api_path: "api".into(),
+        download_origins: vec![],
+        key_origins: vec![],
+        prowlarr_definition: None,
+        magnet_trackers: vec![],
+        uploaders: vec![],
+        recent_feed: true,
+        timeout: Duration::from_secs(5),
+        max_concurrent: 1,
+        min_interval: Duration::ZERO,
+        cache_ttl: Duration::from_secs(60),
+        max_response_bytes: 1 << 20,
+        max_pages: 1,
+        page_size: 100,
+        query_limit: None,
+        grab_limit: None,
+        limits_window: Duration::from_secs(86_400),
+    };
+    let reg = arr::indexer::Registry::new(std::slice::from_ref(&cfg), store);
+    let ix = reg.get(2).unwrap();
+    let req = arr::prowlarr::SearchRequest {
+        query: "Futurama S05".into(),
+        categories: vec![5000],
+        indexer_ids: vec![2],
+    };
+    let out = ix.search(&req, false).await.unwrap();
+    assert_eq!(
+        (out.raw_count, out.releases.len(), out.from_cache),
+        (4, 4, false)
+    );
+    assert!(!out.truncated_by_page_limit);
+    {
+        let seen = seen.lock().unwrap();
+        let (body, ua, ct) = &seen[0];
+        assert_eq!(body["query"], "Futurama S05");
+        assert_eq!(body["search_field"], "title");
+        assert_eq!(body["order_by"], "seeders");
+        assert_eq!(body["size"], 100);
+        assert_eq!(
+            (&body["hide_unsafe"], &body["hide_xxx"]),
+            (&json!(true), &json!(true))
+        );
+        assert!(
+            body["categories"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(2000000))
+        );
+        assert!(
+            ua.starts_with("arr/") && !ua.contains('@') && !ua.contains("http"),
+            "{ua}"
+        );
+        assert_eq!(ct, "application/json");
+    }
+    // The cache answers the same query without a request.
+    assert!(ix.search(&req, false).await.unwrap().from_cache);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    // The latest releases: no query, newest first.
+    let feed = ix.feed(&[5000], 100).await.unwrap();
+    assert_eq!(feed.window, 4);
+    let last = seen.lock().unwrap().last().unwrap().0.clone();
+    assert!(last.get("query").is_none(), "{last}");
+    assert_eq!(last["order_by"], "date");
+    // A movie request names movie categories only.
+    let movies = arr::prowlarr::SearchRequest {
+        categories: vec![2000],
+        ..req.clone()
+    };
+    ix.search(&movies, true).await.unwrap();
+    let cats = seen.lock().unwrap().last().unwrap().0["categories"].clone();
+    assert!(
+        !cats.as_array().unwrap().contains(&json!(2000000)),
+        "{cats}"
+    );
+    assert!(cats.as_array().unwrap().contains(&json!(3000000)));
+    // A request that maps to no Knaben category is refused without a request.
+    let n = seen.lock().unwrap().len();
+    let none = arr::prowlarr::SearchRequest {
+        categories: vec![3000],
+        ..req.clone()
+    };
+    assert!(ix.search(&none, true).await.is_err());
+    assert_eq!(seen.lock().unwrap().len(), n);
+    // A server error fails the search; a 429 backs the indexer off.
+    status.store(503, Ordering::SeqCst);
+    let e = ix.search(&req, true).await.unwrap_err();
+    assert!(
+        matches!(e, arr::upstream::UpstreamError::Unavailable { .. }),
+        "{e:?}"
+    );
+    status.store(429, Ordering::SeqCst);
+    assert_eq!(
+        ix.search(&req, true).await.unwrap_err(),
+        arr::upstream::UpstreamError::RateLimited
+    );
+    let n = seen.lock().unwrap().len();
+    let backed_off = ix.search(&req, true).await.unwrap_err();
+    assert!(
+        matches!(backed_off, arr::upstream::UpstreamError::Throttled { .. }),
+        "{backed_off:?}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        n,
+        "no request during the backoff"
+    );
+    assert_eq!(ix.health().status, "backoff");
+}

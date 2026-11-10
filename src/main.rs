@@ -163,6 +163,7 @@ enum Command {
     ///   upload-limit-kib N        KiB/s for all torrents; 0 for no limit
     ///   torrent-port N            1 to 65535
     ///   error-reports on|off
+    ///   default-indexers          add Knaben next to The Pirate Bay (once; then run `arr setup`)
     ///   api-token, mcp-token      make a new random token
     #[command(verbatim_doc_comment)]
     Set {

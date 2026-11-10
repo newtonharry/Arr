@@ -203,6 +203,7 @@ printf %s YOUR_KEY | arr set --config ~/.local/share/arr/config.toml tmdb-key
 | `upload-limit-kib` | KiB/s for all torrents; `0` for no limit |
 | `torrent-port` | 1 to 65535 |
 | `error-reports` | `on` or `off` |
+| `default-indexers` | no value: adds Knaben next to The Pirate Bay (what a re-run of the installer does); then run `arr setup` and restart Arr |
 | `api-token`, `mcp-token` | no value: makes a new random token (update anything that uses it) |
 
 Plex stopped accepting Arr's sign-in? `arr plex-signin --config <config>` prints a plex.tv
@@ -415,8 +416,16 @@ Sonarr and Radarr can keep running next to Arr. Arr ignores titles you add there
 ignore titles you add to Arr. If both monitor the same title, both may download it; Arr
 won't replace their file, so you lose bandwidth, not media.
 
-The default search source is The Pirate Bay's public API. You can add any Torznab indexer
-(Jackett, Prowlarr) as an `[[indexer]]` in `config.toml`
+Arr searches two public sources by default, at the same priority: The Pirate Bay's API and
+[Knaben](https://knaben.org), a search that covers several public trackers at once (it finds
+well-seeded releases The Pirate Bay's own search misses). When both list the same torrent, Arr
+keeps the copy with more seeders. A re-run of the installer adds Knaben to an install that
+only has The Pirate Bay, once; delete its `[[indexer]]` entry to stop using it, and Arr won't
+add it back. Going back to an older Arr by hand after that needs the entry removed too: older
+versions don't know `kind = "knaben"` and refuse the config. (The installer's own rollback of
+a failed update puts your config back as it was.)
+
+You can add any Torznab indexer (Jackett, Prowlarr) as an `[[indexer]]` in `config.toml`
 ([config/standalone.example.toml](config/standalone.example.toml) has one). Arr uses it once
 you run `arr setup --config <config>`, then [restart Arr](#restarting-arr). Without
 `--settings`, `arr setup` keeps your current profiles and seed goals; if you gave it a settings

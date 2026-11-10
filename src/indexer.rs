@@ -2,7 +2,8 @@
 //! resolution, RSS, diagnostics and readiness share when `[[indexer]]` entries are configured
 //! (instead of `[prowlarr]`; never both, and never a fallback between them).
 //!
-//! Two providers exist: The Pirate Bay's JSON API (`tpb`) and generic Torznab (`torznab`).
+//! Three providers exist: The Pirate Bay's JSON API (`tpb`), Knaben's JSON search API
+//! (`knaben`, an aggregate of public trackers) and generic Torznab (`torznab`).
 //! Any other Prowlarr/Cardigann definition is refused, never approximated.
 //!
 //! Every request to an indexer goes through one gate per indexer: a provider-requested backoff
@@ -22,7 +23,7 @@ use crate::prowlarr::{Payload, ProwlarrClient, ProwlarrRelease, SearchOutcome, S
 use crate::settings::{IndexerSetting, Settings};
 use crate::store::Store;
 use crate::upstream::{self, TtlCache, UpstreamError};
-use crate::{torznab, tpb};
+use crate::{knaben, torznab, tpb};
 use rusqlite::params;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -297,6 +298,7 @@ impl Indexer {
         }
         let r = match self.cfg.kind {
             IndexerKind::ThePirateBay => tpb::search(self, req).await,
+            IndexerKind::Knaben => knaben::search(self, req).await,
             IndexerKind::Torznab => torznab::search(self, req).await,
         };
         self.record(r.as_ref().map(|o| o.confirmed_empty));
@@ -311,6 +313,7 @@ impl Indexer {
     pub async fn feed(&self, categories: &[u32], limit: u32) -> Result<FeedWindow, UpstreamError> {
         let r = match self.cfg.kind {
             IndexerKind::ThePirateBay => tpb::feed(self, categories).await,
+            IndexerKind::Knaben => knaben::feed(self, categories).await,
             IndexerKind::Torznab => torznab::feed(self, categories, limit).await,
         };
         self.record(r.as_ref().map(|f| f.window == 0));
@@ -323,6 +326,9 @@ impl Indexer {
             IndexerKind::ThePirateBay => Err(UpstreamError::BadResponse {
                 reason: "The Pirate Bay releases are magnets built from their info-hash; no download link is fetched".into(),
             }),
+            IndexerKind::Knaben => Err(UpstreamError::BadResponse {
+                reason: "Knaben releases are magnets built from their info-hash; no download link is fetched".into(),
+            }),
             IndexerKind::Torznab => torznab::fetch(self, url).await,
         };
         self.record(r.as_ref().map(|_| false));
@@ -334,6 +340,9 @@ impl Indexer {
         match self.cfg.kind {
             IndexerKind::ThePirateBay if !self.cfg.recent_feed => Some(
                 "recent_feed = false: the top-100 recent feed is not read for this indexer".into(),
+            ),
+            IndexerKind::Knaben if !self.cfg.recent_feed => Some(
+                "recent_feed = false: the latest releases are not read for this indexer".into(),
             ),
             _ => None,
         }
@@ -354,7 +363,7 @@ impl Indexer {
             "origin": self.cfg.base_url.origin().ascii_serialization(),
             "api_key": self.cfg.api_key.is_some(),
             "download_origins": self.cfg.download_origins.iter().map(|u| u.origin().ascii_serialization()).collect::<Vec<_>>(),
-            "recent_feed": self.cfg.kind == IndexerKind::ThePirateBay && self.cfg.recent_feed,
+            "recent_feed": self.cfg.kind.builds_magnets() && self.cfg.recent_feed,
             "magnet_trackers": self.cfg.magnet_trackers.len(),
             "uploaders_filter": self.cfg.uploaders.len(),
             "limits": {
@@ -681,6 +690,12 @@ fn validate_source(native: &Indexer, ix: &IndexerSetting) -> Option<String> {
                 ix.prowlarr_indexer_id
             ));
         }
+        (IndexerKind::Knaben, Some(d)) => {
+            return Some(format!(
+                "imported indexer {} is the Prowlarr definition '{d}', which the native knaben provider does not implement",
+                ix.prowlarr_indexer_id
+            ));
+        }
         (IndexerKind::Torznab, Some(d)) if native.cfg.prowlarr_definition.as_deref() == Some(d) => {
         }
         (IndexerKind::Torznab, Some(d)) => {
@@ -701,7 +716,7 @@ fn validate_source(native: &Indexer, ix: &IndexerSetting) -> Option<String> {
     }
     let site: &[&str] = match native.cfg.kind {
         IndexerKind::ThePirateBay => TPB_FIELDS,
-        IndexerKind::Torznab => &[],
+        IndexerKind::Knaben | IndexerKind::Torznab => &[],
     };
     let unknown: Vec<String> = src
         .settings
