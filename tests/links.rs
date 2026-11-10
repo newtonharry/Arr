@@ -436,7 +436,11 @@ fn requests(e: &Exec) -> Vec<Value> {
 
 #[tokio::test]
 async fn a_partially_refused_execution_keeps_the_request_until_the_missing_unit_is_queued() {
-    let e = start_exec(ExecOptions::legacy()).await;
+    let e = start_exec(ExecOptions {
+        stall_timeout_minutes: Some(720), // the test jumps the clock 2 h with nothing downloading
+        ..ExecOptions::legacy()
+    })
+    .await;
     let ep = |n: u8| format!("Parity.Partial.S01E0{n}.1080p.WEB-DL.x264-NEW");
     let (e1_hash, e1) = e.publish(
         &ep(1),

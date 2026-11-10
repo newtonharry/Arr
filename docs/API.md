@@ -296,7 +296,7 @@ curl -s -H "Authorization: Bearer $(cat STATE/secrets/api_token)" \
       "indexer": { "id": 1, "name": "The Pirate Bay" }, "protocol": "torrent", "size_bytes": 2684354560, "seeders": 20,
       "parsed": { "title": "slow horses", "year": null, "numbering": { "kind": "episodes", "season": 1, "episodes": [2] },
                   "quality": "webdl_1080p", "quality_basis": "parsed", "revision": { "version": 1, "real": 0 }, "languages": [] },
-      "decision": { "approved": true, "rejections": [], "covered_episodes": [2], "owned_overlap": [],
+      "decision": { "approved": true, "health": "healthy", "rejections": [], "covered_episodes": [2], "owned_overlap": [],
                     "notes": ["release names no year; matched by title only", "..."] } },
     { "rank": 2, "title": "Slow.Horses.S01.1080p.ATVP.WEB-DL.DDP5.1.H.264-NTb",
       "decision": { "approved": false, "full_season": true, "owned_overlap": [1, 3],

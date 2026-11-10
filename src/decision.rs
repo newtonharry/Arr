@@ -144,6 +144,50 @@ fn rej(code: &'static str, message: impl Into<String>) -> Rejection {
     }
 }
 
+/// How well a release's swarm can be expected to deliver; ranks above the quality tier among
+/// approved releases (see [`health`]). `Weak < Ok < Healthy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Health {
+    /// Passes the indexer's minimum seeders but is likely to be slow or to stall.
+    Weak,
+    Ok,
+    Healthy,
+}
+
+/// Swarm health from the seeder and leecher counts (`None` = unknown, which counts as the worst).
+///
+/// - `healthy`: 50 or more seeders, or 10 or more with leechers at most 10 times the seeders,
+///   or 5 or more with leechers at most equal to the seeders.
+/// - `ok`: 3 or more seeders.
+/// - `weak`: anything else (fewer than 3 seeders, or unknown).
+///
+/// Seeders are the supply. Leechers are demand, but they also upload what they already have,
+/// so they count against a release only when they swamp the seeders. Ten seeders are enough
+/// for one episode or one movie to fill a home connection even with a crowd (hence the
+/// generous 10x allowance); with only 5 to 9 seeders the crowd must be no bigger than they
+/// are. 50 seeders are healthy whatever the crowd, and also when an indexer reports no leecher
+/// count. Inside a band the order is by seeders first, so fewer leechers never beat more
+/// seeders.
+pub fn health(seeders: Option<i64>, leechers: Option<i64>) -> Health {
+    let Some(s) = seeders.filter(|s| *s >= 0) else {
+        return Health::Weak;
+    };
+    if s >= 50 {
+        return Health::Healthy;
+    }
+    // Unknown leechers count as worst: they never satisfy a leecher bound.
+    let l = leechers.filter(|l| *l >= 0);
+    let within = |factor: i64| l.is_some_and(|l| l <= s.saturating_mul(factor));
+    if (s >= 10 && within(10)) || (s >= 5 && within(1)) {
+        Health::Healthy
+    } else if s >= 3 {
+        Health::Ok
+    } else {
+        Health::Weak
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Decision {
     pub approved: bool,
@@ -156,6 +200,8 @@ pub struct Decision {
     /// known revision); `owned_overlap` lists which episodes (empty for a movie).
     #[serde(default)]
     pub replacement: bool,
+    /// Swarm health band (`weak`, `ok`, `healthy`); ranks above the quality tier.
+    pub health: Health,
     #[serde(skip)]
     pub tier: Option<usize>,
     #[serde(skip)]
@@ -1107,7 +1153,47 @@ pub fn evaluate(
         owned_overlap: owned,
         full_season: cov.full_season,
         tier,
+        health: health(r.seeders, r.leechers),
         preferred_distance,
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use Health::{Healthy, Ok as Fine, Weak};
+
+    #[test]
+    fn bands_and_their_boundaries() {
+        let h = |s, l| health(Some(s), Some(l));
+        // 10+ seeders: healthy while leechers are at most 10x the seeders.
+        assert_eq!(h(10, 0), Healthy);
+        assert_eq!(h(10, 100), Healthy);
+        assert_eq!(h(10, 101), Fine);
+        assert_eq!(h(9, 9), Healthy, "5-9 seeders need leechers <= seeders");
+        assert_eq!(h(9, 10), Fine);
+        assert_eq!(h(5, 5), Healthy);
+        assert_eq!(h(5, 6), Fine);
+        assert_eq!(h(4, 0), Fine);
+        assert_eq!(h(3, 500), Fine);
+        assert_eq!(h(2, 0), Weak);
+        assert_eq!(h(0, 0), Weak);
+        assert_eq!(h(49, 100_000), Fine);
+        assert_eq!(h(50, 100_000), Healthy);
+        // Unknown counts are the worst case.
+        assert_eq!(health(None, Some(0)), Weak);
+        assert_eq!(health(None, None), Weak);
+        assert_eq!(health(Some(-1), Some(0)), Weak);
+        assert_eq!(health(Some(30), None), Fine);
+        assert_eq!(health(Some(4), None), Fine);
+        assert_eq!(health(Some(60), None), Healthy);
+        assert_eq!(health(Some(2), None), Weak);
+        // The Futurama S05 evidence.
+        assert_eq!(h(0, 6), Weak);
+        assert_eq!(h(2, 0), Weak);
+        assert_eq!(h(8, 3), Healthy);
+        assert_eq!(h(27, 4), Healthy);
+        assert_eq!(h(48, 3), Healthy);
     }
 }
 

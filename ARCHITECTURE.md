@@ -201,8 +201,11 @@ revision upgrade. Ordinary quality upgrades are not implemented.
 
 Revision candidates come from RSS and from explicit revision searches
 (`POST /plans {revisions: true}`). Import re-checks the rule against the current evidence.
-Ranking is unchanged and deterministic: approved, tier, revision, coverage, certainty,
-indexer priority, seeders, size, ref.
+Ranking is deterministic: approved, swarm health band, tier, revision, coverage, certainty,
+seeders (more first), leecher-to-seeder ratio (lower first), indexer priority, size, ref.
+The band (`decision.health`) is `healthy` (50+ seeders; 10+ with leechers at most 10x the
+seeders; or 5+ with leechers at most equal), `ok` (3+ seeders) or `weak` (fewer, or unknown),
+so a healthy 720p beats a weak 1080p, and indexer priority never beats a bigger swarm.
 
 ## Plans and execution
 
