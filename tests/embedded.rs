@@ -525,8 +525,15 @@ async fn a_new_movie_arrives_over_bittorrent_imports_and_seeds_to_ratio_two_acro
             d["embedded"]["dht"].as_bool(),
             d["embedded"]["upnp"].as_bool()
         ),
-        (Some(false), Some(false))
+        (Some(false), Some(true)),
+        "UPnP is on by default (it only maps a non-loopback listener)"
     );
+    assert_eq!(d["embedded"]["transport"], "tcp+utp");
+    assert_eq!(
+        d["embedded"]["ipv6"], false,
+        "a loopback listener stays IPv4"
+    );
+    assert!(d["embedded"]["connections"]["utp"]["v4"]["attempts"].is_u64());
     let (_, caps, _) = e.json(e.get("/api/v1/capabilities")).await;
     let names: Vec<&str> = caps["capabilities"]
         .as_array()

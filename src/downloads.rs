@@ -1267,6 +1267,28 @@ async fn record_event(
         .await
 }
 
+/// How long a download makes no progress before it stops holding an active-download slot.
+const IDLE_SLOT_AFTER: Duration = Duration::from_secs(300);
+
+/// Whether the embedded engine has room to start one more queued grab. `rows` are the active
+/// grabs in `downloading` or `unconfirmed` as `(state, stalled_since)`.
+///
+/// A download that has made no progress for `IDLE_SLOT_AFTER` (dead swarm, no peers) and a
+/// grab still waiting for its magnet metadata (`unconfirmed`) do not use one of the `cap`
+/// slots, so one dead release no longer blocks the queue. A hard ceiling of `2 * cap`
+/// torrents that are not complete (idle ones and unconfirmed ones included) keeps the engine
+/// from collecting an unbounded number. Only grabs already chosen are ever submitted.
+fn slot_free(rows: &[(String, Option<String>)], cap: usize, now: OffsetDateTime) -> bool {
+    let counted = rows
+        .iter()
+        .filter(|(state, stalled)| {
+            state == "downloading"
+                && since(stalled.as_deref(), now).is_none_or(|d| d < IDLE_SLOT_AFTER)
+        })
+        .count();
+    counted < cap && rows.len() < cap.saturating_mul(2)
+}
+
 /// Submits due grabs (`queued`, or `unconfirmed` awaiting reconciliation). Returns how many
 /// were confirmed in the client.
 pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
@@ -1300,17 +1322,19 @@ pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         if g.state == "queued"
             && let Some(cap) = cap
         {
-            let busy: i64 = st
+            let rows: Vec<(String, Option<String>)> = st
                 .store
                 .with(|c| {
-                    Ok(c.query_row(
-                        "SELECT COUNT(*) FROM grabs WHERE active = 1 AND state IN ('downloading', 'unconfirmed')",
-                        [],
-                        |r| r.get(0),
-                    )?)
+                    let mut stmt = c.prepare(
+                        "SELECT state, stalled_since FROM grabs WHERE active = 1 AND state IN ('downloading', 'unconfirmed')",
+                    )?;
+                    let rows = stmt
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
                 })
                 .await?;
-            if busy as usize >= cap {
+            if !slot_free(&rows, cap, now) {
                 continue;
             }
         }
@@ -2833,6 +2857,77 @@ pub fn recover(c: &Connection, now: OffsetDateTime) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slots(rows: &[(&str, Option<i64>)], cap: usize) -> bool {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let rows: Vec<(String, Option<String>)> = rows
+            .iter()
+            .map(|(s, ago)| {
+                (
+                    s.to_string(),
+                    ago.map(|a| ts(now - time::Duration::seconds(a))),
+                )
+            })
+            .collect();
+        slot_free(&rows, cap, now)
+    }
+
+    #[test]
+    fn idle_and_metadata_waiting_grabs_do_not_hold_a_slot() {
+        // Three live downloads fill three slots.
+        let live = [
+            ("downloading", None),
+            ("downloading", Some(60)),
+            ("downloading", Some(299)),
+        ];
+        assert!(!slots(&live, 3));
+        // The observed queue: one moving, one stalled for 10 min, one waiting for metadata.
+        let jam = [
+            ("downloading", Some(10)),
+            ("downloading", Some(600)),
+            ("unconfirmed", None),
+        ];
+        assert!(slots(&jam, 3), "the dead ones no longer block the queue");
+        // Exactly at the threshold counts as idle; just under still holds a slot.
+        assert!(slots(
+            &[
+                ("downloading", Some(300)),
+                ("downloading", None),
+                ("downloading", None)
+            ],
+            3
+        ));
+        assert!(!slots(
+            &[
+                ("downloading", Some(299)),
+                ("downloading", None),
+                ("downloading", None)
+            ],
+            3
+        ));
+        assert!(slots(&[], 1));
+    }
+
+    #[test]
+    fn the_engine_never_holds_more_than_twice_the_limit_of_incomplete_torrents() {
+        let idle = ("downloading", Some(3600));
+        assert!(slots(&[idle; 5], 3), "five idle, six allowed");
+        assert!(
+            !slots(&[idle; 6], 3),
+            "the ceiling holds however idle they are"
+        );
+        let mixed = [
+            idle,
+            idle,
+            idle,
+            idle,
+            ("unconfirmed", None),
+            ("unconfirmed", None),
+        ];
+        assert!(!slots(&mixed, 3));
+        assert!(!slots(&[idle, idle], 1));
+        assert!(slots(&[idle], 1));
+    }
 
     /// What makes a failure no longer need anyone: every episode it covered is in the library
     /// or covered by a download still going.

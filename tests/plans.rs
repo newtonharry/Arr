@@ -1171,6 +1171,83 @@ async fn legacy_idempotency_keys_replay_after_the_upgrade() {
     );
 }
 
+async fn fargo_s05_plan(releases: Vec<(String, Vec<serde_json::Value>)>) -> serde_json::Value {
+    let app = start_exec(ExecOptions::shadow()).await;
+    {
+        let mut m = app.mock.lock().unwrap();
+        for (q, r) in releases {
+            m.releases.insert(q, r);
+        }
+    }
+    let (s, v, text) = body(
+        app.post("/api/v1/plans")
+            .json(&json!({ "media_id": "season:tvdb:269613:5" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, 201, "{text}");
+    v["plan"].clone()
+}
+
+#[tokio::test]
+async fn a_weak_season_pack_gives_way_to_healthy_episodes_but_still_beats_nothing() {
+    let pack = |seeders| {
+        (
+            "Fargo S05".to_string(),
+            vec![release(
+                "Fargo.S05.1080p.WEB-DL.DDP5.1.H.264-GRP",
+                25.0,
+                seeders,
+            )],
+        )
+    };
+    // Weak pack, healthy singles for every episode: the singles win.
+    let mut v = vec![pack(2)];
+    for n in 1..=10 {
+        v.push((
+            format!("Fargo S05E{n:02}"),
+            vec![release(
+                &format!("Fargo.S05E{n:02}.1080p.WEB-DL.H.264-GRP"),
+                2.5,
+                40,
+            )],
+        ));
+    }
+    let plan = fargo_s05_plan(v.clone()).await;
+    assert_eq!(plan["selection"], "episodes", "{plan}");
+    assert_eq!(plan["state"], "shadow_planned", "{plan}");
+    // A weak E01 in the season query's results doesn't stop E01's own search from finding
+    // the healthy copy, and doesn't hand the season to the weak pack.
+    let mut v2 = v.clone();
+    v2[0]
+        .1
+        .push(release("Fargo.S05E01.1080p.WEB-DL.H.264-WEAK", 2.5, 1));
+    let plan = fargo_s05_plan(v2).await;
+    assert_eq!(plan["selection"], "episodes", "{plan}");
+    let titles: Vec<&str> = plan["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.contains(&"Fargo.S05E01.1080p.WEB-DL.H.264-GRP"),
+        "{plan}"
+    );
+    assert!(
+        !titles.contains(&"Fargo.S05E01.1080p.WEB-DL.H.264-WEAK"),
+        "{plan}"
+    );
+    // Weak pack and nothing else: the pack is still used.
+    let plan = fargo_s05_plan(vec![pack(2)]).await;
+    assert_eq!(plan["selection"], "season_pack", "{plan}");
+    // A healthy pack is taken first.
+    let plan = fargo_s05_plan(vec![pack(60)]).await;
+    assert_eq!(plan["selection"], "season_pack", "{plan}");
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))

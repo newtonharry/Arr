@@ -475,7 +475,11 @@ async fn outages_back_off_without_advancing_and_hostile_feeds_are_refused() {
 
 #[tokio::test]
 async fn a_new_series_added_for_one_episode_is_matched_by_rss_for_that_episode_only() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions {
+        stall_timeout_minutes: Some(720), // the test jumps the clock 2 h with nothing downloading
+        ..Default::default()
+    })
+    .await;
     let t0 = time::OffsetDateTime::now_utc();
     // The default episode add of a new series, before anything is released.
     let (s, v, text) = e
@@ -599,7 +603,11 @@ async fn a_new_series_added_for_one_episode_is_matched_by_rss_for_that_episode_o
 
 #[tokio::test]
 async fn an_episode_added_to_an_unmonitored_season_is_matched_alone_by_rss() {
-    let e = start_exec(ExecOptions::default()).await;
+    let e = start_exec(ExecOptions {
+        stall_timeout_minutes: Some(720), // the test jumps the clock 2 h with nothing downloading
+        ..Default::default()
+    })
+    .await;
     let t0 = time::OffsetDateTime::now_utc();
     // Imported Slow Horses (S1 E1/E3 owned). The operator left seasons 1 and 2 unmonitored.
     for scope in ["season:tvdb:372264:1", "season:tvdb:372264:2"] {

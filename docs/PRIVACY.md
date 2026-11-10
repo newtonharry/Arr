@@ -105,3 +105,11 @@ command again with `--error-reports` or `--no-error-reports` (on Windows,
 Set `ARR_SENTRY_DSN` in Arr's environment to send reports to your own Sentry or
 [GlitchTip](https://glitchtip.com) server instead. Setting it to an empty value turns reporting
 off completely, whatever the config says, and setup won't ask.
+
+## Your router (UPnP)
+
+The built-in download engine asks your home router to forward the torrent port, so other
+peers can connect in. This talks to the router on your own network only, and nothing is sent
+over the internet for it. It asks for that one port (TCP) and nothing else, and renews the
+request every 30 seconds. To turn it off, add `upnp = false` under `[embedded]` in
+`config.toml` and restart Arr. Arr never writes that line itself.

@@ -719,12 +719,19 @@ pub fn apply_seed_requirement(
     }
 }
 
-/// Deterministic preference order (approved first; tier; revision when preferred; coverage;
-/// certainty; indexer priority; seeders; preferred size; release ref).
+/// Deterministic preference order: approved; swarm health band; tier; revision when
+/// preferred; coverage; certainty; seeders (more first); leecher-to-seeder ratio (lower
+/// first); indexer priority; preferred size; release ref.
+///
+/// Health comes before tier so that a release that will actually download beats a nicer one
+/// that will not (both already passed every content and quality check). Indexer priority sits
+/// below seeders so that, with several indexers, a preferred indexer never wins with a
+/// thinner swarm.
 pub fn compare(a: &Candidate, b: &Candidate, prefer_revision: bool) -> std::cmp::Ordering {
     let (da, db) = (&a.decision, &b.decision);
     db.approved
         .cmp(&da.approved)
+        .then(db.health.cmp(&da.health))
         .then(db.tier.cmp(&da.tier))
         .then(if prefer_revision {
             b.parsed.revision.cmp(&a.parsed.revision)
@@ -733,15 +740,29 @@ pub fn compare(a: &Candidate, b: &Candidate, prefer_revision: bool) -> std::cmp:
         })
         .then(db.covered_episodes.len().cmp(&da.covered_episodes.len()))
         .then(da.uncertainty.cmp(&db.uncertainty))
-        .then(a.indexer_priority.cmp(&b.indexer_priority))
         .then(
             b.release
                 .seeders
                 .unwrap_or(-1)
                 .cmp(&a.release.seeders.unwrap_or(-1)),
         )
+        .then(leech_ratio(a, b))
+        .then(a.indexer_priority.cmp(&b.indexer_priority))
         .then(da.preferred_distance.cmp(&db.preferred_distance))
         .then(a.release_ref.cmp(&b.release_ref))
+}
+
+/// Lower leecher-to-seeder ratio first (cross-multiplied, no division). Unknown leechers
+/// sort last.
+fn leech_ratio(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    let part = |c: &Candidate| {
+        (
+            i128::from(c.release.leechers.filter(|l| *l >= 0).unwrap_or(i64::MAX)),
+            i128::from(c.release.seeders.filter(|s| *s > 0).unwrap_or(1)),
+        )
+    };
+    let ((la, sa), (lb, sb)) = (part(a), part(b));
+    (la * sb).cmp(&(lb * sa))
 }
 
 pub fn rank(candidates: &mut [Candidate], prefer_revision: bool) {
@@ -834,6 +855,104 @@ mod tests {
     use super::*;
     use crate::ids::{MediaId, SeriesKey};
     use crate::target::{MovieTarget, Ownership, SeasonTarget, SeriesTarget, Source};
+
+    fn cand(name: &str, tier: usize, seeders: i64, leechers: i64, priority: i32) -> Candidate {
+        let release: ProwlarrRelease = serde_json::from_value(serde_json::json!({
+            "title": name, "seeders": seeders, "leechers": leechers,
+        }))
+        .unwrap();
+        Candidate {
+            release_ref: release_ref(&release),
+            parsed: release::parse(name),
+            decision: Decision {
+                approved: true,
+                rejections: vec![],
+                notes: vec![],
+                covered_episodes: vec![1],
+                owned_overlap: vec![],
+                full_season: false,
+                replacement: false,
+                health: decision::health(Some(seeders), Some(leechers)),
+                tier: Some(tier),
+                preferred_distance: 0,
+                uncertainty: 0,
+            },
+            release,
+            found_by: vec![],
+            indexer_priority: priority,
+        }
+    }
+
+    fn order(mut v: Vec<Candidate>) -> Vec<String> {
+        rank(&mut v, true);
+        v.iter().map(|c| c.release.title.clone().unwrap()).collect()
+    }
+
+    #[test]
+    fn healthy_swarms_outrank_tier_and_more_seeders_win_inside_a_band() {
+        // Higher tier number = better quality.
+        let weak_1080 = cand("weak 1080", 5, 2, 0, 25);
+        let healthy_720 = cand("healthy 720", 3, 12, 2, 25);
+        let healthy_1080 = cand("healthy 1080", 5, 12, 2, 25);
+        assert_eq!(
+            order(vec![weak_1080, healthy_720, healthy_1080]),
+            ["healthy 1080", "healthy 720", "weak 1080"]
+        );
+        // Same band, same tier: more seeders first, whatever the leechers.
+        assert_eq!(
+            order(vec![
+                cand("30 seeders", 3, 30, 29, 25),
+                cand("200 seeders", 3, 200, 150, 25),
+                cand("12 seeders", 3, 12, 0, 25),
+            ]),
+            ["200 seeders", "30 seeders", "12 seeders"]
+        );
+        // Equal seeders: fewer leechers per seeder first.
+        assert_eq!(
+            order(vec![
+                cand("crowded", 3, 20, 40, 25),
+                cand("quiet", 3, 20, 2, 25)
+            ]),
+            ["quiet", "crowded"]
+        );
+    }
+
+    #[test]
+    fn seeders_beat_indexer_priority_but_priority_breaks_ties() {
+        assert_eq!(
+            order(vec![
+                cand("preferred, thin", 3, 12, 0, 1),
+                cand("other, thick", 3, 80, 0, 50)
+            ]),
+            ["other, thick", "preferred, thin"]
+        );
+        assert_eq!(
+            order(vec![
+                cand("other", 3, 80, 0, 50),
+                cand("preferred", 3, 80, 0, 1)
+            ]),
+            ["preferred", "other"]
+        );
+    }
+
+    #[test]
+    fn futurama_s05_prefers_the_swarm_that_can_deliver() {
+        let v = vec![
+            cand("Futurama.S05E01.720p.WEB.H264-BATV[ettv]", 3, 0, 6, 25),
+            cand("Futurama S05E07 1080p HEVC x265-MeGusta", 5, 2, 0, 25),
+            cand("Futurama.S05E02.720p.WEB.H264-BATV", 3, 8, 3, 25),
+            cand("Futurama S05 1080p WEBRip x265-iVy", 5, 48, 3, 25),
+        ];
+        assert_eq!(
+            order(v),
+            [
+                "Futurama S05 1080p WEBRip x265-iVy",
+                "Futurama.S05E02.720p.WEB.H264-BATV",
+                "Futurama S05E07 1080p HEVC x265-MeGusta",
+                "Futurama.S05E01.720p.WEB.H264-BATV[ettv]",
+            ]
+        );
+    }
 
     #[test]
     fn release_refs_are_stable_across_versions() {

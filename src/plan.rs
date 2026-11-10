@@ -4,7 +4,7 @@
 //! goes through the download outbox and the plan records its grabs (`download_started`, then
 //! `imported` once they are all imported).
 
-use crate::decision::{Rejection, Scope};
+use crate::decision::{Health, Rejection, Scope};
 use crate::downloads::ReleaseLink;
 use crate::error::{ApiError, ErrorCode};
 use crate::fsutil;
@@ -743,31 +743,29 @@ async fn season_plan(
             "season packs not eligible: the season has not fully aired".to_string()
         });
     }
-    if pack_eligible
-        && let Some(c) = season_run
-            .candidates
-            .iter()
-            .find(|c| c.decision.approved && c.decision.full_season)
-    {
-        plan.state = PlanState::ShadowPlanned;
-        plan.selection = Some("season_pack".into());
-        for n in wanted.iter().chain(&replaceable) {
-            let u = units.get_mut(n).expect("episode has a unit");
-            u.status = UnitStatus::Planned;
-            u.candidate = Some(c.release_ref.clone());
-            u.reason = if replaceable.contains(n) {
-                "revision upgrade: replaced by the selected season pack".into()
-            } else {
-                "covered by the selected season pack".into()
-            };
+    // The best approved pack. A weak-swarm pack is held back as a fallback: healthy single
+    // episodes are better than a pack that will crawl, but a weak pack still beats nothing or
+    // weak singles.
+    let pack = pack_eligible
+        .then(|| {
+            season_run
+                .candidates
+                .iter()
+                .find(|c| c.decision.approved && c.decision.full_season)
+        })
+        .flatten();
+    let mut weak_pack = None;
+    if let Some(c) = pack {
+        if c.decision.health == Health::Weak {
+            weak_pack = Some(c);
+        } else {
+            take_pack(plan, links, target, c, &wanted, &replaceable, &mut units);
+            plan.units = units.into_values().collect();
+            let summary = summarize(&[&season_run]);
+            plan.notes.extend(retrieval_note(&summary.completeness));
+            plan.search = Some(summary);
+            return Ok(());
         }
-        plan.candidates.push(search::summary(c));
-        links.extend(crate::downloads::link_for(c, target, false));
-        plan.units = units.into_values().collect();
-        let summary = summarize(&[&season_run]);
-        plan.notes.extend(retrieval_note(&summary.completeness));
-        plan.search = Some(summary);
-        return Ok(());
     }
 
     // Phase 2: episode releases for the missing, aired episodes (and, for a revision search,
@@ -775,7 +773,9 @@ async fn season_plan(
     let mut remaining: BTreeSet<u16> = wanted.iter().chain(&replaceable).copied().collect();
     let wanted_set: BTreeSet<u16> = wanted.iter().copied().collect();
     let mut chosen: Vec<&Candidate> = vec![];
-    pick(&season_run, &mut remaining, &wanted_set, &mut chosen);
+    // Weak-swarm singles from the season query don't close their episodes yet: the episode
+    // searches below may find healthier copies. They are the fallback after those searches.
+    pick(&season_run, &mut remaining, &wanted_set, &mut chosen, false);
     let to_query: Vec<u16> = remaining
         .iter()
         .copied()
@@ -832,7 +832,10 @@ async fn season_plan(
         }
     };
     if let Some(run) = &episode_run {
-        pick(run, &mut remaining, &wanted_set, &mut chosen);
+        pick(run, &mut remaining, &wanted_set, &mut chosen, true);
+    }
+    pick(&season_run, &mut remaining, &wanted_set, &mut chosen, true);
+    if let Some(run) = &episode_run {
         for n in to_query
             .iter()
             .filter(|n| remaining.contains(n) && wanted_set.contains(n))
@@ -849,6 +852,21 @@ async fn season_plan(
                 u.reason = "episode query failed".into();
             }
         }
+    }
+    if let Some(c) = weak_pack
+        && (remaining.iter().any(|n| wanted_set.contains(n))
+            || chosen.iter().any(|x| x.decision.health == Health::Weak))
+    {
+        // The singles leave something unplanned or are just as weak: use the pack.
+        take_pack(plan, links, target, c, &wanted, &replaceable, &mut units);
+        plan.units = units.into_values().collect();
+        let all_runs: Vec<&SearchRun> = std::iter::once(&season_run)
+            .chain(episode_run.as_ref())
+            .collect();
+        let summary = summarize(&all_runs);
+        plan.notes.extend(retrieval_note(&summary.completeness));
+        plan.search = Some(summary);
+        return Ok(());
     }
     for c in &chosen {
         for n in &c.decision.covered_episodes {
@@ -972,19 +990,46 @@ async fn season_plan(
     Ok(())
 }
 
+/// Plans the whole of `wanted` (and the replaceable owned episodes) as one season pack.
+fn take_pack(
+    plan: &mut Plan,
+    links: &mut Vec<ReleaseLink>,
+    target: &Target,
+    c: &Candidate,
+    wanted: &[u16],
+    replaceable: &[u16],
+    units: &mut BTreeMap<u16, PlanUnit>,
+) {
+    plan.state = PlanState::ShadowPlanned;
+    plan.selection = Some("season_pack".into());
+    for n in wanted.iter().chain(replaceable) {
+        let u = units.get_mut(n).expect("episode has a unit");
+        u.status = UnitStatus::Planned;
+        u.candidate = Some(c.release_ref.clone());
+        u.reason = if replaceable.contains(n) {
+            "revision upgrade: replaced by the selected season pack".into()
+        } else {
+            "covered by the selected season pack".into()
+        };
+    }
+    plan.candidates.push(search::summary(c));
+    links.extend(crate::downloads::link_for(c, target, false));
+}
+
 /// Greedy selection in rank order: approved releases whose episodes are all still open and
-/// that cover a wanted episode (or are revision replacements).
+/// that cover a wanted episode (or are revision replacements); weak-swarm ones only if `weak`.
 fn pick<'a>(
     run: &'a SearchRun,
     remaining: &mut BTreeSet<u16>,
     wanted: &BTreeSet<u16>,
     chosen: &mut Vec<&'a Candidate>,
+    weak: bool,
 ) {
-    for c in run
-        .candidates
-        .iter()
-        .filter(|c| c.decision.approved && !c.decision.full_season)
-    {
+    for c in run.candidates.iter().filter(|c| {
+        c.decision.approved
+            && !c.decision.full_season
+            && (weak || c.decision.health != Health::Weak)
+    }) {
         let eps = &c.decision.covered_episodes;
         let useful = eps.iter().any(|e| wanted.contains(e)) || c.decision.replacement;
         if useful && !eps.is_empty() && eps.iter().all(|e| remaining.contains(e)) {

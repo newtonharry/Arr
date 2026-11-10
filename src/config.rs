@@ -431,6 +431,10 @@ struct EmbeddedSection {
     seeding_time_limit_minutes: Option<i64>,
     #[serde(default = "d_metadata_timeout")]
     metadata_timeout_secs: u64,
+    /// Map the torrent port on the router with UPnP (default on). Opt-out only; nothing
+    /// writes this key.
+    #[serde(default = "yes")]
+    upnp: bool,
     movie_category: Option<String>,
     tv_category: Option<String>,
 }
@@ -444,7 +448,7 @@ fn d_max_active() -> u32 {
 }
 
 fn d_metadata_timeout() -> u64 {
-    60
+    180
 }
 
 #[derive(Deserialize)]
@@ -546,8 +550,13 @@ fn d_rescan_hours() -> u64 {
 fn d_poll() -> u64 {
     30
 }
+/// Minutes without any download progress before a grab is failed, blocklisted and searched
+/// again. Progress at any poll resets the clock, so a slow download that keeps moving is never
+/// failed; only one that does not move at all is. 90 minutes outlasts a torrent that is merely
+/// slow to find peers or fetch its metadata, yet a dead one is replaced the same evening
+/// instead of the next day.
 fn d_stall() -> u64 {
-    720
+    90
 }
 
 #[derive(Deserialize)]
@@ -624,6 +633,8 @@ pub struct EmbeddedConfig {
     pub ratio_limit: Option<f64>,
     pub seeding_time_limit_minutes: Option<i64>,
     pub metadata_timeout: Duration,
+    /// Ask the router to forward the torrent listen port (UPnP). On unless `upnp = false`.
+    pub upnp: bool,
     pub movie_category: Option<String>,
     pub tv_category: Option<String>,
 }
@@ -1361,6 +1372,7 @@ pub fn parse_config(
                     5,
                     600,
                 )?),
+                upnp: e.upnp,
                 movie_category: category(e.movie_category, "embedded.movie_category")?,
                 tv_category: category(e.tv_category, "embedded.tv_category")?,
             })
@@ -2041,6 +2053,16 @@ pub fn template(listen: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn stall_timeout_defaults_to_ninety_minutes_and_an_explicit_value_wins() {
+        assert_eq!(d_stall(), 90);
+        assert_eq!(AutomationSection::default().stall_timeout_minutes, 90);
+        let a: AutomationSection = toml::from_str("stall_timeout_minutes = 720\n").unwrap();
+        assert_eq!(a.stall_timeout_minutes, 720);
+        let a: AutomationSection = toml::from_str("poll_seconds = 30\n").unwrap();
+        assert_eq!(a.stall_timeout_minutes, 90);
+    }
+
     fn setup(config: &str) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("state");
@@ -2079,6 +2101,26 @@ mod tests {
         assert!(standalone_template("127.0.0.1:8787").contains("listen = \"127.0.0.1:8787\""));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn embedded_upnp_can_be_switched_off() {
+        let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n[execution]\nenabled = true\n[library]\nmovies = \"/srv/movies\"\n[migration]\nmode = \"coexistence\"\n";
+        for (extra, want) in [
+            ("upnp = false\n", false),
+            ("upnp = true\n", true),
+            ("", true),
+        ] {
+            let (_t, cfg) = setup(&format!(
+                "{base}[embedded]\ndownload_dir = \"/srv/um-dl\"\nlisten = \"127.0.0.1:0\"\n{extra}"
+            ));
+            assert_eq!(
+                load(&cfg).unwrap().embedded.unwrap().upnp,
+                want,
+                "{extra:?}"
+            );
+        }
+    }
+
     #[cfg(unix)] // fixtures use Unix absolute paths
     #[test]
     fn embedded_section_is_explicit_exclusive_and_validated() {
@@ -2095,6 +2137,8 @@ mod tests {
         let e = c.embedded.as_ref().unwrap();
         assert_eq!(e.save_path, "/srv/um-dl");
         assert!(!e.trackers && !e.dht && !e.local_discovery);
+        assert!(e.upnp, "UPnP is on unless switched off");
+        assert_eq!(e.metadata_timeout, Duration::from_secs(180));
         assert_eq!(e.initial_peers, ["127.0.0.1:51413".parse().unwrap()]);
         assert_eq!(e.session_dir, cfg.parent().unwrap().join("embedded"));
         assert_eq!(
@@ -2155,7 +2199,13 @@ mod tests {
             ),
             (
                 format!(
-                    "{base}[embedded]\ndownload_dir = \"/srv/um-dl\"\nlisten = \"127.0.0.1:0\"\nupnp = true\n"
+                    "{base}[embedded]\ndownload_dir = \"/srv/um-dl\"\nlisten = \"127.0.0.1:0\"\nupnp = \"yes\"\n"
+                ),
+                "invalid type",
+            ),
+            (
+                format!(
+                    "{base}[embedded]\ndownload_dir = \"/srv/um-dl\"\nlisten = \"127.0.0.1:0\"\nport_forwarding = true\n"
                 ),
                 "unknown field",
             ),

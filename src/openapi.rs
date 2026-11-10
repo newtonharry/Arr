@@ -368,7 +368,8 @@ fn schemas(error_codes: Vec<Value>, plan_states: Vec<&str>, rejection_codes: Vec
         json!({ "Decision": { "type": "object", "properties": {
                     "approved": { "type": "boolean" }, "rejections": { "type": "array", "items": r("Rejection") }, "notes": { "type": "array", "items": { "type": "string" } },
                     "covered_episodes": { "type": "array", "items": { "type": "integer" } }, "owned_overlap": { "type": "array", "items": { "type": "integer" } }, "full_season": { "type": "boolean" },
-                    "replacement": { "type": "boolean", "description": "approved as a native revision upgrade of owned file(s)" } } } }),
+                    "replacement": { "type": "boolean", "description": "approved as a native revision upgrade of owned file(s)" },
+                    "health": { "type": "string", "enum": ["weak", "ok", "healthy"], "description": "swarm health band from seeders and leechers; ranks above quality tier among approved releases (healthy: 50+ seeders, or 10+ with leechers at most 10x seeders, or 5+ with leechers at most equal to seeders; ok: 3+ seeders; weak: fewer, or unknown)" } } } }),
         json!({ "Query": { "type": "object", "properties": {
                     "query": { "type": "string" }, "categories": { "type": "array", "items": { "type": "integer" } }, "indexer_ids": { "type": "array", "items": { "type": "integer" } },
                     "status": { "type": "string", "enum": ["complete", "truncated", "partial", "failed", "unavailable", "ok"],
