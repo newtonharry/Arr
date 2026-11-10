@@ -264,6 +264,9 @@ A calm line of plain-text labels, "IMDb 7.8 · Critics 96% · Audience 87%" (14p
 - **Link button:** no fill, teal-ink, 800, underlined, 44px tall (Sign out, "see all").
 - Busy is 70% opacity with progress cursor.
 
+### Switch
+- **Notifications:** a 52x32px pill (2px warm border, cream fill) with a 22px knob. On, it fills teal and the knob turns on-teal and slides right. It sits in the footer beside its plain state in muted text ("On", "Off", "Blocked in your browser settings", "Add Arr to your Home Screen first"), with a 13px muted privacy line below. Disabled is 50% opacity. The tap target is padded to 44px.
+
 ### Journey Line
 The signature. A 36px-tall four-stop track under any item on its way: Found, Downloading, Checking, In Plex. A 3px warm-line rail with a teal fill that scales from the left (`scaleX`, 0.9s `cubic-bezier(0.16, 1, 0.3, 1)`) as Arr works; stops are 11px circles, hollow until reached, solid teal when on; stop one is left-aligned, stop four right-aligned, two and three centred at one third and two thirds. The current stop's label is ink 800, others muted 600 at 12px. Paused turns the fill muted grey. The last stop, In Plex, is reached only when the row moves to Arrived.
 

@@ -17,8 +17,9 @@ use crate::art::Art;
 use crate::config::{OAuthConfig, RuntimeConfig};
 use crate::fsutil;
 use crate::ids::MediaId;
+use crate::push::{self, Push};
 use anyhow::{Context, Result};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Form, Path as UrlPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -226,12 +227,14 @@ struct Web {
     api: Router,
     token: String,
     oauth: Option<OAuthConfig>,
+    push: Arc<Push>,
 }
 
 type Wa = State<Arc<Web>>;
 
 /// The web app's routes. Has no fallback of its own (the API router's serves unknown paths).
 pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
+    let push = Arc::new(Push::open(&state.cfg.state_dir)?);
     let web = Arc::new(Web {
         state: state.clone(),
         art: Art::new(&state.cfg.state_dir)?,
@@ -239,7 +242,12 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
         api,
         token: state.cfg.api_token.expose().to_string(),
         oauth: state.cfg.mcp.as_ref().and_then(|m| m.oauth.clone()),
+        push: push.clone(),
     });
+    // The notification pass; there is nothing to run it on outside a runtime.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(push::run(push, web.api.clone(), web.token.clone()));
+    }
     Ok(Router::new()
         .route(
             "/",
@@ -280,6 +288,10 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             get(|| async { asset("text/javascript; charset=utf-8", QRCODEGEN_JS) }),
         )
         .route(
+            "/app/sw.js",
+            get(|| async { asset("text/javascript; charset=utf-8", SERVICE_WORKER) }),
+        )
+        .route(
             "/app/manifest.webmanifest",
             get(|| async { asset("application/manifest+json", MANIFEST) }),
         )
@@ -311,6 +323,11 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
         .route("/app/art/{media_id}", get(art))
         .route("/app/api/me", get(me))
         .route("/app/api/signout", post(signout))
+        .route("/app/api/v1/notifications/key", get(notifications_key))
+        .route(
+            "/app/api/v1/notifications/subscribe",
+            post(notifications_subscribe).delete(notifications_unsubscribe),
+        )
         .route("/app/api/v1/{*rest}", any(proxy))
         .with_state(web))
 }
@@ -328,6 +345,8 @@ const MASCOT: &str = include_str!("webapp/mascot.svg");
 const TMDB_LOGO: &str = include_str!("webapp/tmdb.svg");
 /// Nayuki's QR Code generator (MIT), unmodified; the header of the file says where from.
 pub(crate) const QRCODEGEN_JS: &str = include_str!("webapp/qrcodegen.js");
+/// Shows notifications and opens the app when one is tapped; it caches and intercepts nothing.
+const SERVICE_WORKER: &str = include_str!("webapp/sw.js");
 const MANIFEST: &str = include_str!("webapp/manifest.webmanifest");
 // The icons are webapp/mascot.svg on the cream background (#fff8ef), rendered once with
 // headless Chrome at 180, 192 and 512 pixels; the maskable one has extra padding so a
@@ -588,6 +607,106 @@ async fn signout(State(w): Wa, headers: HeaderMap) -> Response {
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
+}
+
+fn no_store(mut r: Response) -> Response {
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+/// The public key a browser needs to subscribe to this Arr's notifications.
+async fn notifications_key(State(w): Wa, headers: HeaderMap) -> Response {
+    if let Some(r) = w.check_app(&headers) {
+        return r;
+    }
+    if w.session(&headers).is_none() {
+        return w.unauthorized();
+    }
+    no_store(Json(json!({ "key": w.push.public_key() })).into_response())
+}
+
+#[derive(Deserialize)]
+struct SubKeys {
+    p256dh: String,
+    auth: String,
+}
+
+/// A browser's `PushSubscription.toJSON()`.
+#[derive(Deserialize)]
+struct SubBody {
+    endpoint: String,
+    #[serde(default)]
+    keys: Option<SubKeys>,
+}
+
+async fn notifications_subscribe(State(w): Wa, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(r) = w.check_app(&headers) {
+        return r;
+    }
+    let Some((session, _)) = w.session(&headers) else {
+        return w.unauthorized();
+    };
+    let bad = |m: &str| json_error(StatusCode::BAD_REQUEST, "invalid_request", m);
+    let Ok(b) = serde_json::from_slice::<SubBody>(&body) else {
+        return bad("send the subscription as {endpoint, keys: {p256dh, auth}}");
+    };
+    let Some(keys) = b.keys else {
+        return bad("the subscription has no keys");
+    };
+    if let Err(m) = push::validate_endpoint(&b.endpoint) {
+        return bad(m);
+    }
+    if let Err(m) = push::check_keys(&keys.p256dh, &keys.auth) {
+        return bad(m);
+    }
+    let sub = push::Sub {
+        endpoint: b.endpoint,
+        p256dh: keys.p256dh,
+        auth: keys.auth,
+    };
+    match w.push.subscribe(&sub, Some(&sha256_hex(&session))) {
+        Ok(true) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Ok(false) => json_error(
+            StatusCode::CONFLICT,
+            "too_many_devices",
+            "too many devices get notifications already",
+        ),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not save the subscription",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct UnsubBody {
+    endpoint: String,
+}
+
+async fn notifications_unsubscribe(State(w): Wa, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(r) = w.check_app(&headers) {
+        return r;
+    }
+    if w.session(&headers).is_none() {
+        return w.unauthorized();
+    }
+    let Ok(b) = serde_json::from_slice::<UnsubBody>(&body) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "send {endpoint}",
+        );
+    };
+    match w.push.unsubscribe(&b.endpoint) {
+        Ok(()) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not remove the subscription",
+        ),
+    }
 }
 
 #[derive(Deserialize)]

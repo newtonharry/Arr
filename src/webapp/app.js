@@ -1378,6 +1378,79 @@ function Phone({ url }) {
       h('p', null, h('b', null, 'iPhone: '), 'open the address in Safari, tap Share, then Add to Home Screen.'),
       h('p', null, h('b', null, 'Android: '), 'open the address in Chrome, tap the menu (three dots), then Add to Home screen or Install app.')));
 }
+// ---------- notifications: standard Web Push, opt-in on each device ----------
+// The service worker lives at /app/sw.js, so its scope is /app/ (the page itself is at /).
+const SW_SCOPE = '/app/';
+const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+const canPush = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const keyBytes = (b64) => Uint8Array.from(atob(b64.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+// `navigator.serviceWorker.ready` never settles for a worker outside the page's scope, so wait on the worker itself.
+function activated(reg) {
+  const w = reg.installing || reg.waiting || reg.active;
+  if (!w || w.state === 'activated') return Promise.resolve(reg);
+  return new Promise((ok, no) => w.addEventListener('statechange', () => {
+    if (w.state === 'activated') ok(reg); else if (w.state === 'redundant') no(new Error('worker failed'));
+  }));
+}
+// 'on', 'off', 'blocked', 'home' (iPhone: add to the Home Screen first) or 'none' (this browser can't).
+async function pushState() {
+  if (isIos && !isStandalone()) return 'home';
+  if (!canPush()) return 'none';
+  if (Notification.permission === 'denied') return 'blocked';
+  try {
+    const reg = await navigator.serviceWorker.getRegistration(SW_SCOPE);
+    return reg && (await reg.pushManager.getSubscription()) ? 'on' : 'off';
+  } catch { return 'off'; }
+}
+async function turnOn() {
+  if ((await Notification.requestPermission()) !== 'granted') return Notification.permission === 'denied' ? 'blocked' : 'off';
+  const reg = await activated(await navigator.serviceWorker.register('/app/sw.js', { scope: SW_SCOPE }));
+  const k = await api('/v1/notifications/key');
+  if (!k.ok) throw new Error('key');
+  // A subscription made for another key (Arr was set up again) has to go first.
+  const old = await reg.pushManager.getSubscription();
+  if (old) await old.unsubscribe();
+  const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(k.data.key) });
+  const r = await api('/v1/notifications/subscribe', { method: 'POST', body: sub.toJSON() });
+  if (!r.ok) { await sub.unsubscribe(); throw new Error('subscribe'); }
+  return 'on';
+}
+async function turnOff() {
+  const reg = await navigator.serviceWorker.getRegistration(SW_SCOPE);
+  const sub = reg && await reg.pushManager.getSubscription();
+  if (sub) {
+    await sub.unsubscribe();
+    await api('/v1/notifications/subscribe', { method: 'DELETE', body: { endpoint: sub.endpoint } });
+  }
+  return 'off';
+}
+const NOTIFY_TEXT = {
+  on: 'On', off: 'Off',
+  blocked: 'Blocked in your browser settings',
+  home: 'Add Arr to your Home Screen first',
+  none: "This browser can't show notifications",
+};
+function Notify() {
+  const [st, setSt] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  useEffect(() => { pushState().then(setSt); }, []);
+  const toggle = async () => {
+    setBusy(true); setErr('');
+    try { setSt(st === 'on' ? await turnOff() : await turnOn()); }
+    catch (e) { if (e.message !== 'signed out') setErr("Couldn't change that. Try again."); setSt(await pushState()); }
+    setBusy(false);
+  };
+  const usable = st === 'on' || st === 'off';
+  return h('section', { class: 'notify', 'aria-label': 'Notifications' },
+    h('div', { class: 'notify-row' },
+      h('span', { id: 'notify-label' }, 'Notifications'),
+      h('button', { type: 'button', class: 'toggle', id: 'notify-switch', role: 'switch', 'aria-checked': String(st === 'on'), 'aria-labelledby': 'notify-label notify-state', disabled: !usable || busy, onClick: toggle }, h('span', { class: 'knob' })),
+      h('span', { id: 'notify-state', class: 'notify-state', role: 'status' }, st ? NOTIFY_TEXT[st] : '')),
+    err ? h('p', { class: 'notify-err', role: 'alert' }, err) : null,
+    h('p', { class: 'notify-note' }, 'Get a message on this device when something is ready to watch or needs you. It goes through your browser maker’s push service (Google, Apple or Mozilla) and carries only a title. On iPhone this works from the Home Screen, on iOS 16.4 or later.'));
+}
 function Footer() {
   const [open, setOpen] = useState(false);
   const shown = useRef(false);
@@ -1391,6 +1464,7 @@ function Footer() {
     h('button', { type: 'button', class: 'link', id: 'phone-btn', 'aria-expanded': String(open), 'aria-controls': 'phone', onClick: () => setOpen(!open) }, 'Use Arr on your phone'),
     h('button', { type: 'button', class: 'link', id: 'signout', onClick: signOut }, 'Sign out'),
     h('section', { class: 'phone', id: 'phone', 'aria-label': 'Use Arr on your phone', hidden: !open }, open && S.me ? h(Phone, { url: me.public_url || null }) : null),
+    S.me ? h(Notify) : null,
     h('p', { class: 'credit' }, 'Movie details and posters from Plex',
       h('span', { id: 'tmdb-credit', hidden: !S.tmdb }, ' and ', h('img', { src: '/app/tmdb.svg', alt: 'TMDB', width: 85, height: 11 }), ' (Arr uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB)'),
       ', show details and posters from ', h('a', { href: 'https://www.tvmaze.com', target: '_blank', rel: 'noopener noreferrer' }, 'TVmaze'), '.'));

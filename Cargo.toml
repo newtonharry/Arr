@@ -40,6 +40,7 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-normalization = "0.1"
+url = "2.5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
@@ -50,7 +51,6 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "json
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 rmcp = { version = "=3.6.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3"
-url = "2.5"
 
 [profile.release]
 strip = true

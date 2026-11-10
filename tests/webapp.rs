@@ -1734,3 +1734,300 @@ async fn a_movie_plex_has_no_poster_for_falls_back_to_tmdb() {
     );
     assert_eq!(image_fetches(&e), ["/t/p/w342/leviticus.jpg"]);
 }
+
+// ------------------------------------------------------------------ notifications
+
+/// What a mock push service received.
+#[derive(Clone, Debug)]
+struct Pushed {
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// A push service on loopback: `/ok/..` accepts, `/gone/..` answers 410.
+async fn push_service() -> (String, Arc<Mutex<Vec<Pushed>>>) {
+    let log = Arc::new(Mutex::new(vec![]));
+    let app = axum::Router::new()
+        .route(
+            "/{kind}/{id}",
+            post(
+                |State(log): State<Arc<Mutex<Vec<Pushed>>>>,
+                 axum::extract::Path((kind, id)): axum::extract::Path<(String, String)>,
+                 headers: axum::http::HeaderMap,
+                 body: axum::body::Bytes| async move {
+                    log.lock().unwrap().push(Pushed {
+                        path: format!("/{kind}/{id}"),
+                        headers: headers
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                            .collect(),
+                        body: body.to_vec(),
+                    });
+                    if kind == "gone" {
+                        axum::http::StatusCode::GONE
+                    } else {
+                        axum::http::StatusCode::CREATED
+                    }
+                },
+            ),
+        )
+        .with_state(log.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, log)
+}
+
+/// A browser's subscription keys: a P-256 public key and a 16-byte secret.
+fn browser_keys() -> (String, String) {
+    use ring::{agreement, rand};
+    let k =
+        agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rand::SystemRandom::new())
+            .unwrap();
+    (
+        B64.encode(k.compute_public_key().unwrap().as_ref()),
+        B64.encode([9u8; 16]),
+    )
+}
+
+fn subscription(endpoint: &str) -> Value {
+    let (p256dh, auth) = browser_keys();
+    json!({ "endpoint": endpoint, "keys": { "p256dh": p256dh, "auth": auth } })
+}
+
+#[tokio::test]
+async fn notification_routes_need_a_sign_in_and_check_their_input() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let good = subscription("https://fcm.googleapis.com/fcm/send/abc");
+
+    // Signed out: every route refuses.
+    for (m, p) in [
+        (Method::GET, "/app/api/v1/notifications/key"),
+        (Method::POST, "/app/api/v1/notifications/subscribe"),
+        (Method::DELETE, "/app/api/v1/notifications/subscribe"),
+    ] {
+        let (s, _) = site.json(site.app(m.clone(), p, None).json(&good)).await;
+        assert_eq!(s, 401, "{m} {p}");
+    }
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+
+    // The key is a base64url P-256 point, the same every time, and kept in the secrets folder.
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/notifications/key", c))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let key = v["key"].as_str().unwrap();
+    assert_eq!(B64.decode(key).unwrap().len(), 65);
+    let (_, again) = site
+        .json(site.app(Method::GET, "/app/api/v1/notifications/key", c))
+        .await;
+    assert_eq!(again["key"], key);
+    fsutil::check_private_file(&e.state.cfg.state_dir.join("secrets/vapid_key")).unwrap();
+
+    // Needs the app marker like every app route.
+    let r = site
+        .plain(Method::GET, "/app/api/v1/notifications/key")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // Bad input is a 400.
+    let (p256dh, auth) = browser_keys();
+    let keys = json!({ "p256dh": p256dh, "auth": auth });
+    let ep = |e: &str| json!({ "endpoint": e, "keys": keys });
+    for (what, body) in [
+        ("not json", json!("x")),
+        (
+            "no keys",
+            json!({ "endpoint": "https://fcm.googleapis.com/x" }),
+        ),
+        ("http", ep("http://fcm.googleapis.com/x")),
+        // (Loopback is refused too; the unit tests cover it, since another test here
+        // switches the test-only loopback allowance on for the whole binary.)
+        ("private", ep("https://192.168.1.10/x")),
+        ("link-local", ep("https://169.254.169.254/x")),
+        (
+            "bad key",
+            json!({ "endpoint": "https://fcm.googleapis.com/x", "keys": { "p256dh": "AAAA", "auth": auth } }),
+        ),
+        (
+            "bad auth",
+            json!({ "endpoint": "https://fcm.googleapis.com/x", "keys": { "p256dh": p256dh, "auth": "AAAA" } }),
+        ),
+    ] {
+        let (s, v) = site
+            .json(
+                site.app(Method::POST, "/app/api/v1/notifications/subscribe", c)
+                    .json(&body),
+            )
+            .await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{what}: {v}"
+        );
+    }
+
+    // A good one is stored (once, however often it is sent), and removed again.
+    let count = || -> i64 {
+        rusqlite::Connection::open(e.state.cfg.state_dir.join("web.sqlite"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM push_subs", [], |r| r.get(0))
+            .unwrap()
+    };
+    for _ in 0..2 {
+        let (s, _) = site
+            .json(
+                site.app(Method::POST, "/app/api/v1/notifications/subscribe", c)
+                    .json(&good),
+            )
+            .await;
+        assert_eq!(s, 204);
+    }
+    assert_eq!(count(), 1);
+    let (s, _) = site
+        .json(
+            site.app(Method::DELETE, "/app/api/v1/notifications/subscribe", c)
+                .json(&json!({ "endpoint": good["endpoint"] })),
+        )
+        .await;
+    assert_eq!(s, 204);
+    assert_eq!(count(), 0);
+}
+
+#[tokio::test]
+async fn the_service_worker_is_served_to_the_app_scope() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let r = site.plain(Method::GET, "/app/sw.js").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(
+        r.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript")
+    );
+    let text = r.text().await.unwrap();
+    assert!(text.contains("showNotification") && text.contains("notificationclick"));
+    assert!(
+        !text.contains("addEventListener('fetch'"),
+        "no fetch handler"
+    );
+}
+
+#[tokio::test]
+async fn a_new_arrival_is_pushed_once_to_each_device_and_a_gone_device_is_forgotten() {
+    arr::push::allow_loopback_for_tests();
+    arr::push::set_tick_for_tests(150);
+    let e = exec().await;
+    let (push, log) = push_service().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    // The first pass has recorded what exists (nothing) by now.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    for path in ["ok/one", "gone/two"] {
+        let (s, v) = site
+            .json(
+                site.app(Method::POST, "/app/api/v1/notifications/subscribe", c)
+                    .json(&subscription(&format!("{push}/{path}"))),
+            )
+            .await;
+        assert_eq!(s, 204, "{v}");
+    }
+
+    // A movie arrives.
+    let (hash, r) = e.publish(
+        "The.Matrix.1999.1080p.WEB-DL.x264-UM",
+        "The.Matrix.1999.1080p.WEB-DL.x264-UM",
+        matrix_files(),
+        8.0,
+        false,
+    );
+    e.search_results("The Matrix 1999", vec![r]);
+    let (s, _, text) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "movie:tmdb:603", "execute": true })),
+        )
+        .await;
+    assert_eq!(s, 201, "{text}");
+    e.tick().await;
+    e.complete(&hash);
+    e.tick().await;
+
+    let mut seen = vec![];
+    for _ in 0..60 {
+        seen = log.lock().unwrap().clone();
+        if seen.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Let a few more passes run: nothing may be sent twice.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let all = log.lock().unwrap().clone();
+    assert_eq!(all.len(), seen.len(), "sent again: {all:?}");
+    assert_eq!(all.len(), 2, "one push per device: {all:?}");
+    let one = all.iter().find(|p| p.path == "/ok/one").unwrap();
+    assert_eq!(one.headers["ttl"], "86400");
+    assert_eq!(one.headers["content-encoding"], "aes128gcm");
+    assert_eq!(one.headers["content-type"], "application/octet-stream");
+    let auth = &one.headers["authorization"];
+    let key = site
+        .json(site.app(Method::GET, "/app/api/v1/notifications/key", c))
+        .await
+        .1["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(auth.starts_with("vapid t="), "{auth}");
+    assert!(auth.ends_with(&format!(",k={key}")), "{auth}");
+    let jwt = auth
+        .strip_prefix("vapid t=")
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap();
+    let claims: Value =
+        serde_json::from_slice(&B64.decode(jwt.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    assert_eq!(
+        claims["aud"],
+        push.as_str(),
+        "the audience is the push service's origin"
+    );
+    // The encrypted record: header (salt, record size 4096, 65-byte sender key), then ciphertext.
+    let b = &one.body;
+    assert_eq!(&b[16..20], &4096u32.to_be_bytes());
+    assert_eq!(b[20], 65);
+    assert_eq!(b[21], 4, "uncompressed P-256 point");
+    assert!(b.len() > 86 + 16, "{}", b.len());
+    assert!(
+        !String::from_utf8_lossy(b).contains("Matrix"),
+        "the message is encrypted"
+    );
+
+    // The 410 device was dropped; the other stays.
+    let db = rusqlite::Connection::open(e.state.cfg.state_dir.join("web.sqlite")).unwrap();
+    let left: Vec<String> = db
+        .prepare("SELECT endpoint FROM push_subs")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(left, vec![format!("{push}/ok/one")]);
+    let sent: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM push_sent WHERE item LIKE 'arrived:movie:tmdb:603:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sent, 1);
+}

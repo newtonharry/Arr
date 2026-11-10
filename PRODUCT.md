@@ -75,6 +75,10 @@ Arr's interface exposes the wish and the outcome.
 - Existing setup page and website exist (src/wizard/, site/); their look is evidence for the
   visual world, not yet a documented design system.
 - Opt-in only for anything that phones home (error reports, auto-updates).
+- Phone notifications are opt-in on each device. They use standard Web Push, so a message
+  goes through the browser maker's push service (Google, Apple or Mozilla); it is encrypted
+  for the device and carries only a title ("*Title* is ready to watch" or "*Title* needs
+  you"). On iPhone they work only once Arr is added to the Home Screen (iOS 16.4 or later).
 
 ## Evidence on Hand
 

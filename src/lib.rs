@@ -34,6 +34,7 @@ pub mod plexinstall;
 pub mod plexsignin;
 pub mod probe;
 pub mod prowlarr;
+pub mod push;
 pub mod qbit;
 pub mod quality;
 pub mod release;
