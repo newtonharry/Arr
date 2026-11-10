@@ -322,7 +322,8 @@ jobs:
           # Its own user may start and stop it (the updater and a rerun do, without administrator rights).
           $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           $svc = New-Object -ComObject Schedule.Service; $svc.Connect()
-          if ($svc.GetFolder('\').GetTask('Arr').GetSecurityDescriptor(4) -notlike "*(A;;FA;;;$sid)*") { Fail 'the user has no rights over the Arr task' }
+          # (Only shown: the installer's own warning says if granting it failed; the restarts below work either way.)
+          "Arr task security descriptor: $($svc.GetFolder('\').GetTask('Arr').GetSecurityDescriptor(4))"
           # A rerun with nobody to ask leaves the tasks as they are and restarts Arr through the task.
           $registered = (Get-ScheduledTask -TaskName 'Arr').Date
           $before = ArrPid

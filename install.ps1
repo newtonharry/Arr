@@ -442,6 +442,9 @@ function Install-Arr {
 				else { Write-Warning "Arr still starts when you log in, not at boot: $why" }
 				$bootFailure = $why
 			} else {
+				if ($script:ElevatedNote) {
+					Write-Warning "Arr starts at boot, but $($script:ElevatedNote) Restarting Arr will end its process and Windows will start it again within a minute."
+				}
 				# Arr and its tunnel restart under the new tasks: the ones running now were started at log-on.
 				Stop-Arr $Background
 				$started = Start-ArrTask 'Arr'
@@ -766,7 +769,8 @@ function Start-ArrTask($name) {
 # writing and running.
 function Invoke-Elevated($body) {
 	$result = Join-Path ([IO.Path]::GetTempPath()) ('arr-elevated-' + [guid]::NewGuid().ToString('N') + '.txt')
-	$text = "`$ErrorActionPreference = 'Stop'`ntry {`n$body`n'ok' | Set-Content -LiteralPath $(Quote-Ps $result)`n} catch { ('error: ' + `$_.Exception.Message) | Set-Content -LiteralPath $(Quote-Ps $result) }`n"
+	$script:ElevatedNote = ''
+	$text = "`$ErrorActionPreference = 'Stop'`ntry {`n`$note = ''`n$body`n('ok' + `$note) | Set-Content -LiteralPath $(Quote-Ps $result)`n} catch { ('error: ' + `$_.Exception.Message) | Set-Content -LiteralPath $(Quote-Ps $result) }`n"
 	$file = $null
 	try {
 		if (Test-Admin) {
@@ -786,7 +790,7 @@ function Invoke-Elevated($body) {
 			if ($p.ExitCode -eq 9) { return 'the administrator step was changed after it was written, so it did not run' }
 		}
 		$out = if (Test-Path -LiteralPath $result) { ([string](Get-Content -LiteralPath $result -Raw)).Trim() } else { '' }
-		if ($out -eq 'ok') { return $null }
+		if ($out -match '^ok( .*)?$') { $script:ElevatedNote = "$($Matches[1])".Trim(); return $null }
 		if ($out) { return ($out -replace '^error: ', '') }
 		return 'the administrator step did not finish'
 	} finally {
@@ -837,9 +841,23 @@ foreach ($t in $tasks) {
 		$svc = New-Object -ComObject Schedule.Service
 		$svc.Connect()
 		$rt = $svc.GetFolder('\').GetTask($t.Name)
-		$sd = $rt.GetSecurityDescriptor(4)
-		if ($sd -notlike "*(A;;FA;;;$sid)*") { $rt.SetSecurityDescriptor($sd + "(A;;FA;;;$sid)", 0) }
-		if ($rt.GetSecurityDescriptor(4) -notlike "*(A;;FA;;;$sid)*") { throw "could not let $user start and stop the task $($t.Name)" }
+		# Best effort: letting the user start and stop the task is what makes restarts need no
+		# administrator, but without it Arr still starts at boot (a restart then ends Arr's
+		# process and Windows starts the task again within a minute). Windows may write the entry
+		# back in another spelling, so what is checked is the parsed entry, and a failure is
+		# reported (with Windows' own message), not thrown.
+		$err = ''
+		$granted = $false
+		try {
+			$rt = $svc.GetFolder('\').GetTask($t.Name)
+			$rt.SetSecurityDescriptor($rt.GetSecurityDescriptor(4) + "(A;;FA;;;$sid)", 0)
+			$acl = (New-Object Security.AccessControl.RawSecurityDescriptor($rt.GetSecurityDescriptor(4))).DiscretionaryAcl
+			foreach ($ace in $acl) {
+				if ($ace.SecurityIdentifier.Value -eq $sid -and "$($ace.AceType)" -eq 'AccessAllowed' -and ($ace.AccessMask -band 0x20) -ne 0) { $granted = $true }
+			}
+			if (-not $granted) { $err = 'the entry is not in the security descriptor Windows returns: ' + $rt.GetSecurityDescriptor(4) }
+		} catch { $err = $_.Exception.Message }
+		if (-not $granted) { $note += " could not let $user start and stop the task $($t.Name) ($(($err -replace '\s+', ' ')))." }
 	}
 }
 '@
