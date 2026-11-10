@@ -178,10 +178,6 @@ enum Command {
         name: String,
         /// Its new value.
         value: Option<String>,
-        /// Called by the installer, which restarts Arr afterwards: only changes what the
-        /// messages say.
-        #[arg(long, hide = true)]
-        installer: bool,
     },
     /// Prints a sign-in link for the web app: valid for 15 minutes, works once. Anyone who has
     /// the link can sign in, so send it only to the person it is for.
@@ -671,7 +667,6 @@ async fn run() -> Result<std::process::ExitCode> {
             config,
             name,
             value,
-            installer,
         } => {
             let value = match arr::set::secret(&name)? {
                 Some(what) if value.is_some() => {
@@ -680,7 +675,10 @@ async fn run() -> Result<std::process::ExitCode> {
                 Some(what) => Some(read_secret(what)?),
                 None => value,
             };
-            let caller = if installer {
+            // The installer, which restarts Arr afterwards, sets ARR_INSTALLER=1: only the
+            // messages change. An environment variable rather than a flag, so a newer installer
+            // can still drive an older binary (`install.sh --version`), which ignores it.
+            let caller = if std::env::var_os("ARR_INSTALLER").is_some_and(|v| v == "1") {
                 arr::set::Caller::Installer
             } else {
                 arr::set::Caller::Person

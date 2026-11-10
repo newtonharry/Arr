@@ -131,7 +131,8 @@ function Install-Arr {
 	}
 	# Changes one setting through `arr set`, which checks it and changes nothing if it's refused.
 	function Set-Arr {
-		$out = $input | Run-Arr set --config $Config --installer @args
+		$env:ARR_INSTALLER = '1'
+		try { $out = $input | Run-Arr set --config $Config @args } finally { Remove-Item Env:ARR_INSTALLER -ErrorAction SilentlyContinue }
 		if ($LASTEXITCODE -ne 0) { throw "couldn't set $($args[0]): $(($out -join ' ') -replace '^Error: ', '')" }
 		Say $out
 	}
@@ -280,7 +281,8 @@ function Install-Arr {
 		# profiles and goals already there.
 		$beforeIndexers = "$Config.before-indexers"
 		Copy-Item $Config $beforeIndexers -Force
-		$out = Run-Arr set --config $Config --installer default-indexers
+		$env:ARR_INSTALLER = '1'
+		try { $out = Run-Arr set --config $Config default-indexers } finally { Remove-Item Env:ARR_INSTALLER -ErrorAction SilentlyContinue }
 		if ($LASTEXITCODE -ne 0) {
 			Write-Warning "$(($out -join ' ') -replace '^Error: ', ''); carrying on without the new search source."
 		} else {
