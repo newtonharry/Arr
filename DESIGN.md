@@ -276,6 +276,14 @@ Home / Ideas / Library, icon plus label. Phone: bottom bar, white, 2px warm top 
 ### Segmented Pills and Filter
 Pill buttons (999px, 2px warm border, 44px tall, 800) for choices like Movies / Shows; selected is teal filled with on-teal text. The library filter input is 44px, white, 2px warm border, 14px radius.
 
+### Ideas, Search and Title-page Extras
+- **Genre chips:** the segmented pill style above, one row that scrolls sideways on a phone: "All" plus the six genres most ideas share. One is selected at a time and nothing is saved.
+- **Not interested:** a quiet 13px/700 muted link button under an idea; it hides the show for everyone using this Arr and raises the toast. Shows already in the library or Plex are left out of Ideas unless "Show ones I have" (a link button with a pressed state) is on.
+- **Toast:** one small pill above the tab bar, ink fill with page-coloured text and a link-button action ("Hidden · Undo"), gone after seven seconds. No shadow.
+- **Search before typing:** tapping the search field opens Search with "Recent" (the last eight searches on this device, each removable, plus "Clear") and "Popular now" (the same ideas row as Home).
+- **Owned badge:** the "In Plex" tag style (teal ink, check glyph) under a search result's meta line: "In Plex", "On its way" or "Tracking". A movie already in Plex shows the Done button instead of a second badge.
+- **Title pages:** under the summary (four lines, then "More"), genres as small pills (999px, 2px warm border, 13px/800 muted); at the end of the page a "Cast" section of up to six names with the character in muted text, two columns on a phone. Names only, no photos.
+
 ### Empty and Sign-in
 Centred mascot (96px empty, 120px sign-in), a heading, one muted line (max 30ch) and at most one teal button. The mascot (`src/webapp/mascot.svg`) is the brand mark at 34px beside "Arr" and as the favicon.
 

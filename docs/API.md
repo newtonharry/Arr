@@ -194,7 +194,8 @@ response bodies or credentials.
 - **`GET /api/v1/discover?kind=movie|series&q=&year=`** merges catalog hits with TVmaze (for
   series, when enabled) and Plex's metadata service, then TMDB as the backup (for movies, when
   configured). Each result carries
-  `media_id`, `in_catalog`, `sources` and `external_ids`. `providers[]` gives each provider's
+  `media_id`, `in_catalog`, `library_state` (`in_plex`, `on_its_way`, `tracking` or `null`),
+  `sources` and `external_ids`. `providers[]` gives each provider's
   status: `ok`, `failed` (with `error`), `disabled`, `not_configured` or `not_imported`. When
   neither Plex nor TMDB can answer, the `plex` provider is `not_configured` and its message says
   the install needs to sign in to Plex.
@@ -212,6 +213,18 @@ response bodies or credentials.
   `probably_skip`, critics 15 or more above the audience `critics_pick`, audience 15 or more
   above critics `crowd_pleaser`, else `mixed`. Movies in `/discover` get scores only from
   Plex's own search hits.
+- **`GET /api/v1/ideas`** lists popular shows with a new episode in the last 7 days (TVmaze
+  web schedule, cached 6 hours): `{status: ok|unavailable|disabled, items}`. Each item has
+  `media_id`, `title`, `year`, `network`, `summary`, `rating`, `genres` (up to four),
+  `in_library`, `owned` (already in the library or in Plex) and `library_state` (as in
+  discover). Shows hidden with `hide` are left out.
+- **`POST /api/v1/ideas/hide`** with `{media_id}` (a series id) is "Not interested": the show
+  stops appearing in Ideas for everyone using this Arr. The list is kept in the private
+  `web.sqlite` (table `hidden_ideas`). It changes no download, file or library entry.
+  **`DELETE /api/v1/ideas/hide/{media_id}`** undoes it. Both are idempotent.
+- **`GET /api/v1/show/{media_id}`** and **`GET /api/v1/movie/{media_id}`** carry the title page:
+  `summary`, `runtime_minutes`, `genres`, and `cast` (up to six `{name, character}`, from Plex or
+  TVmaze, or TMDB for a movie when it has a key). Any of them can be empty or null.
 - **`GET /api/v1/media/{media_id}`** resolves a target. For a season or episode it returns the
   episode list with `aired` and `ownership` (`owned` / `missing` / `unknown`), plus
   `ownership_source` and `episode_list_source`.

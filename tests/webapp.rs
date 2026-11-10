@@ -935,6 +935,148 @@ async fn plex_scores_reach_ideas_pages_and_search_and_never_break_them() {
 }
 
 #[tokio::test]
+async fn ideas_can_be_hidden_for_everyone_and_unhidden() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    {
+        let mut m = e.mock.lock().unwrap();
+        m.schedule = vec![
+            scheduled(
+                372,
+                "Slow Horses",
+                Some(372264),
+                90,
+                "<p>In the library.</p>",
+            ),
+            scheduled(21, "Fresh Show", Some(5021), 80, "<p>New.</p>"),
+            scheduled(22, "Other Show", None, 70, "<p>New.</p>"),
+        ];
+        m.schedule[1]["_embedded"]["show"]["genres"] = json!(["Comedy", " Drama ", "Comedy"]);
+    }
+    let get = |cookie: &str| site.json(site.app(Method::GET, "/app/api/v1/ideas", Some(cookie)));
+    let ids = |v: &Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["media_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (s, v) = get(&cookie).await;
+    assert_eq!(s, 200, "{v}");
+    // Owned shows say so (the page hides them by default); genres are cleaned.
+    assert_eq!(v["items"][0]["owned"], true, "{v}");
+    assert_eq!(v["items"][1]["owned"], false, "{v}");
+    assert_eq!(v["items"][1]["genres"], json!(["Comedy", "Drama"]), "{v}");
+    assert_eq!(v["items"][2]["genres"], json!([]), "{v}");
+    assert_eq!(ids(&v).len(), 3);
+    // Not interested: gone from the list; a non-series or junk id is refused.
+    let hide = |id: &str| {
+        site.json(
+            site.app(Method::POST, "/app/api/v1/ideas/hide", Some(&cookie))
+                .json(&json!({ "media_id": id })),
+        )
+    };
+    let (s, v) = hide("series:tvdb:5021").await;
+    assert_eq!((s, v["hidden"].clone()), (200, json!(true)), "{v}");
+    assert_eq!(hide("series:tvdb:5021").await.0, 200, "twice is fine");
+    assert_eq!(hide("movie:tmdb:603").await.0, 400);
+    assert_eq!(hide("nonsense").await.0, 400);
+    let (_, v) = get(&cookie).await;
+    assert_eq!(
+        ids(&v),
+        ["series:tvdb:372264", "series:tvmaze:22"],
+        "only the hidden show is gone"
+    );
+    // It is kept for everyone: another session, and the bearer API, see the same list.
+    let other = site.sign_in(&e).await;
+    let (_, v) = get(&other).await;
+    assert_eq!(ids(&v).len(), 2);
+    let (s, v, _) = e.json(e.get("/api/v1/ideas")).await;
+    assert_eq!((s, ids(&v).len()), (200, 2));
+    let (s, v, _) = e
+        .json(
+            e.post("/api/v1/ideas/hide")
+                .json(&json!({ "media_id": "series:tvmaze:22" })),
+        )
+        .await;
+    assert_eq!((s, v["media_id"].clone()), (200, json!("series:tvmaze:22")));
+    let (_, v) = get(&cookie).await;
+    assert_eq!(ids(&v), ["series:tvdb:372264"]);
+    // Undo.
+    for id in ["series:tvdb:5021", "series:tvmaze:22"] {
+        let (s, v) = site
+            .json(site.app(
+                Method::DELETE,
+                &format!("/app/api/v1/ideas/hide/{id}"),
+                Some(&cookie),
+            ))
+            .await;
+        assert_eq!((s, v["hidden"].clone()), (200, json!(false)), "{v}");
+    }
+    let (_, v) = get(&cookie).await;
+    assert_eq!(ids(&v).len(), 3);
+    // The app can reach these two routes and nothing broader.
+    for (method, path) in [
+        (Method::GET, "/app/api/v1/ideas/hide"),
+        (Method::DELETE, "/app/api/v1/ideas/hide"),
+        (Method::DELETE, "/app/api/v1/ideas"),
+        (Method::PUT, "/app/api/v1/ideas/hide/series:tvdb:1"),
+    ] {
+        let (s, v) = site
+            .json(site.app(method.clone(), path, Some(&cookie)))
+            .await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (404, Some("not_found")),
+            "{method} {path}"
+        );
+    }
+    // Without the session they are refused like the other app routes.
+    let r = site
+        .plain(Method::POST, "/app/api/v1/ideas/hide")
+        .header("x-arr-app", "1")
+        .json(&json!({ "media_id": "series:tvdb:1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+}
+
+#[tokio::test]
+async fn search_results_say_what_arr_already_has() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let find = |kind: &'static str, q: &'static str| {
+        let (site, cookie) = (&site, &cookie);
+        async move {
+            let path = format!("/app/api/v1/discover?kind={kind}&q={q}");
+            let (s, v) = site.json(site.app(Method::GET, &path, Some(cookie))).await;
+            assert_eq!(s, 200, "{v}");
+            v["results"].as_array().unwrap().clone()
+        }
+    };
+    // A show with episodes in Plex, and a show Arr does not have.
+    let rows = find("series", "slow").await;
+    assert_eq!(rows[0]["library_state"], "in_plex", "{rows:?}");
+    let rows = find("series", "coming soon").await;
+    assert!(rows[0]["library_state"].is_null(), "{rows:?}");
+    // A movie in Plex, and a movie Arr does not have.
+    let rows = find("movie", "matrix").await;
+    assert!(
+        rows.iter().any(|r| r["library_state"] == "in_plex"),
+        "{rows:?}"
+    );
+    let rows = find("movie", "plex").await;
+    assert!(
+        rows.iter().all(|r| r["library_state"].is_null()),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn ideas_say_when_they_are_unavailable_or_off() {
     let e = exec().await;
     e.mock.lock().unwrap().schedule_fail = true;

@@ -73,6 +73,14 @@ struct Show {
     /// The ids Plex can look the show up by, for its review scores.
     tvdb: Option<u32>,
     imdb: Option<String>,
+    genres: Vec<String>,
+    cast: Vec<metadata::CastName>,
+}
+
+fn cast_json(cast: &[metadata::CastName]) -> Vec<Value> {
+    cast.iter()
+        .map(|c| json!({ "name": c.name, "character": c.character }))
+        .collect()
 }
 
 fn status_word(raw: Option<&str>) -> Option<&'static str> {
@@ -210,9 +218,27 @@ async fn load_show(st: &Arc<AppState>, key: SeriesKey) -> Result<Show, ApiError>
         .as_ref()
         .and_then(|s| s.imdb_id.clone())
         .or_else(|| show.as_ref().and_then(|s| s.externals.imdb.clone()));
+    let mut cast = show.as_ref().map(|s| s.cast()).unwrap_or_default();
+    if let (true, Some(tv), Some(sh)) = (
+        cast.is_empty(),
+        &st.tvmaze,
+        show.as_ref().filter(|s| s.embedded.is_none()),
+    ) {
+        // A show found by its TVDB id comes without its cast: one cached lookup by TVmaze id.
+        if let Ok(Some(full)) = tv.by_id(sh.id).await {
+            cast = full.cast();
+        }
+    }
+    let genres = metadata::clean_genres(
+        show.iter()
+            .flat_map(|s| s.genres.iter().map(String::as_str)),
+        6,
+    );
     Ok(Show {
         tvdb,
         imdb,
+        genres,
+        cast,
         runtime,
         profile: catalog.as_ref().and_then(|s| s.quality_profile.clone()),
         tracked: catalog.is_some(),
@@ -355,6 +381,7 @@ pub(super) async fn show(State(st): St, p: Result<Path<String>, PathRejection>) 
         "media_id": s.id, "title": s.title, "year": s.year, "network": s.network,
         "summary": s.summary, "status": s.status, "following": s.following, "seasons": seasons,
         "scores": metadata::scores_json(scores),
+        "runtime_minutes": s.runtime, "genres": s.genres, "cast": cast_json(&s.cast),
     });
     let l = st.loaded()?;
     options::page_fields(
@@ -460,6 +487,8 @@ pub(super) async fn movie(State(st): St, p: Result<Path<String>, PathRejection>)
         }
     }
     let scores = meta.as_ref().and_then(|m| m.scores);
+    let genres = meta.as_ref().map(|m| m.genre_names()).unwrap_or_default();
+    let cast = meta.as_ref().map(|m| m.cast()).unwrap_or_default();
     let summary = meta
         .and_then(|m| m.overview)
         .map(|t| cut(t.trim(), 400))
@@ -468,6 +497,7 @@ pub(super) async fn movie(State(st): St, p: Result<Path<String>, PathRejection>)
         "media_id": id, "title": title, "year": year, "runtime_minutes": runtime,
         "summary": summary, "state": state, "progress": progress, "until": until,
         "scores": metadata::scores_json(scores),
+        "genres": genres, "cast": cast_json(&cast),
     });
     let l = st.loaded()?;
     options::page_fields(
