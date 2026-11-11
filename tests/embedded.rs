@@ -2013,17 +2013,16 @@ async fn an_episode_the_pack_has_no_file_for_leaves_the_grab_and_is_not_picked_f
     let (_, bl, _) = e.json(e.get("/api/v1/blocklist")).await;
     assert_eq!(bl["items"][0]["reason"], "no_episode_file", "{bl}");
     let (_, show, text) = e.json(e.get("/api/v1/show/series:tvdb:372264")).await;
-    // E02 and E06 are wanted, not on their way; E04 and E05 are coming.
+    // E02 and E06 are wanted, not on their way; E04 and E05 are coming or, on a fast
+    // machine, already in (with E01 and E03, owned from the start).
     let season = &show["seasons"][0];
+    let n = |k: &str| season[k].as_i64().unwrap_or(0);
     assert_eq!(
-        (
-            season["in_plex"].as_i64(),
-            season["on_its_way"].as_i64(),
-            season["wanted"].as_i64()
-        ),
-        (Some(2), Some(2), Some(2)),
+        (n("in_plex") + n("on_its_way"), n("wanted")),
+        (4, 2),
         "{text}"
     );
+    assert!(n("in_plex") >= 2, "{text}");
 
     // A search for E02 is not given this pack again.
     let (_, v, text) = execute(&e, "season:tvdb:372264:1").await;
