@@ -4359,7 +4359,8 @@ async fn feed(State(st): St) -> ApiResult {
     st.loaded()?;
     let now = OffsetDateTime::now_utc();
     let index = st.index();
-    let since = rfc3339(now - Duration::from_secs(7 * 86_400));
+    // Arrived shows the last day only: the home is about what's new, Plex holds the rest.
+    let since = rfc3339(now - Duration::from_secs(86_400));
     let (active, imported, requests) = st
         .store
         .with(move |c| {

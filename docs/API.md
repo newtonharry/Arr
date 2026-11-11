@@ -198,8 +198,8 @@ have none. The plain API does not return it. The movie and show pages also carry
 
   No notifications are sent.
 - **`GET /api/v1/feed`** is what the web app's home shows, in plain words: `needs_you`,
-  `on_its_way`, `arrived`, `looking` and `coming_up`. Catalog and state only, no network
-  calls. Two things in it help a client explain itself:
+  `on_its_way`, `arrived` (imports of the last 24 hours, newest first, at most 20), `looking`
+  and `coming_up`. Catalog and state only, no network calls. Two things in it help a client explain itself:
   - each `needs_you` item has `problem` (a short sentence), plus `kind` (`download_failed`,
     `import_blocked` or `request_expired`) and `failure` (why a download failed, for example
     `stalled`, `no_metadata` or `wrong_quality`; null otherwise), and `count`, how many

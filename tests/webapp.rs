@@ -684,6 +684,21 @@ async fn the_feed_tells_what_is_happening_in_plain_words() {
     );
     assert!(a["at"].is_string());
 
+    // A day later it has left Arrived: the home shows what's new, Plex holds the rest.
+    let id = matrix.clone();
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute(
+                "UPDATE grabs SET imported_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-25 hours') WHERE id = ?1",
+                [&id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let v = feed().await;
+    assert_eq!(v["arrived"], json!([]), "{v}");
+
     // A request nobody could fill yet, and an episode coming up.
     let (s, q) = site
         .json(
