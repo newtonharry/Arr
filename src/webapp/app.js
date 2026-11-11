@@ -1548,6 +1548,8 @@ async function loadHealth() {
 async function renderSettings() {
   G.msg = ''; G.err = '';
   setView({ t: 'settings' });
+  // Open at the top, where "You" and Sign out are, not where the last screen was scrolled to.
+  window.scrollTo(0, 0);
   await Promise.all([loadSettings(), loadHealth(), loadUpdate()]);
 }
 async function applySetting(name, value) {
