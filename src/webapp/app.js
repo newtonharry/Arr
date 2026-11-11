@@ -68,6 +68,7 @@ const ICONS = {
   close: 'M6 6l12 12M18 6L6 18',
   down: 'M6 9l6 6l6-6',
   right: 'M9 6l6 6l-6 6',
+  settings: 'M12 9a3 3 0 1 0 0 6a3 3 0 0 0 0-6zM12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1',
   star: 'M12 3.5l2.6 5.4l5.9.8l-4.3 4.1l1 5.9L12 16.9l-5.2 2.8l1-5.9l-4.3-4.1l5.9-.8z',
 };
 const ic = (name) => h('svg', { viewBox: '0 0 24 24', class: 'ic', 'aria-hidden': 'true' }, h('path', { d: ICONS[name] }));
@@ -1298,7 +1299,7 @@ function parseHash(hash = location.hash) {
   return { path, q: new URLSearchParams(qs || '').get('q') || '' };
 }
 const pageName = (path) => (path === '/search' ? 'Search' : path === '/ideas' ? 'Ideas' : path === '/library' ? 'Library' : path === '/settings' ? 'Settings' : 'Home');
-const TABS = [['/', 'Home', 'home'], ['/ideas', 'Ideas', 'ideas'], ['/library', 'Library', 'library']];
+const TABS = [['/', 'Home', 'home'], ['/ideas', 'Ideas', 'ideas'], ['/library', 'Library', 'library'], ['/settings', 'Settings', 'settings']];
 function route() {
   if (S.out) return;
   const { path, q } = parseHash();
@@ -1514,6 +1515,7 @@ async function startUpdate() {
 function clearUpdate() { U.phase = 'idle'; U.updated = ''; U.err = ''; bump(); }
 function UpdateBar() {
   const i = U.info;
+  if (!S.me || S.out) return null;
   const close = h('button', { type: 'button', class: 'link', onClick: clearUpdate }, 'Dismiss');
   let line = null, bad = false;
   if (U.phase === 'waiting') line = ['Updating… Arr will be back in a minute.'];
@@ -1523,7 +1525,7 @@ function UpdateBar() {
   else if (U.updated) line = [`Updated to ${U.updated} · `, whatsNew(`${REPO}/releases/tag/v${U.updated}`), ' ', close];
   else if (i && i.available && i.can_update) line = [`Arr ${i.latest} is available · `, h('button', { type: 'button', class: 'link', id: 'update-now', onClick: startUpdate }, 'Update now')];
   if (!line) return null;
-  return h('p', { class: 'upd' + (bad ? ' bad' : ''), id: 'update-bar', role: bad ? 'alert' : 'status' }, line);
+  return h('div', { class: 'upd-wrap', inert: P.shown }, h('p', { class: 'upd' + (bad ? ' bad' : ''), id: 'update-bar', role: bad ? 'alert' : 'status' }, line));
 }
 
 // Settings: the few things a person may change from a phone. Every change restarts Arr.
@@ -1631,15 +1633,18 @@ function UpdatesSection() {
       i.available && i.release_url ? h('p', { class: 'sw-m' }, whatsNew(i.release_url)) : null)));
 }
 function Settings() {
+  // "You" comes first and never waits on the settings: Sign out works while they load, fail or restart.
+  const you = h(You);
   if (G.restarting) {
-    return h('section', { class: 'empty', 'aria-labelledby': 'h-restart' }, h('img', { src: '/app/mascot.svg', alt: '' }),
-      h('h2', { id: 'h-restart' }, 'Restarting…'), h('p', { role: 'status' }, 'Arr will be back in a minute.'));
+    return h('div', { class: 'stack' }, you,
+      h('section', { class: 'empty', 'aria-labelledby': 'h-restart' }, h('img', { src: '/app/mascot.svg', alt: '' }),
+        h('h2', { id: 'h-restart' }, 'Restarting…'), h('p', { role: 'status' }, 'Arr will be back in a minute.')));
   }
   const d = G.data;
-  if (!d) return h(Hint, { text: 'Loading settings…' });
+  if (!d) return h('div', { class: 'stack' }, you, h(Hint, { text: 'Loading settings…' }));
   const lock = !d.can_restart || !!G.busy;
   const busy = (n) => G.busy === n;
-  return h('div', { class: 'stack' },
+  return h('div', { class: 'stack' }, you,
     !d.can_restart ? h('p', { class: 'hint', role: 'note' }, 'Arr isn’t running as a service on its computer, so it can’t restart itself. Change these there with “arr set”.') : null,
     G.err ? h('p', { class: 'msg', role: 'alert', 'data-err': '' }, G.err) : null,
     G.msg ? h('p', { class: 'msg', role: 'status' }, G.msg) : null,
@@ -1667,7 +1672,8 @@ function Settings() {
     h(HealthSection));
 }
 
-function Footer() {
+// Who is signed in, Arr on a phone, notifications and Sign out: the top of Settings.
+function You() {
   const [open, setOpen] = useState(false);
   const shown = useRef(false);
   useEffect(() => {
@@ -1675,14 +1681,17 @@ function Footer() {
     shown.current = true;
   }, [open]);
   const me = S.me || {};
+  return h(Section, { id: 'you', title: 'You' }, h('div', { class: 'rows' },
+    h('div', { class: 'item setting' }, h('div', { class: 'what' },
+      h('span', { class: 'sw-t', id: 'who' }, me.email ? 'Signed in as ' + me.email : 'Signed in'),
+      h('button', { type: 'button', class: 'link', id: 'phone-btn', 'aria-expanded': String(open), 'aria-controls': 'phone', onClick: () => setOpen(!open) }, 'Use Arr on your phone'),
+      h('section', { class: 'phone', id: 'phone', 'aria-label': 'Use Arr on your phone', hidden: !open }, open ? h(Phone, { url: me.public_url || null }) : null))),
+    h('div', { class: 'item setting' }, h(Notify)),
+    h('div', { class: 'item setting' }, h('div', { class: 'what' },
+      h('button', { type: 'button', class: 'btn ghost', id: 'signout', onClick: signOut }, 'Sign out')))));
+}
+function Footer() {
   return h('footer', { class: 'foot', id: 'foot', hidden: !S.me || S.out, inert: P.shown },
-    h(UpdateBar),
-    h('span', { id: 'who' }, S.me ? (me.email ? 'Signed in as ' + me.email : 'Signed in') : null),
-    h('a', { class: 'link', id: 'settings-link', href: '#/settings' }, 'Settings'),
-    h('button', { type: 'button', class: 'link', id: 'phone-btn', 'aria-expanded': String(open), 'aria-controls': 'phone', onClick: () => setOpen(!open) }, 'Use Arr on your phone'),
-    h('button', { type: 'button', class: 'link', id: 'signout', onClick: signOut }, 'Sign out'),
-    h('section', { class: 'phone', id: 'phone', 'aria-label': 'Use Arr on your phone', hidden: !open }, open && S.me ? h(Phone, { url: me.public_url || null }) : null),
-    S.me ? h(Notify) : null,
     h('p', { class: 'credit' }, 'Movie details and posters from Plex',
       h('span', { id: 'tmdb-credit', hidden: !S.tmdb }, ' and ', h('img', { src: '/app/tmdb.svg', alt: 'TMDB', width: 85, height: 11 }), ' (Arr uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB)'),
       ', show details and posters from ', h('a', { href: 'https://www.tvmaze.com', target: '_blank', rel: 'noopener noreferrer' }, 'TVmaze'), '.'));
@@ -1720,6 +1729,7 @@ function App() {
         h('label', { class: 'sr', for: 'q' }, 'Find a movie or show'),
         h('input', { id: 'q', name: 'q', type: 'search', placeholder: 'Find a movie or show', enterkeyhint: 'search', autocapitalize: 'off', spellcheck: false, onInput: searchInput, onFocus: openSearch, onClick: openSearch })),
       h('div', { id: 'banner', class: 'banner', role: 'status' }, S.banner || (S.setup ? SETUP_MSG : null))),
+    h(UpdateBar),
     h('main', { id: 'view', tabindex: '-1', inert }, h(View)),
     h(Toast),
     h(Footer),

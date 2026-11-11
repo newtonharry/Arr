@@ -190,6 +190,18 @@ async fn pages_and_assets_carry_the_security_headers() {
         .unwrap();
     assert!(html.contains("/app/app.js") && html.contains("/app/app.css"));
     assert!(!html.contains("<style") && !html.contains("onclick"));
+    // Settings is a tab, and Sign out lives in its "You" section, not in the footer.
+    let js = site
+        .plain(Method::GET, "/app/app.js")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(js.contains("['/settings', 'Settings', 'settings']"));
+    assert!(js.contains("function You()") && js.contains("id: 'signout'"));
+    assert!(!js.contains("settings-link"));
     // It can be put on a home screen: a manifest, a touch icon and a theme colour.
     for want in [
         "rel=\"manifest\" href=\"/app/manifest.webmanifest\"",

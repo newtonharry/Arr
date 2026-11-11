@@ -316,7 +316,8 @@ h2 .link .ic{width:16px;height:16px;stroke-width:3}
 .toast-undo[data-s=busy]{opacity:.7;cursor:progress}
 @media (min-width:760px){.toast-region{bottom:20px}}
 /* update now, settings, health */
-.upd{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:0 8px;padding:6px 14px;border:2px solid var(--teal);border-radius:12px;background:var(--card);color:var(--ink);font-weight:700}
+.upd-wrap{max-width:680px;margin:0 auto;padding:0 20px 12px}
+.upd{display:flex;flex-wrap:wrap;align-items:center;gap:0 8px;padding:6px 14px;border:2px solid var(--teal);border-radius:12px;background:var(--card);color:var(--ink);font-weight:700}
 .upd.bad{border-color:var(--coral);color:var(--coral-ink)}
 .upd .link{min-height:44px;padding:0}
 a.link{display:inline-flex;align-items:center;padding:0 6px}
@@ -325,6 +326,10 @@ a.link{display:inline-flex;align-items:center;padding:0 6px}
 .field-row .filter{flex:1 1 120px;min-width:0}
 .item.setting .what{display:grid;gap:2px}
 .item.setting .btn{justify-self:start;margin-top:8px}
+.item.setting .link{justify-self:start;padding-left:0}
+.item.setting .phone{margin-top:6px}
+.item.setting .notify{width:100%}
+.item.setting:has(#signout) .btn{margin-top:0}
 .item.setting .field-row .btn{margin-top:0}
 .health{align-items:flex-start}
 .health .dot{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--teal);color:var(--on-teal)}
