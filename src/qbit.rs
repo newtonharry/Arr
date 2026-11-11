@@ -236,6 +236,9 @@ pub struct FileSelection {
     pub series: crate::ids::MediaId,
     /// The episodes (as `MediaId::Episode`) the grab covers.
     pub targets: Vec<crate::ids::MediaId>,
+    /// Every episode of the series the catalog lists (the pack is of a full season): what a
+    /// file named only after the pack can be matched against.
+    pub known: Vec<crate::ids::MediaId>,
 }
 
 struct Session {

@@ -96,6 +96,21 @@ impl Client {
         }
     }
 
+    /// For a season pack grabbed for some of its episodes and already in the embedded
+    /// engine: selects the files of those episodes besides the ones already selected, and says
+    /// which episodes the pack has no file for. An error saying `invalid` refuses the grab
+    /// (no file of the pack is for it). Other clients: nothing to do.
+    pub async fn settle_selection(
+        &self,
+        hash: &str,
+        sel: &crate::qbit::FileSelection,
+    ) -> Result<Vec<crate::ids::MediaId>, UpstreamError> {
+        match self {
+            Client::Embedded(e) => e.settle_selection(hash, sel).await,
+            _ => Ok(vec![]),
+        }
+    }
+
     pub async fn pause(&self, hash: &str) -> Result<(), UpstreamError> {
         match self {
             Client::Qbit(q) => q.pause(hash).await,
