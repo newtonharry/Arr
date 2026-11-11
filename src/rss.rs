@@ -639,6 +639,7 @@ async fn process(
             now,
             catalog_observed_at: None,
             blocked: Some(&blocked),
+            partial_packs: st.can_select_files(),
         };
         let blockers = ctx.target_blockers();
         let decision = decision::evaluate(&ctx, &r, &parsed, &blockers);

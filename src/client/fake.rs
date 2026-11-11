@@ -55,6 +55,8 @@ pub struct AddRecord {
     pub paused: bool,
     pub ratio_limit: Option<f64>,
     pub seeding_time_limit_minutes: Option<i64>,
+    /// The episodes a season pack grab was limited to (`None` = all files).
+    pub select: Option<Vec<crate::ids::MediaId>>,
 }
 
 #[derive(Default)]
@@ -297,6 +299,7 @@ impl Fake {
             paused: req.paused,
             ratio_limit: req.ratio_limit,
             seeding_time_limit_minutes: req.seeding_time_limit_minutes,
+            select: req.select.as_ref().map(|x| x.targets.clone()),
         });
         if s.refuse_next_add {
             s.refuse_next_add = false;

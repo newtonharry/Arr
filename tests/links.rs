@@ -56,6 +56,7 @@ fn link(hash: &str, magnet: Option<String>, download: Option<String>) -> Release
         full_season: false,
         covers: vec![MATRIX_ID],
         replaces: vec![],
+        supersedes: vec![],
         interactive: true,
     }
 }

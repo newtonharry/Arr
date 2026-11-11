@@ -131,6 +131,7 @@ fn eps(owned: &[u16], unaired: &[u16], count: u16) -> Vec<EpisodeInfo> {
             },
             existing: None,
             queued: false,
+            replaceable: false,
         })
         .collect()
 }
@@ -181,6 +182,7 @@ struct Env {
     settings: Settings,
     catalog: CatalogIndex,
     blocked: Option<std::collections::HashSet<String>>,
+    partial_packs: bool,
 }
 
 impl Env {
@@ -206,6 +208,7 @@ impl Env {
             settings: managed_settings(&o),
             catalog: standard_catalog(),
             blocked: None,
+            partial_packs: false,
         }
     }
 
@@ -233,6 +236,7 @@ impl Env {
             now: OffsetDateTime::now_utc(),
             catalog_observed_at: None,
             blocked: self.blocked.as_ref(),
+            partial_packs: self.partial_packs,
         };
         let blockers = ctx.target_blockers();
         evaluate(&ctx, &r, &p, &blockers)
@@ -1080,4 +1084,157 @@ fn franchise_prefixed_alias_is_one_title_for_decisions_and_rss() {
             "{wrong}"
         );
     }
+}
+
+// ---- season packs that leave episodes out (a client that selects files)
+
+/// A 16-episode season (like Futurama S05) with some episodes owned and some covered by an
+/// active download: `(episode, replaceable)`.
+fn futurama(owned: &[u16], active: &[(u16, bool)]) -> Target {
+    let mut list = eps(owned, &[], 16);
+    for (n, replaceable) in active {
+        let e = list.iter_mut().find(|e| e.number == *n).unwrap();
+        e.queued = true;
+        e.replaceable = *replaceable;
+    }
+    season(series("Futurama", 73871, Some(1999), vec![]), 5, Some(list))
+}
+
+const IVY: &str = "Futurama-1999-S05 1080p WEBRip 10bit EAC3 2 0 x265-iVy";
+
+#[test]
+fn a_healthy_pack_takes_what_is_missing_and_leaves_the_rest() {
+    let mut env = Env::new();
+    env.partial_packs = true;
+    // E02 is owned. E01 and E07 are idle, E06 is unconfirmed, E11 and E14 are unsent: all
+    // replaceable. E09 is downloading at 40%: it keeps its download.
+    let target = futurama(
+        &[2],
+        &[
+            (1, true),
+            (6, true),
+            (7, true),
+            (11, true),
+            (14, true),
+            (9, false),
+        ],
+    );
+    let d = env.eval_release(&target, Scope::Season(5), {
+        let mut r = release(IVY, 16.0, 39);
+        r["leechers"] = json!(3);
+        r
+    });
+    assert!(d.approved, "{:?}", d.rejections);
+    assert_eq!(d.health, arr::decision::Health::Healthy);
+    assert!(d.full_season);
+    assert_eq!(d.skips_owned, [2]);
+    assert_eq!(d.skips_active, [9]);
+    assert_eq!(d.supersedes, [1, 6, 7, 11, 14]);
+    // The grab gets every episode but the owned one and the one that is downloading.
+    assert_eq!(
+        d.covered_episodes,
+        [1, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16]
+    );
+    assert!(d.owned_overlap.is_empty() && !d.replacement);
+    assert!(
+        d.notes
+            .iter()
+            .any(|n| n.contains("E02") && n.contains("owned")),
+        "{:?}",
+        d.notes
+    );
+    // The decision as JSON, for the release list.
+    let v = serde_json::to_value(&d).unwrap();
+    assert_eq!(v["skips_owned"], json!([2]));
+    assert_eq!(v["skips_active"], json!([9]));
+    assert_eq!(v["supersedes"], json!([1, 6, 7, 11, 14]));
+}
+
+#[test]
+fn a_pack_never_displaces_a_download_that_is_progressing_or_not_its_to_replace() {
+    let mut env = Env::new();
+    env.partial_packs = true;
+    // Not replaceable: progressing, paused, user-chosen or another pack all look the same here.
+    let target = futurama(&[], &[(3, false), (4, false)]);
+    let d = env.eval(&target, Scope::Season(5), IVY, 16.0, 39);
+    assert!(d.approved, "{:?}", d.rejections);
+    assert_eq!(d.skips_active, [3, 4]);
+    assert!(d.supersedes.is_empty());
+    assert!(!d.covered_episodes.contains(&3) && !d.covered_episodes.contains(&4));
+    // A pack with a weak swarm replaces nothing: replaceable downloads stay too.
+    let target = futurama(&[], &[(3, true)]);
+    let weak = env.eval(&target, Scope::Season(5), IVY, 16.0, 2);
+    assert!(weak.approved, "{:?}", weak.rejections);
+    assert_eq!(weak.health, arr::decision::Health::Weak);
+    assert!(weak.supersedes.is_empty());
+    assert_eq!(weak.skips_active, [3]);
+}
+
+#[test]
+fn a_pack_with_nothing_left_for_it_is_still_rejected() {
+    let mut env = Env::new();
+    env.partial_packs = true;
+    let all: Vec<u16> = (1..=16).collect();
+    let owned = futurama(&all, &[]);
+    let d = env.eval(&owned, Scope::Season(5), IVY, 16.0, 39);
+    assert_eq!(
+        d.rejections
+            .iter()
+            .map(|r| r.code.as_str())
+            .collect::<Vec<_>>(),
+        ["covers_owned"]
+    );
+    // Everything missing is already being downloaded, and progressing.
+    let active: Vec<(u16, bool)> = (1..=16).map(|n| (n, false)).collect();
+    let busy = futurama(&[], &active);
+    let d = env.eval(&busy, Scope::Season(5), IVY, 16.0, 39);
+    assert_eq!(
+        d.rejections
+            .iter()
+            .map(|r| r.code.as_str())
+            .collect::<Vec<_>>(),
+        ["covers_queued"]
+    );
+    // Single and multi-episode releases of owned episodes keep covers_owned.
+    let some_owned = futurama(&[2, 3], &[]);
+    let d = env.eval(
+        &some_owned,
+        Scope::Season(5),
+        "Futurama.1999.S05E02E03.1080p.WEBRip.x265-iVy",
+        2.0,
+        39,
+    );
+    assert_eq!(d.rejections[0].code, "covers_owned");
+}
+
+#[test]
+fn without_file_selection_a_pack_must_cover_every_episode_as_before() {
+    // The default environment is a client that cannot select files (qBittorrent).
+    let env = Env::new();
+    let target = futurama(&[2], &[(1, true)]);
+    let d = env.eval(&target, Scope::Season(5), IVY, 16.0, 39);
+    let codes: Vec<&str> = d.rejections.iter().map(|r| r.code.as_str()).collect();
+    assert_eq!(codes, ["covers_queued", "covers_owned"]);
+    assert!(d.skips_owned.is_empty() && d.supersedes.is_empty());
+    assert_eq!(d.covered_episodes.len(), 16);
+}
+
+#[test]
+fn a_pack_is_judged_by_size_over_the_whole_season_not_by_what_it_gets() {
+    let mut env = Env::new();
+    env.partial_packs = true;
+    // 14 of 16 episodes owned: the pack still has to be a sane size for 16 episodes.
+    let owned: Vec<u16> = (1..=14).collect();
+    let target = futurama(&owned, &[]);
+    let ok = env.eval(&target, Scope::Season(5), IVY, 16.0, 39);
+    assert!(ok.approved, "{:?}", ok.rejections);
+    assert_eq!(ok.covered_episodes, [15, 16]);
+    let tiny = env.eval(&target, Scope::Season(5), IVY, 0.2, 39);
+    assert!(
+        tiny.rejections
+            .iter()
+            .any(|r| r.code == "size_below_minimum"),
+        "{:?}",
+        tiny.rejections
+    );
 }

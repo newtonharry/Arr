@@ -94,6 +94,9 @@ pub struct ReleaseLink {
     pub full_season: bool,
     pub covers: Vec<MediaId>,
     pub replaces: Vec<MediaId>,
+    /// Episodes of a season pack that the decision took over from idle, unconfirmed or
+    /// unsent single-episode grabs (a subset of `covers`). Re-checked when the pack is grabbed.
+    pub supersedes: Vec<MediaId>,
     pub interactive: bool,
 }
 
@@ -132,7 +135,7 @@ pub fn link_for(
     if c.release.magnet_url.is_none() && c.release.download_url.is_none() {
         return None;
     }
-    let (media_id, covers, replaces) = match target {
+    let (media_id, covers, replaces, supersedes) = match target {
         Target::Movie(m) => (
             m.id,
             vec![m.id],
@@ -141,6 +144,7 @@ pub fn link_for(
             } else {
                 vec![]
             },
+            vec![],
         ),
         Target::Season(s) | Target::Episode { season: s, .. } => {
             let ep = |n: &u16| library::episode_id(s.series.id, s.season, *n);
@@ -153,6 +157,7 @@ pub fn link_for(
                 s.series.id,
                 c.decision.covered_episodes.iter().map(ep).collect(),
                 replaces,
+                c.decision.supersedes.iter().map(ep).collect(),
             )
         }
     };
@@ -193,6 +198,7 @@ pub fn link_for(
         full_season: c.decision.full_season,
         covers,
         replaces,
+        supersedes,
         interactive,
     })
 }
@@ -213,16 +219,16 @@ fn ids_parse(s: &str) -> Vec<MediaId> {
 pub fn save_links(c: &Connection, links: &[ReleaseLink], now: OffsetDateTime) -> Result<()> {
     for l in links {
         c.execute(
-            "INSERT INTO release_links (release_ref, target, media_id, info_hash, magnet, download_url, title, size, indexer_id, quality, revision_version, revision_real, full_season, covers, replaces, interactive, seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "INSERT INTO release_links (release_ref, target, media_id, info_hash, magnet, download_url, title, size, indexer_id, quality, revision_version, revision_real, full_season, covers, replaces, interactive, seen_at, supersedes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT (release_ref, target) DO UPDATE SET info_hash = excluded.info_hash, magnet = excluded.magnet, download_url = excluded.download_url,
                title = excluded.title, size = excluded.size, indexer_id = excluded.indexer_id, quality = excluded.quality, revision_version = excluded.revision_version,
                revision_real = excluded.revision_real, full_season = excluded.full_season, covers = excluded.covers, replaces = excluded.replaces,
-               interactive = MAX(interactive, excluded.interactive), seen_at = excluded.seen_at",
+               interactive = MAX(interactive, excluded.interactive), seen_at = excluded.seen_at, supersedes = excluded.supersedes",
             params![
                 l.release_ref, l.target.to_string(), l.media_id.to_string(), l.info_hash, l.magnet, l.download_url, l.title, l.size, l.indexer_id,
                 l.quality.as_str(), i64::from(l.revision.version), i64::from(l.revision.real), l.full_season, ids_json(&l.covers), ids_json(&l.replaces),
-                l.interactive, ts(now)
+                l.interactive, ts(now), ids_json(&l.supersedes)
             ],
         )?;
     }
@@ -236,7 +242,7 @@ pub fn load_link(
     target: Option<MediaId>,
 ) -> Result<Option<ReleaseLink>> {
     let mut stmt = c.prepare(
-        "SELECT release_ref, target, media_id, info_hash, magnet, download_url, title, size, indexer_id, quality, revision_version, revision_real, full_season, covers, replaces, interactive
+        "SELECT release_ref, target, media_id, info_hash, magnet, download_url, title, size, indexer_id, quality, revision_version, revision_real, full_season, covers, replaces, interactive, supersedes
          FROM release_links WHERE release_ref = ?1 ORDER BY CASE WHEN target = ?2 THEN 0 ELSE 1 END, seen_at DESC LIMIT 1",
     )?;
     let row = stmt
@@ -258,6 +264,7 @@ pub fn load_link(
                 r.get::<_, String>(13)?,
                 r.get::<_, String>(14)?,
                 r.get::<_, bool>(15)?,
+                r.get::<_, String>(16)?,
             ))
         })
         .optional()?;
@@ -289,6 +296,7 @@ pub fn load_link(
         full_season: r.12,
         covers: ids_parse(&r.13),
         replaces: ids_parse(&r.14),
+        supersedes: ids_parse(&r.16),
         interactive: r.15,
     }))
 }
@@ -352,6 +360,10 @@ pub struct Grab {
     pub completed_at: Option<String>,
     pub imported_at: Option<String>,
     pub targets: Vec<GrabTarget>,
+    /// Ids of grabs this one took over when it was enqueued (a season pack replacing idle or
+    /// unsent single-episode downloads). Set by `enqueue` only.
+    #[serde(skip)]
+    pub replaced: Vec<String>,
 }
 
 const GRAB_COLUMNS: &str = "id, media_id, target, plan_id, release_ref, info_hash, title, indexer_id, size, quality, revision_version, revision_real, full_season, category, save_path, seed_ratio, seed_time_minutes, remove_completed, remove_failed, origin, state, active, attempts, next_attempt_at, progress, client_state, client_name, last_error, user_paused, stalled_since, problem_since, absent_since, last_progress, failure, retry, cleanup, cleanup_detail, cleanup_at, imported_files, created_at, updated_at, submitted_at, completed_at, imported_at, cleanup_files";
@@ -414,6 +426,7 @@ fn grab_row(r: &rusqlite::Row) -> rusqlite::Result<Grab> {
         imported_at: r.get(43)?,
         cleanup_files: r.get(44)?,
         targets: vec![],
+        replaced: vec![],
     })
 }
 
@@ -1047,6 +1060,9 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
     let id2 = id.clone();
     let category = policy.category.clone();
     let loaded = loaded.clone();
+    // Serialised with submission, cancellation and cleanup: a pack that takes over other
+    // grabs must not interleave with the worker submitting one of them.
+    let _guard = st.worker.grabs.lock().await;
     let result = st
         .store
         .with(move |c| {
@@ -1085,17 +1101,72 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
                     ),
                 )));
             }
+            // Coverage, decided on the stored rows in this transaction. An episode with no
+            // active grab joins the grab. One the decision marked as taken over (`supersedes`)
+            // is taken over if its grab is still idle, unconfirmed or unsent, automatic and
+            // not paused; if it has started making progress since, that grab is kept and the
+            // episode is left out of this one. If that grab has finished since (imported, or
+            // gone), the episode is left out too: it may be owned now, and a later search
+            // looks again. Anything else already downloading refuses.
+            let mut covers: Vec<MediaId> = vec![];
+            let mut taken: Vec<String> = vec![];
+            let mut left_out: Vec<MediaId> = vec![];
             for t in &link.covers {
-                let busy: Option<String> = tx
-                    .query_row(
-                        "SELECT g.id FROM grab_targets t JOIN grabs g ON g.id = t.grab_id WHERE g.active = 1 AND t.target = ?1",
-                        [t.to_string()],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if let Some(g) = busy {
-                    return Ok(Err(("covers_queued", format!("{t} is already being downloaded by {g}"))));
+                let active = active_covers(&tx, now, Some(&t.to_string()))?;
+                match active.as_slice() {
+                    [] if link.supersedes.contains(t) => left_out.push(*t),
+                    [] => covers.push(*t),
+                    [a] if link.supersedes.contains(t) && a.replaceable => {
+                        if !taken.contains(&a.grab_id) {
+                            taken.push(a.grab_id.clone());
+                        }
+                        covers.push(*t);
+                    }
+                    [_] if link.supersedes.contains(t) => left_out.push(*t),
+                    [a, ..] => {
+                        return Ok(Err((
+                            "covers_queued",
+                            format!("{t} is already being downloaded by {}", a.grab_id),
+                        )));
+                    }
                 }
+            }
+            if covers.is_empty() {
+                return Ok(Err((
+                    "covers_queued",
+                    "every episode this pack was chosen for is already being downloaded".to_string(),
+                )));
+            }
+            let now_s = ts(now);
+            for old in &taken {
+                let Some(og) = get(&tx, old)? else { continue };
+                let unsent = og.state == "queued" && og.submitted_at.is_none();
+                let why = format!("replaced by a healthier season pack {}", link.title);
+                tx.execute(
+                    "UPDATE grabs SET state = 'cancelled', active = 0, updated_at = ?2, lease_owner = NULL, lease_until = NULL,
+                       cleanup = ?3, cleanup_detail = ?4, cleanup_at = ?2 WHERE id = ?1 AND active = 1",
+                    params![
+                        og.id,
+                        now_s,
+                        if unsent { "kept" } else { "seeding" },
+                        if unsent {
+                            format!("{why}; it had not been sent to the download client")
+                        } else {
+                            format!("{why}; its torrent and incomplete data are removed")
+                        }
+                    ],
+                )?;
+                // Not blocklisted, and no search is held back: the pack now owns its episodes.
+                library::event(
+                    &tx,
+                    &now_s,
+                    "download_cancelled",
+                    Some(&og.media_id.to_string()),
+                    Some(&og.target.to_string()),
+                    Some(&og.id),
+                    &format!("{}: {why}", og.title),
+                    Some(&json!({ "blocklisted": false, "superseded_by": link.release_ref, "reason": "replaced_by_season_pack" })),
+                )?;
             }
             let blocked: Option<i64> = tx
                 .query_row(
@@ -1113,7 +1184,6 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
             if let Some(g) = dup {
                 return Ok(Err(("duplicate_torrent", format!("the torrent is already tracked by {g}"))));
             }
-            let now_s = ts(now);
             tx.execute(
                 "INSERT INTO grabs (id, media_id, target, plan_id, release_ref, info_hash, title, indexer_id, size, quality, revision_version, revision_real, full_season, category, save_path, seed_ratio, seed_time_minutes, remove_completed, remove_failed, origin, payload_kind, payload, state, active, attempts, next_attempt_at, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, 'queued', 1, 0, ?23, ?23, ?23)",
@@ -1123,7 +1193,7 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
                     seed_ratio, seed_time, policy.remove_completed, policy.remove_failed, origin, kind, bytes, now_s
                 ],
             )?;
-            for t in &link.covers {
+            for t in &covers {
                 tx.execute(
                     "INSERT INTO grab_targets (grab_id, target, replaces) VALUES (?1, ?2, ?3)",
                     params![id2, t.to_string(), link.replaces.contains(t)],
@@ -1137,23 +1207,70 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
                 Some(&link.target.to_string()),
                 Some(&id2),
                 &format!("grabbed {} ({origin})", link.title),
-                Some(&json!({ "release_ref": link.release_ref, "covers": link.covers, "replaces": link.replaces, "quality": link.quality.as_str(), "revision": link.revision })),
+                Some(&json!({ "release_ref": link.release_ref, "covers": covers, "replaces": link.replaces, "quality": link.quality.as_str(), "revision": link.revision, "left_out": left_out, "replaced_grabs": taken })),
             )?;
             tx.commit()?;
-            Ok(Ok(()))
+            Ok(Ok(taken))
         })
         .await?;
-    if let Err((code, msg)) = result {
-        return Err(refused(code, msg));
+    let taken = match result {
+        Ok(t) => t,
+        Err((code, msg)) => return Err(refused(code, msg)),
+    };
+    for old in &taken {
+        remove_superseded(st, old).await;
     }
+    drop(_guard);
     st.reload_index().await?;
     st.worker.notify.notify_one();
     let id3 = id.clone();
-    Ok(st
+    let mut grab = st
         .store
         .with(move |c| get(c, &id3))
         .await?
-        .expect("just inserted"))
+        .expect("just inserted");
+    grab.replaced = taken;
+    Ok(grab)
+}
+
+/// A season pack's grab for fewer episodes than the season: the episodes whose files the
+/// embedded engine fetches. `None` for everything else (all files, as before).
+fn pack_selection(g: &Grab) -> Option<crate::qbit::FileSelection> {
+    if !g.full_season || g.targets.is_empty() {
+        return None;
+    }
+    let targets: Vec<MediaId> = g.targets.iter().map(|t| t.target).collect();
+    targets
+        .iter()
+        .all(|t| matches!(t, MediaId::Episode(..)))
+        .then_some(crate::qbit::FileSelection {
+            series: g.media_id,
+            targets,
+        })
+}
+
+/// Right after a season pack took over `id`: removes its torrent and incomplete data the way
+/// a cancel with removal does (journaled, never touching library files). Best effort: a
+/// failure leaves the grab with `cleanup = 'seeding'`, and the cleanup pass tries again.
+/// Called with the grab lock held.
+async fn remove_superseded(st: &AppState, id: &str) {
+    let Ok(g) = load(st, id).await else { return };
+    if g.cleanup != "seeding" || st.client.is_none() {
+        return;
+    }
+    let Ok(Some(t)) = our_torrent(st, &g).await else {
+        return;
+    };
+    if let Ok(files) = prepare_removal(st, &g, &t).await {
+        let _ = journal_removal(
+            st,
+            &g,
+            &files,
+            "replaced by a healthier season pack; removing the torrent and its incomplete data",
+            OffsetDateTime::now_utc(),
+        )
+        .await;
+    }
 }
 
 /// Identity of a managed item (movie or series) from the current index.
@@ -1268,7 +1385,90 @@ async fn record_event(
 }
 
 /// How long a download makes no progress before it stops holding an active-download slot.
-const IDLE_SLOT_AFTER: Duration = Duration::from_secs(300);
+/// It is also how long a download must be idle before a season pack may replace it.
+pub const IDLE_SLOT_AFTER: Duration = Duration::from_secs(300);
+
+/// Whether a season pack may replace this active grab. Only an automatic, single-episode
+/// grab qualifies, and only while it has nothing to lose: it is still in the outbox
+/// (`queued`), waiting for magnet metadata (`unconfirmed`), or downloading with no progress
+/// for `IDLE_SLOT_AFTER`. A grab the user paused or chose, another pack, or one that is
+/// making progress or finishing (`completed`, `importing`, `import_blocked`) is kept.
+fn replaceable_by_pack(g: &GrabFacts, now: OffsetDateTime) -> bool {
+    g.origin == "automatic"
+        && !g.full_season
+        && !g.user_paused
+        && g.target_count == 1
+        && match g.state {
+            "queued" | "unconfirmed" => true,
+            "downloading" => {
+                g.client_state != Some("paused")
+                    && since(g.stalled_since, now).is_some_and(|d| d >= IDLE_SLOT_AFTER)
+            }
+            _ => false,
+        }
+}
+
+/// What the pack rule needs to know about an active grab.
+struct GrabFacts<'a> {
+    origin: &'a str,
+    state: &'a str,
+    user_paused: bool,
+    full_season: bool,
+    target_count: i64,
+    stalled_since: Option<&'a str>,
+    client_state: Option<&'a str>,
+}
+
+/// An active grab covering a target: its id, and whether a season pack may replace it.
+#[derive(Debug, Clone)]
+pub struct ActiveCover {
+    pub target: String,
+    pub grab_id: String,
+    pub replaceable: bool,
+}
+
+/// Every active grab's targets (or just `target`'s), each with its replaceable verdict.
+pub fn active_covers(
+    c: &Connection,
+    now: OffsetDateTime,
+    target: Option<&str>,
+) -> Result<Vec<ActiveCover>> {
+    let mut stmt = c.prepare(
+        "SELECT t.target, g.id, g.origin, g.state, g.user_paused, g.full_season, g.stalled_since, g.client_state,
+                (SELECT COUNT(*) FROM grab_targets x WHERE x.grab_id = g.id)
+         FROM grab_targets t JOIN grabs g ON g.id = t.grab_id
+         WHERE g.active = 1 AND (?1 IS NULL OR t.target = ?1)",
+    )?;
+    let rows = stmt.query_map([target], |r| {
+        let (origin, state, paused, full, stalled, client, n) = (
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, bool>(4)?,
+            r.get::<_, bool>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, i64>(8)?,
+        );
+        Ok(ActiveCover {
+            target: r.get(0)?,
+            grab_id: r.get(1)?,
+            replaceable: replaceable_by_pack(
+                &GrabFacts {
+                    origin: &origin,
+                    state: &state,
+                    user_paused: paused,
+                    full_season: full,
+                    target_count: n,
+                    stalled_since: stalled.as_deref(),
+                    client_state: client.as_deref(),
+                },
+                now,
+            ),
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
 
 /// Whether the embedded engine has room to start one more queued grab. `rows` are the active
 /// grabs in `downloading` or `unconfirmed` as `(state, stalled_since)`.
@@ -1426,6 +1626,7 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
         sequential: policy.sequential,
         first_last_piece: policy.first_last,
         content_layout: policy.content_layout,
+        select: pack_selection(g),
     };
     let answer = qb.add(&req).await;
     // 3. Verify by hash whatever the answer was.
@@ -2679,25 +2880,32 @@ pub async fn cleanup(st: &AppState, now: OffsetDateTime) -> Result<CleanupReport
                 }
                 // A failed, incomplete download has no seeding obligation; everything else
                 // must meet its share limit and seed goal.
-                let verdict = if g.state == "failed" && t.progress < 1.0 {
-                    Seed::Met {
-                        reason: "failed incomplete download".into(),
-                    }
-                } else {
-                    let secs = seeding_secs(st, t).await;
-                    seed_criteria(
-                        t,
-                        secs,
-                        prefs.as_ref(),
-                        g.seed_ratio,
-                        g.seed_time_minutes,
-                        false,
-                    )
-                };
+                let verdict =
+                    if matches!(g.state.as_str(), "failed" | "cancelled") && t.progress < 1.0 {
+                        Seed::Met {
+                            reason: if g.state == "failed" {
+                                "failed incomplete download".into()
+                            } else {
+                                "replaced by a season pack; incomplete download".into()
+                            },
+                        }
+                    } else {
+                        let secs = seeding_secs(st, t).await;
+                        seed_criteria(
+                            t,
+                            secs,
+                            prefs.as_ref(),
+                            g.seed_ratio,
+                            g.seed_time_minutes,
+                            false,
+                        )
+                    };
                 match verdict {
                     Seed::Met { reason } => match prepare_removal(st, &g, t).await {
                         Ok(files) => {
-                            let why = if g.state == "failed" {
+                            let why = if g.state == "cancelled" {
+                                reason
+                            } else if g.state == "failed" {
                                 format!("removeFailedDownloads: {reason}")
                             } else {
                                 format!("removeCompletedDownloads: {reason}")
@@ -2858,6 +3066,78 @@ pub fn recover(c: &Connection, now: OffsetDateTime) -> Result<usize> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_idle_unsent_or_unconfirmed_automatic_single_grabs_are_replaceable() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let ago = |s: u64| Some(ts(now - Duration::from_secs(s)));
+        let ok = |origin, state, paused, full, n, stalled: Option<String>, client| {
+            let facts = GrabFacts {
+                origin,
+                state,
+                user_paused: paused,
+                full_season: full,
+                target_count: n,
+                stalled_since: stalled.as_deref(),
+                client_state: client,
+            };
+            replaceable_by_pack(&facts, now)
+        };
+        // Not yet sent, or waiting for magnet metadata.
+        assert!(ok("automatic", "queued", false, false, 1, None, None));
+        assert!(ok("automatic", "unconfirmed", false, false, 1, None, None));
+        // Downloading: idle exactly from the idle-slot rule, never before.
+        let idle = IDLE_SLOT_AFTER.as_secs();
+        assert!(ok(
+            "automatic",
+            "downloading",
+            false,
+            false,
+            1,
+            ago(idle),
+            None
+        ));
+        assert!(!ok(
+            "automatic",
+            "downloading",
+            false,
+            false,
+            1,
+            ago(idle - 1),
+            None
+        ));
+        assert!(!ok("automatic", "downloading", false, false, 1, None, None));
+        // Finishing or finished downloads keep their episodes.
+        for state in ["completed", "importing", "import_blocked", "imported"] {
+            assert!(
+                !ok("automatic", state, false, false, 1, ago(9999), None),
+                "{state}"
+            );
+        }
+        // The user's: paused, chosen by hand; another pack; a multi-episode release; paused
+        // in the client.
+        assert!(!ok(
+            "automatic",
+            "downloading",
+            true,
+            false,
+            1,
+            ago(9999),
+            None
+        ));
+        assert!(!ok("interactive", "queued", false, false, 1, None, None));
+        assert!(!ok("automatic", "queued", false, true, 1, None, None));
+        assert!(!ok("automatic", "queued", false, false, 2, None, None));
+        assert!(!ok(
+            "automatic",
+            "downloading",
+            false,
+            false,
+            1,
+            ago(9999),
+            Some("paused")
+        ));
+    }
+
     fn slots(rows: &[(&str, Option<i64>)], cap: usize) -> bool {
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
         let rows: Vec<(String, Option<String>)> = rows
@@ -2987,6 +3267,7 @@ mod tests {
                     replaces: false,
                 })
                 .collect(),
+            replaced: vec![],
         };
         let owned = |set: &'static [u16]| move |m: MediaId| matches!(m, MediaId::Episode(_, 1, e) if set.contains(&e));
         let none = HashSet::new();

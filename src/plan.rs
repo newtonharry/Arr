@@ -159,6 +159,9 @@ pub struct Execution {
     /// plans executed by earlier builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ExecutionOutcome>,
+    /// Grab ids that a season pack of this plan took over (cancelled, not blocklisted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_grabs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +189,7 @@ impl Execution {
             executed_at: None,
             confirmed_at: None,
             outcome: None,
+            superseded_grabs: vec![],
         }
     }
 
@@ -395,6 +399,7 @@ pub async fn build(
         now: inputs.search.now,
         catalog_observed_at: None,
         blocked: None,
+        partial_packs: inputs.search.partial_packs,
     };
     let target_blockers = ctx.target_blockers();
     if !target_blockers.is_empty() {
@@ -661,6 +666,18 @@ async fn season_plan(
     } else {
         vec![]
     };
+    // With a client that selects files, a season pack may leave out owned episodes and ones
+    // a download is making progress on, and may take over idle or unsent single-episode
+    // downloads: those are worth a pack search even when nothing else is missing.
+    let partial = inputs.search.partial_packs;
+    let takeover: Vec<u16> = if partial {
+        eps.iter()
+            .filter(|e| e.queued && e.replaceable)
+            .map(|e| e.number)
+            .collect()
+    } else {
+        vec![]
+    };
 
     if !unknown.is_empty() {
         plan.blockers
@@ -717,7 +734,7 @@ async fn season_plan(
         }
         plan.units = units.into_values().collect();
     };
-    if wanted.is_empty() && replaceable.is_empty() {
+    if wanted.is_empty() && replaceable.is_empty() && takeover.is_empty() {
         finish_idle(plan, units);
         return Ok(());
     }
@@ -732,12 +749,12 @@ async fn season_plan(
         season_scope,
     )
     .await?;
-    let pack_eligible =
-        unaired.is_empty() && queued.is_empty() && (owned.is_empty() || inputs.revisions);
+    let pack_eligible = unaired.is_empty()
+        && (partial || (queued.is_empty() && (owned.is_empty() || inputs.revisions)));
     if !pack_eligible {
-        plan.notes.push(if !queued.is_empty() {
+        plan.notes.push(if !queued.is_empty() && !partial {
             format!("season packs not eligible: episodes {queued:?} are already being downloaded")
-        } else if !owned.is_empty() && !inputs.revisions {
+        } else if !owned.is_empty() && !inputs.revisions && !partial {
             format!("season packs not eligible: they would re-download owned episodes {owned:?} (owned items are re-searched only by an explicit revision search)")
         } else {
             "season packs not eligible: the season has not fully aired".to_string()
@@ -759,7 +776,7 @@ async fn season_plan(
         if c.decision.health == Health::Weak {
             weak_pack = Some(c);
         } else {
-            take_pack(plan, links, target, c, &wanted, &replaceable, &mut units);
+            take_pack(plan, links, target, c, &mut units);
             plan.units = units.into_values().collect();
             let summary = summarize(&[&season_run]);
             plan.notes.extend(retrieval_note(&summary.completeness));
@@ -858,7 +875,7 @@ async fn season_plan(
             || chosen.iter().any(|x| x.decision.health == Health::Weak))
     {
         // The singles leave something unplanned or are just as weak: use the pack.
-        take_pack(plan, links, target, c, &wanted, &replaceable, &mut units);
+        take_pack(plan, links, target, c, &mut units);
         plan.units = units.into_values().collect();
         let all_runs: Vec<&SearchRun> = std::iter::once(&season_run)
             .chain(episode_run.as_ref())
@@ -990,27 +1007,47 @@ async fn season_plan(
     Ok(())
 }
 
-/// Plans the whole of `wanted` (and the replaceable owned episodes) as one season pack.
+/// Plans the episodes the season pack's grab gets (`covered_episodes`: the wanted ones, the
+/// ones it takes over and its revision upgrades) as one season pack.
 fn take_pack(
     plan: &mut Plan,
     links: &mut Vec<ReleaseLink>,
     target: &Target,
     c: &Candidate,
-    wanted: &[u16],
-    replaceable: &[u16],
     units: &mut BTreeMap<u16, PlanUnit>,
 ) {
     plan.state = PlanState::ShadowPlanned;
     plan.selection = Some("season_pack".into());
-    for n in wanted.iter().chain(replaceable) {
+    let d = &c.decision;
+    for n in &d.covered_episodes {
         let u = units.get_mut(n).expect("episode has a unit");
         u.status = UnitStatus::Planned;
         u.candidate = Some(c.release_ref.clone());
-        u.reason = if replaceable.contains(n) {
+        u.reason = if d.owned_overlap.contains(n) {
             "revision upgrade: replaced by the selected season pack".into()
+        } else if d.supersedes.contains(n) {
+            "covered by the selected season pack, which replaces this episode's idle or unstarted download (cancelled, not blocklisted)".into()
         } else {
             "covered by the selected season pack".into()
         };
+    }
+    if !d.skips_owned.is_empty() {
+        plan.notes.push(format!(
+            "the season pack leaves out owned episodes {:?}; they are not downloaded",
+            d.skips_owned
+        ));
+    }
+    if !d.skips_active.is_empty() {
+        plan.notes.push(format!(
+            "the season pack leaves out episodes {:?}: their downloads are making progress and stay as they are",
+            d.skips_active
+        ));
+    }
+    if !d.supersedes.is_empty() {
+        plan.notes.push(format!(
+            "the season pack takes over episodes {:?} from downloads that are idle or not started; those are cancelled, not blocklisted, when the plan is executed",
+            d.supersedes
+        ));
     }
     plan.candidates.push(search::summary(c));
     links.extend(crate::downloads::link_for(c, target, false));

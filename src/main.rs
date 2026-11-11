@@ -675,7 +675,18 @@ async fn run() -> Result<std::process::ExitCode> {
                 Some(what) => Some(read_secret(what)?),
                 None => value,
             };
-            println!("{}", arr::set::run(&config, &name, value.as_deref()).await?);
+            // The installer, which restarts Arr afterwards, sets ARR_INSTALLER=1: only the
+            // messages change. An environment variable rather than a flag, so a newer installer
+            // can still drive an older binary (`install.sh --version`), which ignores it.
+            let caller = if std::env::var_os("ARR_INSTALLER").is_some_and(|v| v == "1") {
+                arr::set::Caller::Installer
+            } else {
+                arr::set::Caller::Person
+            };
+            println!(
+                "{}",
+                arr::set::run_as(&config, &name, value.as_deref(), caller).await?
+            );
             Ok(())
         }
         Command::AppLink { config } => {

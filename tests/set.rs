@@ -132,7 +132,22 @@ base_url = "https://apibay.org/"
 }
 
 fn set(config: &Path, args: &[&str], stdin: Option<&str>) -> Output {
-    let mut child = Command::new(BIN)
+    set_by(config, args, stdin, false)
+}
+
+/// `arr set` as the installer runs it (`ARR_INSTALLER=1`).
+fn installer_set(config: &Path, args: &[&str]) -> Output {
+    set_by(config, args, None, true)
+}
+
+fn set_by(config: &Path, args: &[&str], stdin: Option<&str>, installer: bool) -> Output {
+    let mut cmd = Command::new(BIN);
+    if installer {
+        cmd.env("ARR_INSTALLER", "1");
+    } else {
+        cmd.env_remove("ARR_INSTALLER");
+    }
+    let mut child = cmd
         .args(["set", "--config"])
         .arg(config)
         .args(args)
@@ -658,5 +673,32 @@ async fn a_saved_setup_document_with_an_explicit_indexer_list_gets_knaben_too() 
     assert_eq!(
         setup_ids(&arr_setup(&config, &["--add-default-indexers"])),
         [1, 2]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_installer_is_told_it_restarts_arr_and_a_person_is_asked_to() {
+    let (tmdb, plex) = (start_tmdb().await, start_plex("good").await);
+    // The installer's call (`ARR_INSTALLER=1`) runs setup and restarts Arr itself.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = full_install(tmp.path(), tmdb, plex);
+    says(
+        &installer_set(&config, &["default-indexers"]),
+        "Added Knaben as search source 2, next to The Pirate Bay. Arr uses it once it restarts, which the installer does.",
+    );
+    says(
+        &installer_set(&config, &["downloading", "on"]),
+        "Turned downloading on. The installer restarts Arr to use it.",
+    );
+    // A person who runs `arr set` is still told what to do.
+    says(
+        &set(&config, &["downloading", "off"], None),
+        "Turned downloading off. Restart Arr to use it.",
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let config = full_install(tmp.path(), tmdb, plex);
+    says(
+        &set(&config, &["default-indexers"], None),
+        "Added Knaben as search source 2, next to The Pirate Bay. Run `arr setup` and restart Arr to use it.",
     );
 }

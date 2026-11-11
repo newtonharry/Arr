@@ -204,6 +204,10 @@ pub struct Layout {
     pub piece_length: u64,
     pub pieces: Vec<u8>,
     pub files: Vec<(PathBuf, u64, bool)>,
+    /// Per file, whether it was selected for download (`None` = all of them). Only the
+    /// pieces of selected files were fetched; the other files hold at most the edges of
+    /// those pieces.
+    pub selected: Option<Vec<bool>>,
 }
 
 impl Layout {
@@ -215,14 +219,125 @@ impl Layout {
                 .iter_file_details()
                 .map(|f| (f.filename.to_pathbuf(), f.len, f.attrs().padding))
                 .collect(),
+            selected: None,
         }
     }
+
+    /// The layout of a torrent downloaded with `only_files` (`None` = all files).
+    pub fn with_selection(mut self, only_files: Option<&[usize]>) -> Layout {
+        self.selected = only_files.map(|o| (0..self.files.len()).map(|i| o.contains(&i)).collect());
+        self
+    }
+}
+
+/// As `verify_pieces`, for a download of some files only: every piece that overlaps a
+/// selected file is checked against its hash. Selected files must be regular files of their
+/// exact length; a file that was not selected need only exist as a regular file (it is created
+/// empty, and holds just the bytes of the pieces it shares with a selected neighbour).
+fn verify_selected(root: &Path, layout: &Layout, selected: &[bool]) -> Result<(), String> {
+    use sha1::{Digest, Sha1};
+    use std::io::{Seek, SeekFrom};
+    let piece = layout.piece_length;
+    if piece == 0 || !layout.pieces.len().is_multiple_of(20) {
+        return Err("malformed piece table".into());
+    }
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(layout.files.len());
+    let mut total = 0u64;
+    for (_, len, _) in &layout.files {
+        spans.push((total, total + len));
+        total += len;
+    }
+    let count = layout.pieces.len() / 20;
+    if total.div_ceil(piece) != count as u64 {
+        return Err("the files do not match the piece table".into());
+    }
+    let is_selected = |i: usize| selected.get(i).copied().unwrap_or(false);
+    let mut needed = vec![false; count];
+    for (i, (_, len, padding)) in layout.files.iter().enumerate() {
+        if *padding || *len == 0 || !is_selected(i) {
+            continue;
+        }
+        let (start, end) = spans[i];
+        for n in needed
+            .iter_mut()
+            .take(((end - 1) / piece) as usize + 1)
+            .skip((start / piece) as usize)
+        {
+            *n = true;
+        }
+    }
+    let touches_needed = |i: usize| {
+        let (start, end) = spans[i];
+        end > start
+            && (start / piece..=(end - 1) / piece).any(|p| needed.get(p as usize) == Some(&true))
+    };
+    for (i, (rel, len, padding)) in layout.files.iter().enumerate() {
+        if *padding || !(is_selected(i) || touches_needed(i)) {
+            continue;
+        }
+        let path = root.join(rel);
+        paths::check_no_symlinks(root, &path)?;
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("{}: {}", rel.display(), e.kind()))?;
+        if !meta.file_type().is_file() || (is_selected(i) && meta.len() != *len) {
+            return Err(format!(
+                "{} is not a regular file of {len} bytes",
+                rel.display()
+            ));
+        }
+    }
+    let mut open: Option<(usize, std::fs::File)> = None;
+    let mut buf: Vec<u8> = Vec::with_capacity(piece as usize);
+    for (index, _) in needed.iter().enumerate().filter(|(_, n)| **n) {
+        let start = index as u64 * piece;
+        let end = (start + piece).min(total);
+        buf.clear();
+        let mut pos = start;
+        let mut f = spans.partition_point(|s| s.1 <= start);
+        while pos < end {
+            let (fs, fe) = spans[f];
+            if fe <= pos {
+                f += 1;
+                continue;
+            }
+            let take = (end.min(fe) - pos) as usize;
+            let (rel, _, padding) = &layout.files[f];
+            if *padding {
+                buf.resize(buf.len() + take, 0);
+            } else {
+                if open.as_ref().is_none_or(|(i, _)| *i != f) {
+                    let file = std::fs::File::open(root.join(rel))
+                        .map_err(|e| format!("{}: {}", rel.display(), e.kind()))?;
+                    open = Some((f, file));
+                }
+                let file = &mut open.as_mut().expect("opened").1;
+                file.seek(SeekFrom::Start(pos - fs))
+                    .map_err(|e| format!("{}: {}", rel.display(), e.kind()))?;
+                let at = buf.len();
+                buf.resize(at + take, 0);
+                file.read_exact(&mut buf[at..])
+                    .map_err(|e| format!("{}: {}", rel.display(), e.kind()))?;
+            }
+            pos += take as u64;
+            if pos >= fe {
+                f += 1;
+            }
+        }
+        let digest = Sha1::digest(&buf);
+        if digest.as_slice() != &layout.pieces[index * 20..index * 20 + 20] {
+            return Err(format!("piece {index} does not match its hash"));
+        }
+    }
+    Ok(())
 }
 
 /// Checks every piece of the files below `root` against its hash. Each file must be a
 /// regular file of exactly its length, reached without symlinks; padding entries are zeros.
 pub fn verify_pieces(root: &Path, layout: &Layout) -> Result<(), String> {
     use sha1::{Digest, Sha1};
+    if let Some(selected) = &layout.selected {
+        return verify_selected(root, layout, selected);
+    }
     let piece = layout.piece_length;
     if piece == 0 || !layout.pieces.len().is_multiple_of(20) {
         return Err("malformed piece table".into());
@@ -731,6 +846,7 @@ impl Embedded {
                 .map_err(|e| engine_failure(stage, &e))?;
             let output = t.output_folder().to_string_lossy().to_string();
             let paused = t.is_paused();
+            let only_files = t.only_files();
             session
                 .delete(TorrentIdOrHash::Hash(t.info_hash()), false)
                 .await
@@ -743,6 +859,9 @@ impl Embedded {
                         output_folder: Some(output),
                         overwrite: true,
                         initial_peers: Some(self.cfg.initial_peers.clone()),
+                        // The engine does not keep the file selection across a delete; it
+                        // is re-applied from the torrent it just had.
+                        only_files,
                         ..Default::default()
                     }),
                 )
@@ -943,6 +1062,27 @@ impl Embedded {
                 "the grab's save path is not the embedded download directory",
             ));
         }
+        // A season pack grabbed for some of its episodes: only those files are fetched. The
+        // names are matched exactly as the import matches them.
+        let only_files = match &req.select {
+            Some(sel) => {
+                let names: Vec<String> = t
+                    .files
+                    .iter()
+                    .map(|f| {
+                        let rel = paths::rel_string(f)
+                            .unwrap_or_else(|| f.to_string_lossy().into_owned());
+                        if t.multi {
+                            format!("{}/{rel}", t.name)
+                        } else {
+                            rel
+                        }
+                    })
+                    .collect();
+                crate::ingest::pack_files(&names, sel.series, &sel.targets).map_err(invalid)?
+            }
+            None => None,
+        };
         // Already managed by the engine (a replayed or retried add): its record keeps its
         // counters and verification and the observation of its live state stays, so the
         // replay counts nothing again; it is only confirmed admitted, as at a restore.
@@ -1037,6 +1177,7 @@ impl Embedded {
             output_folder: Some(output_s),
             overwrite: trusted,
             initial_peers: peers,
+            only_files,
             ..Default::default()
         };
         let answer = session
@@ -1201,6 +1342,7 @@ impl Embedded {
         let Ok(layout) = h.with_metadata(|m| Layout::of(&m.info)) else {
             return;
         };
+        let layout = layout.with_selection(h.only_files().as_deref());
         if self
             .verifying
             .lock()
@@ -1782,6 +1924,7 @@ mod tests {
             sequential: false,
             first_last_piece: false,
             content_layout: None,
+            select: None,
         };
         // Spawned checks wait for this gate, so nothing below can race them.
         let gate = e.check_gate.clone().write_owned().await;

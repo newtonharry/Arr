@@ -84,6 +84,9 @@ pub struct EpisodeInfo {
     pub ownership: Ownership,
     pub existing: Option<crate::catalog::FileEvidence>,
     pub queued: bool,
+    /// The grab covering this episode may be replaced by a season pack (see
+    /// `catalog::Episode::replaceable`).
+    pub replaceable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -385,6 +388,7 @@ impl Resolver<'_> {
                     },
                     existing: e.file.clone(),
                     queued: e.queued,
+                    replaceable: e.replaceable,
                 })
                 .collect();
             if !list.is_empty() {
@@ -459,6 +463,7 @@ impl Resolver<'_> {
                     ownership: season_ownership,
                     existing: None,
                     queued: false,
+                    replaceable: false,
                 })
             })
             .collect();

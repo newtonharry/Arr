@@ -1112,6 +1112,7 @@ fn request(payload: arr::prowlarr::Payload, save: &str) -> arr::qbit::AddRequest
         sequential: false,
         first_last_piece: false,
         content_layout: None,
+        select: None,
     }
 }
 
@@ -1685,4 +1686,128 @@ fn an_occupied_api_port_starts_no_engine() {
         !root.join("state/embedded/engine.lock").exists(),
         "no engine was started"
     );
+}
+
+#[tokio::test]
+async fn a_season_pack_fetches_only_the_files_of_the_episodes_it_was_grabbed_for() {
+    // Slow Horses S01: E01 and E03 are in the library already.
+    let mut e = start(Opts {
+        // Slow enough that the abrupt stop lands mid-download.
+        download_limit: Some(24 * 1024),
+        ..Default::default()
+    })
+    .await;
+    let title = "Slow.Horses.S01.1080p.WEB-DL.x264-UM";
+    let name = |n: u16| format!("Slow.Horses.S01E{n:02}.1080p.WEB-DL.x264-UM.mkv");
+    // The owned episodes (and the nfo) are big, so the saving is plain: nothing like their
+    // size should be fetched or written.
+    let big = |bytes: Vec<u8>| {
+        let mut b = bytes;
+        b.resize(400 * 1024, 0);
+        b
+    };
+    let files: Vec<(String, Vec<u8>)> = (1..=6)
+        .map(|n| {
+            let video = mkv_sized(4, 1280, 720);
+            (
+                name(n),
+                if [1, 3].contains(&n) {
+                    big(video)
+                } else {
+                    video
+                },
+            )
+        })
+        .chain([("Slow.Horses.S01.nfo".to_string(), big(b"nfo".to_vec()))])
+        .collect();
+    let total: usize = files.iter().map(|f| f.1.len()).sum();
+    let (t, r) = e.publish(title, files, 12.0, false).await;
+    e.search_results("Slow Horses S01", vec![r]);
+    let (s, v, text) = e
+        .json(e.post("/api/v1/plans").json(&json!({
+            "media_id": "season:tvdb:372264:1", "execute": true
+        })))
+        .await;
+    assert_eq!(s, 201, "{text}");
+    let cand = &v["plan"]["candidates"][0];
+    assert_eq!(cand["covers_episodes"], json!([2, 4, 5, 6]), "{text}");
+    assert_eq!(cand["skips_owned"], json!([1, 3]), "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    let started = Instant::now();
+    while progress(&e, &t.info_hash)
+        .await
+        .is_none_or(|(p, _)| p <= 0.0)
+    {
+        assert!(started.elapsed() < Duration::from_secs(30), "no progress");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Only the four episodes are selected: the owned ones and the nfo are not wanted.
+    let wanted = |fs: &[arr::qbit::TorrentFile]| -> Vec<(String, i64)> {
+        fs.iter()
+            .map(|f| (f.name.rsplit('/').next().unwrap().to_string(), f.priority))
+            .collect()
+    };
+    let expect: Vec<(String, i64)> = (1..=6)
+        .map(|n| (name(n), i64::from(![1, 3].contains(&n))))
+        .chain([("Slow.Horses.S01.nfo".to_string(), 0)])
+        .collect();
+    let fs = e.engine().files(&t.info_hash).await.unwrap().unwrap();
+    assert_eq!(wanted(&fs), expect);
+    // The engine's total is what it was asked for, not the whole pack.
+    let size = e
+        .engine()
+        .info(std::slice::from_ref(&t.info_hash))
+        .await
+        .unwrap()[0]
+        .size;
+    assert!(size > 0 && (size as usize) < total, "{size} of {total}");
+
+    // The selection survives an abrupt stop.
+    let before = progress(&e, &t.info_hash).await.unwrap().0;
+    assert!(before < 1.0, "still downloading ({before})");
+    e.restart(false).await;
+    let fs = e.engine().files(&t.info_hash).await.unwrap().unwrap();
+    assert_eq!(wanted(&fs), expect, "the selection came back");
+
+    e.until(&id, "imported", |g| g.state == "imported").await;
+    assert_eq!(e.grab(&id).imported_files, 4);
+    let season = e.tv.join("Slow Horses/Season 1");
+    for n in [2, 4, 5, 6] {
+        assert!(season.join(name(n)).is_file(), "E{n:02} from the pack");
+    }
+    for n in [1, 3] {
+        assert!(
+            !season.join(name(n)).exists(),
+            "E{n:02} stays the file it was"
+        );
+        assert!(
+            season
+                .join(format!("Slow.Horses.S01E0{n}.1080p.WEB-DL.x264-OLD.mkv"))
+                .is_file()
+        );
+    }
+    // Files that were not selected hold no more than the edges of the pieces they share with
+    // a selected one: nothing like their size is on the disk.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for f in [name(1), name(3), "Slow.Horses.S01.nfo".to_string()] {
+            let p = e.downloads.join(title).join(&f);
+            let m = std::fs::metadata(&p).unwrap_or_else(|_| panic!("{f} is not created"));
+            let used = m.blocks() * 512;
+            assert!(
+                used <= 64 * 1024 || used < m.len() / 2,
+                "{f}: {used} bytes on disk of {}",
+                m.len()
+            );
+        }
+    }
+    // Every selected piece passed the check, so the grab is not held back by it.
+    let (_, _, _, valid, verified) = e.counters(&t.info_hash);
+    assert!(valid && verified);
 }

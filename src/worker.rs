@@ -1142,6 +1142,7 @@ async fn refresh_series(
                     file: None,
                     ownership_unknown: false,
                     queued: false,
+                    replaceable: false,
                 })
             })
             .collect();

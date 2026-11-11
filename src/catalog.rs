@@ -216,6 +216,11 @@ pub struct Episode {
     pub ownership_unknown: bool,
     #[serde(default)]
     pub queued: bool,
+    /// The active download covering this episode is a single-episode grab that a healthier
+    /// season pack may replace (idle, waiting for metadata or not yet submitted; not paused,
+    /// not user-chosen). Set by the index, never stored.
+    #[serde(default, skip_serializing)]
+    pub replaceable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

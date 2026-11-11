@@ -195,6 +195,54 @@ fn scene_name(client_name: &str, ext: &str) -> String {
     }
 }
 
+/// Which files of a season pack to download for a grab that covers only `targets`.
+///
+/// `names` are the pack's files as the client names them (`<torrent name>/<path>`), padding
+/// entries included so that indexes stay the torrent's file indexes. A file is wanted when it
+/// is an importable video (not a sample or extra) whose file name parses to episodes that are
+/// all in `targets`, which is exactly the test `select` applies at import. Subtitles, nfo
+/// files and the like are not fetched when a selection is made.
+///
+/// `Ok(None)`: every episode the pack holds is wanted, so nothing is left out (all files, as
+/// without a selection). `Ok(Some(indexes))`: download only these. `Err`: no file maps to a
+/// wanted episode.
+pub fn pack_files(
+    names: &[String],
+    series: MediaId,
+    targets: &[MediaId],
+) -> Result<Option<Vec<usize>>, String> {
+    let mut wanted = vec![];
+    let mut left_out = false;
+    for (i, name) in names.iter().enumerate() {
+        let Some(rel) = paths::safe_rel(name) else {
+            continue;
+        };
+        let rel = paths::rel_string(&rel).unwrap_or_else(|| rel.to_string_lossy().into_owned());
+        let Some(ext) = ext_of(&rel) else { continue };
+        if !VIDEO_EXTENSIONS.contains(&ext.as_str()) || excluded(&rel) || sample_name(&rel) {
+            continue;
+        }
+        let base = rel.rsplit('/').next().unwrap_or(&rel);
+        let Numbering::Episodes { season, episodes } = release::parse(base).numbering else {
+            continue;
+        };
+        let mut ids = episodes
+            .iter()
+            .map(|e| library::episode_id(series, season, *e));
+        if !episodes.is_empty() && ids.all(|id| targets.contains(&id)) {
+            wanted.push(i);
+        } else {
+            left_out = true;
+        }
+    }
+    if wanted.is_empty() {
+        return Err(
+            "no video file in the pack is for an episode this download was grabbed for".into(),
+        );
+    }
+    Ok(left_out.then_some(wanted))
+}
+
 pub fn select(
     g: &Grab,
     files: &[FileEntry],
@@ -1584,6 +1632,7 @@ mod tests {
                 .into_iter()
                 .map(|(target, replaces)| downloads::GrabTarget { target, replaces })
                 .collect(),
+            replaced: vec![],
         }
     }
 
@@ -1594,6 +1643,69 @@ mod tests {
             complete: true,
             wanted: true,
         }
+    }
+
+    #[test]
+    fn a_pack_selection_picks_exactly_the_files_the_import_would_take() {
+        let series: MediaId = "series:tvdb:1".parse().unwrap();
+        let e = |n| library::episode_id(series, 1, n);
+        let names: Vec<String> = [
+            "Pack/Show.S01E01.1080p.mkv",
+            "Pack/Show.S01E02E03.1080p.mkv",
+            "Pack/Sample/Show.S01E04.sample.mkv",
+            "Pack/Show.S01E04.1080p.mkv",
+            "Pack/Show.S01E05.1080p.mkv",
+            "Pack/Show.S01.nfo",
+            "Pack/Show.S01E04.srt",
+            ".pad/1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // Episodes 1, 2, 3 and 5 are wanted (E04 is owned): a multi-episode file needs all
+        // of its episodes to be wanted.
+        let wanted = [e(1), e(2), e(3), e(5)];
+        assert_eq!(
+            pack_files(&names, series, &wanted).unwrap(),
+            Some(vec![0, 1, 4])
+        );
+        // The import agrees: the same files, and only those, are not skipped for coverage.
+        let item = ItemInfo {
+            folder: "Show".into(),
+            runtime: Some(45),
+            episodes: Default::default(),
+            existing: None,
+            series: Some(series),
+            identity: None,
+            profile: None,
+            original_language: None,
+        };
+        let g = grab(
+            series,
+            wanted.iter().map(|t| (*t, false)).collect(),
+            true,
+            "Pack",
+        );
+        let entries: Vec<FileEntry> = names.iter().map(|n| entry(n)).collect();
+        let s = select(&g, &entries, Path::new("/dl"), &item, true);
+        let planned: Vec<&str> = s.planned.iter().map(|p| p.rel.as_str()).collect();
+        assert_eq!(
+            planned,
+            [
+                "Pack/Show.S01E01.1080p.mkv",
+                "Pack/Show.S01E02E03.1080p.mkv",
+                "Pack/Show.S01E05.1080p.mkv"
+            ]
+        );
+        // Everything the pack holds is wanted: nothing is left out, all files are fetched.
+        let all = [e(1), e(2), e(3), e(4), e(5)];
+        assert_eq!(pack_files(&names, series, &all).unwrap(), None);
+        // Nothing the pack holds is wanted.
+        let none = pack_files(&names, series, &[e(9)]);
+        assert!(none.unwrap_err().contains("no video file"));
+        // Another season's file name is not for these episodes.
+        let other = vec!["Pack/Show.S02E01.mkv".to_string()];
+        assert!(pack_files(&other, series, &[e(1)]).is_err());
     }
 
     #[test]

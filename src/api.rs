@@ -391,7 +391,17 @@ impl AppState {
             automatic,
             refresh,
             blocked,
+            partial_packs: self.can_select_files(),
         }
+    }
+
+    /// Whether the download client can fetch some files of a torrent: the embedded engine
+    /// can. qBittorrent is not driven that way, and with no client nothing is grabbed, so a
+    /// season pack must cover every episode there (the behaviour before file selection).
+    pub fn can_select_files(&self) -> bool {
+        self.client
+            .as_deref()
+            .is_some_and(|c| c.embedded_semantics())
     }
 
     /// Search-and-grab for one target: a fresh plan (superseding an active one), executed
@@ -596,6 +606,7 @@ impl AppState {
         }
         let now = OffsetDateTime::now_utc();
         let mut grabs = vec![];
+        let mut replaced: Vec<String> = vec![];
         let mut refused = vec![];
         for c in plan.candidates.clone() {
             let (r, t) = (c.release_ref.clone(), plan.target);
@@ -625,7 +636,10 @@ impl AppState {
             )
             .await
             {
-                Ok(g) => grabs.push(g.id),
+                Ok(g) => {
+                    replaced.extend(g.replaced.iter().cloned());
+                    grabs.push(g.id);
+                }
                 Err(EnqueueError::Refused(code, msg)) => refused.push(Rejection {
                     code: code.into(),
                     message: format!("{}: {msg}", c.title),
@@ -673,6 +687,7 @@ impl AppState {
             executed_at: Some(rfc3339(now)),
             confirmed_at: None,
             outcome: Some(outcome),
+            superseded_grabs: replaced,
         };
         if queued {
             plan.state = PlanState::DownloadQueued;
@@ -2007,6 +2022,7 @@ fn catalog_episodes(eps: &[crate::metadata::TvmazeEpisode]) -> Vec<crate::catalo
                 file: None,
                 ownership_unknown: false,
                 queued: false,
+                replaceable: false,
             })
         })
         .collect()

@@ -1403,6 +1403,7 @@ fn link(
         full_season: false,
         covers: vec![id],
         replaces: vec![],
+        supersedes: vec![],
         interactive: true,
     }
 }
