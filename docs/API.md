@@ -202,9 +202,22 @@ have none. The plain API does not return it. The movie and show pages also carry
   calls. Two things in it help a client explain itself:
   - each `needs_you` item has `problem` (a short sentence), plus `kind` (`download_failed`,
     `import_blocked` or `request_expired`) and `failure` (why a download failed, for example
-    `stalled` or `wrong_quality`; null otherwise);
+    `stalled`, `no_metadata` or `wrong_quality`; null otherwise), and `count`, how many
+    failed downloads the card stands for (1 unless repeats were folded in);
+  - a failed download shows once per wanted episode or movie: the newest failure stands for the
+    older ones of the same units, and `count` says how many. A failed download whose every
+    episode or movie is no longer wanted (unmonitored, stopped or no longer managed) is left
+    out, here and in `/attention`; it stays in `/queue` and the history;
   - each `on_its_way` item has `eta_seconds`, the time left at the download's recent rate
     (smoothed over polls, kept in memory), or null when unknown, paused or stalled.
+- A grab's `failure` code `no_metadata` means a magnet link never delivered its metadata
+  within the engine's wait, on every attempt (`submission_failed` is the client being
+  unreachable or refusing the add). `no_metadata` blocklists the release for that item
+  (blocklist `reason` `no_metadata`) and, like other failures, may start a re-search. A
+  re-search after a failed single episode searches its whole season when other episodes of it
+  are still wanted (at most one pending search per season). `/attention` `download_failed`
+  items also carry `covers`, the episodes or movie the download covered. Code that does not
+  know a `failure` value should show `last_error` and treat it as any other failure.
 - Season counts in `/library/series`, `/discover` and `/media/{series}` come from the live
   episode list (`source: live`), not from the snapshot's statistics.
 

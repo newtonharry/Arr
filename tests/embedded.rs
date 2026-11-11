@@ -1080,13 +1080,25 @@ fn standalone(
     arr::store::Store,
     config::EmbeddedConfig,
 ) {
+    standalone_with(root, "")
+}
+
+/// `standalone`, with more `[embedded]` settings.
+fn standalone_with(
+    root: &Path,
+    extra: &str,
+) -> (
+    arr::embedded::Embedded,
+    arr::store::Store,
+    config::EmbeddedConfig,
+) {
     let state = root.join("state");
     fsutil::ensure_private_dir(&state).unwrap();
     fsutil::ensure_private_dir(&state.join("secrets")).unwrap();
     fsutil::write_new_private_file(&state.join("secrets/api_token"), TOKEN.as_bytes()).unwrap();
     std::fs::create_dir_all(root.join("downloads")).unwrap();
     let text = format!(
-        "[server]\napi_token_file = \"secrets/api_token\"\n[embedded]\ndownload_dir = '{}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\n",
+        "[server]\napi_token_file = \"secrets/api_token\"\n[embedded]\ndownload_dir = '{}'\nlisten = \"127.0.0.1:0\"\ntrackers = false\n{extra}",
         root.join("downloads").display()
     );
     fsutil::write_new_private_file(&state.join("config.toml"), text.as_bytes()).unwrap();
@@ -1212,6 +1224,30 @@ async fn a_released_record_acquired_again_starts_a_fresh_seeding_lifecycle() {
         (uploaded, seeding, fresh, admitted, active),
         (0, 0, true, true, true)
     );
+    engine.shutdown().await;
+}
+
+/// A magnet wait in which no peer could be reached is not read as a dead swarm: the network
+/// may be down, and blocklisting the release then would be wrong.
+#[tokio::test]
+async fn a_metadata_wait_that_reached_no_peer_is_not_a_dead_magnet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _store, cfg) = standalone_with(
+        tmp.path(),
+        "dht = false\nmetadata_timeout_secs = 5\ninitial_peers = [\"127.0.0.1:1\"]\n",
+    );
+    let magnet = format!("magnet:?xt=urn:btih:{}", "cd".repeat(20));
+    let err = engine
+        .add(&request(
+            arr::prowlarr::Payload::Magnet(magnet),
+            &cfg.save_path,
+        ))
+        .await
+        .unwrap_err();
+    // Where the refused peer makes the engine give up early (Windows) the error differs; on
+    // Linux the wait times out. Either way it must not read as a dead magnet.
+    let text = err.describe();
+    assert!(!arr::upstream::describes_missing_metadata(&text), "{text}");
     engine.shutdown().await;
 }
 

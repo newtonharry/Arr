@@ -736,7 +736,7 @@ fn search_targets(st: &AppState, id: MediaId, now: OffsetDateTime) -> Vec<MediaI
     }
 }
 
-fn aired(date: Option<&str>, now: OffsetDateTime) -> bool {
+pub(crate) fn aired(date: Option<&str>, now: OffsetDateTime) -> bool {
     date.and_then(parse_ts).is_some_and(|t| t <= now)
 }
 
