@@ -522,8 +522,13 @@ Queue actions:
 - `GET /api/v1/history?media_id=&kind=&limit=&offset=` returns events, newest first. Kinds
   include `grabbed`, `release_rejected`, `download_started`, `download_completed`, `file_imported`,
   `file_replaced`, `import_completed`, `import_blocked`, `download_failed`,
-  `download_cancelled`, `download_released`, `download_removed`, `added`, `monitored`,
+  `download_cancelled`, `download_released`, `download_removed`, `target_dropped`, `added`, `monitored`,
   `unmonitored`, `removed`, `metadata_refreshed`, `rescan` and `recovered`.
+  `target_dropped` means a season pack holds no file for some episode it was grabbed for: the
+  episode leaves the grab (it is wanted again and searched for), `data` lists `dropped`,
+  `research` and `blocklisted`, and the release is blocklisted for the show (blocklist `reason`
+  `no_episode_file`). `import_completed` says "matched by elimination" when a pack's one file
+  named only after the pack was taken for the one episode of the season without a file.
 - `GET /api/v1/blocklist?media_id=` and `DELETE /api/v1/blocklist/{entry_id}`.
 
 ### Commands, tasks, requests and RSS

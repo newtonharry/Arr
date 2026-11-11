@@ -115,6 +115,37 @@ fn sample_name(name: &str) -> bool {
         .any(|w| w == "sample")
 }
 
+/// A file name that says it isn't an episode (an extra, a trailer, a special...). Only used
+/// before matching a file by elimination, which must never take an extra for an episode.
+fn extra_name(name: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "extra",
+        "extras",
+        "bonus",
+        "featurette",
+        "featurettes",
+        "special",
+        "specials",
+        "trailer",
+        "trailers",
+        "teaser",
+        "promo",
+        "preview",
+        "recap",
+        "interview",
+        "interviews",
+        "deleted",
+        "behind",
+        "making",
+        "commentary",
+        "ncop",
+        "nced",
+    ];
+    let stem = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    stem.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| MARKERS.contains(&w))
+}
+
 fn excluded(rel: &str) -> bool {
     let mut parts: Vec<&str> = rel.split('/').collect();
     let file = parts.pop().unwrap_or("");
@@ -156,6 +187,11 @@ pub struct Selection {
     pub skipped: Vec<Skipped>,
     /// Problems that block the whole import (ambiguity).
     pub blocker: Option<String>,
+    /// Targets of a season pack that no video file of the download holds, not even by
+    /// elimination.
+    pub unfiled: Vec<MediaId>,
+    /// Files taken for an episode by elimination (shown in the history).
+    pub notes: Vec<String>,
 }
 
 /// Season -> episode -> (runtime, evidence about the owned file).
@@ -195,42 +231,139 @@ fn scene_name(client_name: &str, ext: &str) -> String {
     }
 }
 
-/// Which files of a season pack to download for a grab that covers only `targets`.
+/// An importable video of a pack: its safe relative path, or `None` for anything else
+/// (not a video, a sample or extra, an unsafe name).
+fn candidate(name: &str) -> Option<String> {
+    let rel = paths::safe_rel(name)?;
+    let rel = paths::rel_string(&rel).unwrap_or_else(|| rel.to_string_lossy().into_owned());
+    let ext = ext_of(&rel)?;
+    (VIDEO_EXTENSIONS.contains(&ext.as_str()) && !excluded(&rel) && !sample_name(&rel))
+        .then_some(rel)
+}
+
+/// The episodes each video of a pack holds (`episodes[i]` for `cands[i]`, a path with its
+/// size): what its file name says, or, in a full-season pack, one file by elimination.
 ///
-/// `names` are the pack's files as the client names them (`<torrent name>/<path>`), padding
-/// entries included so that indexes stay the torrent's file indexes. A file is wanted when it
-/// is an importable video (not a sample or extra) whose file name parses to episodes that are
-/// all in `targets`, which is exactly the test `select` applies at import. Subtitles, nfo
-/// files and the like are not fetched when a selection is made.
-///
-/// `Ok(None)`: every episode the pack holds is wanted, so nothing is left out (all files, as
-/// without a selection). `Ok(Some(indexes))`: download only these. `Err`: no file maps to a
-/// wanted episode.
-pub fn pack_files(
-    names: &[String],
+/// A full season can have one file named only after the pack, with no episode number, and
+/// one episode of the season with no file: that file is that episode. Only when all of these
+/// hold: exactly one file maps to no episode and its name has no numbering but, at most, the
+/// season's own (`...S05 1080p...`), every other file is of one season, exactly one of that
+/// season's `known` episodes (the catalog's) has no file, and the file is within half to
+/// twice the median size of the others. Samples and extras are never candidates. Otherwise a
+/// file with no episode in its name holds none. `eliminated` is the file matched this way.
+pub struct Held {
+    pub episodes: Vec<Vec<MediaId>>,
+    pub eliminated: Option<usize>,
+}
+
+pub fn held_episodes(
+    cands: &[(String, u64)],
+    series: MediaId,
+    known: &[MediaId],
+    full_season: bool,
+) -> Held {
+    let parsed: Vec<Numbering> = cands
+        .iter()
+        .map(|(rel, _)| release::parse(rel.rsplit('/').next().unwrap_or(rel)).numbering)
+        .collect();
+    let mut episodes: Vec<Vec<MediaId>> = parsed
+        .iter()
+        .map(|n| match n {
+            Numbering::Episodes { season, episodes } => episodes
+                .iter()
+                .map(|e| library::episode_id(series, *season, *e))
+                .collect(),
+            _ => vec![],
+        })
+        .collect();
+    let eliminated = full_season
+        .then(|| {
+            let unmapped: Vec<usize> = (0..cands.len())
+                .filter(|i| episodes[*i].is_empty())
+                .collect();
+            let [i] = unmapped[..] else { return None };
+            if extra_name(&cands[i].0) {
+                return None;
+            }
+            let seasons: std::collections::BTreeSet<u16> = parsed
+                .iter()
+                .filter_map(|n| match n {
+                    Numbering::Episodes { season, .. } => Some(*season),
+                    _ => None,
+                })
+                .collect();
+            let [season] = seasons.into_iter().collect::<Vec<_>>()[..] else {
+                return None;
+            };
+            // Named for nothing but the pack: no numbering, or this season's alone.
+            match parsed[i] {
+                Numbering::None => {}
+                Numbering::Season { season: s } if s == season => {}
+                _ => return None,
+            }
+            let have: Vec<MediaId> = episodes.iter().flatten().copied().collect();
+            let lacking: Vec<MediaId> = known
+                .iter()
+                .copied()
+                .filter(|k| matches!(k, MediaId::Episode(_, s, _) if *s == season))
+                .filter(|k| !have.contains(k))
+                .collect();
+            let [episode] = lacking[..] else { return None };
+            let mut sizes: Vec<u64> = (0..cands.len())
+                .filter(|j| *j != i)
+                .map(|j| cands[j].1)
+                .collect();
+            sizes.sort_unstable();
+            let median = sizes[sizes.len() / 2];
+            let size = cands[i].1;
+            // Sample-sized or oversized: not an episode of this pack.
+            if size == 0 || median == 0 || size < median / 2 || size > median.saturating_mul(2) {
+                return None;
+            }
+            episodes[i] = vec![episode];
+            Some(i)
+        })
+        .flatten();
+    Held {
+        episodes,
+        eliminated,
+    }
+}
+
+/// Which files of a season pack to download for a grab that covers only some episodes.
+pub struct PackPlan {
+    /// `None`: every episode the pack holds is wanted, so nothing is left out (all files, as
+    /// without a selection). `Some(indexes)`: download only these.
+    pub only: Option<Vec<usize>>,
+    /// Targets with no file in the pack at all.
+    pub missing: Vec<MediaId>,
+    /// The file (an index into `files`) matched to its episode by elimination.
+    pub matched: Option<(usize, MediaId)>,
+}
+
+/// `files` are the pack's files as the client names them (`<torrent name>/<path>`) with their
+/// sizes, padding entries included so that indexes stay the torrent's file indexes. A file is
+/// wanted when it is an importable video (not a sample or extra) whose episodes (see
+/// `held_episodes`) are all in `targets`, which is exactly the test `select` applies at
+/// import. Subtitles, nfo files and the like are not fetched when a selection is made.
+/// `known` is the series' episodes in the catalog. `Err`: no file maps to a wanted episode.
+pub fn pack_plan(
+    files: &[(String, u64)],
     series: MediaId,
     targets: &[MediaId],
-) -> Result<Option<Vec<usize>>, String> {
+    known: &[MediaId],
+) -> Result<PackPlan, String> {
+    let (at, cands): (Vec<usize>, Vec<(String, u64)>) = files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (name, size))| candidate(name).map(|rel| (i, (rel, *size))))
+        .unzip();
+    let held = held_episodes(&cands, series, known, true);
     let mut wanted = vec![];
     let mut left_out = false;
-    for (i, name) in names.iter().enumerate() {
-        let Some(rel) = paths::safe_rel(name) else {
-            continue;
-        };
-        let rel = paths::rel_string(&rel).unwrap_or_else(|| rel.to_string_lossy().into_owned());
-        let Some(ext) = ext_of(&rel) else { continue };
-        if !VIDEO_EXTENSIONS.contains(&ext.as_str()) || excluded(&rel) || sample_name(&rel) {
-            continue;
-        }
-        let base = rel.rsplit('/').next().unwrap_or(&rel);
-        let Numbering::Episodes { season, episodes } = release::parse(base).numbering else {
-            continue;
-        };
-        let mut ids = episodes
-            .iter()
-            .map(|e| library::episode_id(series, season, *e));
-        if !episodes.is_empty() && ids.all(|id| targets.contains(&id)) {
-            wanted.push(i);
+    for (n, eps) in held.episodes.iter().enumerate() {
+        if !eps.is_empty() && eps.iter().all(|id| targets.contains(id)) {
+            wanted.push(at[n]);
         } else {
             left_out = true;
         }
@@ -240,7 +373,34 @@ pub fn pack_files(
             "no video file in the pack is for an episode this download was grabbed for".into(),
         );
     }
-    Ok(left_out.then_some(wanted))
+    let missing = targets
+        .iter()
+        .copied()
+        .filter(|t| !held.episodes.iter().any(|e| e.contains(t)))
+        .collect();
+    Ok(PackPlan {
+        only: left_out.then_some(wanted),
+        missing,
+        matched: held.eliminated.map(|n| (at[n], held.episodes[n][0])),
+    })
+}
+
+fn episode_label(e: MediaId) -> String {
+    match e {
+        MediaId::Episode(_, s, n) => format!("S{s:02}E{n:02}"),
+        other => other.to_string(),
+    }
+}
+
+/// The catalog's episodes of a series, as `held_episodes` wants them.
+fn known_episodes(item: &ItemInfo) -> Vec<MediaId> {
+    let Some(series) = item.series else {
+        return vec![];
+    };
+    item.episodes
+        .iter()
+        .flat_map(|(s, m)| m.keys().map(move |n| library::episode_id(series, *s, *n)))
+        .collect()
 }
 
 pub fn select(
@@ -296,6 +456,29 @@ pub fn select(
     }
     let mut planned: Vec<Planned> = vec![];
     let targets: Vec<MediaId> = g.targets.iter().map(|t| t.target).collect();
+    // A full-season pack's one unnamed episode file, matched to its episode by elimination
+    // exactly as the selection did when the pack was added. Every video counts here, selected
+    // or not.
+    let mut elim: Option<(String, MediaId)> = None;
+    let mut unfiled: Vec<MediaId> = vec![];
+    let mut notes: Vec<String> = vec![];
+    if g.full_season
+        && let Some(series) = item.series
+    {
+        let cands: Vec<(String, u64)> = files
+            .iter()
+            .filter_map(|f| candidate(&f.name).map(|rel| (rel, f.size)))
+            .collect();
+        let held = held_episodes(&cands, series, &known_episodes(item), true);
+        elim = held
+            .eliminated
+            .map(|n| (cands[n].0.clone(), held.episodes[n][0]));
+        unfiled = targets
+            .iter()
+            .copied()
+            .filter(|t| !held.episodes.iter().any(|e| e.contains(t)))
+            .collect();
+    }
     let replaces = |t: &MediaId| g.targets.iter().any(|x| x.target == *t && x.replaces);
     let client_name = g.client_name.clone().unwrap_or_else(|| g.title.clone());
     let single = videos.len() == 1 && !g.full_season;
@@ -346,7 +529,9 @@ pub fn select(
             for (f, rel) in &videos {
                 let base = rel.rsplit('/').next().unwrap_or(rel);
                 let parsed = release::parse(base);
+                let eliminated = elim.as_ref().filter(|(r, _)| r == rel).map(|(_, e)| *e);
                 let eps: Vec<MediaId> = match (&parsed.numbering, g.target) {
+                    (_, _) if eliminated.is_some() => eliminated.into_iter().collect(),
                     (Numbering::Episodes { season, episodes }, _) => {
                         let Some(series) = item.series else { continue };
                         episodes
@@ -420,9 +605,18 @@ pub fn select(
                 let ext = ext_of(rel).unwrap_or_default();
                 let name = if single {
                     scene_name(&client_name, &ext)
+                } else if eliminated.is_some() {
+                    // Named after the pack, which Plex could not match: name it for its episode.
+                    format!("{} - S{season:02}E{number:02}.{ext}", item.folder)
                 } else {
                     base.to_string()
                 };
+                if let Some(e) = eliminated {
+                    notes.push(format!(
+                        "{rel} is {}, matched by elimination: the pack's only unnamed episode-sized file",
+                        episode_label(e)
+                    ));
+                }
                 planned.push(Planned {
                     source: local_save.join(rel),
                     rel: rel.clone(),
@@ -440,6 +634,8 @@ pub fn select(
         planned,
         skipped,
         blocker,
+        unfiled,
+        notes,
     }
 }
 
@@ -450,6 +646,10 @@ pub enum Outcome {
         files: usize,
         skipped: Vec<Skipped>,
         missing: Vec<MediaId>,
+        /// Of `missing`, the targets no file of the download holds: they are wanted again.
+        unfiled: Vec<MediaId>,
+        /// Files taken for an episode by elimination.
+        notes: Vec<String>,
     },
     /// Not importable now; stays active (retried with backoff or on request).
     Blocked(String),
@@ -516,25 +716,35 @@ async fn apply(st: &AppState, g: &Grab, outcome: Outcome, now: OffsetDateTime) -
             files,
             skipped,
             missing,
+            unfiled,
+            notes,
         } => {
             let (cleanup, detail) = downloads::after_import_cleanup(g);
-            let note = if missing.is_empty() {
+            let still: Vec<&MediaId> = missing.iter().filter(|m| !unfiled.contains(m)).collect();
+            let note = if still.is_empty() {
                 None
             } else {
                 Some(format!(
                     "imported {files} file(s); not imported: {}",
-                    missing
+                    still
                         .iter()
                         .map(|m| m.to_string())
                         .collect::<Vec<_>>()
                         .join(", ")
                 ))
             };
-            let (media_s, target_s, title) = (
-                g.media_id.to_string(),
-                g.target.to_string(),
-                g.title.clone(),
-            );
+            let research = downloads::research_for_dropped(st, g, &unfiled, now);
+            let message = if notes.is_empty() {
+                format!("{title}: {files} file(s) imported", title = g.title)
+            } else {
+                format!(
+                    "{title}: {files} file(s) imported ({})",
+                    notes.join("; "),
+                    title = g.title
+                )
+            };
+            let (media_s, target_s) = (g.media_id.to_string(), g.target.to_string());
+            let g2 = g.clone();
             let skipped_json = json!(skipped);
             let plex = st.plex.is_some();
             let media = g.media_id;
@@ -545,7 +755,8 @@ async fn apply(st: &AppState, g: &Grab, outcome: Outcome, now: OffsetDateTime) -
                         "UPDATE grabs SET state = 'imported', active = 0, imported_at = ?2, updated_at = ?2, lease_owner = NULL, lease_until = NULL, last_error = ?3, cleanup = ?4, cleanup_detail = ?5 WHERE id = ?1",
                         params![id, now_s, note, cleanup, detail],
                     )?;
-                    library::event(&tx, &now_s, "import_completed", Some(&media_s), Some(&target_s), Some(&id), &format!("{title}: {files} file(s) imported"), Some(&json!({ "skipped": skipped_json, "missing": missing })))?;
+                    library::event(&tx, &now_s, "import_completed", Some(&media_s), Some(&target_s), Some(&id), &message, Some(&json!({ "skipped": skipped_json, "missing": missing, "matched_by_elimination": notes })))?;
+                    downloads::drop_targets(&tx, &g2, &unfiled, &research, &now_s)?;
                     if plex {
                         crate::worker::queue_command(&tx, "plex_refresh", Some(media), &now_s)?;
                     }
@@ -1101,10 +1312,17 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
         .map(|t| t.target)
         .filter(|t| !covered.contains(t))
         .collect();
+    let unfiled = missing
+        .iter()
+        .copied()
+        .filter(|t| sel.unfiled.contains(t))
+        .collect();
     Ok(Outcome::Imported {
         files: imported,
         skipped: sel.skipped,
         missing,
+        unfiled,
+        notes: sel.notes,
     })
 }
 
@@ -1665,10 +1883,7 @@ mod tests {
         // Episodes 1, 2, 3 and 5 are wanted (E04 is owned): a multi-episode file needs all
         // of its episodes to be wanted.
         let wanted = [e(1), e(2), e(3), e(5)];
-        assert_eq!(
-            pack_files(&names, series, &wanted).unwrap(),
-            Some(vec![0, 1, 4])
-        );
+        assert_eq!(only(&names, series, &wanted).unwrap(), Some(vec![0, 1, 4]));
         // The import agrees: the same files, and only those, are not skipped for coverage.
         let item = ItemInfo {
             folder: "Show".into(),
@@ -1699,13 +1914,221 @@ mod tests {
         );
         // Everything the pack holds is wanted: nothing is left out, all files are fetched.
         let all = [e(1), e(2), e(3), e(4), e(5)];
-        assert_eq!(pack_files(&names, series, &all).unwrap(), None);
+        assert_eq!(only(&names, series, &all).unwrap(), None);
         // Nothing the pack holds is wanted.
-        let none = pack_files(&names, series, &[e(9)]);
+        let none = only(&names, series, &[e(9)]);
         assert!(none.unwrap_err().contains("no video file"));
         // Another season's file name is not for these episodes.
         let other = vec!["Pack/Show.S02E01.mkv".to_string()];
-        assert!(pack_files(&other, series, &[e(1)]).is_err());
+        assert!(only(&other, series, &[e(1)]).is_err());
+    }
+
+    fn only(
+        names: &[String],
+        series: MediaId,
+        targets: &[MediaId],
+    ) -> Result<Option<Vec<usize>>, String> {
+        let files: Vec<(String, u64)> = names.iter().map(|n| (n.clone(), 10)).collect();
+        pack_plan(&files, series, targets, &[]).map(|p| p.only)
+    }
+
+    /// A full season of six episodes whose E02 file is named only after the pack.
+    fn season_pack(
+        unnamed: &[(&str, u64)],
+        owned_gap: Option<u16>,
+    ) -> (MediaId, Vec<(String, u64)>, Vec<MediaId>) {
+        let series: MediaId = "series:tvdb:1".parse().unwrap();
+        let mut files: Vec<(String, u64)> = (1..=6u16)
+            .filter(|n| *n != 2 && Some(*n) != owned_gap)
+            .map(|n| (format!("Pack/Show.S01E{n:02}.1080p.mkv"), 250))
+            .collect();
+        files.extend(unnamed.iter().map(|(n, s)| (format!("Pack/{n}"), *s)));
+        files.push(("Pack/Show.S01.nfo".into(), 1));
+        let known = (1..=6).map(|n| library::episode_id(series, 1, n)).collect();
+        (series, files, known)
+    }
+
+    #[test]
+    fn the_last_episode_of_a_full_season_is_found_by_elimination() {
+        let (series, files, known) = season_pack(&[("Show.S01.1080p.WEB.mkv", 230)], None);
+        let targets = [1, 2, 4, 5, 6].map(|n| library::episode_id(series, 1, n));
+        let plan = pack_plan(&files, series, &targets, &known).unwrap();
+        let (i, ep) = plan.matched.unwrap();
+        assert_eq!(files[i].0, "Pack/Show.S01.1080p.WEB.mkv");
+        assert_eq!(ep, library::episode_id(series, 1, 2));
+        assert!(plan.missing.is_empty());
+        // E03 is owned: its file is left out, the unnamed one is selected.
+        assert_eq!(plan.only.unwrap().len(), 5);
+
+        // The import takes the same file for the same episode and says so.
+        let item = ItemInfo {
+            folder: "Show".into(),
+            runtime: Some(45),
+            episodes: (1..=6u16)
+                .map(|n| (n, (Some(45), None)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .fold(Default::default(), |mut m: EpisodeMap, (n, v)| {
+                    m.entry(1).or_default().insert(n, v);
+                    m
+                }),
+            existing: None,
+            series: Some(series),
+            identity: None,
+            profile: None,
+            original_language: None,
+        };
+        let g = grab(
+            series,
+            targets.iter().map(|t| (*t, false)).collect(),
+            true,
+            "Pack",
+        );
+        let entries: Vec<FileEntry> = files
+            .iter()
+            .map(|(n, s)| FileEntry {
+                size: *s,
+                ..entry(n)
+            })
+            .collect();
+        let s = select(&g, &entries, Path::new("/dl"), &item, true);
+        assert!(s.blocker.is_none() && s.unfiled.is_empty());
+        let p = s
+            .planned
+            .iter()
+            .find(|p| p.rel == "Pack/Show.S01.1080p.WEB.mkv")
+            .unwrap();
+        assert_eq!(p.targets, vec![library::episode_id(series, 1, 2)]);
+        assert_eq!(p.dest_name, "Show - S01E02.mkv");
+        assert_eq!(s.notes.len(), 1);
+        assert!(
+            s.notes[0].contains("matched by elimination"),
+            "{:?}",
+            s.notes
+        );
+    }
+
+    #[test]
+    fn elimination_applies_only_to_one_unnamed_episode_sized_file_of_a_full_season() {
+        // Two unnamed files: nothing says which is which.
+        let (series, files, known) = season_pack(
+            &[("Show.S01.1080p.WEB.mkv", 230), ("Show.S01.extra.mkv", 240)],
+            None,
+        );
+        assert!(
+            held_episodes(&cands(&files), series, &known, true)
+                .eliminated
+                .is_none()
+        );
+        // Sample-sized, or far too big for an episode.
+        for size in [20, 100, 600] {
+            let (series, files, known) = season_pack(&[("Show.S01.1080p.WEB.mkv", size)], None);
+            assert!(
+                held_episodes(&cands(&files), series, &known, true)
+                    .eliminated
+                    .is_none(),
+                "{size}"
+            );
+        }
+        // The only unnamed file is an extra by name: it is not taken for the missing episode,
+        // which stays missing.
+        for name in ["Show.S01.extra.mkv", "Show.S01.Bonus.Featurette.mkv"] {
+            let (series, files, known) = season_pack(&[(name, 240)], None);
+            assert!(
+                held_episodes(&cands(&files), series, &known, true)
+                    .eliminated
+                    .is_none(),
+                "{name}"
+            );
+            let targets = [1, 2, 4, 5, 6].map(|n| library::episode_id(series, 1, n));
+            let plan = pack_plan(&files, series, &targets, &known).unwrap();
+            assert_eq!(plan.missing, [library::episode_id(series, 1, 2)], "{name}");
+        }
+        // A sample by name is not a candidate at all.
+        let (series, files, known) = season_pack(&[("Show.S01.sample.mkv", 230)], None);
+        assert!(
+            held_episodes(&cands(&files), series, &known, true)
+                .eliminated
+                .is_none()
+        );
+        // Not a full season.
+        let (series, files, known) = season_pack(&[("Show.S01.1080p.WEB.mkv", 230)], None);
+        assert!(
+            held_episodes(&cands(&files), series, &known, false)
+                .eliminated
+                .is_none()
+        );
+        // Two episodes have no file (E02 and E05): the file could be either.
+        let (series, files, known) = season_pack(&[("Show.S01.1080p.WEB.mkv", 230)], Some(5));
+        assert!(
+            held_episodes(&cands(&files), series, &known, true)
+                .eliminated
+                .is_none()
+        );
+        // The file names another season or episode.
+        let (series, files, known) = season_pack(&[("Show.S02E01.1080p.mkv", 230)], None);
+        assert!(
+            held_episodes(&cands(&files), series, &known, true)
+                .eliminated
+                .is_none()
+        );
+        // Without the catalog's episodes nothing can be eliminated.
+        let (series, files, _) = season_pack(&[("Show.S01.1080p.WEB.mkv", 230)], None);
+        assert!(
+            held_episodes(&cands(&files), series, &[], true)
+                .eliminated
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_target_with_no_file_is_missing_and_a_pack_without_any_is_refused() {
+        let (series, files, known) = season_pack(&[], None);
+        // E02 has no file and nothing can stand in for it.
+        let targets = [2, 4].map(|n| library::episode_id(series, 1, n));
+        let plan = pack_plan(&files, series, &targets, &known).unwrap();
+        assert_eq!(plan.missing, vec![library::episode_id(series, 1, 2)]);
+        assert!(plan.matched.is_none());
+        assert_eq!(plan.only.unwrap().len(), 1);
+        let none = [library::episode_id(series, 1, 2)];
+        assert!(pack_plan(&files, series, &none, &known).is_err());
+
+        // A pack downloaded before this check: the import imports what is there and says which
+        // target no file holds (E02), apart from one that has a file (E03, owned).
+        let mut item = ItemInfo {
+            folder: "Show".into(),
+            runtime: Some(45),
+            episodes: Default::default(),
+            existing: None,
+            series: Some(series),
+            identity: None,
+            profile: None,
+            original_language: None,
+        };
+        for n in 1..=6u16 {
+            item.episodes
+                .entry(1)
+                .or_default()
+                .insert(n, (Some(45), None));
+        }
+        let wanted = [2, 3, 4].map(|n| library::episode_id(series, 1, n));
+        let g = grab(
+            series,
+            wanted.iter().map(|t| (*t, false)).collect(),
+            true,
+            "Pack",
+        );
+        let entries: Vec<FileEntry> = files.iter().map(|(n, _)| entry(n)).collect();
+        let s = select(&g, &entries, Path::new("/dl"), &item, true);
+        assert_eq!(s.unfiled, vec![library::episode_id(series, 1, 2)]);
+        assert!(s.notes.is_empty());
+    }
+
+    fn cands(files: &[(String, u64)]) -> Vec<(String, u64)> {
+        files
+            .iter()
+            .filter_map(|(n, s)| candidate(n).map(|r| (r, *s)))
+            .collect()
     }
 
     #[test]

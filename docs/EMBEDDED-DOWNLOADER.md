@@ -196,10 +196,32 @@ backends: a torrent being checked, or in error, waits even at 100 %.
 
 A season pack grabbed for fewer episodes than it holds (some are owned, or have a download of
 their own) is added with librqbit's `only_files`: the video files whose names parse to episodes
-that are all in the grab's targets, by the same rule the import uses (`ingest::pack_files`).
+that are all in the grab's targets, by the same rule the import uses (`ingest::pack_plan`).
 Subtitles, nfo files and samples are not fetched. A pack that covers every episode in it is
 added whole, as before. If no file maps to a wanted episode the add is refused as an invalid
 torrent, so the grab fails and the release is blocklisted.
+
+- **An episode with no file.** A target the pack has no file for is dropped from the grab
+  (`grab_targets`) once the pack is in the engine, so it is wanted again and not shown on its
+  way. The history gets a `target_dropped` event ("S01E01 isn't in this download's files; Arr
+  will look for it elsewhere"), the release is blocklisted for the series (reason
+  `no_episode_file`: the blocklist has no narrower key, and every episode the pack can supply
+  is in this grab or owned) and the dropped episodes are searched for as a failed download
+  would be (`research_target`, when failed downloads are researched). The import does the same
+  for a download that finished without a file for a target.
+- **One unnamed file.** In a full-season pack, a video file named only after the pack (no
+  episode number) is taken for an episode by elimination when it is the pack's only file that
+  maps to no episode, the pack's files are of one season, exactly one of that season's
+  episodes in the catalog has no file, the file is not a sample and its size is within half to
+  twice the median of the others. The selection and the import both use it
+  (`ingest::held_episodes`); the import is named `<Series> - SxxExx` and the history says
+  "matched by elimination".
+- **A pack already in the engine.** A new grab of a torrent the engine already holds (the
+  earlier grab is done, and the torrent is still seeding) goes through the same mapping: no
+  file for any of its episodes refuses the grab and leaves the torrent alone; otherwise the
+  files of its episodes are added to the torrent's selection (never removed from it), the
+  completed check is run again, and a torrent stopped at its share limit goes on. The seeding
+  cleanup of the earlier grab leaves the torrent while a later grab on it is active.
 
 - **Sizes and progress.** The engine's size, progress and "amount left" count the selected
   files, so a partial pack completes and imports like any other. The import takes only files

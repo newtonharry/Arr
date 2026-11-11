@@ -408,6 +408,8 @@ struct Inspected {
     multi: bool,
     /// Paths relative to the output folder, as the engine writes them.
     files: Vec<PathBuf>,
+    /// Each file's length.
+    sizes: Vec<u64>,
 }
 
 fn now_s() -> String {
@@ -449,6 +451,16 @@ fn invalid(what: impl std::fmt::Display) -> UpstreamError {
     }
 }
 
+/// A torrent file as the client names it: `<torrent name>/<path>` in a multi-file torrent.
+fn pack_name(torrent: &str, multi: bool, file: &Path) -> String {
+    let rel = paths::rel_string(file).unwrap_or_else(|| file.to_string_lossy().into_owned());
+    if multi {
+        format!("{torrent}/{rel}")
+    } else {
+        rel
+    }
+}
+
 fn id20(hash: &str) -> Option<Id20> {
     crate::torrent::is_info_hash(hash)
         .then(|| Id20::from_str(hash).ok())
@@ -473,6 +485,7 @@ fn inspect(bytes: &[u8]) -> Result<Inspected, String> {
         return Err(format!("unsafe torrent name {name:?}"));
     }
     let mut files = vec![];
+    let mut sizes = vec![];
     for f in info.iter_file_details() {
         if f.attrs().symlink {
             return Err("the torrent contains a symlink entry".into());
@@ -485,12 +498,14 @@ fn inspect(bytes: &[u8]) -> Result<Inspected, String> {
             return Err(format!("unsafe file name {:?}", rel.to_string_lossy()));
         }
         files.push(rel);
+        sizes.push(f.len);
     }
     Ok(Inspected {
         hash,
         name,
         multi,
         files,
+        sizes,
     })
 }
 
@@ -1081,20 +1096,15 @@ impl Embedded {
         // names are matched exactly as the import matches them.
         let only_files = match &req.select {
             Some(sel) => {
-                let names: Vec<String> = t
+                let names: Vec<(String, u64)> = t
                     .files
                     .iter()
-                    .map(|f| {
-                        let rel = paths::rel_string(f)
-                            .unwrap_or_else(|| f.to_string_lossy().into_owned());
-                        if t.multi {
-                            format!("{}/{rel}", t.name)
-                        } else {
-                            rel
-                        }
-                    })
+                    .zip(&t.sizes)
+                    .map(|(f, len)| (pack_name(&t.name, t.multi, f), *len))
                     .collect();
-                crate::ingest::pack_files(&names, sel.series, &sel.targets).map_err(invalid)?
+                crate::ingest::pack_plan(&names, sel.series, &sel.targets, &sel.known)
+                    .map_err(invalid)?
+                    .only
             }
             None => None,
         };
@@ -1102,7 +1112,12 @@ impl Embedded {
         // counters and verification and the observation of its live state stays, so the
         // replay counts nothing again; it is only confirmed admitted, as at a restore.
         // Reconciliation by hash decides whether it is ours.
-        if self.handle(&session, &t.hash).is_some() {
+        if let Some(h) = self.handle(&session, &t.hash) {
+            // A pack grabbed again for other episodes: their files are selected as well.
+            if req.select.is_some() {
+                self.widen_selection(&session, &h, &t.hash, &only_files)
+                    .await?;
+            }
             let hash = t.hash.clone();
             self.store
                 .with(move |c| {
@@ -1233,6 +1248,95 @@ impl Embedded {
                 )))
             }
         }
+    }
+
+    /// A season pack that is already in the engine, grabbed (again) for `sel`'s episodes: the
+    /// same file mapping as a fresh add, so a grab with no file in the pack is refused
+    /// (`invalid`) and nothing of the torrent is touched, and otherwise the files of its
+    /// episodes are selected besides those already selected. Returns the episodes the pack has
+    /// no file for. A torrent that is not ours or not in the engine: nothing to do.
+    pub async fn settle_selection(
+        &self,
+        hash: &str,
+        sel: &crate::qbit::FileSelection,
+    ) -> Result<Vec<crate::ids::MediaId>, UpstreamError> {
+        let session = self.start().await?;
+        let hash = hash.to_ascii_lowercase();
+        let _ops = self.ops.lock().await;
+        let (Some(h), Some(row)) = (self.handle(&session, &hash), self.row(&hash).await?) else {
+            return Ok(vec![]);
+        };
+        let infos = h
+            .with_metadata(|m| {
+                m.file_infos
+                    .iter()
+                    .map(|f| (f.relative_filename.clone(), f.len))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| engine_failure("reading the torrent's metadata", &e))?;
+        let names: Vec<(String, u64)> = infos
+            .iter()
+            .map(|(f, len)| (pack_name(&row.name, row.multi_file, f), *len))
+            .collect();
+        let plan = crate::ingest::pack_plan(&names, sel.series, &sel.targets, &sel.known)
+            .map_err(invalid)?;
+        self.widen_selection(&session, &h, &hash, &plan.only)
+            .await?;
+        Ok(plan.missing)
+    }
+
+    /// Adds the files `only` wants (`None` = all) to the torrent's selection, leaving every
+    /// file already selected as it is. A selection that grows has files still to fetch and
+    /// check, so the completed check is run again; a torrent the share limit stopped goes on.
+    async fn widen_selection(
+        &self,
+        session: &Arc<Session>,
+        h: &Arc<ManagedTorrent>,
+        hash: &str,
+        only: &Option<Vec<usize>>,
+    ) -> Result<(), UpstreamError> {
+        let Some(current) = h.only_files() else {
+            return Ok(());
+        };
+        let count = h
+            .with_metadata(|m| m.file_infos.len())
+            .map_err(|e| engine_failure("reading the torrent's metadata", &e))?;
+        let mut union: std::collections::HashSet<usize> = current.iter().copied().collect();
+        match only {
+            Some(more) => union.extend(more.iter().copied()),
+            None => union.extend(0..count),
+        }
+        if union.len() == current.len() {
+            return Ok(());
+        }
+        session
+            .update_only_files(h, &union)
+            .await
+            .map_err(|e| engine_failure("selecting more files", &e))?;
+        let hs = hash.to_string();
+        let was_stopped: bool = self
+            .store
+            .with(move |c| {
+                let stopped: bool = c.query_row(
+                    "SELECT stopped_at_limit IS NOT NULL FROM embedded_torrents WHERE info_hash = ?1",
+                    [&hs],
+                    |r| r.get(0),
+                )?;
+                c.execute(
+                    "UPDATE embedded_torrents SET verified_at = NULL, verify_error = NULL, verify_token = NULL, completed_at = NULL, stopped_at_limit = NULL, updated_at = ?2 WHERE info_hash = ?1",
+                    params![hs, now_s()],
+                )?;
+                Ok(stopped)
+            })
+            .await
+            .map_err(db_failure)?;
+        if was_stopped && h.is_paused() {
+            session
+                .unpause(h)
+                .await
+                .map_err(|e| engine_failure("resuming", &e))?;
+        }
+        Ok(())
     }
 
     /// Engine state and this app's records for the given hashes (absent hashes are omitted).

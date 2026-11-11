@@ -1235,18 +1235,175 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
 
 /// A season pack's grab for fewer episodes than the season: the episodes whose files the
 /// embedded engine fetches. `None` for everything else (all files, as before).
-fn pack_selection(g: &Grab) -> Option<crate::qbit::FileSelection> {
+fn pack_selection(st: &AppState, g: &Grab) -> Option<crate::qbit::FileSelection> {
     if !g.full_season || g.targets.is_empty() {
         return None;
     }
     let targets: Vec<MediaId> = g.targets.iter().map(|t| t.target).collect();
+    let known = match g.media_id {
+        MediaId::Series(key) => st
+            .index()
+            .series(key)
+            .and_then(|s| s.episodes.as_deref())
+            .map(|eps| {
+                eps.iter()
+                    .map(|e| library::episode_id(g.media_id, e.season, e.number))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => vec![],
+    };
     targets
         .iter()
         .all(|t| matches!(t, MediaId::Episode(..)))
         .then_some(crate::qbit::FileSelection {
             series: g.media_id,
             targets,
+            known,
         })
+}
+
+/// A season pack that is in the embedded engine for this grab (just added, or already there
+/// for an earlier grab of the same torrent): its files for this grab's episodes are selected,
+/// and an episode the pack has no file for is dropped from the grab (see `drop_targets`).
+/// `Ok(false)`: the grab was failed (no file of the pack is for it) or the engine could not
+/// be asked; nothing is confirmed.
+async fn settle_pack(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -> Result<bool> {
+    let Some(sel) = pack_selection(st, g) else {
+        return Ok(true);
+    };
+    let missing = match qb.settle_selection(&g.info_hash, &sel).await {
+        Ok(m) => m,
+        Err(crate::upstream::UpstreamError::BadResponse { reason })
+            if reason.contains("invalid") =>
+        {
+            // The release is not picked again for this item; the torrent is not touched.
+            fail(
+                st,
+                g,
+                "invalid_torrent",
+                &format!("{} {reason}", qb.label()),
+                true,
+                now,
+            )
+            .await?;
+            return Ok(false);
+        }
+        Err(e) => {
+            let next = ts(now + backoff(g.attempts));
+            update(st, &g.id, "UPDATE grabs SET last_error = ?2, next_attempt_at = ?3, updated_at = ?4 WHERE id = ?1", vec![text(format!("{} {}", qb.label(), e.describe())), text(next), text(ts(now))]).await?;
+            return Ok(false);
+        }
+    };
+    if missing.is_empty() {
+        return Ok(true);
+    }
+    let research = research_for_dropped(st, g, &missing, now);
+    let (g2, now_s) = (g.clone(), ts(now));
+    st.store
+        .with(move |c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            drop_targets(&tx, &g2, &missing, &research, &now_s)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    st.reload_index().await?;
+    st.worker.notify.notify_one();
+    Ok(true)
+}
+
+/// Whether the episodes of `g` that cannot be had from it are searched for again: the choice
+/// `fail` makes for a failed download.
+fn redownload(st: &AppState, g: &Grab) -> bool {
+    let loaded = st.current();
+    let policy = loaded
+        .as_deref()
+        .and_then(|l| l.settings.policy(media_kind(g.media_id)));
+    match g.origin.as_str() {
+        "interactive" => policy.is_some_and(|p| p.redownload_failed_interactive),
+        _ => policy.is_some_and(|p| p.redownload_failed),
+    }
+}
+
+/// What to search for after `dropped` episodes left `g` (see `drop_targets`): per episode what
+/// `research_target` picks for a failure, once each; nothing when failures are not searched
+/// for again.
+pub fn research_for_dropped(
+    st: &AppState,
+    g: &Grab,
+    dropped: &[MediaId],
+    now: OffsetDateTime,
+) -> Vec<MediaId> {
+    if dropped.is_empty() || !redownload(st, g) {
+        return vec![];
+    }
+    let index = st.index();
+    let mut out: Vec<MediaId> = vec![];
+    for d in dropped {
+        let mut one = g.clone();
+        one.target = *d;
+        let t = research_target(&index, &one, now);
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Takes episodes out of a grab because the download has no file for them: they stop counting
+/// as covered (so they are wanted again, and the web app no longer shows them on their way),
+/// the history says so, and the release is blocklisted for the series so that no search picks
+/// it again for them, then `research` is queued. The blocklist is keyed by the series, and
+/// there is no narrower key; that is harmless here because every episode the download can
+/// supply is already part of this grab or owned, and an entry can be removed
+/// (`DELETE /api/v1/blocklist/{id}`). Part of the caller's transaction.
+pub fn drop_targets(
+    tx: &Connection,
+    g: &Grab,
+    dropped: &[MediaId],
+    research: &[MediaId],
+    now_s: &str,
+) -> Result<()> {
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    for d in dropped {
+        tx.execute(
+            "DELETE FROM grab_targets WHERE grab_id = ?1 AND target = ?2",
+            params![g.id, d.to_string()],
+        )?;
+    }
+    let (media_s, target_s) = (g.media_id.to_string(), g.target.to_string());
+    let list = dropped
+        .iter()
+        .map(|d| match d {
+            MediaId::Episode(_, s, n) => format!("S{s:02}E{n:02}"),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    tx.execute(
+        "INSERT OR IGNORE INTO blocklist (media_id, release_ref, info_hash, title, reason, grab_id, created_at) VALUES (?1, ?2, ?3, ?4, 'no_episode_file', ?5, ?6)",
+        params![media_s, g.release_ref, g.info_hash, g.title, g.id, now_s],
+    )?;
+    library::event(
+        tx,
+        now_s,
+        "target_dropped",
+        Some(&media_s),
+        Some(&target_s),
+        Some(&g.id),
+        &format!(
+            "{}: {list} isn't in this download's files; Arr will look for it elsewhere",
+            g.title
+        ),
+        Some(&json!({ "dropped": dropped, "research": research, "blocklisted": true })),
+    )?;
+    for r in research {
+        crate::worker::queue_command(tx, "search", Some(*r), now_s)?;
+    }
+    Ok(())
 }
 
 /// Right after a season pack took over `id`: removes its torrent and incomplete data the way
@@ -1569,6 +1726,9 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
     };
     if let Some(t) = present {
         if ours(&t, g, post.as_deref()) {
+            if !settle_pack(st, qb, g, now).await? {
+                return Ok(false);
+            }
             confirm(st, g, &t, now).await?;
             return Ok(true);
         }
@@ -1638,7 +1798,7 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
         sequential: policy.sequential,
         first_last_piece: policy.first_last,
         content_layout: policy.content_layout,
-        select: pack_selection(g),
+        select: pack_selection(st, g),
     };
     let answer = qb.add(&req).await;
     // 3. Verify by hash whatever the answer was.
@@ -1652,6 +1812,9 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
         });
     match (answer, found) {
         (_, Some(t)) if ours(&t, g, post.as_deref()) => {
+            if !settle_pack(st, qb, g, now).await? {
+                return Ok(false);
+            }
             if policy.force_start {
                 let _ = qb.set_force_start(&g.info_hash).await;
             }
@@ -2889,6 +3052,23 @@ pub async fn cleanup(st: &AppState, now: OffsetDateTime) -> Result<CleanupReport
                 if !ours(t, &g, post_category(st, &g).as_deref()) {
                     set_cleanup(st, &g, "blocked", "the torrent's category or unified-media tag was changed; it is treated as user-managed", now).await?;
                     report.blocked += 1;
+                    continue;
+                }
+                // The torrent is also another download's (a season pack grabbed again for other
+                // episodes): it stays while that one is going, whatever this one's goal is.
+                let (hash, gid) = (g.info_hash.clone(), g.id.clone());
+                let shared: bool = st
+                    .store
+                    .with(move |c| {
+                        Ok(c.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM grabs WHERE info_hash = ?1 AND active = 1 AND id != ?2)",
+                            params![hash, gid],
+                            |r| r.get(0),
+                        )?)
+                    })
+                    .await?;
+                if shared {
+                    report.seeding += 1;
                     continue;
                 }
                 // A failed, incomplete download has no seeding obligation; everything else

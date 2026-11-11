@@ -1847,3 +1847,292 @@ async fn a_season_pack_fetches_only_the_files_of_the_episodes_it_was_grabbed_for
     let (_, _, _, valid, verified) = e.counters(&t.info_hash);
     assert!(valid && verified);
 }
+
+const SHOW: &str = "series:tvdb:372264";
+
+fn episode(n: u16) -> arr::ids::MediaId {
+    arr::library::episode_id(SHOW.parse().unwrap(), 1, n)
+}
+
+/// Every search the app queued, whether it has run or not.
+fn searches(e: &Emb) -> Vec<String> {
+    e.state
+        .store
+        .blocking(|c| {
+            let mut stmt =
+                c.prepare("SELECT media_id FROM commands WHERE name = 'search' ORDER BY media_id")?;
+            Ok(stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap()
+}
+
+async fn history(e: &Emb, kind: &str) -> Vec<String> {
+    let (_, v, text) = e
+        .json(e.get(&format!("/api/v1/history?kind={kind}&limit=50")))
+        .await;
+    v["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{text}"))
+        .iter()
+        .map(|i| i["message"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A season pack of Slow Horses whose E02 file is named only after the pack (S01E01 and
+/// S01E03 are in the library already; `without` leaves episodes out of the pack).
+fn pack_with_unnamed_e02(title: &str, without: &[u16]) -> Vec<(String, Vec<u8>)> {
+    let big = |mut b: Vec<u8>| {
+        b.resize(400 * 1024, 0);
+        b
+    };
+    let mut files: Vec<(String, Vec<u8>)> = (1..=6)
+        .filter(|n| !without.contains(n))
+        .map(|n| {
+            let video = mkv_sized(4, 1280, 720);
+            (
+                if n == 2 {
+                    format!("{title}.mkv")
+                } else {
+                    format!("Slow.Horses.S01E{n:02}.1080p.WEB-DL.x264-UM.mkv")
+                },
+                if [1, 3].contains(&n) {
+                    big(video)
+                } else {
+                    video
+                },
+            )
+        })
+        .collect();
+    files.push(("Slow.Horses.S01.nfo".to_string(), b"nfo".to_vec()));
+    files
+}
+
+async fn execute(e: &Emb, media_id: &str) -> (u16, Value, String) {
+    e.json(e.post("/api/v1/plans").json(&json!({
+        "media_id": media_id, "execute": true, "replan": true
+    })))
+    .await
+}
+
+#[tokio::test]
+async fn a_pack_file_named_only_after_the_pack_is_the_episode_nothing_else_is() {
+    let e = start(Default::default()).await;
+    let title = "Slow.Horses.S01.1080p.WEB-DL.x264-UM";
+    let (t, r) = e
+        .publish(title, pack_with_unnamed_e02(title, &[]), 12.0, false)
+        .await;
+    e.search_results("Slow Horses S01", vec![r]);
+    let (s, v, text) = execute(&e, "season:tvdb:372264:1").await;
+    assert_eq!(s, 201, "{text}");
+    assert_eq!(
+        v["plan"]["candidates"][0]["covers_episodes"],
+        json!([2, 4, 5, 6]),
+        "{text}"
+    );
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    e.until(&id, "submitted", |g| g.state != "queued").await;
+
+    // E02's file is selected, though its name says no episode; the owned ones are not.
+    let fs = e.engine().files(&t.info_hash).await.unwrap().unwrap();
+    let wanted: Vec<(String, i64)> = fs
+        .iter()
+        .map(|f| (f.name.rsplit('/').next().unwrap().to_string(), f.priority))
+        .collect();
+    assert_eq!(
+        wanted.iter().map(|w| w.1).collect::<Vec<_>>(),
+        [0, 1, 0, 1, 1, 1, 0],
+        "{wanted:?}"
+    );
+    assert_eq!(e.grab(&id).targets.len(), 4, "nothing is dropped");
+
+    e.until(&id, "imported", |g| g.state == "imported").await;
+    assert_eq!(e.grab(&id).imported_files, 4);
+    let season = e.tv.join("Slow Horses/Season 1");
+    assert!(
+        season.join("Slow Horses - S01E02.mkv").is_file(),
+        "the unnamed file is E02"
+    );
+    for n in [4, 5, 6] {
+        assert!(
+            season
+                .join(format!("Slow.Horses.S01E0{n}.1080p.WEB-DL.x264-UM.mkv"))
+                .is_file()
+        );
+    }
+    let done = history(&e, "import_completed").await;
+    assert!(
+        done.iter().any(|m| m.contains("matched by elimination")),
+        "{done:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_episode_the_pack_has_no_file_for_leaves_the_grab_and_is_not_picked_from_it_again() {
+    let e = start(Default::default()).await;
+    let title = "Slow.Horses.S01.1080p.WEB-DL.x264-UM";
+    // E02 and E06 are not in the pack at all.
+    let (_t, r) = e
+        .publish(title, pack_with_unnamed_e02(title, &[2, 6]), 12.0, false)
+        .await;
+    e.search_results("Slow Horses S01", vec![r.clone()]);
+    let (s, v, text) = execute(&e, "season:tvdb:372264:1").await;
+    assert_eq!(s, 201, "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    e.until(&id, "submitted", |g| g.state != "queued").await;
+
+    // The grab covers only what the pack holds; the other two are wanted again.
+    let g = e.grab(&id);
+    let mut covered: Vec<String> = g.targets.iter().map(|t| t.target.to_string()).collect();
+    covered.sort();
+    assert_eq!(
+        covered,
+        [episode(4).to_string(), episode(5).to_string()],
+        "{g:?}"
+    );
+    let dropped = history(&e, "target_dropped").await;
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert!(
+        dropped[0].contains("S01E02, S01E06")
+            && dropped[0].contains("Arr will look for it elsewhere"),
+        "{dropped:?}"
+    );
+    assert_eq!(
+        searches(&e),
+        [episode(2).to_string(), episode(6).to_string()]
+    );
+    let (_, bl, _) = e.json(e.get("/api/v1/blocklist")).await;
+    assert_eq!(bl["items"][0]["reason"], "no_episode_file", "{bl}");
+    let (_, show, text) = e.json(e.get("/api/v1/show/series:tvdb:372264")).await;
+    // E02 and E06 are wanted, not on their way; E04 and E05 are coming or, on a fast
+    // machine, already in (with E01 and E03, owned from the start).
+    let season = &show["seasons"][0];
+    let n = |k: &str| season[k].as_i64().unwrap_or(0);
+    assert_eq!(
+        (n("in_plex") + n("on_its_way"), n("wanted")),
+        (4, 2),
+        "{text}"
+    );
+    assert!(n("in_plex") >= 2, "{text}");
+
+    // A search for E02 is not given this pack again.
+    let (_, v, text) = execute(&e, "season:tvdb:372264:1").await;
+    let grabs = v["plan"]["execution"]["grabs"].as_array().cloned();
+    assert!(grabs.is_none_or(|g| g.is_empty()), "{text}");
+
+    // What the pack does hold imports as usual.
+    e.until(&id, "imported", |g| g.state == "imported").await;
+    assert_eq!(e.grab(&id).imported_files, 2);
+    let season = e.tv.join("Slow Horses/Season 1");
+    for n in [4, 5] {
+        assert!(
+            season
+                .join(format!("Slow.Horses.S01E0{n}.1080p.WEB-DL.x264-UM.mkv"))
+                .is_file()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_pack_already_in_the_engine_is_checked_for_the_next_grab_and_its_selection_grows() {
+    let e = start(Default::default()).await;
+    let title = "Slow.Horses.S01.1080p.WEB-DL.x264-UM";
+    let (t, r) = e
+        .publish(title, pack_with_unnamed_e02(title, &[]), 12.0, false)
+        .await;
+    e.search_results("Slow Horses S01", vec![r.clone()]);
+    // E02 is in the library for now: the first grab is E04 to E06.
+    let owned = "Slow Horses/Season 1/Slow.Horses.S01E02.1080p.WEB-DL.x264-OLD.mkv";
+    put(&e.tv, owned, &mkv(1));
+    let rescan = |e: &Emb| {
+        e.post("/api/v1/commands")
+            .json(&json!({ "name": "rescan" }))
+    };
+    let (s, _, text) = e.json(rescan(&e)).await;
+    assert!(s == 200 || s == 202, "{text}");
+    e.tick().await;
+    let (s, v, text) = execute(&e, "season:tvdb:372264:1").await;
+    assert_eq!(s, 201, "{text}");
+    assert_eq!(
+        v["plan"]["candidates"][0]["covers_episodes"],
+        json!([4, 5, 6]),
+        "{text}"
+    );
+    let first = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    e.until(&first, "imported", |g| g.state == "imported").await;
+    let selected =
+        |fs: &[arr::qbit::TorrentFile]| -> Vec<i64> { fs.iter().map(|f| f.priority).collect() };
+    let fs = e.engine().files(&t.info_hash).await.unwrap().unwrap();
+    assert_eq!(
+        selected(&fs),
+        [0, 0, 0, 1, 1, 1, 0],
+        "E02's file is not fetched yet"
+    );
+
+    // Another grab of the same torrent for an episode the pack has no file for is refused and
+    // leaves the torrent as it was.
+    let series: arr::ids::MediaId = SHOW.parse().unwrap();
+    let known: Vec<arr::ids::MediaId> = (1..=6).map(episode).collect();
+    let sel = |targets: Vec<arr::ids::MediaId>| arr::qbit::FileSelection {
+        series,
+        targets,
+        known: known.clone(),
+    };
+    let err = e
+        .engine()
+        .settle_selection(&t.info_hash, &sel(vec![episode(9)]))
+        .await
+        .unwrap_err();
+    assert!(err.describe().contains("invalid"), "{}", err.describe());
+    let fs = e.engine().files(&t.info_hash).await.unwrap().unwrap();
+    assert_eq!(selected(&fs), [0, 0, 0, 1, 1, 1, 0]);
+
+    // E02 is wanted again: the same pack is picked for it, its unnamed file is the one
+    // episode the pack has no name for, and it joins the selection of the torrent already
+    // there.
+    std::fs::remove_file(e.tv.join(owned)).unwrap();
+    let (s, _, text) = e.json(rescan(&e)).await;
+    assert!(s == 200 || s == 202, "{text}");
+    e.tick().await;
+    let (s, v, text) = execute(&e, "season:tvdb:372264:1").await;
+    assert_eq!(s, 201, "{text}");
+    assert_eq!(
+        v["plan"]["candidates"][0]["covers_episodes"],
+        json!([2]),
+        "{text}"
+    );
+    let second = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("{text}"))
+        .to_string();
+    e.tick().await;
+    e.until(&second, "imported", |g| g.state == "imported")
+        .await;
+    let fs = e.engine().files(&t.info_hash).await.unwrap().unwrap();
+    assert_eq!(
+        selected(&fs),
+        [0, 1, 0, 1, 1, 1, 0],
+        "E02's file joined the selection"
+    );
+    assert!(
+        e.tv.join("Slow Horses/Season 1/Slow Horses - S01E02.mkv")
+            .is_file(),
+        "imported as E02"
+    );
+    // The first grab is as it was.
+    assert_eq!(e.grab(&first).state, "imported");
+    assert_eq!(e.grab(&first).imported_files, 3);
+}
