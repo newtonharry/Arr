@@ -137,7 +137,7 @@ the state folder on macOS.
 
 #### Updating and changing settings from the web app
 
-With automatic updates on, the web app (Settings, and a line at the bottom of every screen) shows
+With automatic updates on, the web app (Settings, and a line under the header on every screen) shows
 "Arr X is available · Update now". Arr checks GitHub's latest release at most every six hours
 (only when automatic updates are installed) and, when you tap, asks the same updater to run:
 it never installs anything itself. On Linux it creates `update-requested` in its state folder
@@ -339,7 +339,7 @@ and your library.
   works once, within 15 minutes; anyone who has it can sign in, so share it only with people
   you'd give Arr to.
 
-A sign-in lasts 30 days. **Sign out** is at the bottom of the app.
+A sign-in lasts 30 days. **Sign out** is in the Settings tab.
 
 ### From Claude Desktop, Claude Code or another MCP client on the same machine
 

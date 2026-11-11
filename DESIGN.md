@@ -221,7 +221,7 @@ Title-tile gradients (eight fixed pairs, `.t0` to `.t7`: teal, coral-red, ochre,
 
 ## Layout
 
-A single centred column, `max-width: 680px`, 20px side gutters, on every viewport. Page structure: brand row, search field, banner (only when non-empty: "Can't reach Arr right now" or "Arr is still being set up"; Arr asks again every 5s on any screen and the banner goes as soon as the answer is good), then the feed in `main`, then a quiet footer with who is signed in and Sign out. Sections stack with 22px between them; rows in a list are 10px apart and each row is a full-width card. The ideas section is the one horizontal scroller: 132px-wide cards with proximity snap, bleeding to the page edge (`margin: 0 -20px`).
+A single centred column, `max-width: 680px`, 20px side gutters, on every viewport. Page structure: brand row, search field, banner (only when non-empty: "Can't reach Arr right now" or "Arr is still being set up"; Arr asks again every 5s on any screen and the banner goes as soon as the answer is good), then the update bar (only when there is something to say), then the feed in `main`, then a quiet footer holding only the data credits. Who is signed in and Sign out are in Settings. Sections stack with 22px between them; rows in a list are 10px apart and each row is a full-width card. The ideas section is the one horizontal scroller: 132px-wide cards with proximity snap, bleeding to the page edge (`margin: 0 -20px`).
 
 Responsive: under 760px the tab bar is fixed to the bottom (68px plus safe-area inset, 56px tall targets, icon over 12px label) and the page pads for it. From 760px the same nav moves to the top right on the brand row as 44px pills; the current tab fills teal. Under 420px the coral button in a Needs-you row collapses to its icon. Under 360px journey labels drop to 11px. Safe-area insets are respected top and bottom.
 
@@ -261,15 +261,15 @@ A calm line of plain-text labels, "IMDb 7.8 · Critics 96% · Audience 87%" (14p
 - **Needs-you (coral outline):** transparent fill, 2px coral border, coral-ink label, same size. Used only inside Needs-you rows ("Try again" style actions).
 - **Done:** after adding, the primary button becomes transparent with warm border and teal-ink label ("Added", "In Plex", "Following").
 - **Ghost:** transparent, warm border, ink label, border turns teal on hover.
-- **Link button:** no fill, teal-ink, 800, underlined, 44px tall (Sign out, "see all").
+- **Link button:** no fill, teal-ink, 800, underlined, 44px tall ("see all", Use Arr on your phone).
 - Busy is 70% opacity with progress cursor.
 
 ### Switch
-- **Notifications:** a 52x32px pill (2px warm border, cream fill) with a 22px knob. On, it fills teal and the knob turns on-teal and slides right. It sits in the footer beside its plain state in muted text ("On", "Off", "Blocked in your browser settings", "Add Arr to your Home Screen first"), with a 13px muted privacy line below. Disabled is 50% opacity. The tap target is padded to 44px.
+- **Notifications:** a 52x32px pill (2px warm border, cream fill) with a 22px knob. On, it fills teal and the knob turns on-teal and slides right. It sits in the "You" section of Settings beside its plain state in muted text ("On", "Off", "Blocked in your browser settings", "Add Arr to your Home Screen first"), with a 13px muted privacy line below. Disabled is 50% opacity. The tap target is padded to 44px.
 
 ### Update Bar, Settings and Health
-- **Update bar:** one line at the top of the footer in a card with a 2px teal border ("Arr 0.12.1 is available · Update now"; coral border for "The update didn't work"). Its action is a link button; it is a polite status, or an alert when something failed.
-- **Settings:** sections as plain h2 labels over Item Rows. On/off settings use the Switch row (title, a muted line saying what the state means). Values are an Item Row with a label, a muted line, and a 44px input beside a teal Save button. Changing anything shows the mascot with "Restarting…" until Arr answers again.
+- **Update bar:** one line in a card just under the header, above the feed, so it shows without scrolling with a 2px teal border ("Arr 0.12.1 is available · Update now"; coral border for "The update didn't work"). Its action is a link button; it is a polite status, or an alert when something failed.
+- **Settings:** the first section is "You": who is signed in, Use Arr on your phone, notifications and a ghost-style Sign out button. It never waits on the settings, so Sign out works while they load, fail or Arr restarts. Then sections as plain h2 labels over Item Rows. On/off settings use the Switch row (title, a muted line saying what the state means). Values are an Item Row with a label, a muted line, and a 44px input beside a teal Save button. Changing anything shows the mascot with "Restarting…" until Arr answers again.
 - **Health:** one Item Row per check with a 28px round mark: teal check for OK; sun-yellow ring with "!" for needs a look; coral with "!" for a problem. The word ("OK", "Needs a look", "Problem") is in the row for screen readers, so colour is never the only signal. "Recent problems" is a details list of cards: muted time and component, then the message.
 
 ### Journey Line
@@ -279,7 +279,7 @@ The signature. A 36px-tall four-stop track under any item on its way: Found, Dow
 The note after Add or Get ("Added **Title**", "Following **Title**", and "Undone. ..." after Undo). Inverse of the page (ink fill with cream text; cream fill with ink text in dark mode), 14px radius, no border and no shadow, one line, with a 44px "Undo" link button when an existing route fully reverses the add (only for a title Arr did not track at all before: Undo removes it from Arr, which cancels downloads that have not finished and never touches files already in Plex; if a download is nearly done it says "Too late to undo: it's nearly downloaded." and changes nothing). No Undo when the title was already tracked or in Plex. It sits at the bottom, centred, above the tab bar on phones, over a title sheet. It is an `aria-live="polite"` region, lasts about 6s, waits while hovered or focused, is reachable by Tab (it is after the list, before the footer, and inside the sheet's focus loop), Z undoes, Escape closes it.
 
 ### Tabs
-Home / Ideas / Library, icon plus label. Phone: bottom bar, white, 2px warm top border, inactive muted 12px/800, current teal ink. Desktop: top-right pills, inactive muted with teal on hover, current filled teal with on-teal text.
+Home / Ideas / Library / Settings, icon plus label (a ring with eight short rays for Settings). Phone: bottom bar, white, 2px warm top border, inactive muted 12px/800, current teal ink. Desktop: top-right pills, inactive muted with teal on hover, current filled teal with on-teal text.
 
 ### Date Chips
 46x52px, 12px radius, sun tint with sun ink text: a 12px uppercase month or day name over a 20px day number. Used as the lead for anything with a date.
