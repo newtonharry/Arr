@@ -3687,7 +3687,8 @@ pub async fn serve(cfg: RuntimeConfig) -> anyhow::Result<()> {
         ),
     }
     let worker = state.cfg.execution_enabled.then(|| {
-        tracing::warn!(
+        // Normal operation, not a problem: info, so the Health screen doesn't list it.
+        tracing::info!(
             backend = state.cfg.download_backend().unwrap_or("none"),
             "execution is ENABLED: torrents are submitted to the configured download client and files imported into [library]"
         );

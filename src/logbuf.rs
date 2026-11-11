@@ -35,10 +35,24 @@ fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Libraries whose warnings are routine and not something the owner can act on, so they are
+/// kept out of the list (they still reach the log). The uTP library warns on every start that
+/// the kernel caps its UDP receive buffer (it asks for room for 128 full windows, far above
+/// Linux's default `rmem_max`), and when a peer opens several connections at once. Its errors
+/// are still listed.
+const QUIET_WARNINGS: [&str; 1] = ["librqbit_utp"];
+
 /// Stores one event, scrubbed. `target` is the module that logged it.
 pub fn record(at: i64, level: &Level, target: &str, text: &str) {
     let level = match *level {
         Level::ERROR => "error",
+        Level::WARN
+            if QUIET_WARNINGS
+                .iter()
+                .any(|q| target == *q || target.starts_with(&format!("{q}::"))) =>
+        {
+            return;
+        }
         Level::WARN => "warning",
         _ => return,
     };
@@ -219,6 +233,33 @@ mod tests {
                 assert!(!p.message.contains(leak), "{leak} in {}", p.message);
             }
         }
+    }
+
+    #[test]
+    fn routine_utp_warnings_are_left_out_but_its_errors_are_not() {
+        let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        record(
+            1,
+            &Level::WARN,
+            "librqbit_utp::socket",
+            "couldn't set UDP rcv buf size",
+        );
+        record(
+            2,
+            &Level::WARN,
+            "librqbit_utp",
+            "too many concurrent connectins",
+        );
+        record(3, &Level::ERROR, "librqbit_utp::socket", "socket failed");
+        record(4, &Level::WARN, "librqbit_utpx", "another library");
+        let got = recent();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].component, "librqbit_utpx");
+        assert_eq!(
+            (got[1].level, got[1].component.as_str()),
+            ("error", "librqbit_utp")
+        );
     }
 
     #[test]
