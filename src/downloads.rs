@@ -3053,6 +3053,28 @@ pub fn not_wanted(g: &Grab, wanted: impl Fn(MediaId) -> bool) -> bool {
     !covered.into_iter().any(wanted)
 }
 
+/// Folds a failure (walked newest first) into the cards already shown when every unit it
+/// covered has one: each of those cards counts it once, and `true` says it gets no card of
+/// its own. Otherwise its units not shown yet are recorded as its own card.
+pub fn fold_failure(
+    shown: &mut HashMap<MediaId, String>,
+    counts: &mut HashMap<String, i64>,
+    id: &str,
+    covered: &[MediaId],
+) -> bool {
+    if covered.iter().all(|t| shown.contains_key(t)) {
+        let cards: HashSet<&String> = covered.iter().filter_map(|t| shown.get(t)).collect();
+        for c in cards {
+            *counts.entry(c.clone()).or_insert(1) += 1;
+        }
+        return true;
+    }
+    for t in covered {
+        shown.entry(*t).or_insert_with(|| id.to_string());
+    }
+    false
+}
+
 /// What a re-search after `g` failed should search. Normally the grab's own target. When it
 /// was a single episode and the season has other wanted episodes still missing, the whole
 /// season, so a pack can be found; the commands queue holds one pending search per season
@@ -3378,6 +3400,32 @@ mod tests {
         assert!(!not_wanted(&bare, wanted(&[5])));
         assert!(not_wanted(&bare, wanted(&[])), "plan target stands in");
         assert!(!not_wanted(&done, wanted(&[])), "only failures");
+    }
+
+    /// Newest first: E02 and E04 singles get cards; an older pack of both counts on each.
+    #[test]
+    fn an_older_pack_failure_counts_on_every_card_it_overlaps() {
+        let ep = |n: u16| MediaId::Episode(crate::ids::SeriesKey::Tvdb(1), 1, n);
+        let (mut shown, mut counts) = (HashMap::new(), HashMap::new());
+        assert!(!fold_failure(&mut shown, &mut counts, "e2", &[ep(2)]));
+        assert!(!fold_failure(&mut shown, &mut counts, "e4", &[ep(4)]));
+        assert!(fold_failure(
+            &mut shown,
+            &mut counts,
+            "pack",
+            &[ep(2), ep(4)]
+        ));
+        assert!(fold_failure(&mut shown, &mut counts, "e2-old", &[ep(2)]));
+        assert_eq!(counts.get("e2"), Some(&3));
+        assert_eq!(counts.get("e4"), Some(&2));
+        // A pack with a unit nobody has shown yet is its own card.
+        assert!(!fold_failure(
+            &mut shown,
+            &mut counts,
+            "pack2",
+            &[ep(4), ep(5)]
+        ));
+        assert_eq!(shown.get(&ep(5)).map(String::as_str), Some("pack2"));
     }
 
     fn t(state: &str, ratio: f64, ratio_limit: f64, seeding: i64, time_limit: i64) -> TorrentInfo {

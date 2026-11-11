@@ -4232,21 +4232,10 @@ async fn attention_list(
                     if kept.len() >= 100 {
                         break;
                     }
-                    if collapse {
-                        let covered: Vec<MediaId> = if g.targets.is_empty() {
-                            vec![g.target]
-                        } else {
-                            g.targets.iter().map(|t| t.target).collect()
-                        };
-                        if let Some(first) = covered.iter().find_map(|t| shown.get(t).cloned())
-                            && covered.iter().all(|t| shown.contains_key(t))
-                        {
-                            *counts.entry(first).or_insert(1) += 1;
-                            continue;
-                        }
-                        for t in covered {
-                            shown.entry(t).or_insert_with(|| g.id.clone());
-                        }
+                    if collapse
+                        && downloads::fold_failure(&mut shown, &mut counts, &g.id, &covered_by(&g))
+                    {
+                        continue;
                     }
                     kept.push(g);
                 }

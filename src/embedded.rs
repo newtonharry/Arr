@@ -1030,12 +1030,28 @@ impl Embedded {
                     initial_peers: peers.clone(),
                     ..Default::default()
                 };
+                let reached = || {
+                    let c = session.stats_snapshot().connections;
+                    [c.tcp, c.utp, c.socks]
+                        .iter()
+                        .map(|f| f.v4.successes + f.v6.successes)
+                        .sum::<u64>()
+                };
+                let before = reached();
                 let fetch = session.add_torrent(AddTorrent::from_url(m.clone()), Some(opts));
                 match tokio::time::timeout(self.cfg.metadata_timeout, fetch).await {
-                    Err(_) => {
+                    // Only a wait in which the engine reached some peer says the magnet is
+                    // dead; without one the network may be down, which is no release's fault.
+                    Err(_) if reached() > before => {
                         return Err(crate::upstream::no_metadata(
                             self.cfg.metadata_timeout.as_secs(),
                         ));
+                    }
+                    Err(_) => {
+                        return Err(unavailable(format_args!(
+                            "magnet metadata did not arrive within {} s and no peer could be reached",
+                            self.cfg.metadata_timeout.as_secs()
+                        )));
                     }
                     Ok(Err(e)) => return Err(engine_failure("fetching magnet metadata", &e)),
                     Ok(Ok(AddTorrentResponse::ListOnly(l))) => l.torrent_bytes.to_vec(),
