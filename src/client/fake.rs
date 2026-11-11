@@ -74,6 +74,11 @@ pub struct FakeState {
     pub down_after_add: bool,
     /// Every call fails as unavailable.
     pub down: bool,
+    /// Every magnet add times out waiting for metadata (a dead swarm); nothing is added.
+    pub no_metadata: bool,
+    /// Every add fails as unavailable while reads still answer (a client that cannot be
+    /// reached for the add itself).
+    pub add_fails: bool,
     /// The next add is refused (the client answers "not added").
     pub refuse_next_add: bool,
     /// Where data is written, and the save path the application knows (set when attached).
@@ -304,6 +309,12 @@ impl Fake {
         if s.refuse_next_add {
             s.refuse_next_add = false;
             return Ok(false);
+        }
+        if s.add_fails {
+            return Err(down());
+        }
+        if s.no_metadata && magnet {
+            return Err(crate::upstream::no_metadata(180));
         }
         // Already managed (a replayed add): confirmed, reconciliation decides whether it is ours.
         if !s.torrents.contains_key(&hash) {

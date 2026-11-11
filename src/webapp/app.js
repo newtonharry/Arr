@@ -317,6 +317,7 @@ const WHY = {
   stalled: ['This download stopped getting data, so Arr gave up on it.'],
   removed_from_client: ['This download was removed from your downloader.'],
   submission_failed: ["Arr couldn't hand this to your downloader."],
+  no_metadata: ['No one is sharing this copy any more. Arr will look for another.'],
   invalid_torrent: ['This copy was damaged, so Arr dropped it.'],
   client_error: ['Your downloader ran into an error with this one.'],
   missing_files: ['Your downloader lost the files for this one.'],

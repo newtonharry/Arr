@@ -3942,13 +3942,22 @@ fn owned_now(index: &CatalogIndex, t: MediaId) -> bool {
 
 /// Items needing a person (or the bridge): metadata numbering holds, imports that cannot
 /// proceed, recent failures, requests that keep retrying or expired. Bounded.
+/// The movie or episodes a download covered (its own target when none are recorded).
+fn covered_by(g: &downloads::Grab) -> Vec<MediaId> {
+    if g.targets.is_empty() {
+        vec![g.target]
+    } else {
+        g.targets.iter().map(|t| t.target).collect()
+    }
+}
+
 fn attention_items(grabs: &[downloads::Grab], requests: &[Value], holds: Vec<Value>) -> Vec<Value> {
     let mut out = holds;
     for g in grabs {
         if g.active && g.state == "import_blocked" {
             out.push(json!({ "kind": "import_blocked", "target": g.target, "grab_id": g.id, "since": g.updated_at, "reason": g.last_error, "action": "fix the reason, then POST /api/v1/queue/{grab_id}/retry, or cancel it" }));
         } else if g.state == "failed" {
-            out.push(json!({ "kind": "download_failed", "target": g.target, "grab_id": g.id, "failure": g.failure, "reason": g.last_error, "retry": g.retry, "at": g.updated_at }));
+            out.push(json!({ "kind": "download_failed", "target": g.target, "grab_id": g.id, "failure": g.failure, "reason": g.last_error, "retry": g.retry, "at": g.updated_at, "covers": covered_by(g) }));
         }
     }
     for r in requests {
@@ -4163,7 +4172,10 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
     // Failures another download has made good stay in the history, not in attention.
     let needs: Vec<downloads::Grab> = scoped
         .iter()
-        .filter(|g| !downloads::made_good(g, |t| owned_now(&index, t), &active_cover))
+        .filter(|g| {
+            !downloads::made_good(g, |t| owned_now(&index, t), &active_cover)
+                && !downloads::not_wanted(g, |t| downloads::wanted_now(&index, t))
+        })
         .cloned()
         .collect();
     body["attention"] = json!(attention_items(&needs, &scoped_requests, holds));
@@ -4176,7 +4188,7 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
 async fn attention(State(st): St) -> ApiResult {
     st.loaded()?;
     let now = OffsetDateTime::now_utc();
-    let items = attention_list(&st, now, true).await?;
+    let items = attention_list(&st, now, true, false).await?;
     ok(json!({ "total": items.len(), "items": items, "observed_at": rfc3339(now) }))
 }
 
@@ -4184,6 +4196,7 @@ async fn attention_list(
     st: &AppState,
     now: OffsetDateTime,
     with_holds: bool,
+    collapse: bool,
 ) -> Result<Vec<Value>, ApiError> {
     let since = rfc3339(now - Duration::from_secs(7 * 86_400));
     let index = st.index();
@@ -4200,18 +4213,43 @@ async fn attention_list(
             )?;
             const PAGE: i64 = 200;
             let mut offset: i64 = 0;
+            // With `collapse`, a failure shows once per wanted episode or movie: the most
+            // recent one (newest first), the older ones only raising its `count`. Done before
+            // the bound too, so repeats never crowd out a different problem.
+            let mut shown: HashMap<MediaId, String> = HashMap::new();
+            let mut counts: HashMap<String, i64> = HashMap::new();
             while kept.len() < 100 {
                 let page = downloads::select(
                     c,
-                    "state = 'failed' AND updated_at >= ?1 ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3",
+                    "state = 'failed' AND updated_at >= ?1 ORDER BY updated_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
                     &[&since, &PAGE, &offset],
                 )?;
                 let n = page.len() as i64;
-                kept.extend(
-                    page.into_iter()
-                        .filter(|g| !downloads::made_good(g, |t| owned_now(&index, t), &active))
-                        .take(100 - kept.len()),
-                );
+                for g in page.into_iter().filter(|g| {
+                    !downloads::made_good(g, |t| owned_now(&index, t), &active)
+                        && !downloads::not_wanted(g, |t| downloads::wanted_now(&index, t))
+                }) {
+                    if kept.len() >= 100 {
+                        break;
+                    }
+                    if collapse {
+                        let covered: Vec<MediaId> = if g.targets.is_empty() {
+                            vec![g.target]
+                        } else {
+                            g.targets.iter().map(|t| t.target).collect()
+                        };
+                        if let Some(first) = covered.iter().find_map(|t| shown.get(t).cloned())
+                            && covered.iter().all(|t| shown.contains_key(t))
+                        {
+                            *counts.entry(first).or_insert(1) += 1;
+                            continue;
+                        }
+                        for t in covered {
+                            shown.entry(t).or_insert_with(|| g.id.clone());
+                        }
+                    }
+                    kept.push(g);
+                }
                 if n < PAGE {
                     break;
                 }
@@ -4219,10 +4257,11 @@ async fn attention_list(
             }
             kept.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
             kept.truncate(100);
-            Ok(kept)
+            Ok((kept, counts))
         })
         .await
         .map_err(internal("grabs"))?;
+    let (grabs, counts) = grabs;
     let horizon = rfc3339(now - Duration::from_secs(14 * 86_400));
     let requests: Vec<Value> = st
         .store
@@ -4247,7 +4286,15 @@ async fn attention_list(
     } else {
         vec![]
     };
-    Ok(attention_items(&grabs, &requests, holds))
+    let mut items = attention_items(&grabs, &requests, holds);
+    if collapse {
+        for i in &mut items {
+            if let Some(n) = i["grab_id"].as_str().and_then(|g| counts.get(g)) {
+                i["count"] = json!(n);
+            }
+        }
+    }
+    Ok(items)
 }
 
 // ---------------------------------------------------------------- web app: feed, ideas, quick add
@@ -4383,7 +4430,7 @@ async fn feed(State(st): St) -> ApiResult {
         })
         .collect();
 
-    let needs_you: Vec<Value> = attention_list(&st, now, false)
+    let needs_you: Vec<Value> = attention_list(&st, now, false, true)
         .await?
         .into_iter()
         .filter_map(|a| {
@@ -4402,12 +4449,19 @@ async fn feed(State(st): St) -> ApiResult {
                 (None, t) => MediaId::Series(t.series_key()?),
                 (Some(_), t) => t,
             };
-            let (title, year, detail) = entry(target, &[target]);
+            // A download made for a season plan names the episodes it really covered.
+            let covers: Vec<MediaId> = a["covers"]
+                .as_array()
+                .map(|v| v.iter().filter_map(|x| x.as_str()?.parse().ok()).collect())
+                .filter(|v: &Vec<MediaId>| !v.is_empty())
+                .unwrap_or_else(|| vec![target]);
+            let (title, year, detail) = entry(target, &covers);
             Some(json!({
                 "key": format!("{kind}:{}", grab_id.map_or_else(|| target.to_string(), str::to_string)),
                 "media_id": media_id, "target": target, "title": title, "year": year, "detail": detail,
                 "problem": problem, "grab_id": grab_id,
                 "kind": kind, "failure": a.get("failure").cloned().unwrap_or(Value::Null),
+                "count": a.get("count").cloned().unwrap_or(json!(1)),
                 "at": a.get("at").or_else(|| a.get("since")).cloned().unwrap_or(Value::Null),
             }))
         })

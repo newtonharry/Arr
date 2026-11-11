@@ -1033,10 +1033,9 @@ impl Embedded {
                 let fetch = session.add_torrent(AddTorrent::from_url(m.clone()), Some(opts));
                 match tokio::time::timeout(self.cfg.metadata_timeout, fetch).await {
                     Err(_) => {
-                        return Err(unavailable(format_args!(
-                            "magnet metadata was not received within {} s",
-                            self.cfg.metadata_timeout.as_secs()
-                        )));
+                        return Err(crate::upstream::no_metadata(
+                            self.cfg.metadata_timeout.as_secs(),
+                        ));
                     }
                     Ok(Err(e)) => return Err(engine_failure("fetching magnet metadata", &e)),
                     Ok(Ok(AddTorrentResponse::ListOnly(l))) => l.torrent_bytes.to_vec(),

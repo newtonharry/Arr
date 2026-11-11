@@ -32,6 +32,25 @@ pub enum UpstreamError {
     },
 }
 
+/// The one phrase that says a magnet's metadata never arrived (no peer shared it within the
+/// wait). The embedded engine builds its error from it and `describes_missing_metadata`
+/// recognises it in a stored `last_error`; nothing else matches message text for this.
+const NO_METADATA: &str = "magnet metadata was not received";
+
+/// The error for a magnet whose metadata did not arrive within `secs`. It stays an
+/// `Unavailable` error so everything that already handles that keeps working.
+pub fn no_metadata(secs: u64) -> UpstreamError {
+    UpstreamError::Unavailable {
+        reason: format!("embedded engine: {NO_METADATA} within {secs} s"),
+    }
+}
+
+/// Whether a stored add error says the magnet's metadata never arrived: the swarm is dead,
+/// not the client.
+pub fn describes_missing_metadata(last_error: &str) -> bool {
+    last_error.contains(NO_METADATA)
+}
+
 impl UpstreamError {
     pub fn describe(&self) -> String {
         match self {
@@ -265,5 +284,34 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
             map.remove(&oldest);
         }
         map.insert(k, (Instant::now(), v));
+    }
+}
+
+#[cfg(test)]
+mod no_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_metadata_timeout_reads_as_a_dead_magnet() {
+        // The text the engine produces, as it lands in a grab's last_error.
+        let stored = format!(
+            "add outcome unknown: embedded engine {}; reconciling by hash",
+            no_metadata(180).describe()
+        );
+        assert!(describes_missing_metadata(&stored), "{stored}");
+        for other in [
+            UpstreamError::Unavailable {
+                reason: "HTTP 503".into(),
+            },
+            UpstreamError::Unavailable {
+                reason: "embedded engine: not running".into(),
+            },
+            UpstreamError::Auth { status: 403 },
+            UpstreamError::Timeout,
+        ] {
+            let stored = format!("add outcome unknown: embedded engine {}", other.describe());
+            assert!(!describes_missing_metadata(&stored), "{stored}");
+        }
+        assert!(!describes_missing_metadata("qBittorrent answered Fails."));
     }
 }

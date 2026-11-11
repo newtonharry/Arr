@@ -1577,16 +1577,28 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
         return Ok(false);
     }
     if g.attempts >= MAX_SUBMIT_ATTEMPTS {
+        // A magnet whose metadata never arrived has no one sharing it: that is the release's
+        // fault, so it is blocklisted. Any other reason (the client down, refusing, failing)
+        // is not the release's fault and never blocklists.
+        let dead = g
+            .last_error
+            .as_deref()
+            .is_some_and(crate::upstream::describes_missing_metadata);
+        let (code, blocklist) = if dead {
+            ("no_metadata", true)
+        } else {
+            ("submission_failed", false)
+        };
         fail(
             st,
             g,
-            "submission_failed",
+            code,
             &format!(
                 "{name} did not accept the torrent after {} attempts ({})",
                 g.attempts,
                 g.last_error.as_deref().unwrap_or("no detail")
             ),
-            false,
+            blocklist,
             now,
         )
         .await?;
@@ -1747,6 +1759,7 @@ pub async fn fail(
         || matches!(code, "wrong_payload" | "wrong_quality" | "wrong_language");
     let cleanup = if code == "foreign_torrent"
         || code == "submission_failed"
+        || code == "no_metadata"
         || g.submitted_at.is_none()
     {
         ("none", None)
@@ -1775,7 +1788,7 @@ pub async fn fail(
         g.title.clone(),
     );
     let (code_s, message_s) = (code.to_string(), message.to_string());
-    let target = g.target;
+    let target = research_target(&st.index(), g, now);
     let now_s = ts(now);
     st.store
         .with(move |c| {
@@ -2381,7 +2394,7 @@ pub async fn retry(st: &AppState, id: &str) -> Result<(Grab, &'static str), Acti
             "cleanup"
         }
         ("failed" | "cancelled", _) => {
-            let target = g.target;
+            let target = research_target(&st.index(), &g, OffsetDateTime::now_utc());
             let now2 = now.clone();
             st.store
                 .with(move |c| {
@@ -3018,6 +3031,66 @@ pub fn made_good(g: &Grab, owned: impl Fn(MediaId) -> bool, active: &HashSet<Str
         .all(|t| owned(t) || active.contains(&t.to_string()))
 }
 
+/// Whether Arr would take a download for `target` now: it is in the catalog, adopted and
+/// monitored (the same test every acquisition passes, so "not wanted" is exactly where a
+/// retry would answer `not_adopted`).
+pub fn wanted_now(index: &crate::catalog::CatalogIndex, target: MediaId) -> bool {
+    not_adopted_one(index, target).is_none()
+}
+
+/// A failed download nobody wants any more: everything it covered (`grab_targets`) is
+/// unmonitored, stopped or no longer managed. Its card would only offer a retry that is
+/// refused, so it drops out of attention (the history keeps it).
+pub fn not_wanted(g: &Grab, wanted: impl Fn(MediaId) -> bool) -> bool {
+    if g.state != "failed" {
+        return false;
+    }
+    let covered: Vec<MediaId> = if g.targets.is_empty() {
+        vec![g.target]
+    } else {
+        g.targets.iter().map(|t| t.target).collect()
+    };
+    !covered.into_iter().any(wanted)
+}
+
+/// What a re-search after `g` failed should search. Normally the grab's own target. When it
+/// was a single episode and the season has other wanted episodes still missing, the whole
+/// season, so a pack can be found; the commands queue holds one pending search per season
+/// however many episodes fail. Only when the season is wholly adopted here, the same rule
+/// the backlog search uses before it searches a season as one.
+pub fn research_target(
+    index: &crate::catalog::CatalogIndex,
+    g: &Grab,
+    now: OffsetDateTime,
+) -> MediaId {
+    let MediaId::Episode(key, season, _) = g.target else {
+        return g.target;
+    };
+    let Some(episodes) = index.series(key).and_then(|s| s.episodes.as_deref()) else {
+        return g.target;
+    };
+    let mine: HashSet<MediaId> = g
+        .targets
+        .iter()
+        .map(|t| t.target)
+        .chain([g.target])
+        .collect();
+    let others_missing = episodes.iter().any(|e| {
+        e.season == season
+            && e.monitored
+            && !e.has_file
+            && !e.queued
+            && crate::worker::aired(e.air_date_utc.as_deref(), now)
+            && !mine.contains(&MediaId::Episode(key, season, e.number))
+    });
+    let season_id = MediaId::Season(key, season);
+    if others_missing && wanted_now(index, season_id) {
+        season_id
+    } else {
+        g.target
+    }
+}
+
 /// Blocked release refs/hashes for a media item (used by searches).
 pub fn blocked_for(c: &Connection, media: MediaId) -> Result<HashSet<String>> {
     let mut stmt = c.prepare("SELECT release_ref, info_hash FROM blocklist WHERE media_id = ?1")?;
@@ -3297,6 +3370,14 @@ mod tests {
         let mut done = failed(&[ep(2)]);
         done.state = "imported".into();
         assert!(!made_good(&done, owned(&[2]), &none));
+
+        // Not wanted: only when nothing it covered is wanted any more.
+        let wanted = |set: &'static [u16]| move |m: MediaId| matches!(m, MediaId::Episode(_, 1, e) if set.contains(&e));
+        assert!(!not_wanted(&g, wanted(&[3])), "E3 is still wanted");
+        assert!(not_wanted(&g, wanted(&[])), "the season was stopped");
+        assert!(!not_wanted(&bare, wanted(&[5])));
+        assert!(not_wanted(&bare, wanted(&[])), "plan target stands in");
+        assert!(!not_wanted(&done, wanted(&[])), "only failures");
     }
 
     fn t(state: &str, ratio: f64, ratio_limit: f64, seeding: i64, time_limit: i64) -> TorrentInfo {
