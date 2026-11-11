@@ -115,6 +115,37 @@ fn sample_name(name: &str) -> bool {
         .any(|w| w == "sample")
 }
 
+/// A file name that says it isn't an episode (an extra, a trailer, a special...). Only used
+/// before matching a file by elimination, which must never take an extra for an episode.
+fn extra_name(name: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "extra",
+        "extras",
+        "bonus",
+        "featurette",
+        "featurettes",
+        "special",
+        "specials",
+        "trailer",
+        "trailers",
+        "teaser",
+        "promo",
+        "preview",
+        "recap",
+        "interview",
+        "interviews",
+        "deleted",
+        "behind",
+        "making",
+        "commentary",
+        "ncop",
+        "nced",
+    ];
+    let stem = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    stem.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| MARKERS.contains(&w))
+}
+
 fn excluded(rel: &str) -> bool {
     let mut parts: Vec<&str> = rel.split('/').collect();
     let file = parts.pop().unwrap_or("");
@@ -251,6 +282,9 @@ pub fn held_episodes(
                 .filter(|i| episodes[*i].is_empty())
                 .collect();
             let [i] = unmapped[..] else { return None };
+            if extra_name(&cands[i].0) {
+                return None;
+            }
             let seasons: std::collections::BTreeSet<u16> = parsed
                 .iter()
                 .filter_map(|n| match n {
@@ -1995,6 +2029,20 @@ mod tests {
                     .is_none(),
                 "{size}"
             );
+        }
+        // The only unnamed file is an extra by name: it is not taken for the missing episode,
+        // which stays missing.
+        for name in ["Show.S01.extra.mkv", "Show.S01.Bonus.Featurette.mkv"] {
+            let (series, files, known) = season_pack(&[(name, 240)], None);
+            assert!(
+                held_episodes(&cands(&files), series, &known, true)
+                    .eliminated
+                    .is_none(),
+                "{name}"
+            );
+            let targets = [1, 2, 4, 5, 6].map(|n| library::episode_id(series, 1, n));
+            let plan = pack_plan(&files, series, &targets, &known).unwrap();
+            assert_eq!(plan.missing, [library::episode_id(series, 1, 2)], "{name}");
         }
         // A sample by name is not a candidate at all.
         let (series, files, known) = season_pack(&[("Show.S01.sample.mkv", 230)], None);
