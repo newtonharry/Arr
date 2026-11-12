@@ -528,6 +528,79 @@ async fn the_proxy_only_passes_the_allow_listed_routes() {
     assert_eq!(s, 401);
 }
 
+#[tokio::test]
+async fn the_app_has_the_delete_controls_and_reaches_the_bin_routes() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let js = site
+        .plain(Method::GET, "/app/app.js")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // Movie, show, season and episode each have a delete control; the question and the bin render.
+    for want in [
+        "'Delete files…'",
+        "'Delete this season’s files…'",
+        "deleteLink('del:' + e.media_id, 'Delete…'",
+        "function ConfirmDelete()",
+        "'data-fk': 'del-cancel'",
+        "'data-fk': 'del-go'",
+        "Get a new copy afterwards",
+        "'/v1/delete/preview'",
+        "function BinSection()",
+        "'Delete now'",
+        "restoreEntry(res.id)",
+        "A download is still being shared",
+    ] {
+        assert!(js.contains(want), "app.js lacks {want}");
+    }
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    let (s, v) = site
+        .json(
+            site.app(Method::POST, "/app/api/v1/delete/preview", c)
+                .json(&json!({ "media_id": "movie:tmdb:604" })),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let token = v["token"].as_str().unwrap().to_string();
+    let (s, v) = site
+        .json(
+            site.app(Method::POST, "/app/api/v1/delete", c)
+                .json(&json!({ "media_id": "movie:tmdb:604", "token": token })),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let id = v["delete_id"].as_str().unwrap().to_string();
+    let (s, v) = site.json(site.app(Method::GET, "/app/api/v1/bin", c)).await;
+    assert_eq!((s, v["entries"][0]["delete_id"].clone()), (200, json!(id)));
+    let (s, v) = site
+        .json(site.app(Method::POST, &format!("/app/api/v1/bin/{id}/restore"), c))
+        .await;
+    assert_eq!((s, v["restored"].clone()), (200, json!(1)), "{v}");
+    let (s, v) = site
+        .json(site.app(Method::DELETE, &format!("/app/api/v1/bin/{id}"), c))
+        .await;
+    assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
+    // Nothing else about the bin or deleting is open to the app.
+    for (method, path) in [
+        (Method::GET, "/app/api/v1/delete"),
+        (Method::POST, "/app/api/v1/bin"),
+        (Method::GET, "/app/api/v1/bin/x/restore"),
+        (Method::DELETE, "/app/api/v1/bin"),
+    ] {
+        let (s, v) = site.json(site.app(method.clone(), path, c)).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (404, Some("not_found")),
+            "{method} {path}"
+        );
+    }
+}
+
 // ------------------------------------------------------------------ feed
 
 fn matrix_files() -> Vec<(String, Vec<u8>)> {

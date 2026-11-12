@@ -831,9 +831,12 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | ["show", _, "season", _]
                 | ["movie", _]
                 | ["copies", _]
+                | ["bin"]
         ),
         Method::POST => match parts.as_slice() {
             ["quick-add" | "follow" | "stop" | "quality" | "remove"] => true,
+            ["delete"] | ["delete", "preview"] => true,
+            ["bin", id, "restore"] => !id.is_empty(),
             // Update now, and a changed setting: signed-in household members only, like the rest.
             ["update"] | ["settings", "app"] => true,
             ["ideas", "hide"] => true,
@@ -841,7 +844,10 @@ fn allowed(method: &Method, path: &str) -> bool {
             ["queue", id, "retry"] => !id.is_empty(),
             _ => false,
         },
-        Method::DELETE => matches!(parts.as_slice(), ["ideas", "hide", id] if !id.is_empty()),
+        Method::DELETE => matches!(
+            parts.as_slice(),
+            ["ideas", "hide", id] | ["bin", id] if !id.is_empty()
+        ),
         _ => false,
     }
 }

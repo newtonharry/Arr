@@ -1,6 +1,7 @@
 //! The pages of one show or one movie in the web app: what is in Plex, what is on its way,
 //! and the safe actions (get, stop, follow new episodes, remove). Nothing here deletes a file:
 //! a stop unmonitors and cancels downloads that have not finished, never an imported file.
+//! Deleting files is `delete.rs`.
 
 use super::*;
 use crate::catalog::{Availability, Episode, SeasonInfo, Series};
@@ -605,11 +606,11 @@ pub(super) async fn follow(State(st): St, ApiJson(body): ApiJson<FollowBody>) ->
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StopBody {
-    media_id: String,
+    pub(super) media_id: String,
 }
 
 /// Whether a download target lies inside the stopped scope.
-fn within(scope: MediaId, t: MediaId) -> bool {
+pub(super) fn within(scope: MediaId, t: MediaId) -> bool {
     match (scope, t) {
         (MediaId::Season(k, n), MediaId::Season(k2, n2) | MediaId::Episode(k2, n2, _)) => {
             k == k2 && n == n2
@@ -621,7 +622,7 @@ fn within(scope: MediaId, t: MediaId) -> bool {
 /// Cancels the given active downloads that lie entirely inside a scope and have not finished
 /// (a season pack that also holds other episodes is left to finish). Returns how many were
 /// cancelled and how many were left because their data is all there and they are being added.
-async fn cancel_unfinished(
+pub(super) async fn cancel_unfinished(
     st: &Arc<AppState>,
     grabs: Vec<downloads::Grab>,
     inside: impl Fn(MediaId) -> bool,
@@ -667,8 +668,13 @@ async fn cancel_unfinished(
 /// `POST /stop`: Arr stops looking for a movie, season or episode, and cancels its
 /// downloads that have not finished. Files already in the library are never touched.
 pub(super) async fn stop(State(st): St, ApiJson(body): ApiJson<StopBody>) -> ApiResult {
+    stop_scope(&st, &body.media_id, true).await
+}
+
+/// `stop`, with or without cancelling the downloads (a delete decides those itself).
+pub(super) async fn stop_scope(st: &Arc<AppState>, media_id: &str, cancel: bool) -> ApiResult {
     st.loaded()?;
-    let id = parse_media_id(&body.media_id)?;
+    let id = parse_media_id(media_id)?;
     if matches!(id, MediaId::Series(_)) {
         return Err(ApiError::bad_request(
             ErrorCode::InvalidMediaId,
@@ -715,13 +721,16 @@ pub(super) async fn stop(State(st): St, ApiJson(body): ApiJson<StopBody>) -> Api
             .map_err(internal("requests"))?;
         st.reload_index().await.map_err(internal("index"))?;
     }
-    let pid = parent.to_string();
-    let grabs = st
-        .store
-        .with(move |c| downloads::select(c, "media_id = ?1 AND active = 1", &[&pid]))
-        .await
-        .map_err(internal("downloads"))?;
-    let (cancelled, finishing) = cancel_unfinished(&st, grabs, |t| within(scope, t)).await?;
+    let (mut cancelled, mut finishing) = (0, 0);
+    if cancel {
+        let pid = parent.to_string();
+        let grabs = st
+            .store
+            .with(move |c| downloads::select(c, "media_id = ?1 AND active = 1", &[&pid]))
+            .await
+            .map_err(internal("downloads"))?;
+        (cancelled, finishing) = cancel_unfinished(st, grabs, |t| within(scope, t)).await?;
+    }
     ok(
         json!({ "media_id": scope, "stopped": true, "cancelled": cancelled, "finishing": finishing }),
     )
@@ -750,15 +759,20 @@ pub(super) async fn quick_scope(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RemoveBody {
-    media_id: String,
+    pub(super) media_id: String,
 }
 
 /// `POST /remove`: Arr stops tracking a movie or show. Downloads that have not finished are
 /// cancelled and a retrying request ends; then the title leaves management exactly as
 /// `DELETE /library/{media_id}` does it. Files already in the library are never touched.
 pub(super) async fn remove(State(st): St, ApiJson(body): ApiJson<RemoveBody>) -> ApiResult {
+    remove_title(&st, &body.media_id, true).await
+}
+
+/// `remove`, with or without cancelling the downloads (a delete decides those itself).
+pub(super) async fn remove_title(st: &Arc<AppState>, media_id: &str, cancel: bool) -> ApiResult {
     st.loaded()?;
-    let id = parse_media_id(&body.media_id)?;
+    let id = parse_media_id(media_id)?;
     if !matches!(id, MediaId::Movie { .. } | MediaId::Series(_)) {
         return Err(ApiError::bad_request(
             ErrorCode::InvalidMediaId,
@@ -803,13 +817,16 @@ pub(super) async fn remove(State(st): St, ApiJson(body): ApiJson<RemoveBody>) ->
         })
         .await
         .map_err(internal("requests"))?;
-    let pid = id.to_string();
-    let grabs = st
-        .store
-        .with(move |c| downloads::select(c, "media_id = ?1 AND active = 1", &[&pid]))
-        .await
-        .map_err(internal("downloads"))?;
-    let (cancelled, finishing) = cancel_unfinished(&st, grabs, mine).await?;
+    let (mut cancelled, mut finishing) = (0, 0);
+    if cancel {
+        let pid = id.to_string();
+        let grabs = st
+            .store
+            .with(move |c| downloads::select(c, "media_id = ?1 AND active = 1", &[&pid]))
+            .await
+            .map_err(internal("downloads"))?;
+        (cancelled, finishing) = cancel_unfinished(st, grabs, mine).await?;
+    }
     if finishing > 0 {
         return Err(ApiError::conflict(
             ErrorCode::ActiveDownloads,

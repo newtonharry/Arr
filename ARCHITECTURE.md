@@ -72,6 +72,7 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
 | `setup`, `bootstrap` | managed setup documents normalised into `Settings` with an empty catalog, replacement guards, Plex mapping checks; the read-only, resumable Plex library bootstrap into owned, unmonitored catalog entries |
 | `torrent`, `fixture` | magnet/`.torrent` info-hash identity; authored fixtures (ffmpeg media, `.torrent` with real piece hashes) |
 | `library` | the managed catalog: insert-only seeding from imports, add/monitor/remove, episode upserts, wanted, calendar, history events |
+| `trash` | the bin behind "Delete files": checked renames into `<root>/.arr-bin/<delete_id>/`, restore, the 7-day purge (the `bin` task), the `bin_entries` table |
 | `target`, `decision`, `search`, `plan`, `store` | target resolution from the managed index; release decisions (including native revision upgrades, queued coverage, blocklist); search and ranking; plans; SQLite (schema 3) |
 | `downloads` | the grab outbox, submission/reconciliation, polling, failure classification, user actions, completed/failed download cleanup |
 | `ingest`, `probe` | completed-download import with a journal and crash recovery; the bounded ffprobe media probe |

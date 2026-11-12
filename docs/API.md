@@ -60,6 +60,9 @@ checks that every route is documented.
 | `cleanup_blocked` | 409 | data removal refused: not ours, moved, symlinked or library file changed |
 | `foreign_torrent` | 409 | the torrent in qBittorrent is not owned by arr |
 | `not_managed` / `active_downloads` | 404 / 409 | not a managed item / removal refused while downloads are active |
+| `changed` | 409 | the files differ from the preview a delete was confirmed on |
+| `delete_refused` | 409 | a file is not safe to delete (a symbolic link, not a regular file, outside the library folder, in the bin) or a restore has nowhere to go |
+| `move_failed` | 409 | a file could not be moved (for example it sits on another drive); what moved went back |
 | `internal` | 500 | details only in the server log |
 
 Upstream errors set `details.provider` and `details.failure`. They never contain URLs,
@@ -141,6 +144,39 @@ response bodies or credentials.
   `{media_id, managed: false, cancelled}`. A download whose data is all there and that is being
   added to Plex is left to finish, and the call answers `409 active_downloads` until it is done.
   Files in the library are never touched. The web app's "Remove from Arr" uses it.
+- **`POST /api/v1/delete/preview`** with `{"media_id"}` (a movie, series, season or episode)
+  answers what a delete would take: `{media_id, title, files: [{path, bytes, kind}],
+  library_bytes, downloads: [{grab_id, title, bytes, removed, reason?}], unknown, token}`.
+  `files` are the owned files Arr knows the place of (`kind: "video"`) and the subtitles
+  (`.srt .ass .ssa .sub .idx .vtt`), `.nfo` and images beside a video whose names start with
+  the video's name (`"extra"`), nothing else in the folder. Paths are relative to their library
+  folder. `unknown` counts owned items whose file Arr cannot place. A download that is
+  finished goes with its data (a hardlinked copy frees no space while the torrent seeds)
+  only when everything it holds is inside the delete: a season pack that also holds episodes
+  being kept stays, with `removed: false` and a reason. `token` is a digest of the exact
+  files with their sizes and modified times. A symbolic link, a file that is not regular, one
+  that resolves outside the library folder or one in the bin refuses the whole preview with
+  `409 delete_refused`.
+- **`POST /api/v1/delete`** with `{"media_id", "token", "keep_wanted"?}` deletes those files
+  safely. The token must be the preview's: if anything differs it answers `409 changed`.
+  Downloads that have not finished are cancelled with their data (`409 active_downloads`
+  while one is being added to Plex), finished ones inside the delete are removed with their
+  data. Each file is then moved with a rename (never a copy) to
+  `<library folder>/.arr-bin/<delete_id>/<relative path>` on the same drive, and the bin holds a
+  `.plexignore`. If a rename fails, the files already moved go back and the answer is
+  `409 move_failed`. Folders left empty are removed, never the library folder. Unless
+  `keep_wanted` is true, Arr stops wanting what it deleted: a show leaves Arr exactly as
+  `POST /remove` does, a movie, season or episode is unmonitored. The catalog no longer owns
+  the files, a `deleted` event is recorded and Plex is asked to refresh. Answers
+  `{delete_id, moved, bytes, purge_at, downloads_kept}` (`downloads_kept` counts finished
+  downloads that could not be removed and keep seeding).
+- **`GET /api/v1/bin`** lists `{entries: [{delete_id, media_id, title, files, bytes,
+  deleted_at, purge_at}]}`. **`POST /api/v1/bin/{delete_id}/restore`** moves the files back,
+  leaving in the bin any whose place is taken (answers `{delete_id, media_id, restored,
+  skipped: [{path, reason}], ownership}`), re-checks ownership, asks Plex to refresh and
+  records `restored`; it does not monitor anything again. **`DELETE /api/v1/bin/{delete_id}`**
+  empties one entry now. Entries empty themselves 7 days after the delete (the `bin` scheduled
+  task); only that entry's folder under `.arr-bin` is removed. The web app uses all of these.
 - **`GET /api/v1/library/roots`** shows each root's status from the last rescan.
 - **`GET /api/v1/storage`** returns `{drives: [{label, free_bytes, total_bytes}]}`: the drive
   holding the movie folder and the one holding the TV folder, or a single `Movies and TV` entry
@@ -562,7 +598,7 @@ Queue actions:
   Commands are leased, retried up to 3 times on outages, and requeued after a restart.
   Follow them with `GET /api/v1/commands` and `GET /api/v1/commands/{id}` (`state`, `result`).
 - **`GET /api/v1/system/tasks`** shows each scheduled task (`downloads`, `rss_sync`,
-  `requests`, `refresh_metadata`, `rescan`, `prune`) with its last start, finish, status and
+  `requests`, `refresh_metadata`, `rescan`, `prune`, `bin`) with its last start, finish, status and
   result, and its next run.
 - **`GET /api/v1/requests`** lists explicit requests that are still owed something: a wanted
   unit was unplanned, or its candidate was refused and no active download covers it. It shows

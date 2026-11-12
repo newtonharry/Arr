@@ -63,6 +63,12 @@ pub enum ErrorCode {
     /// Managed setup would replace settings it must not replace (an imported native
     /// configuration, or ids that catalog items or downloads still use).
     SetupConflict,
+    /// The files differ from the preview a delete was confirmed on.
+    Changed,
+    /// A delete or restore was refused: a file is not safe to touch.
+    DeleteRefused,
+    /// A file could not be moved; what already moved was put back.
+    MoveFailed,
     Internal,
 }
 
@@ -114,6 +120,9 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::QualityChanged,
     ErrorCode::InvalidSetup,
     ErrorCode::SetupConflict,
+    ErrorCode::Changed,
+    ErrorCode::DeleteRefused,
+    ErrorCode::MoveFailed,
     ErrorCode::Internal,
 ];
 

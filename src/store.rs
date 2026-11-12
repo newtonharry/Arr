@@ -503,6 +503,23 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS indexer_usage_at ON indexer_usage(indexer_id, kind, at);",
         )?;
+        // Files a delete moved into the library's bin, kept so they can be put back until
+        // `purge_at`.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bin_entries (
+                delete_id TEXT PRIMARY KEY,
+                media_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                media TEXT NOT NULL,
+                files TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                deleted_at TEXT NOT NULL,
+                purge_at TEXT NOT NULL
+            );",
+        )?;
+        // Set when Arr's own delete moved the imported file to the bin; its download may then
+        // be removed although the file is no longer in the library. Restoring clears it.
+        ensure_column(&conn, "import_journal", "deleted_at", "TEXT")?;
         // Added within schema 3 after the table's first build (idempotent).
         // A full piece check binds to the run that started it.
         ensure_column(&conn, "embedded_torrents", "verify_token", "TEXT")?;

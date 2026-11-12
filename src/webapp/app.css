@@ -308,6 +308,12 @@ h2 .link .ic{width:16px;height:16px;stroke-width:3}
 .confirm h2{font-size:18px;text-transform:none;letter-spacing:0;color:var(--ink)}
 .confirm em{font-style:normal;font-weight:800}
 .confirm-act{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
+.confirm p{margin:0}
+.chk{display:flex;align-items:center;gap:12px;min-height:44px;font-weight:700;cursor:pointer}
+.chk input{width:22px;height:22px;flex:none}
+.sea-del{padding:0 12px 8px}
+.item.bin{flex-wrap:wrap}
+.item.bin h3{font-size:16px}
 /* the note after Add: above the tab bar on phones, over the sheet, never in the way of a tap outside it */
 .toast-region{position:fixed;left:0;right:0;bottom:calc(var(--tab-h) + env(safe-area-inset-bottom) + 12px);z-index:40;display:flex;justify-content:center;padding:0 16px;pointer-events:none}
 .toast{pointer-events:auto;display:flex;align-items:center;gap:8px;max-width:min(100%,460px);background:var(--toast-bg);color:var(--toast-ink);border-radius:14px;padding:4px 6px 4px 16px;font-weight:600;animation:rise .25s cubic-bezier(.16,1,.3,1)}
