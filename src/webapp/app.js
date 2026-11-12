@@ -1831,11 +1831,14 @@ function route() {
   renderPath(path, q, hash);
 }
 // A new screen: tabs slide the way they sit in the bar, any other change is a short rise.
+// A sideways slide pokes past the edge of the screen, so it only runs where the page clips that
+// (app.css); a browser that can't would widen the page, and gets the rise instead.
+const CLIPS = !!window.CSS?.supports?.('overflow-x', 'clip');
 function enterRoute(prev, path) {
   if (prev === path) return;
   M.fresh = true;
   if (prev === null) return;
-  const a = TABS.findIndex((t) => t[0] === prev), b = TABS.findIndex((t) => t[0] === path), dir = a >= 0 && b >= 0 ? Math.sign(b - a) : 0;
+  const a = TABS.findIndex((t) => t[0] === prev), b = TABS.findIndex((t) => t[0] === path), dir = CLIPS && a >= 0 && b >= 0 ? Math.sign(b - a) : 0;
   after(() => {
     anim($('#view'), [{ opacity: 0, transform: dir ? `translateX(${dir * 28}px)` : 'translateY(8px)' }, { opacity: 1, transform: 'none' }], { duration: 300 });
     if (b >= 0) anim($('#tabs a[aria-current] .ic'), [{ transform: 'none' }, { transform: 'translateY(-7px) scale(1.25) rotate(-8deg)', offset: 0.4 }, { transform: 'none' }], { duration: 520, easing: SPRING });
@@ -2318,7 +2321,7 @@ function App() {
   }, []);
   // After every redraw: the sheet's scroll lock, focus a redraw took away, then what was waiting.
   useLayoutEffect(() => {
-    document.body.classList.toggle('sheet-open', P.shown);
+    document.documentElement.classList.toggle('sheet-open', P.shown);
     const pk = pendingFk, a = document.activeElement;
     pendingFk = null;
     if (pk && pk.fk && (!a || a === document.body || !a.isConnected)) {
