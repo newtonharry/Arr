@@ -827,6 +827,8 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | ["people"]
                 | ["people", _]
                 | ["library", "movies" | "series"]
+                | ["sport", "search" | "leagues" | "following" | "events"]
+                | ["sport", "league", _]
                 | ["show", _]
                 | ["show", _, "season", _]
                 | ["movie", _]
@@ -835,6 +837,7 @@ fn allowed(method: &Method, path: &str) -> bool {
         ),
         Method::POST => match parts.as_slice() {
             ["quick-add" | "follow" | "stop" | "quality" | "remove"] => true,
+            ["sport", "follow" | "unfollow"] => true,
             ["delete"] | ["delete", "preview"] => true,
             ["bin", id, "restore"] => !id.is_empty(),
             // Update now, and a changed setting: signed-in household members only, like the rest.

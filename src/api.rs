@@ -46,6 +46,7 @@ use tokio::sync::Semaphore;
 
 mod delete;
 mod options;
+mod sport;
 mod system;
 mod titles;
 
@@ -96,6 +97,13 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/status/{media_id}"),
     ("get", "/api/v1/attention"),
     ("get", "/api/v1/feed"),
+    ("get", "/api/v1/sport/search"),
+    ("get", "/api/v1/sport/leagues"),
+    ("get", "/api/v1/sport/league/{slug}"),
+    ("post", "/api/v1/sport/follow"),
+    ("post", "/api/v1/sport/unfollow"),
+    ("get", "/api/v1/sport/following"),
+    ("get", "/api/v1/sport/events"),
     ("get", "/api/v1/ideas"),
     ("post", "/api/v1/ideas/hide"),
     ("delete", "/api/v1/ideas/hide/{media_id}"),
@@ -164,6 +172,8 @@ pub struct AppState {
     /// The release search backend: native indexers or Prowlarr (never both, no fallback).
     pub search: Option<Backend>,
     pub tvmaze: Option<Arc<Tvmaze>>,
+    /// Sport schedules (ESPN); none when `[sports] enabled = false`.
+    pub sports: Option<Arc<crate::sport::Sports>>,
     /// Movie metadata: Plex first, TMDB (when it has a key) as the backup.
     pub movies: Option<Movies>,
     /// The download client ([qbittorrent] or [embedded]); none in shadow mode.
@@ -275,6 +285,10 @@ impl AppState {
         Ok(AppState {
             search,
             tvmaze: cfg.tvmaze.as_ref().map(|c| Arc::new(Tvmaze::new(c))),
+            sports: cfg
+                .sports
+                .as_ref()
+                .map(|c| Arc::new(crate::sport::Sports::new(c))),
             movies: Movies::new(
                 cfg.plex.as_ref().and_then(|p| {
                     crate::plexsignin::client_id(&cfg.state_dir)
@@ -827,6 +841,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/status/{media_id}", get(media_status))
         .route("/api/v1/attention", get(attention))
         .route("/api/v1/feed", get(feed))
+        .route("/api/v1/sport/search", get(sport::search))
+        .route("/api/v1/sport/leagues", get(sport::leagues))
+        .route("/api/v1/sport/league/{slug}", get(sport::league))
+        .route("/api/v1/sport/follow", post(sport::follow))
+        .route("/api/v1/sport/unfollow", post(sport::unfollow))
+        .route("/api/v1/sport/following", get(sport::following))
+        .route("/api/v1/sport/events", get(sport::events))
         .route("/api/v1/ideas", get(ideas))
         .route("/api/v1/ideas/hide", post(ideas_hide))
         .route("/api/v1/ideas/hide/{media_id}", delete(ideas_unhide))
@@ -1126,6 +1147,7 @@ fn capability_rows(st: &AppState) -> Vec<Cap> {
         Cap { name: "release_decisions", implemented: true, configured: imported, tested: "unit_tests", detail: "independent evaluation of imported quality/size/seeder/language/scope/delay/revision rules".into() },
         Cap { name: "movie_discovery", implemented: true, configured: st.movies.is_some(), tested: "loopback_mocks", detail: match &st.movies { Some(m) if m.has_tmdb() => "Plex search and details, with TMDB as the backup".into(), Some(_) => "Plex search and details".into(), None => crate::tmdbkey::MISSING.into() } },
         Cap { name: "tv_discovery", implemented: true, configured: st.tvmaze.is_some(), tested: "loopback_mocks", detail: "TVmaze search and episode lists (enable [tvmaze])".into() },
+        Cap { name: "sport_schedules", implemented: true, configured: st.sports.is_some(), tested: "loopback_mocks", detail: "schedules of followed sport leagues and teams (ESPN's public feed, no key; fixtures only, never scores); follow, unfollow, events, feed and calendar. Nothing is downloaded for sport yet (turn off with [sports] enabled = false)".into() },
         Cap { name: "plans", implemented: true, configured: imported, tested: "loopback_mocks", detail: "durable idempotent plans; executable when execution is enabled".into() },
         Cap { name: name("download_submission", "embedded_download_submission"), implemented: true, configured: exec && qb, tested, detail: if embedded { "embedded engine (no qBittorrent API): .torrent bytes or magnet metadata fetched from peers, names validated by the engine's parser before anything is written, durable record before the add, reconciliation by hash, never overwrites existing files, outbox queue limit".into() } else { "qBittorrent WebAPI 2.8.2 (4.3.9) to 2.11 (5.x): hash identity persisted before add, ambiguous-add reconciliation, category + unified-media tag ownership".into() } },
         Cap { name: name("download_monitoring", "embedded_download_monitoring"), implemented: true, configured: exec && qb, tested, detail: "queue status mapping, stall/error/missing/removed classification, pause/resume/cancel/retry".into() },
@@ -2488,7 +2510,8 @@ async fn calendar(State(st): St, ApiQuery(q): ApiQuery<CalendarQuery>) -> ApiRes
         ));
     }
     let entries = library::calendar(&st.index(), start, end, now);
-    ok(json!({ "start": rfc3339(start), "end": rfc3339(end), "items": entries }))
+    let sport = sport::in_window(&st, start, end).await?;
+    ok(json!({ "start": rfc3339(start), "end": rfc3339(end), "items": entries, "sport": sport }))
 }
 
 // ---------------------------------------------------------------- discovery and search
@@ -4728,6 +4751,7 @@ async fn feed(State(st): St) -> ApiResult {
             })
             .collect();
 
+    let sport = sport::coming_up(&st, now).await?;
     ok(json!({
         "generated_at": rfc3339(now),
         "movies_enabled": st.movies.is_some(),
@@ -4737,6 +4761,7 @@ async fn feed(State(st): St) -> ApiResult {
         "arrived": arrived,
         "looking": looking,
         "coming_up": coming_up,
+        "sport": sport,
     }))
 }
 

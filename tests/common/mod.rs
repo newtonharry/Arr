@@ -111,6 +111,18 @@ pub struct MockState {
     pub plex_slow_keys: Vec<(String, Duration)>,
     /// TVmaze `shows/{id}` answers only after this delay.
     pub tvmaze_show_delay: Option<Duration>,
+    /// The fake ESPN: recorded events per league path (`soccer/eng.1`), exactly as recorded
+    /// (dates are moved to the present when they are served, see `espn_shift`). A test edits
+    /// these to postpone, drop or add an event.
+    pub espn_events: HashMap<String, Vec<Value>>,
+    /// Recorded team lists per league path.
+    pub espn_teams: HashMap<String, Value>,
+    /// Each request received: path and query.
+    pub espn_log: Vec<String>,
+    /// Every answer is this HTTP status.
+    pub espn_fail: Option<u16>,
+    /// Every answer comes only after this delay.
+    pub espn_delay: Option<Duration>,
 }
 
 pub type Mock = Arc<Mutex<MockState>>;
@@ -395,6 +407,217 @@ async fn tvmaze_search(Query(q): Query<HashMap<String, String>>) -> Response {
         .map(|s| json!({ "score": 1.0, "show": s }))
         .collect();
     axum::Json(hits).into_response()
+}
+
+// ------------------------------------------------------------------ fake ESPN
+
+/// The day the recorded answers were taken on; they are served as if that day were today.
+const ESPN_ANCHOR: time::Date = time::macros::date!(2026 - 11 - 12);
+
+/// The recorded fixtures (answers from the real feed, trimmed, scores and winners included).
+fn espn_fixtures() -> (HashMap<String, Vec<Value>>, HashMap<String, Value>) {
+    let boards: [(&str, &str, Option<&str>); 5] = [
+        (
+            "soccer/eng.1",
+            include_str!("../fixtures/espn/soccer_eng1.json"),
+            Some(include_str!("../fixtures/espn/soccer_eng1_teams.json")),
+        ),
+        (
+            "basketball/nba",
+            include_str!("../fixtures/espn/basketball_nba.json"),
+            Some(include_str!("../fixtures/espn/basketball_nba_teams.json")),
+        ),
+        (
+            "rugby/270559",
+            include_str!("../fixtures/espn/rugby_top14.json"),
+            Some(include_str!("../fixtures/espn/rugby_top14_teams.json")),
+        ),
+        (
+            "mma/ufc",
+            include_str!("../fixtures/espn/mma_ufc.json"),
+            None,
+        ),
+        (
+            "golf/eur",
+            include_str!("../fixtures/espn/golf_eur.json"),
+            None,
+        ),
+    ];
+    let (mut events, mut teams) = (HashMap::new(), HashMap::new());
+    for (path, board, team_list) in boards {
+        let board: Value = serde_json::from_str(board).unwrap();
+        events.insert(
+            path.to_string(),
+            board["events"].as_array().unwrap().clone(),
+        );
+        if let Some(t) = team_list {
+            teams.insert(path.to_string(), serde_json::from_str(t).unwrap());
+        }
+    }
+    (events, teams)
+}
+
+fn espn_short(t: time::OffsetDateTime) -> String {
+    t.format(&time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]Z"
+    ))
+    .unwrap()
+}
+
+/// Moves every date of a recorded event by the days between the recording day and today, so
+/// the same fixtures are about as far from now whenever the tests run.
+fn espn_shift(v: &mut Value, days: i64) {
+    match v {
+        Value::Object(map) => {
+            for (k, x) in map.iter_mut() {
+                match (k.as_str(), &*x) {
+                    ("date" | "endDate" | "startDate", Value::String(s)) => {
+                        if let Ok(t) = time::PrimitiveDateTime::parse(
+                            s,
+                            &time::macros::format_description!(
+                                "[year]-[month]-[day]T[hour]:[minute]Z"
+                            ),
+                        ) {
+                            *x = Value::String(espn_short(
+                                t.assume_utc() + time::Duration::days(days),
+                            ));
+                        }
+                    }
+                    _ => espn_shift(x, days),
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| espn_shift(x, days)),
+        _ => {}
+    }
+}
+
+fn espn_days_from_recording() -> i64 {
+    (time::OffsetDateTime::now_utc().date() - ESPN_ANCHOR).whole_days()
+}
+
+/// An event's start as the fake serves it now (the recording's date moved to the present).
+pub fn espn_start(mock: &Mock, path: &str, id: &str) -> time::OffsetDateTime {
+    let m = mock.lock().unwrap();
+    let e = m.espn_events[path]
+        .iter()
+        .find(|e| e["id"] == id)
+        .unwrap_or_else(|| panic!("no recorded event {id} in {path}"));
+    let mut e = e.clone();
+    espn_shift(&mut e, espn_days_from_recording());
+    time::PrimitiveDateTime::parse(
+        e["date"].as_str().unwrap(),
+        &time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]Z"),
+    )
+    .unwrap()
+    .assume_utc()
+}
+
+/// Sets what an event's status says (`STATUS_POSTPONED`, `STATUS_CANCELED`, `STATUS_FINAL`,
+/// `STATUS_SCHEDULED`), at the event and its first competition.
+pub fn espn_set_status(mock: &Mock, path: &str, id: &str, name: &str, state: &str) {
+    let mut m = mock.lock().unwrap();
+    let e = m
+        .espn_events
+        .get_mut(path)
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["id"] == id)
+        .unwrap();
+    if e["status"].is_object() {
+        e["status"]["type"]["name"] = json!(name);
+        e["status"]["type"]["state"] = json!(state);
+    }
+    if e["competitions"][0]["status"].is_object() {
+        e["competitions"][0]["status"]["type"]["name"] = json!(name);
+        e["competitions"][0]["status"]["type"]["state"] = json!(state);
+    }
+}
+
+/// Removes an event from what the fake serves (it vanished from the schedule).
+pub fn espn_remove(mock: &Mock, path: &str, id: &str) {
+    let mut m = mock.lock().unwrap();
+    m.espn_events
+        .get_mut(path)
+        .unwrap()
+        .retain(|e| e["id"] != id);
+}
+
+/// How many requests the fake ESPN has received so far.
+pub fn espn_requests(mock: &Mock) -> usize {
+    mock.lock().unwrap().espn_log.len()
+}
+
+async fn espn_scoreboard(
+    State(m): State<Mock>,
+    axum::extract::Path((sport, league)): axum::extract::Path<(String, String)>,
+    uri: Uri,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (delay, fail) = {
+        let mut m = m.lock().unwrap();
+        m.espn_log.push(format!(
+            "{sport}/{league}/scoreboard{}",
+            uri.query().map(|q| format!("?{q}")).unwrap_or_default()
+        ));
+        (m.espn_delay, m.espn_fail)
+    };
+    if let Some(d) = delay {
+        tokio::time::sleep(d).await;
+    }
+    if let Some(code) = fail {
+        return StatusCode::from_u16(code).unwrap().into_response();
+    }
+    // Like the real feed, a range of days is refused for team sports.
+    let dates = q.get("dates").cloned().unwrap_or_default();
+    if dates.contains('-') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let days = espn_days_from_recording();
+    let mut events: Vec<Value> = m
+        .lock()
+        .unwrap()
+        .espn_events
+        .get(&format!("{sport}/{league}"))
+        .cloned()
+        .unwrap_or_default();
+    events.iter_mut().for_each(|e| espn_shift(e, days));
+    let in_month = |t: Option<&str>| t.is_some_and(|t| t.replace('-', "").starts_with(&dates));
+    events.retain(|e| {
+        dates.is_empty() || in_month(e["date"].as_str()) || in_month(e["endDate"].as_str())
+    });
+    axum::Json(json!({
+        "leagues": [{ "id": "1", "name": format!("{sport} {league}") }],
+        "events": events,
+    }))
+    .into_response()
+}
+
+async fn espn_teams(
+    State(m): State<Mock>,
+    axum::extract::Path((sport, league)): axum::extract::Path<(String, String)>,
+    uri: Uri,
+) -> Response {
+    let (delay, fail, doc) = {
+        let mut m = m.lock().unwrap();
+        m.espn_log.push(format!(
+            "{sport}/{league}/teams{}",
+            uri.query().map(|q| format!("?{q}")).unwrap_or_default()
+        ));
+        (
+            m.espn_delay,
+            m.espn_fail,
+            m.espn_teams.get(&format!("{sport}/{league}")).cloned(),
+        )
+    };
+    if let Some(d) = delay {
+        tokio::time::sleep(d).await;
+    }
+    if let Some(code) = fail {
+        return StatusCode::from_u16(code).unwrap().into_response();
+    }
+    axum::Json(doc.unwrap_or(json!({ "sports": [{ "leagues": [{ "teams": [] }] }] })))
+        .into_response()
 }
 
 fn tmdb_authorized(headers: &HeaderMap, q: &HashMap<String, String>) -> bool {
@@ -1184,6 +1407,11 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         tvmaze_show_delay: None,
         plex_extra_offers: vec![],
         slow_horses_s2: false,
+        espn_events: espn_fixtures().0,
+        espn_teams: espn_fixtures().1,
+        espn_log: vec![],
+        espn_fail: None,
+        espn_delay: None,
     }));
     let app = Router::new()
         .route("/prowlarr/api/v1/search", get(prowlarr_search))
@@ -1211,6 +1439,8 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         .route("/uploads/{file}", get(image_host))
         .route("/prowlarr/{id}/download", get(prowlarr_download))
         .route("/prowlarr/{id}/api", get(prowlarr_feed))
+        .route("/espn/{sport}/{league}/scoreboard", get(espn_scoreboard))
+        .route("/espn/{sport}/{league}/teams", get(espn_teams))
         .route("/tz/api", get(tz_api))
         .route("/tz/dl/{link}", get(tz_download))
         .route(
@@ -1398,6 +1628,10 @@ pub struct ExecOptions {
     pub sample_detection: bool,
     pub cleanup: bool,
     pub tvmaze: bool,
+    /// Configure `[sports]` against the fake ESPN (false: `enabled = false`).
+    pub sports: bool,
+    /// `[sports] backoff_secs` (0 by default, so a failure never pauses later requests).
+    pub sports_backoff_secs: u64,
     /// Extra TOML appended (whole sections only).
     pub extra: String,
     /// Configure [tmdb] against the mock (v3 key).
@@ -1442,6 +1676,8 @@ impl Default for ExecOptions {
             sample_detection: false,
             cleanup: true,
             tvmaze: true,
+            sports: true,
+            sports_backoff_secs: 0,
             extra: String::new(),
             tmdb: false,
             categories: None,
@@ -1718,6 +1954,14 @@ fn managed_config(
     } else {
         String::new()
     };
+    let sports = if o.sports {
+        format!(
+            "[sports]\nbase_url = \"http://{mock}/espn\"\ntimeout_secs = 2\nmin_interval_ms = 0\nbackoff_secs = {}\n",
+            o.sports_backoff_secs
+        )
+    } else {
+        "[sports]\nenabled = false\n".to_string()
+    };
     let plex = if o.plex {
         format!(
             "[plex]\nbase_url = \"http://{mock}/plex\"\ntoken_file = \"secrets/plex_token\"\nmovie_section = 1\ntv_section = 2\n\
@@ -1760,7 +2004,7 @@ fn managed_config(
     };
     format!(
         "[server]\napi_token_file = \"secrets/api_token\"\n{timeout}{server}\
-         {indexer}{tvmaze}{tmdb}{execution}\
+         {indexer}{tvmaze}{tmdb}{sports}{execution}\
          [migration]\nmode = \"coexistence\"\n\
          [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = {sample}\nprobe_timeout_secs = 30\n\
          [automation]\npoll_seconds = 3600\n{stall}\
