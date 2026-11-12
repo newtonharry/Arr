@@ -8,6 +8,7 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -316,7 +317,15 @@ pub struct Tvmaze {
     episodes: TtlCache<u32, Vec<TvmazeEpisode>>,
     people: TtlCache<u32, TvmazeCredits>,
     ideas: Mutex<Option<(Instant, Vec<WebShow>)>>,
+    /// How long a page waits for decoration (see `decoration`).
+    budget: Duration,
+    /// Show lookups running in the background, by cache key. A receiver reports `Err` from
+    /// `changed()` once its lookup has finished (and so has filled the cache, if it worked).
+    inflight: Mutex<HashMap<String, tokio::sync::watch::Receiver<()>>>,
 }
+
+/// How long a page waits for TVmaze details it can do without (summary, network, cast).
+const DECORATION_BUDGET: Duration = Duration::from_millis(2500);
 
 impl Tvmaze {
     pub fn new(cfg: &MetadataConfig) -> Self {
@@ -327,6 +336,8 @@ impl Tvmaze {
             episodes: TtlCache::new(METADATA_TTL, 128),
             people: TtlCache::new(METADATA_TTL, 64),
             ideas: Mutex::new(None),
+            budget: DECORATION_BUDGET.min(cfg.timeout / 2),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -562,6 +573,56 @@ impl Tvmaze {
     ) -> Result<Option<TvmazeShow>, UpstreamError> {
         let url = self.url(&format!("shows/{id}"), &[("embed", "cast")])?;
         self.cached_show(format!("id:{id}"), url, fresh).await
+    }
+
+    /// Like `by_tvdb`, for decoration: waits at most the budget, then gives up with `None`
+    /// while the lookup finishes in the background and fills the cache for the next call.
+    pub async fn by_tvdb_decoration(self: &Arc<Self>, tvdb: u32) -> Option<TvmazeShow> {
+        let url = self
+            .url("lookup/shows", &[("thetvdb", &tvdb.to_string())])
+            .ok()?;
+        self.decoration(format!("tvdb:{tvdb}"), url).await
+    }
+
+    /// `by_id` for decoration (see `by_tvdb_decoration`).
+    pub async fn by_id_decoration(self: &Arc<Self>, id: u32) -> Option<TvmazeShow> {
+        let url = self
+            .url(&format!("shows/{id}"), &[("embed", "cast")])
+            .ok()?;
+        self.decoration(format!("id:{id}"), url).await
+    }
+
+    async fn decoration(self: &Arc<Self>, key: String, url: Url) -> Option<TvmazeShow> {
+        if let Some(hit) = self.shows.get(&key) {
+            return hit;
+        }
+        let mut done = {
+            let mut running = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            match running.get(&key) {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(());
+                    running.insert(key.clone(), rx.clone());
+                    let (this, key) = (self.clone(), key.clone());
+                    tokio::spawn(async move {
+                        let _ = this.cached_show(key.clone(), url, false).await;
+                        this.inflight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&key);
+                        drop(tx);
+                    });
+                    rx
+                }
+            }
+        };
+        let finished =
+            tokio::time::timeout(self.budget, async { while done.changed().await.is_ok() {} })
+                .await;
+        match finished {
+            Ok(()) => self.shows.get(&key).flatten(),
+            Err(_) => None,
+        }
     }
 
     /// The show's official alternative titles (TVmaze AKAs), exactly as listed: at most
@@ -1469,32 +1530,34 @@ impl PlexMovies {
             .collect();
         let mut out: Vec<Option<TmdbSearchResult>> = vec![None; keys.len()];
         let mut failure = None;
-        for chunk in keys.chunks(PLEX_LOOKUPS).enumerate() {
-            let mut set = tokio::task::JoinSet::new();
-            for (i, key) in chunk.1.iter().enumerate() {
-                let (this, key) = (self.clone(), key.clone());
-                let at = chunk.0 * PLEX_LOOKUPS + i;
-                set.spawn(async move { (at, this.meta_by_key(&key).await) });
-            }
-            while let Some(done) = set.join_next().await {
-                let Ok((at, meta)) = done else { continue };
-                match meta {
-                    Ok(Some(m)) => {
-                        out[at] = m.tmdb_id().map(|id| TmdbSearchResult {
-                            id,
-                            title: Some(m.title.clone()),
-                            original_title: m.original_title.clone(),
-                            release_date: m
-                                .originally_available_at
-                                .clone()
-                                .or(m.year.map(|y| y.to_string())),
-                            original_language: None,
-                            scores: m.scores,
-                        })
-                    }
-                    Ok(None) => {}
-                    Err(e) => failure = Some(e),
+        // All lookups at once, at most PLEX_LOOKUPS running: one slow key holds up only itself.
+        let slots = Arc::new(tokio::sync::Semaphore::new(PLEX_LOOKUPS));
+        let mut set = tokio::task::JoinSet::new();
+        for (at, key) in keys.into_iter().enumerate() {
+            let (this, slots) = (self.clone(), slots.clone());
+            set.spawn(async move {
+                let _slot = slots.acquire().await;
+                (at, this.meta_by_key(&key).await)
+            });
+        }
+        while let Some(done) = set.join_next().await {
+            let Ok((at, meta)) = done else { continue };
+            match meta {
+                Ok(Some(m)) => {
+                    out[at] = m.tmdb_id().map(|id| TmdbSearchResult {
+                        id,
+                        title: Some(m.title.clone()),
+                        original_title: m.original_title.clone(),
+                        release_date: m
+                            .originally_available_at
+                            .clone()
+                            .or(m.year.map(|y| y.to_string())),
+                        original_language: None,
+                        scores: m.scores,
+                    })
                 }
+                Ok(None) => {}
+                Err(e) => failure = Some(e),
             }
         }
         let results: Vec<TmdbSearchResult> = out.into_iter().flatten().collect();

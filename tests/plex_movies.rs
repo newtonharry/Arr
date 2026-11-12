@@ -281,3 +281,29 @@ async fn an_imdb_only_movie_is_resolved_through_plex() {
     assert_eq!(movies.find_imdb("tt9100004").await.unwrap(), None);
     assert_eq!(movies.find_imdb("../x").await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn plex_lookups_do_not_wait_for_the_slowest_of_their_chunk() {
+    let e = start_exec(ExecOptions::default()).await;
+    // One slow key in each group of four. Run four at a time, group by group, the search
+    // would take two delays; with a bounded pool the slow keys overlap and it takes one.
+    let slow = std::time::Duration::from_millis(1200);
+    e.mock.lock().unwrap().plex_slow_keys =
+        vec![("crw0001".into(), slow), ("crw0005".into(), slow)];
+    let started = std::time::Instant::now();
+    let (s, v, text) = e.json(e.get("/api/v1/discover?kind=movie&q=crowd")).await;
+    let took = started.elapsed();
+    assert_eq!(s, 200, "{text}");
+    let ids: Vec<&str> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["media_id"].as_str().unwrap())
+        .collect();
+    let want: Vec<String> = (1..=8)
+        .map(|n| format!("movie:tmdb:{}", 920_000 + n))
+        .collect();
+    assert_eq!(ids, want, "search order is kept: {v}");
+    assert!(took >= slow, "the slow keys were waited for: {took:?}");
+    assert!(took < slow * 2, "lookups ran group by group: {took:?}");
+}

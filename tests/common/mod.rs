@@ -107,6 +107,10 @@ pub struct MockState {
     /// Managed stack: TVmaze also lists Slow Horses season 2 (the legacy snapshot's numbering
     /// tests rely on season 1 only).
     pub slow_horses_s2: bool,
+    /// Plex details of these keys answer only after the delay.
+    pub plex_slow_keys: Vec<(String, Duration)>,
+    /// TVmaze `shows/{id}` answers only after this delay.
+    pub tvmaze_show_delay: Option<Duration>,
 }
 
 pub type Mock = Arc<Mutex<MockState>>;
@@ -274,6 +278,10 @@ async fn tvmaze_show_by_id(
     Query(q): Query<HashMap<String, String>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    let delay = m.lock().unwrap().tvmaze_show_delay;
+    if let Some(d) = delay {
+        tokio::time::sleep(d).await;
+    }
     match shows()
         .into_iter()
         .find(|s| s["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id.as_str()))
@@ -533,6 +541,20 @@ fn plex_fixtures() -> Vec<Value> {
             "Canada",
         ),
     ]
+    .into_iter()
+    // Eight more, found only by the query "crowd" (the slow-lookup tests).
+    .chain((1..=8).map(|n| {
+        movie(
+            &format!("crw000{n}"),
+            &format!("tt930000{n}"),
+            Some(920_000 + n),
+            &format!("Crowd Film {n}"),
+            None,
+            "2024-06-01",
+            "Canada",
+        )
+    }))
+    .collect()
 }
 
 /// Plex shows (matched by `type=2` and a `tvdb://` guid): Slow Horses (the library's) with every
@@ -765,6 +787,16 @@ async fn plex_details(
 ) -> Response {
     if !plex_meta_seen(&m, &headers, &uri) {
         return plex_denied(&m);
+    }
+    let slow = m
+        .lock()
+        .unwrap()
+        .plex_slow_keys
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, d)| *d);
+    if let Some(d) = slow {
+        tokio::time::sleep(d).await;
     }
     match plex_fixtures()
         .into_iter()
@@ -1148,6 +1180,8 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         tvmaze_images: HashMap::new(),
         plex_meta_fail: false,
         plex_meta_log: vec![],
+        plex_slow_keys: vec![],
+        tvmaze_show_delay: None,
         plex_extra_offers: vec![],
         slow_horses_s2: false,
     }));
