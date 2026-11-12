@@ -239,7 +239,9 @@ have none. The plain API does not return it. The movie and show pages also carry
 - **`GET /api/v1/feed`** is what the web app's home shows, in plain words: `needs_you`,
   `on_its_way`, `arrived` (imports of the last 24 hours, newest first, at most 20), `looking`
   and `coming_up`, and `sport` (followed sport events coming in the next 14 days, separate from
-  `coming_up`; see [Sport](#sport-schedules-and-follows)). Catalog and state only, no network
+  `coming_up`; see [Sport](#sport-schedules-and-follows)), and `sport_enabled` (whether sport is
+  turned on, as `movies_enabled` says for movies; the web app uses it to show or hide sport).
+  Catalog and state only, no network
   calls. Two things in it help a client explain itself:
   - each `needs_you` item has `problem` (a short sentence), plus `kind` (`download_failed`,
     `import_blocked` or `request_expired`) and `failure` (why a download failed, for example
@@ -416,8 +418,9 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
 - **`GET /api/v1/sport/leagues`** lists every league, each with `followed` (the whole league)
   and `followed_teams` (how many of its teams). Answers from the store.
 - **`GET /api/v1/sport/search?q=`** finds leagues by name, alias ("EPL"), sport or the start of a
-  word, and teams (name, short name or abbreviation) of the leagues Arr has read so far. Teams
-  are learnt when a league is opened or followed, so search does not ask the feed for anything:
+  word, and teams (name, short name or abbreviation) of the leagues whose team list Arr has read.
+  Team lists are read when a league is opened or followed, and in the background by the worker
+  for every league that has teams (below), so search does not ask the feed for anything:
   `{"q", "leagues": [league + followed], "teams": [{"league", "team": {"id", "name",
   "short_name", "abbreviation", "followed"}}]}`.
 - **`GET /api/v1/sport/league/{slug}`** is a league's page: `league` (with `followed`),
@@ -453,6 +456,8 @@ a successful read of the list corrects; `since` never changes. An event's own `h
 `name` and `short_name` are as of its last refresh. A request that waits for the schedule source
 (a league page, a follow) has one deadline, four fifths of `timeout_secs` and at most eight
 seconds, shared by everything it waits for; the work carries on in the background after it.
+
+Team lists in the background: after the followed leagues, and only when they all answered, each run of the worker task reads the team list of up to two leagues that have teams and no current list (never read first; a list younger than seven days, or one whose last read failed and is being waited out, is skipped, as is a league being read already). It uses the same client, gap and pause after a failure, and stops at the first failure, so a few runs fill the catalogue and a week later each list is read again. This is the one thing Arr asks ESPN for without anyone having opened or followed a league (see [`PRIVACY.md`](PRIVACY.md)).
 
 How the schedule is kept (worker task `sports`, listed in `/system/tasks`; in shadow mode there is no worker, so a followed league is read when its page is opened or it is followed): a followed league is
 read once it is six hours old, or every twenty minutes within two hours before a followed game

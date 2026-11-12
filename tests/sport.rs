@@ -93,6 +93,18 @@ async fn follow_quietly(e: &Exec, league: &'static str, now: OffsetDateTime) {
 }
 
 async fn refresh_run(e: &Exec, now: OffsetDateTime) -> Value {
+    // The followed leagues only; the team lists of the catalogue have their own tests below.
+    arr::sport::refresh::run_schedules(
+        e.state.store.clone(),
+        e.state.sports.clone().unwrap(),
+        now,
+        Duration::from_secs(45),
+    )
+    .await
+    .0
+}
+
+async fn full_run(e: &Exec, now: OffsetDateTime) -> Value {
     arr::sport::refresh::run(e.state.store.clone(), e.state.sports.clone().unwrap(), now).await
 }
 
@@ -1450,7 +1462,16 @@ async fn one_read_of_a_league_at_a_time_whoever_asks() {
         }
         assert_eq!((p1.0, p2.0), (200, 200));
         assert!(report.tasks.contains(&"sports".to_string()));
-        let log = e.mock.lock().unwrap().espn_log.clone();
+        // (The worker's pass also reads other leagues' team lists: not what is counted here.)
+        let log: Vec<String> = e
+            .mock
+            .lock()
+            .unwrap()
+            .espn_log
+            .iter()
+            .filter(|l| l.contains("eng.1"))
+            .cloned()
+            .collect();
         let distinct: std::collections::HashSet<&String> = log.iter().collect();
         assert_eq!(
             distinct.len(),
@@ -1502,7 +1523,7 @@ async fn a_team_list_that_is_not_json_is_not_asked_for_on_every_page() {
             .unwrap()
             .espn_log
             .iter()
-            .filter(|l| l.contains("/teams"))
+            .filter(|l| l.contains("eng.1/teams"))
             .count()
     };
     let (s, v) = follow(&e, json!({ "league": "premier-league" })).await;
@@ -2392,4 +2413,122 @@ async fn a_bad_name_in_a_later_list_does_not_replace_a_good_label() {
     refresh_run(&e, OffsetDateTime::now_utc() + time::Duration::hours(7)).await;
     let (_, f) = get(&e, "/api/v1/sport/following").await;
     assert_eq!(f["following"][0]["team"]["name"], "Manchester City", "{f}");
+}
+
+// ------------------------------------------------------------------ team lists in the background
+
+fn team_requests(e: &Exec) -> Vec<String> {
+    e.mock
+        .lock()
+        .unwrap()
+        .espn_log
+        .iter()
+        .filter(|l| l.contains("/teams"))
+        .cloned()
+        .collect()
+}
+
+async fn sports_task(e: &Exec) -> Value {
+    arr::worker::run_task(&e.state, "sports", OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_worker_reads_team_lists_so_search_finds_teams_nobody_opened() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (_, v) = get(&e, "/api/v1/sport/search?q=lakers").await;
+    assert_eq!(v["teams"], json!([]), "nothing read yet");
+    // A couple of leagues a tick, so it takes a few ticks to reach the NBA's list.
+    let mut found = false;
+    for tick in 0..24 {
+        let r = sports_task(&e).await;
+        assert!(
+            r["catalogue_teams"].as_array().unwrap().len() <= 2,
+            "tick {tick}: {r}"
+        );
+        let (_, v) = get(&e, "/api/v1/sport/search?q=lakers").await;
+        if v["teams"][0]["team"]["name"] == "Los Angeles Lakers" {
+            assert_eq!(v["teams"][0]["league"]["slug"], "nba");
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "{:?}", team_requests(&e));
+    // Only team lists were read: no schedule, since nobody follows anything.
+    assert!(scoreboard_requests(&e).is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_team_list_backs_off_and_blocks_neither_other_leagues_nor_followed_ones() {
+    let e = start_exec(ExecOptions::default()).await;
+    let now = OffsetDateTime::now_utc();
+    follow_quietly(&e, "nba", now).await;
+    e.mock.lock().unwrap().espn_fail = Some(500);
+    let r = full_run(&e, now).await;
+    // The followed league failed, so the team lists were not tried this run.
+    assert_eq!(r["leagues"][0]["status"], "failed", "{r}");
+    assert_eq!(r["catalogue_teams"], json!([]), "{r}");
+    e.mock.lock().unwrap().espn_fail = None;
+    // Once the wait is over the followed league is read, and so are team lists after it.
+    e.state
+        .store
+        .with(|c| {
+            c.execute("UPDATE sport_refresh SET next_try_utc = NULL", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let before = team_requests(&e).len();
+    let r = full_run(&e, now + time::Duration::hours(1)).await;
+    assert_eq!(r["leagues"][0]["status"], "ok", "{r}");
+    assert!(!r["catalogue_teams"].as_array().unwrap().is_empty(), "{r}");
+    assert!(team_requests(&e).len() > before);
+    // A failing team list stops the catalogue reads for this run and is waited out on its own
+    // timing, not asked for again at the next run.
+    e.mock.lock().unwrap().espn_fail = Some(500);
+    let later = now + time::Duration::hours(2);
+    let r = full_run(&e, later).await;
+    let tried = r["catalogue_teams"].as_array().unwrap();
+    assert_eq!(tried.len(), 1, "stops at the first failure: {r}");
+    assert_eq!(tried[0]["status"], "failed");
+    let failed = tried[0]["league"].as_str().unwrap().to_string();
+    let n = team_requests(&e).len();
+    let r = full_run(&e, later + time::Duration::minutes(1)).await;
+    let again = r["catalogue_teams"].as_array().unwrap();
+    assert!(again.iter().all(|x| x["league"] != failed.as_str()), "{r}");
+    assert!(team_requests(&e).len() > n, "another league was tried");
+}
+
+#[tokio::test]
+async fn a_fresh_team_list_is_not_read_again_by_the_worker() {
+    let e = start_exec(ExecOptions::default()).await;
+    for _ in 0..30 {
+        sports_task(&e).await;
+    }
+    let first = team_requests(&e);
+    assert!(
+        first.iter().any(|l| l.contains("basketball/nba/teams")),
+        "{first:?}"
+    );
+    for _ in 0..5 {
+        sports_task(&e).await;
+    }
+    assert_eq!(
+        team_requests(&e),
+        first,
+        "nothing is read again within a week"
+    );
+}
+
+#[tokio::test]
+async fn with_sport_off_the_worker_reads_nothing() {
+    let e = start_exec(ExecOptions {
+        sports: false,
+        ..Default::default()
+    })
+    .await;
+    let r = sports_task(&e).await;
+    assert_eq!(r["note"], "sport is turned off");
+    assert_eq!(espn_requests(&e.mock), 0);
 }

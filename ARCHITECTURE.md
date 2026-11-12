@@ -48,8 +48,10 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
   - **TVmaze/TMDB:** when enabled.
   - **Sport schedules:** ESPN's public scoreboard feed (`GET {base}/{sport}/{league}/scoreboard?dates=YYYYMM&limit=400`
     and `.../teams`), unauthenticated, with a plain `Arr` user agent, one request at a time.
-    On by default (nothing is asked until a league is opened or followed); `[sports] enabled = false`
-    turns it off.
+    On by default: schedules are asked for only when a league is opened or followed, but the worker
+    also reads the team list of every catalogue league that has teams (two a tick, after the
+    followed schedules, each again after a week) so that team search works with no follows;
+    `[sports] enabled = false` turns it all off.
   - **Plex:** a section or folder refresh (`?path=` from `movies_path`/`tv_path`); read-only
     `GET /library/sections`, paginated `/library/sections/{id}/all?includeGuids=1` and
     `/library/metadata/{key}/allLeaves` for discovery and the library bootstrap.
@@ -476,7 +478,11 @@ What exists (phase one: schedules and follows):
   served; a test keeps real recordings that carry them and proves none gets through;
 - a worker task and on-demand reads that keep followed leagues current within a strict request
   budget (see the Sport section of [`docs/API.md`](docs/API.md)), and the `/api/v1/sport/*`
-  routes, plus a `sport` field on `/feed` and `/calendar`.
+  routes, plus a `sport` field on `/feed` and `/calendar` and `sport_enabled` on `/feed`. After the
+  followed leagues, and only if they all answered, the worker's task reads the team lists of at most
+  two catalogue leagues per run (`read_catalogue_teams`: never read first, a list younger than seven
+  days or in its failure wait is skipped, one failure ends the run's list reads, a league being
+  read already is skipped).
 
 ### No results
 

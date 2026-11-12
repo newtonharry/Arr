@@ -340,19 +340,24 @@ function toastAdded(title, outcome, detail, undo) {
   if (outcome === 'in_plex') return showToast({ before: '', title, after: ' is already in Plex.' });
   showToast({ before: outcome === 'following' ? 'Following ' : 'Added ', title, after: detail ? ` (${detail})` : '' }, undo);
 }
-async function undoToast() {
-  const t = TOAST;
+// `e` is the click, if there was one. A keyboard user's focus follows the note that says what happened;
+// a tap leaves the focus alone, or the note would wait for a second tap before it ever went away.
+async function undoToast(e) {
+  const t = TOAST, byKey = !e || e.detail === 0;
   if (!t || !t.undo || t.busy) return;
   t.busy = true; bump();
   let m = null;
   try { m = await t.undo(); } catch { /* said below */ }
   showToast({ before: m ? (m.ok ? 'Undone. ' : '') + m.text : "Couldn't undo that just now. Try again in a moment.", title: '', after: '' });
-  after(() => $('#toast')?.focus({ preventScroll: true }));
+  if (byKey) after(() => $('#toast')?.focus({ preventScroll: true }));
+  else { held.focus = false; toastTimer(); }
 }
 // It waits while the pointer is over it or focus is in it.
 const inToast = (n) => !!(n && n.closest && n.closest('#toast'));
-document.addEventListener('mouseover', (e) => { held.hover = inToast(e.target); toastTimer(); });
-document.addEventListener('mouseout', (e) => { held.hover = inToast(e.relatedTarget); toastTimer(); });
+// Only a real pointer waits the note out: after a tap a phone leaves "hover" where the finger was, which would keep the note up for good.
+const canHover = () => matchMedia('(hover:hover)').matches;
+document.addEventListener('mouseover', (e) => { held.hover = canHover() && inToast(e.target); toastTimer(); });
+document.addEventListener('mouseout', (e) => { held.hover = canHover() && inToast(e.relatedTarget); toastTimer(); });
 document.addEventListener('focusin', (e) => { held.focus = inToast(e.target); toastTimer(); });
 document.addEventListener('focusout', (e) => { held.focus = inToast(e.relatedTarget); toastTimer(); });
 document.addEventListener('keydown', (e) => {
@@ -374,7 +379,7 @@ function Toast() {
   const t = TOAST;
   return h('div', { class: 'toast-region', 'aria-live': 'polite' }, t && h('div', { id: 'toast', class: 'toast', tabindex: '-1' },
     h('span', { class: 'toast-t' }, t.before, t.title ? h('b', null, t.title) : null, t.after),
-    t.undo && h('button', { type: 'button', class: 'toast-undo', 'data-s': t.busy ? 'busy' : null, 'aria-disabled': t.busy ? 'true' : 'false', 'aria-keyshortcuts': 'Z', onClick: undoToast }, t.busy ? 'Undoing…' : 'Undo',
+    t.undo && h('button', { type: 'button', class: 'toast-undo', 'data-s': t.busy ? 'busy' : null, 'aria-disabled': t.busy ? 'true' : 'false', 'aria-keyshortcuts': 'Z', onClick: (e) => undoToast(e) }, t.busy ? 'Undoing…' : 'Undo',
       h('svg', { class: 'ring', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, h('circle', { cx: 9, cy: 9, r: 7 })))));
 }
 // Undo takes the add back by removing the title from Arr (POST /remove): downloads that have not
@@ -669,6 +674,10 @@ const SF = { rows: null, state: 'loading', seq: 0 }; // what is followed, as the
 const lkey = (slug) => 'l:' + slug, tkey = (slug, id) => `t:${slug}:${id}`;
 const folOn = (key, server) => (FOL.has(key) ? FOL.get(key) : !!server);
 const sportOff = () => Date.now() < SPT.off;
+// The feed says whether sport is on (sport_enabled). A server too old to say is found out from a
+// 503 on the first sport request, and not asked again for five minutes.
+const sportKnown = () => !!S.feed && typeof S.feed.sport_enabled === 'boolean';
+const sportOn = () => (sportKnown() ? S.feed.sport_enabled : !sportOff());
 const nameOf = (d) => (d.league && d.league.name) || d.title || '';
 const leagueHref = (slug) => '#/league/' + slug;
 async function sportReq(path, { method = 'GET', body, signal } = {}) {
@@ -792,7 +801,7 @@ function EarlierRow({ e }) {
 // ----- search: leagues and teams that match, each a row you can follow in place
 const SPORT_ROWS = 6;
 async function findSport(q, signal) {
-  if (sportOff()) return null;
+  if (!sportOn()) return null;
   const cg = cacheGen;
   const r = await sportReq('/search?q=' + encodeURIComponent(q), { signal });
   if (!r || !r.ok || !r.data) return null;
@@ -855,6 +864,7 @@ const folKey = (f) => (f.team ? tkey(f.league.slug, f.team.id) : lkey(f.league.s
 const folSpec = (f) => ({ key: folKey(f), league: f.league.slug, ...(f.team ? { team_id: f.team.id } : {}), name: f.team ? f.team.name : f.league.name || f.league.slug });
 async function loadFollowing() {
   const my = ++SF.seq, ag = authGen, cg = cacheGen;
+  if (!sportOn()) { SF.state = 'off'; SF.rows = null; return bump(); }
   if (!SF.rows) { SF.state = 'loading'; bump(); }
   const r = await sportReq('/following');
   if (my !== SF.seq || ag !== authGen) return;
@@ -1264,10 +1274,11 @@ function Library({ t }) {
   }
   useEffect(() => {
     // Sport is asked about once, so the Sport choice only shows where it is switched on.
-    if (S.kind !== 'sport') { load(true); loadFollowing(); } // the Sport list loads itself
+    if (S.kind !== 'sport') { load(true); if (sportOn()) loadFollowing(); } // the Sport list loads itself
     return () => clearTimeout(m.ft);
   }, []);
-  useEffect(() => { if (S.kind === 'sport' && SF.state === 'off') { S.kind = 'movies'; setKind('movies'); load(true); } }, [SF.state]);
+  const sportShown = sportKnown() ? S.feed.sport_enabled : (SF.state === 'ok' || SF.state === 'err') && !sportOff();
+  useEffect(() => { if (S.kind === 'sport' && (SF.state === 'off' || (sportKnown() && !S.feed.sport_enabled))) { S.kind = 'movies'; setKind('movies'); load(true); } }, [SF.state, sportShown]);
   // Rows come in one after another when a list is first drawn (and when its kind, sort or filter changes).
   useLayoutEffect(() => { if (m.enter && st.items.length) { m.enter = false; stagger([...document.querySelectorAll('#view .list > li')]); } }, [st.items]);
   // The top line runs while the list on screen is the last answer.
@@ -1278,7 +1289,7 @@ function Library({ t }) {
   useEffect(() => () => { if (S.libUpd) { S.libUpd = false; bump(); } }, []);
   const mv = kind === 'movies', sp = kind === 'sport';
   const kinds = [['movies', 'Movies'], ['series', 'Shows']];
-  if (sp || ((SF.state === 'ok' || SF.state === 'err') && !sportOff())) kinds.push(['sport', 'Sport']);
+  if (sp || sportShown) kinds.push(['sport', 'Sport']);
   const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'What to show' },
     kinds.map(([k, l]) => h('button', { key: k, type: 'button', 'aria-pressed': String(kind === k), onClick: () => { S.kind = k; setKind(k); if (k !== 'sport') load(true); } }, l)));
   if (sp) return h(Section, { id: 'lib', title: 'Library' }, h('div', null, h('div', { class: 'bar' }, seg), h(SportFollowing)));

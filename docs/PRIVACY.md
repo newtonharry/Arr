@@ -4,7 +4,7 @@ Arr runs on your computer and talks to Plex, your torrent sources (by default Th
 API and Knaben's search) and, only if you add a key, TMDB.
 Movie searches and lookups go to Plex's metadata service with your Plex sign-in; TV searches go to
 TVmaze; a movie's details go to TMDB only if you've added a TMDB key; sport schedules come from
-ESPN's public feed once you open or follow a league. It doesn't send
+ESPN's public feed (team lists of every league, once Arr is running with sport on, and schedules once you open or follow a league). It doesn't send
 anything about you or your library to its developer, with one optional exception: error reports.
 
 ## Error reports are off unless you turn them on
@@ -40,9 +40,12 @@ two seconds between requests to the same source. To stop using Knaben, delete it
 ## What the sport schedule source sees
 
 Sport schedules (following a league or a team; see [`API.md`](API.md#sport-schedules-and-follows))
-come from ESPN's public scoreboard feed (`site.api.espn.com`). Arr asks it only after someone
-opens or follows a league, and then again to keep followed leagues current (every six hours,
-more often around a followed game). A request names a league and a month, or a league's team
+come from ESPN's public scoreboard feed (`site.api.espn.com`). Schedules are asked for only after
+someone opens or follows a league, and then again to keep followed leagues current (every six
+hours, more often around a followed game). **Team lists are different: with sport on, Arr contacts
+ESPN in the background for the team list of every league that has teams, a couple of leagues at a
+time, even if you follow nothing, so that searching for a team works out of the box. Each list is
+read again after a week.** A request names a league and a month, or a league's team
 list, and nothing else: no Plex data, library, token or account, and no search text. ESPN sees
 your IP address, as any website does, and the User-Agent `Arr`. Arr makes one request at a time
 with half a second between them and pauses after a failure. Arr never reads scores or results

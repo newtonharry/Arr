@@ -634,6 +634,8 @@ async fn the_app_has_its_sport_screens_and_promises_nothing_it_does_not_do() {
         "Nothing is scheduled right now. It may be the off season.",
         "Sport isn't switched on for this Arr.",
         "Search for a league above",
+        "S.feed.sport_enabled",
+        "canHover()",
     ] {
         assert!(js.contains(want), "app.js lacks {want}");
     }
@@ -694,6 +696,7 @@ async fn the_app_follows_a_league_and_reads_its_schedule_through_the_proxy() {
     );
     // Home's Coming up and the Library list.
     let (_, v) = get("/app/api/v1/feed").await;
+    assert_eq!(v["sport_enabled"], true, "{v}");
     assert!(!v["sport"].as_array().unwrap().is_empty(), "{v}");
     assert_eq!(v["sport"][0]["league"]["slug"], "premier-league");
     let (_, v) = get("/app/api/v1/sport/following").await;
@@ -755,6 +758,10 @@ async fn with_sport_off_the_app_gets_the_answer_it_hides_sport_on() {
         .json(site.app(Method::GET, "/app/api/v1/feed", c))
         .await;
     assert_eq!((s, v["sport"].clone()), (200, json!([])), "{v}");
+    assert_eq!(
+        v["sport_enabled"], false,
+        "the app hides sport from the first draw: {v}"
+    );
 }
 
 // ------------------------------------------------------------------ feed
