@@ -336,6 +336,12 @@ routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry a
 - **No spoilers.** Arr never reads, stores or shows scores, winners or result text. An event's
   name is the fixture ("Fulham at Manchester City", "UFC 334: Gane vs. Hokit"), and its state is
   one of `scheduled`, `postponed`, `cancelled` or `played`, with nothing about how it went.
+  `cancelled` is only ever what the schedule source says. An event that merely drops out of the
+  source's answers is kept internally as `unlisted` and appears in no answer (it comes back, in
+  place, if the source lists it again). `round` is kept only when the source's note is exactly a
+  round label ("Round 12", "Matchweek 9", "Group B", "Semi-final", ...); any other note is free
+  text that could name a winner, so it is dropped. Names and venues that read like a result are
+  dropped too.
 - **Ids.** A league is `league:<slug>` (`league:nba`; routes also accept the bare slug), a game,
   fight card or tournament is `event:<slug>:<number>` (`event:nba:401909999`). Slugs are
   `[a-z0-9-]{2,24}`; the number is the feed's own, digits without leading zeros. A team is the
@@ -382,7 +388,8 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
 ```
 
 `home` and `away` are `null` for golf and MMA; `ends_at` is set for events that run for days
-(a golf tournament); `round` and `venue` are `null` when the feed does not say.
+(a golf tournament); `round` and `venue` are `null` when the feed does not say (or, for
+`round`, says something that is not a round label).
 
 - **`GET /api/v1/sport/leagues`** lists every league, each with `followed` (the whole league)
   and `followed_teams` (how many of its teams). Answers from the store.
@@ -412,8 +419,9 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
 - **`GET /api/v1/sport/following`** lists the follows, each as in `follow` with `next_event`.
 - **`GET /api/v1/sport/events?from=&to=&league=`** lists events of what is followed that are not
   over by `from` and start before `to` (RFC 3339 or `YYYY-MM-DD`; default now to 14 days later;
-  at most 92 days), whatever their state, soonest first, at most 500. `league` limits it to one
-  league.
+  at most 92 days), whatever their state (never `unlisted`), soonest first, at most 500. `league`
+  limits it to one league. A `from` so late that its default end does not exist, or a time past
+  the year 9999 once its offset is applied, is `400 invalid_query`.
 
 How the schedule is kept (worker task `sports`, listed in `/system/tasks`; in shadow mode there is no worker, so a followed league is read when its page is opened or it is followed): a followed league is
 read once it is six hours old, or every twenty minutes within two hours before a followed game
@@ -425,11 +433,21 @@ at least `min_interval_ms` (default 500 ms) between them; answers are reused for
 (default 300). After a failure all requests pause for `backoff_secs` (default 60, doubling to 15
 minutes while failures continue) and the league is left alone for 15 minutes (doubling to six
 hours); a worker run stops after two leagues in a row fail, takes at most six leagues and does not
-start new ones after 45 seconds. An event that is stored as still to come, starts inside a window
-that was read in full, and is no longer in the feed becomes `cancelled`; it is never deleted, and
-an empty answer, a failed month or an answer cut off at the page limit cancels nothing. An event
-the feed moves to another date is updated in place. Only events not over by the start of
-yesterday (UTC) are stored, so there is no backlog.
+start new ones after 45 seconds. A league is read by one caller at a time, whoever asks (a page,
+a follow, the worker): the others wait and find it freshly read. An answer that is not a schedule
+(not JSON, or without a list of events) counts as a failure like any other, for a team list too
+(retried after 15 minutes, doubling to six hours).
+
+Absence never cancels. An event that is stored as still to come, starts inside a calendar month
+whose answer was complete, and is in none of the answers read is moved to `unlisted`, which no
+answer shows; if the source lists it again (the same id, possibly a new date) the same row
+becomes `scheduled` again. An answer is complete only if it was not cut at the page limit, was
+not empty and had no record that could not be read (the ids of such records count as seen).
+Each month is judged on its own, and nothing is judged when any month failed. The first and last
+day of a month are left out of its span unless the neighbouring month was read as well, because
+the feed's days are the American ones. A new event is stored only if it is not over by the start
+of yesterday (UTC), so there is no backlog; an event already stored is always updated, however
+long Arr was off.
 
 `/feed` has a `sport` list (followed events in the next 14 days that are `scheduled` or
 `postponed`, at most 20, soonest first) and `/calendar` has one for its window (every state but

@@ -22,13 +22,28 @@ use serde_json::{Value, json};
 /// The schedule source, shared by the API and the worker.
 pub struct Sports {
     pub espn: espn::Espn,
+    /// One turn per league: a league is read by one caller at a time (a page, a follow or
+    /// the worker), and the ones behind it find it freshly read.
+    turns: std::sync::Mutex<
+        std::collections::HashMap<&'static str, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
 }
 
 impl Sports {
     pub fn new(cfg: &SportsConfig) -> Self {
         Sports {
             espn: espn::Espn::new(cfg),
+            turns: Default::default(),
         }
+    }
+
+    pub(crate) fn league_lock(&self, slug: &'static str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(slug)
+            .or_default()
+            .clone()
     }
 }
 

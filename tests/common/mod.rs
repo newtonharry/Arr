@@ -123,6 +123,11 @@ pub struct MockState {
     pub espn_fail: Option<u16>,
     /// Every answer comes only after this delay.
     pub espn_delay: Option<Duration>,
+    /// Dates are moved to the present when served (the default); false serves them as given.
+    pub espn_shift: bool,
+    /// Answers for these parts (`scoreboard`, `teams`) are HTTP 200 with `espn_garbage_body`.
+    pub espn_garbage: Vec<String>,
+    pub espn_garbage_body: String,
 }
 
 pub type Mock = Arc<Mutex<MockState>>;
@@ -543,6 +548,54 @@ pub fn espn_remove(mock: &Mock, path: &str, id: &str) {
         .retain(|e| e["id"] != id);
 }
 
+/// Replaces the events the fake serves for a league and serves them exactly as given
+/// (no moving of dates), so a test can pin them to dates of its own.
+pub fn espn_use_absolute(mock: &Mock, path: &str, events: Vec<Value>) {
+    let mut m = mock.lock().unwrap();
+    m.espn_shift = false;
+    m.espn_events.insert(path.to_string(), events);
+}
+
+/// A copy of the first recorded event of a league with another id, date and name, still
+/// carrying the recorded score fields.
+pub fn espn_event_like(mock: &Mock, path: &str, id: &str, date: &str, name: &str) -> Value {
+    let m = mock.lock().unwrap();
+    let mut e = m.espn_events[path][0].clone();
+    e["id"] = json!(id);
+    e["date"] = json!(date);
+    e["name"] = json!(name);
+    e["status"]["type"] = json!({ "name": "STATUS_SCHEDULED", "state": "pre" });
+    e["competitions"][0]["status"]["type"] = json!({ "name": "STATUS_SCHEDULED", "state": "pre" });
+    e["competitions"][0]["date"] = json!(date);
+    e
+}
+
+/// Sets one field of a served event (`date`, `name`, ...).
+pub fn espn_set_field(mock: &Mock, path: &str, id: &str, field: &str, value: Value) {
+    let mut m = mock.lock().unwrap();
+    let e = m
+        .espn_events
+        .get_mut(path)
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["id"] == id)
+        .unwrap();
+    e[field] = value;
+}
+
+/// Gives an event's first competition a single note with this headline.
+pub fn espn_set_note(mock: &Mock, path: &str, id: &str, headline: &str) {
+    let mut m = mock.lock().unwrap();
+    let e = m
+        .espn_events
+        .get_mut(path)
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["id"] == id)
+        .unwrap();
+    e["competitions"][0]["notes"] = json!([{ "type": "event", "headline": headline }]);
+}
+
 /// How many requests the fake ESPN has received so far.
 pub fn espn_requests(mock: &Mock) -> usize {
     mock.lock().unwrap().espn_log.len()
@@ -554,13 +607,19 @@ async fn espn_scoreboard(
     uri: Uri,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (delay, fail) = {
+    let (delay, fail, garbage) = {
         let mut m = m.lock().unwrap();
         m.espn_log.push(format!(
             "{sport}/{league}/scoreboard{}",
             uri.query().map(|q| format!("?{q}")).unwrap_or_default()
         ));
-        (m.espn_delay, m.espn_fail)
+        (
+            m.espn_delay,
+            m.espn_fail,
+            m.espn_garbage
+                .contains(&"scoreboard".to_string())
+                .then(|| m.espn_garbage_body.clone()),
+        )
     };
     if let Some(d) = delay {
         tokio::time::sleep(d).await;
@@ -568,12 +627,19 @@ async fn espn_scoreboard(
     if let Some(code) = fail {
         return StatusCode::from_u16(code).unwrap().into_response();
     }
+    if let Some(body) = garbage {
+        return body.into_response();
+    }
     // Like the real feed, a range of days is refused for team sports.
     let dates = q.get("dates").cloned().unwrap_or_default();
     if dates.contains('-') {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let days = espn_days_from_recording();
+    let days = if m.lock().unwrap().espn_shift {
+        espn_days_from_recording()
+    } else {
+        0
+    };
     let mut events: Vec<Value> = m
         .lock()
         .unwrap()
@@ -598,7 +664,7 @@ async fn espn_teams(
     axum::extract::Path((sport, league)): axum::extract::Path<(String, String)>,
     uri: Uri,
 ) -> Response {
-    let (delay, fail, doc) = {
+    let (delay, fail, doc, garbage) = {
         let mut m = m.lock().unwrap();
         m.espn_log.push(format!(
             "{sport}/{league}/teams{}",
@@ -608,6 +674,9 @@ async fn espn_teams(
             m.espn_delay,
             m.espn_fail,
             m.espn_teams.get(&format!("{sport}/{league}")).cloned(),
+            m.espn_garbage
+                .contains(&"teams".to_string())
+                .then(|| m.espn_garbage_body.clone()),
         )
     };
     if let Some(d) = delay {
@@ -615,6 +684,9 @@ async fn espn_teams(
     }
     if let Some(code) = fail {
         return StatusCode::from_u16(code).unwrap().into_response();
+    }
+    if let Some(body) = garbage {
+        return body.into_response();
     }
     axum::Json(doc.unwrap_or(json!({ "sports": [{ "leagues": [{ "teams": [] }] }] })))
         .into_response()
@@ -1412,6 +1484,9 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         espn_log: vec![],
         espn_fail: None,
         espn_delay: None,
+        espn_shift: true,
+        espn_garbage: vec![],
+        espn_garbage_body: "this is not json".into(),
     }));
     let app = Router::new()
         .route("/prowlarr/api/v1/search", get(prowlarr_search))

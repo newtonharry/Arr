@@ -38,7 +38,7 @@ pub fn create_tables(c: &Connection) -> Result<()> {
             away_name TEXT,
             round TEXT,
             venue TEXT,
-            state TEXT NOT NULL CHECK (state IN ('scheduled', 'postponed', 'cancelled', 'played')),
+            state TEXT NOT NULL CHECK (state IN ('scheduled', 'postponed', 'cancelled', 'played', 'unlisted')),
             first_seen_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL
         );
@@ -56,6 +56,8 @@ pub fn create_tables(c: &Connection) -> Result<()> {
             league TEXT PRIMARY KEY,
             refreshed_utc TEXT,
             teams_utc TEXT,
+            teams_failures INTEGER NOT NULL DEFAULT 0,
+            teams_next_try_utc TEXT,
             failures INTEGER NOT NULL DEFAULT 0,
             next_try_utc TEXT,
             last_error TEXT
@@ -137,11 +139,14 @@ pub struct Upserted {
 }
 
 /// Stores fixtures. A fixture that is already stored exactly as it is read changes nothing
-/// (not even `updated_utc`), so reading the same schedule twice is a no-op.
+/// (not even `updated_utc`), so reading the same schedule twice is a no-op. A known event is
+/// always updated (it may have been played while Arr was off, or come back from `unlisted`);
+/// a new one is stored only if it is not over by `keep_from`, so there is no backlog.
 pub fn upsert_events(
     c: &mut Connection,
     league: &str,
     fixtures: &[&Fixture],
+    keep_from: OffsetDateTime,
     now: OffsetDateTime,
 ) -> Result<Upserted> {
     let tx = c.transaction()?;
@@ -157,6 +162,7 @@ pub fn upsert_events(
             )
             .optional()?;
         match old {
+            None if f.ends_at.unwrap_or(f.starts_at) < keep_from => continue,
             None => {
                 tx.execute(
                     "INSERT INTO sport_events (id, league, season, starts_at_utc, ends_at_utc, name, short_name, home_id, home_name, away_id, away_name, round, venue, state, first_seen_utc, updated_utc)
@@ -194,34 +200,38 @@ pub fn upsert_events(
     Ok(out)
 }
 
-/// Marks events that were stored as still to come, start inside the window that was just read
-/// in full, and are no longer in the schedule as cancelled. Nothing is deleted.
-pub fn mark_vanished(
+/// Moves events that are stored as still to come, start inside one of `ranges` (spans of
+/// calendar months that came back complete) and are in none of the answers read to the
+/// `unlisted` state. Absence never cancels: `cancelled` is only ever what the schedule source
+/// says. An unlisted event is left out of every answer and comes back, in place, when the
+/// source lists it again. Nothing is deleted.
+pub fn mark_unlisted(
     c: &mut Connection,
     league: &str,
-    from: OffsetDateTime,
-    to: OffsetDateTime,
+    ranges: &[(OffsetDateTime, OffsetDateTime)],
     seen: &HashSet<String>,
     now: OffsetDateTime,
 ) -> Result<usize> {
     let tx = c.transaction()?;
-    let ids: Vec<String> = {
-        let mut stmt = tx.prepare(
-            "SELECT id FROM sport_events WHERE league = ?1 AND state IN ('scheduled', 'postponed') AND starts_at_utc >= ?2 AND starts_at_utc <= ?3",
-        )?;
-        stmt.query_map(params![league, ts(from), ts(to)], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
-    };
     let prefix = event_id(league, "");
     let mut n = 0;
-    for id in ids {
-        let espn_id = id.strip_prefix(&prefix).unwrap_or(&id);
-        if !seen.contains(espn_id) {
-            tx.execute(
-                "UPDATE sport_events SET state = 'cancelled', updated_utc = ?2 WHERE id = ?1",
-                params![id, ts(now)],
+    for (from, to) in ranges {
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM sport_events WHERE league = ?1 AND state IN ('scheduled', 'postponed') AND starts_at_utc >= ?2 AND starts_at_utc < ?3",
             )?;
-            n += 1;
+            stmt.query_map(params![league, ts(*from), ts(*to)], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for id in ids {
+            let espn_id = id.strip_prefix(&prefix).unwrap_or(&id);
+            if !seen.contains(espn_id) {
+                tx.execute(
+                    "UPDATE sport_events SET state = 'unlisted', updated_utc = ?2 WHERE id = ?1",
+                    params![id, ts(now)],
+                )?;
+                n += 1;
+            }
         }
     }
     tx.commit()?;
@@ -372,6 +382,7 @@ pub fn followed_events(
     states: Option<&[&str]>,
     limit: usize,
 ) -> Result<Vec<EventRow>> {
+    // Unlisted events are never served, whatever the caller asks for.
     let states_sql = states
         .map(|s| {
             let list = s
@@ -381,7 +392,7 @@ pub fn followed_events(
                 .join(", ");
             format!("AND e.state IN ({list})")
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| "AND e.state != 'unlisted'".to_string());
     let mut stmt = c.prepare(&format!(
         "SELECT {EVENT_COLUMNS} FROM sport_events e
          WHERE COALESCE(e.ends_at_utc, e.starts_at_utc) >= ?1 AND e.starts_at_utc < ?2
@@ -457,6 +468,8 @@ pub fn league_events(
 pub struct RefreshRow {
     pub refreshed: Option<OffsetDateTime>,
     pub teams: Option<OffsetDateTime>,
+    pub teams_failures: u32,
+    pub teams_next_try: Option<OffsetDateTime>,
     pub failures: u32,
     pub next_try: Option<OffsetDateTime>,
     pub last_error: Option<String>,
@@ -468,7 +481,7 @@ fn parse(s: Option<String>) -> Option<OffsetDateTime> {
 
 pub fn refresh_state(c: &Connection, league: &str) -> Result<RefreshRow> {
     Ok(c.query_row(
-        "SELECT refreshed_utc, teams_utc, failures, next_try_utc, last_error FROM sport_refresh WHERE league = ?1",
+        "SELECT refreshed_utc, teams_utc, failures, next_try_utc, last_error, teams_failures, teams_next_try_utc FROM sport_refresh WHERE league = ?1",
         [league],
         |r| {
             Ok(RefreshRow {
@@ -477,6 +490,8 @@ pub fn refresh_state(c: &Connection, league: &str) -> Result<RefreshRow> {
                 failures: r.get::<_, i64>(2)?.max(0) as u32,
                 next_try: parse(r.get(3)?),
                 last_error: r.get(4)?,
+                teams_failures: r.get::<_, i64>(5)?.max(0) as u32,
+                teams_next_try: parse(r.get(6)?),
             })
         },
     )
@@ -510,8 +525,18 @@ pub fn note_failed(
 pub fn note_teams(c: &Connection, league: &str, now: OffsetDateTime) -> Result<()> {
     c.execute(
         "INSERT INTO sport_refresh (league, teams_utc) VALUES (?1, ?2)
-         ON CONFLICT (league) DO UPDATE SET teams_utc = ?2",
+         ON CONFLICT (league) DO UPDATE SET teams_utc = ?2, teams_failures = 0, teams_next_try_utc = NULL",
         params![league, ts(now)],
+    )?;
+    Ok(())
+}
+
+/// The team list could not be read: not asked for again before `next_try`.
+pub fn note_teams_failed(c: &Connection, league: &str, next_try: OffsetDateTime) -> Result<()> {
+    c.execute(
+        "INSERT INTO sport_refresh (league, teams_failures, teams_next_try_utc) VALUES (?1, 1, ?2)
+         ON CONFLICT (league) DO UPDATE SET teams_failures = teams_failures + 1, teams_next_try_utc = ?2",
+        params![league, ts(next_try)],
     )?;
     Ok(())
 }

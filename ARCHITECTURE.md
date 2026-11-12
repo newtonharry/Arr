@@ -469,7 +469,9 @@ What exists (phase one: schedules and follows):
 - following a league, or a team of a league that has teams, from now on; follows and events
   survive restarts and are available in shadow mode (the immediate read on follow works
   without the worker);
-- events with a fixed state vocabulary (`scheduled`, `postponed`, `cancelled`, `played`). The
+- events with a fixed state vocabulary (`scheduled`, `postponed`, `cancelled`, `played`; plus
+  an internal `unlisted` for an event that dropped out of a complete answer, never served:
+  absence never cancels, only the source can). The
   schedule parser has no field for scores, winners or result text, so none can be stored or
   served; a test keeps real recordings that carry them and proves none gets through;
 - a worker task and on-demand reads that keep followed leagues current within a strict request

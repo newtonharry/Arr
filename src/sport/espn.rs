@@ -81,14 +81,26 @@ pub struct Month {
     pub fixtures: Vec<Fixture>,
     /// The answer reached the page limit, so it may be missing events.
     pub truncated: bool,
+    /// Records that could not be read as fixtures (a broken date, say). Their ids, when they
+    /// had a usable one, count as seen: an event whose record is broken is not an absent one.
+    pub rejected: usize,
+    pub rejected_ids: Vec<String>,
+}
+
+impl Month {
+    /// Whether this answer may be taken to list everything the league has in its month: it
+    /// was not cut at the page limit, it was not empty, and every record could be read.
+    pub fn complete(&self) -> bool {
+        !self.truncated && self.rejected == 0 && !self.fixtures.is_empty()
+    }
 }
 
 // ---- the parts of the feed that are read. No field here may hold a score or a result. ----
 
 #[derive(Deserialize)]
 struct RawBoard {
-    #[serde(default)]
-    events: Vec<RawEvent>,
+    /// Required: an answer without a list of events is not a schedule.
+    events: Option<Vec<RawEvent>>,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +215,21 @@ fn clean(text: Option<&str>, max: usize) -> Option<String> {
     }
 }
 
+/// Text of a fixture (a name, a venue) from the feed. Those are plain names in every recording,
+/// but they are free text, so anything that reads like a result ("3-1", "wins", "beat") is
+/// refused rather than trusted.
+fn fixture_text(text: Option<&str>, max: usize) -> Option<String> {
+    static RESULT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let t = clean(text, max)?;
+    let result = RESULT.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b\d{1,3}\s*[-\u{2013}:]\s*\d{1,3}\b|\b(wins?|won|beats?|defeat(s|ed)?|def\.|tko|ko)\b",
+        )
+        .expect("static pattern")
+    });
+    (!result.is_match(&t)).then_some(t)
+}
+
 /// An id as the feed writes it, a string or a number, kept only when it is a plain number
 /// without leading zeros (so it is safe inside an Arr id).
 fn plain_id(v: Option<&Value>) -> Option<String> {
@@ -284,18 +311,20 @@ fn fixture(e: RawEvent) -> Option<Fixture> {
     } else {
         (None, None)
     };
-    let name = clean(e.name.as_deref(), 200).or_else(|| {
+    let name = fixture_text(e.name.as_deref(), 200).or_else(|| {
         let (h, a) = (home.as_ref()?, away.as_ref()?);
         Some(format!("{} vs {}", h.name, a.name))
     })?;
     let venue = comp
         .and_then(|c| c.venue.as_ref())
         .or(e.venues.first())
-        .and_then(|v| clean(v.full_name.as_deref(), 120));
+        .and_then(|v| fixture_text(v.full_name.as_deref(), 120));
+    // Notes are free text and can say how a game went, so they are never copied: only a
+    // headline that is exactly a round label is kept.
     let round = comp.and_then(|c| {
         c.notes
             .iter()
-            .find_map(|n| clean(n.headline.as_deref(), 100))
+            .find_map(|n| round_label(n.headline.as_deref()?))
     });
     Some(Fixture {
         id,
@@ -307,13 +336,53 @@ fn fixture(e: RawEvent) -> Option<Fixture> {
             .filter(|end| *end > starts_at),
         season: e.season.and_then(|s| plain_id_or_text(s.year.as_ref())),
         name,
-        short_name: clean(e.short_name.as_deref(), 60),
+        short_name: fixture_text(e.short_name.as_deref(), 60),
         home,
         away,
         round,
         venue,
         state,
     })
+}
+
+/// A round name from a strict list: "Round 12", "Matchweek 9", "Group B", "Semi-final", ...
+/// Anything else (a headline that might name a winner or a score) gives nothing.
+pub fn round_label(text: &str) -> Option<String> {
+    static NUMBERED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static NAMED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let numbered = NUMBERED.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^(round|matchweek|match week|matchday|match day|gameweek|game week|week|game|leg|round of)\s+(\d{1,3})$",
+        )
+        .expect("static pattern")
+    });
+    let named = NAMED.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^(group\s+[a-z0-9]|grand[ -]final|quarter[ -]?finals?|semi[ -]?finals?|finals?|play[ -]?offs?|play[ -]?in|preliminary final|qualifying final|elimination final)$",
+        )
+        .expect("static pattern")
+    });
+    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let upper_first = |s: &str| {
+        let mut c = s.chars();
+        c.next()
+            .map(|f| f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase())
+            .unwrap_or_default()
+    };
+    if let Some(c) = numbered.captures(&t) {
+        return Some(format!("{} {}", upper_first(&c[1]), &c[2]));
+    }
+    if named.is_match(&t) {
+        if let Some(g) = t.get(..5).filter(|g| g.eq_ignore_ascii_case("group")) {
+            return Some(format!(
+                "{} {}",
+                upper_first(g),
+                t[5..].trim().to_uppercase()
+            ));
+        }
+        return Some(upper_first(&t));
+    }
+    None
 }
 
 fn plain_id_or_text(v: Option<&Value>) -> Option<String> {
@@ -334,17 +403,31 @@ pub fn parse_month(body: &[u8]) -> Result<Month, UpstreamError> {
             e.column()
         ),
     })?;
-    let truncated = board.events.len() >= PAGE_LIMIT;
+    let events = board.events.ok_or_else(|| UpstreamError::BadResponse {
+        reason: "no list of events in the answer".into(),
+    })?;
+    let truncated = events.len() >= PAGE_LIMIT;
     let mut seen = std::collections::HashSet::new();
-    let fixtures = board
-        .events
-        .into_iter()
-        .filter_map(fixture)
-        .filter(|f| seen.insert(f.id.clone()))
-        .collect();
+    let (mut fixtures, mut rejected, mut rejected_ids) = (vec![], 0, vec![]);
+    for e in events {
+        let id = plain_id(e.id.as_ref());
+        match fixture(e) {
+            Some(f) => {
+                if seen.insert(f.id.clone()) {
+                    fixtures.push(f);
+                }
+            }
+            None => {
+                rejected += 1;
+                rejected_ids.extend(id);
+            }
+        }
+    }
     Ok(Month {
         fixtures,
         truncated,
+        rejected,
+        rejected_ids,
     })
 }
 
@@ -358,7 +441,7 @@ pub fn parse_teams(body: &[u8]) -> Result<Vec<TeamInfo>, UpstreamError> {
         ),
     })?;
     let mut seen = std::collections::HashSet::new();
-    Ok(raw
+    let teams: Vec<TeamInfo> = raw
         .sports
         .into_iter()
         .flat_map(|s| s.leagues)
@@ -375,7 +458,13 @@ pub fn parse_teams(body: &[u8]) -> Result<Vec<TeamInfo>, UpstreamError> {
         })
         .filter(|t| seen.insert(t.id.clone()))
         .take(MAX_TEAMS)
-        .collect())
+        .collect();
+    if teams.is_empty() {
+        return Err(UpstreamError::BadResponse {
+            reason: "no teams in the answer".into(),
+        });
+    }
+    Ok(teams)
 }
 
 struct Gate {
@@ -435,17 +524,21 @@ impl Espn {
         Ok(url)
     }
 
-    /// One request under the gate. `Err(Throttled)` without any request while a pause after
-    /// a failure is running.
-    async fn fetch(
+    /// One request under the gate. `recheck` finds what whoever was ahead of us published;
+    /// `parse` turns the body into the answer and `publish` stores it, both while the gate is
+    /// still held, so the request counts as a success only if the answer is usable and a
+    /// caller behind us always finds it. `Err(Throttled)` without any request while a pause
+    /// after a failure is running.
+    async fn fetch<T>(
         &self,
         url: Url,
-        recheck: impl Fn() -> bool,
-    ) -> Result<Option<Vec<u8>>, UpstreamError> {
+        recheck: impl Fn() -> Option<T>,
+        parse: impl FnOnce(&[u8]) -> Result<T, UpstreamError>,
+        publish: impl FnOnce(&T),
+    ) -> Result<T, UpstreamError> {
         let mut gate = self.gate.lock().await;
-        // Whoever was ahead of us may have fetched exactly this.
-        if recheck() {
-            return Ok(None);
+        if let Some(found) = recheck() {
+            return Ok(found);
         }
         if let Some(until) = gate.blocked_until
             && until > Instant::now()
@@ -461,23 +554,25 @@ impl Espn {
                 tokio::time::sleep(wait).await;
             }
         }
-        let result: Result<Vec<u8>, (UpstreamError, Option<Duration>)> = async {
+        let result: Result<T, (UpstreamError, Option<Duration>)> = async {
             let resp = upstream::send(self.http.get(url).header("Accept", "application/json"))
                 .await
                 .map_err(|e| (e, None))?;
             let retry =
                 upstream::retry_after(resp.headers()).filter(|_| resp.status().as_u16() == 429);
-            upstream::read_bytes(resp, MAX_BYTES)
+            let body = upstream::read_bytes(resp, MAX_BYTES)
                 .await
-                .map_err(|e| (e, retry))
+                .map_err(|e| (e, retry))?;
+            parse(&body).map_err(|e| (e, None))
         }
         .await;
         gate.last = Some(Instant::now());
         match result {
-            Ok(body) => {
+            Ok(answer) => {
+                publish(&answer);
                 gate.failures = 0;
                 gate.blocked_until = None;
-                Ok(Some(body))
+                Ok(answer)
             }
             Err((e, retry)) => {
                 gate.failures = gate.failures.saturating_add(1);
@@ -507,17 +602,13 @@ impl Espn {
         let dates = format!("{year}{month:02}");
         let limit = PAGE_LIMIT.to_string();
         let url = self.url(path, "scoreboard", &[("dates", &dates), ("limit", &limit)])?;
-        let body = self.fetch(url, || self.months.get(&key).is_some()).await?;
-        match body {
-            None => self.months.get(&key).ok_or(UpstreamError::Unavailable {
-                reason: "answer expired".into(),
-            }),
-            Some(b) => {
-                let parsed = Arc::new(parse_month(&b)?);
-                self.months.insert(key, parsed.clone());
-                Ok(parsed)
-            }
-        }
+        self.fetch(
+            url,
+            || self.months.get(&key),
+            |b| parse_month(b).map(Arc::new),
+            |m| self.months.insert(key.clone(), m.clone()),
+        )
+        .await
     }
 
     /// The teams of a league.
@@ -527,17 +618,13 @@ impl Espn {
             return Ok(hit);
         }
         let url = self.url(path, "teams", &[("limit", "400")])?;
-        let body = self.fetch(url, || self.teams.get(&key).is_some()).await?;
-        match body {
-            None => self.teams.get(&key).ok_or(UpstreamError::Unavailable {
-                reason: "answer expired".into(),
-            }),
-            Some(b) => {
-                let parsed = Arc::new(parse_teams(&b)?);
-                self.teams.insert(key, parsed.clone());
-                Ok(parsed)
-            }
-        }
+        self.fetch(
+            url,
+            || self.teams.get(&key),
+            |b| parse_teams(b).map(Arc::new),
+            |t| self.teams.insert(key.clone(), t.clone()),
+        )
+        .await
     }
 }
 

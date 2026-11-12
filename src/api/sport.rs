@@ -55,6 +55,9 @@ fn team_id_of(raw: &str) -> Result<&str, ApiError> {
 fn date_or_time(raw: &str, what: &str) -> Result<OffsetDateTime, ApiError> {
     OffsetDateTime::parse(raw, &Rfc3339)
         .ok()
+        // An offset can push a time past the last year that exists: that is a bad time, not
+        // a panic.
+        .and_then(|t| t.checked_to_offset(time::UtcOffset::UTC))
         .or_else(|| {
             let f = time::macros::format_description!("[year]-[month]-[day]");
             time::Date::parse(raw, &f)
@@ -206,7 +209,7 @@ pub(super) async fn league(State(st): St, p: Result<Path<String>, PathRejection>
         .clone()
         .filter(|_| state.failures > 0)
         .or(match &fresh {
-            refresh::Freshness::Failed(why) => Some(why.clone()),
+            refresh::Freshness::Failed(why) | refresh::Freshness::Backoff(why) => Some(why.clone()),
             _ => None,
         });
     ok(json!({
@@ -404,11 +407,15 @@ pub(super) async fn events(State(st): St, ApiQuery(q): ApiQuery<EventsQuery>) ->
         .map(|s| date_or_time(s, "from"))
         .transpose()?
         .unwrap_or(now);
-    let to =
-        q.to.as_deref()
-            .map(|s| date_or_time(s, "to"))
-            .transpose()?
-            .unwrap_or(from + time::Duration::days(14));
+    let to = match q.to.as_deref() {
+        Some(s) => date_or_time(s, "to")?,
+        None => from.checked_add(time::Duration::days(14)).ok_or_else(|| {
+            ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                "from is too late to have a default end; give to as well",
+            )
+        })?,
+    };
     if to <= from || to - from > time::Duration::days(92) {
         return Err(ApiError::bad_request(
             ErrorCode::InvalidQuery,

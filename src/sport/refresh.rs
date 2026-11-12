@@ -12,7 +12,7 @@
 use super::Sports;
 use super::catalog::{self, League};
 use super::data::{self, Upserted};
-use super::espn::{Fixture, TeamInfo};
+use super::espn::Fixture;
 use crate::store::Store;
 use crate::upstream::UpstreamError;
 use serde_json::{Value, json};
@@ -69,7 +69,8 @@ pub struct Stats {
     pub fixtures: usize,
     pub added: usize,
     pub changed: usize,
-    pub cancelled: usize,
+    /// Events that are no longer listed (see `data::mark_unlisted`). Never cancelled.
+    pub unlisted: usize,
 }
 
 fn start_of_day(t: OffsetDateTime) -> OffsetDateTime {
@@ -97,9 +98,31 @@ fn months(from: OffsetDateTime, to: OffsetDateTime) -> Vec<(i32, u8)> {
     out
 }
 
+/// The span of a month in which an absent event may be called unlisted. The feed's days are
+/// the American ones, so an event on the month's first or last day may be listed under the
+/// neighbouring month: that day is left out of the span unless the neighbour was read too
+/// (`inner_start`, `inner_end`), in which case the event would have shown up there.
+fn month_span(
+    y: i32,
+    m: u8,
+    inner_start: bool,
+    inner_end: bool,
+) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    let first = Date::from_calendar_date(y, time::Month::try_from(m).ok()?, 1).ok()?;
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    let next = Date::from_calendar_date(ny, time::Month::try_from(nm).ok()?, 1).ok()?;
+    let day = time::Duration::days(1);
+    let (start, end) = (first.midnight().assume_utc(), next.midnight().assume_utc());
+    Some((
+        if inner_start { start } else { start + day },
+        if inner_end { end } else { end - day },
+    ))
+}
+
 /// Reads one league's schedule and stores it. A failure is recorded against the league (so it
-/// is left alone for a while) and returned; stored events are left as they were.
-pub async fn refresh_league(
+/// is left alone for a while) and returned; stored events are left as they were. Callers go
+/// through `refresh_when`, which makes sure only one read of a league runs at a time.
+async fn refresh_league(
     store: &Store,
     sports: &Sports,
     league: &'static League,
@@ -150,13 +173,23 @@ async fn read_league(
     let from = start_of_day(now - BACK);
     let to = now + AHEAD;
     let mut fetched: Vec<Fixture> = vec![];
-    let mut complete = true;
+    // Everything the answers mention, including records that could not be read: an event
+    // whose record is broken is not an absent one.
+    let mut seen: HashSet<String> = HashSet::new();
+    // Months whose answer can be trusted to list everything: each is judged on its own.
+    let mut complete_months: Vec<(i32, u8)> = vec![];
+    let mut read_months: Vec<(i32, u8)> = vec![];
     let mut failed = None;
     for (y, m) in months(from, to) {
         match sports.espn.month(league.espn, y, m).await {
             Ok(month) => {
-                complete &= !month.truncated;
+                seen.extend(month.fixtures.iter().map(|f| f.id.clone()));
+                seen.extend(month.rejected_ids.iter().cloned());
                 fetched.extend(month.fixtures.iter().cloned());
+                read_months.push((y, m));
+                if month.complete() {
+                    complete_months.push((y, m));
+                }
             }
             Err(e) => {
                 failed = Some(e);
@@ -164,32 +197,40 @@ async fn read_league(
             }
         }
     }
-    let seen: HashSet<String> = fetched.iter().map(|f| f.id.clone()).collect();
-    // Only what is not over by the start of the window is kept: no backlog of old games.
-    let keep: Vec<Fixture> = fetched
-        .iter()
-        .filter(|f| f.ends_at.unwrap_or(f.starts_at) >= from)
-        .cloned()
-        .collect();
-    // A schedule is only trusted to say what is gone when every month answered, none was cut
-    // short, and it was not empty (an empty answer is more likely a glitch than a league that
-    // cancelled everything).
-    let trusted = failed.is_none() && complete && !fetched.is_empty();
+    // Absence is only ever read from a full set of answers.
+    let complete: Vec<(OffsetDateTime, OffsetDateTime)> = if failed.is_some() {
+        vec![]
+    } else {
+        complete_months
+            .iter()
+            .filter_map(|&(y, m)| {
+                let before = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
+                let after = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+                month_span(
+                    y,
+                    m,
+                    read_months.contains(&before),
+                    read_months.contains(&after),
+                )
+            })
+            .collect()
+    };
     let slug = league.slug;
+    let total = fetched.len();
     let stats = store
         .with(move |c| {
-            let refs: Vec<&Fixture> = keep.iter().collect();
-            let Upserted { added, changed } = data::upsert_events(c, slug, &refs, now)?;
-            let cancelled = if trusted {
-                data::mark_vanished(c, slug, from, to, &seen, now)?
-            } else {
+            let refs: Vec<&Fixture> = fetched.iter().collect();
+            let Upserted { added, changed } = data::upsert_events(c, slug, &refs, from, now)?;
+            let unlisted = if complete.is_empty() {
                 0
+            } else {
+                data::mark_unlisted(c, slug, &complete, &seen, now)?
             };
             Ok(Stats {
-                fixtures: refs.len(),
+                fixtures: total,
                 added,
                 changed,
-                cancelled,
+                unlisted,
             })
         })
         .await?;
@@ -200,6 +241,7 @@ async fn read_league(
 }
 
 /// Reads the league's team list unless it was read within the week (or never produced a team).
+/// A failure is remembered, with a time before which it is not tried again.
 pub async fn ensure_teams(
     store: &Store,
     sports: &Sports,
@@ -224,30 +266,106 @@ pub async fn ensure_teams(
     if fresh && known > 0 {
         return Ok(());
     }
-    // A failure to read it is not retried for a while either.
-    if state.next_try.is_some_and(|t| t > now) {
+    if state.teams_next_try.is_some_and(|t| t > now) {
         return Ok(());
     }
-    let teams: std::sync::Arc<Vec<TeamInfo>> = sports.espn.teams(league.espn).await?;
-    store
-        .with(move |c| {
-            data::upsert_teams(c, slug, &teams)?;
-            data::note_teams(c, slug, now)
-        })
-        .await?;
-    Ok(())
+    match sports.espn.teams(league.espn).await {
+        Ok(teams) => {
+            store
+                .with(move |c| {
+                    data::upsert_teams(c, slug, &teams)?;
+                    data::note_teams(c, slug, now)
+                })
+                .await?;
+            Ok(())
+        }
+        Err(e) => {
+            let failures = state.teams_failures;
+            store
+                .with(move |c| data::note_teams_failed(c, slug, now + backoff(failures)))
+                .await?;
+            Err(e.into())
+        }
+    }
 }
 
-/// What `ensure_fresh_within` found or did.
+/// What `refresh_when` found or did.
 #[derive(Debug)]
 pub enum Freshness {
     /// Read recently enough; nothing was asked of the source.
     Fresh,
     Refreshed(Stats),
-    /// The source failed (or a failure earlier is still being waited out); stored data stands.
+    /// The source failed just now; stored data stands.
     Failed(String),
+    /// An earlier failure is still being waited out; nothing was asked.
+    Backoff(String),
     /// Still being read when the caller stopped waiting; it carries on in the background.
     Pending,
+}
+
+/// When a league needs reading.
+#[derive(Clone, Copy)]
+enum Need {
+    /// Not read within this long.
+    Older(Duration),
+    /// The worker's rule: six hours, or twenty minutes near a followed game.
+    Due,
+}
+
+fn is_near(c: &rusqlite::Connection, slug: &str, now: OffsetDateTime) -> anyhow::Result<bool> {
+    Ok(!data::followed_events(
+        c,
+        now - NEAR_BEFORE,
+        now + NEAR_AFTER,
+        Some(slug),
+        Some(&["scheduled"]),
+        1,
+    )?
+    .is_empty())
+}
+
+/// Reads a league if it needs it. There is one read of a league at a time, whoever asks (a
+/// page, a follow, the worker): the others wait their turn, find the league freshly read and
+/// ask the source for nothing.
+async fn refresh_when(
+    store: &Store,
+    sports: &Sports,
+    league: &'static League,
+    now: OffsetDateTime,
+    need: Need,
+) -> Freshness {
+    let lock = sports.league_lock(league.slug);
+    let _turn = lock.lock().await;
+    let slug = league.slug;
+    let looked = store
+        .with(move |c| Ok((data::refresh_state(c, slug)?, is_near(c, slug, now)?)))
+        .await;
+    let (state, near) = match looked {
+        Ok(x) => x,
+        Err(e) => return Freshness::Failed(format!("{e:#}")),
+    };
+    if let Some(t) = state.next_try.filter(|t| *t > now) {
+        return Freshness::Backoff(format!(
+            "the schedule source failed earlier; trying again after {}",
+            crate::import::rfc3339(t)
+        ));
+    }
+    let needed = match need {
+        Need::Older(max_age) => state
+            .refreshed
+            .is_none_or(|t| now - t >= time::Duration::try_from(max_age).unwrap_or_default()),
+        Need::Due => due(&state, near, now),
+    };
+    if !needed {
+        // The events are current; the team list may still be missing (its first read
+        // failed). Asking costs nothing when it is known.
+        let _ = ensure_teams(store, sports, league, now).await;
+        return Freshness::Fresh;
+    }
+    match refresh_league(store, sports, league, now).await {
+        Ok(s) => Freshness::Refreshed(s),
+        Err(e) => Freshness::Failed(e.describe()),
+    }
 }
 
 /// Brings a league up to date unless it was read within `max_age`, waiting at most `budget`
@@ -260,31 +378,14 @@ pub async fn ensure_fresh_within(
     budget: Duration,
 ) -> Freshness {
     let work = tokio::spawn(async move {
-        let now = OffsetDateTime::now_utc();
-        let slug = league.slug;
-        let state = match store.with(move |c| data::refresh_state(c, slug)).await {
-            Ok(s) => s,
-            Err(e) => return Freshness::Failed(format!("{e:#}")),
-        };
-        let age_ok = state
-            .refreshed
-            .is_some_and(|t| now - t < time::Duration::try_from(max_age).unwrap_or_default());
-        if age_ok {
-            // The events are current; the team list may still be missing (its first read
-            // failed). Asking costs nothing when it is known.
-            let _ = ensure_teams(&store, &sports, league, now).await;
-            return Freshness::Fresh;
-        }
-        if let Some(t) = state.next_try.filter(|t| *t > now) {
-            return Freshness::Failed(format!(
-                "the schedule source failed earlier; trying again after {}",
-                crate::import::rfc3339(t)
-            ));
-        }
-        match refresh_league(&store, &sports, league, now).await {
-            Ok(s) => Freshness::Refreshed(s),
-            Err(e) => Freshness::Failed(e.describe()),
-        }
+        refresh_when(
+            &store,
+            &sports,
+            league,
+            OffsetDateTime::now_utc(),
+            Need::Older(max_age),
+        )
+        .await
     });
     match tokio::time::timeout(budget, work).await {
         Ok(Ok(f)) => f,
@@ -302,6 +403,9 @@ pub async fn ensure_teams_within(
     budget: Duration,
 ) -> Result<(), String> {
     let work = tokio::spawn(async move {
+        // Behind a read of the league that is already running.
+        let lock = sports.league_lock(league.slug);
+        let _turn = lock.lock().await;
         ensure_teams(&store, &sports, league, OffsetDateTime::now_utc())
             .await
             .map_err(|e| e.describe())
@@ -338,16 +442,7 @@ pub async fn run(store: &Store, sports: &Sports, now: OffsetDateTime) -> Value {
                     continue;
                 };
                 let state = data::refresh_state(c, &slug)?;
-                let near = !data::followed_events(
-                    c,
-                    now - NEAR_BEFORE,
-                    now + NEAR_AFTER,
-                    Some(&slug),
-                    Some(&["scheduled"]),
-                    1,
-                )?
-                .is_empty();
-                if due(&state, near, now) {
+                if due(&state, is_near(c, &slug, now)?, now) {
                     due_now.push((state.refreshed, league));
                 }
             }
@@ -373,19 +468,21 @@ pub async fn run(store: &Store, sports: &Sports, now: OffsetDateTime) -> Value {
             stopped = Some("the schedule source is failing");
             break;
         }
-        match refresh_league(store, sports, league, now).await {
-            Ok(s) => {
+        match refresh_when(store, sports, league, now, Need::Due).await {
+            Freshness::Refreshed(s) => {
                 in_a_row = 0;
                 results.push(json!({
                     "league": league.slug, "status": "ok", "fixtures": s.fixtures,
-                    "added": s.added, "changed": s.changed, "cancelled": s.cancelled,
+                    "added": s.added, "changed": s.changed, "unlisted": s.unlisted,
                 }));
             }
-            Err(e) => {
+            Freshness::Failed(why) => {
                 in_a_row += 1;
-                results.push(json!({
-                    "league": league.slug, "status": "failed", "error": e.describe(),
-                }));
+                results.push(json!({ "league": league.slug, "status": "failed", "error": why }));
+            }
+            // Read by someone else while this run waited its turn, or put off meanwhile.
+            Freshness::Fresh | Freshness::Backoff(_) | Freshness::Pending => {
+                results.push(json!({ "league": league.slug, "status": "skipped" }));
             }
         }
     }

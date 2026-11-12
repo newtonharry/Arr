@@ -506,7 +506,7 @@ async fn a_refresh_fills_events_and_reading_again_changes_nothing() {
         (Some(0), Some(0)),
         "{r}"
     );
-    assert_eq!(r["leagues"][0]["cancelled"], 0);
+    assert_eq!(r["leagues"][0]["unlisted"], 0);
     let again = stored(&e, "SELECT id || '|' || state || '|' || first_seen_utc || '|' || updated_utc FROM sport_events ORDER BY id").await;
     assert_eq!(dump, again);
 
@@ -518,24 +518,67 @@ async fn a_refresh_fills_events_and_reading_again_changes_nothing() {
 }
 
 #[tokio::test]
-async fn an_event_that_disappears_upstream_is_cancelled_not_deleted() {
+async fn an_event_that_disappears_upstream_is_unlisted_never_cancelled() {
     let e = start_exec(ExecOptions::default()).await;
     let now = OffsetDateTime::now_utc();
     follow_quietly(&e, "premier-league", now).await;
     refresh_run(&e, now).await;
     espn_remove(&e.mock, EPL, FULHAM_AT_CITY);
     let r = refresh_run(&e, now + time::Duration::hours(7)).await;
-    assert_eq!(r["leagues"][0]["cancelled"], 1, "{r}");
+    assert_eq!(r["leagues"][0]["unlisted"], 1, "{r}");
     let states = stored(
         &e,
         "SELECT state FROM sport_events WHERE id = 'event:premier-league:401879233'",
     )
     .await;
-    assert_eq!(states, ["cancelled"]);
+    assert_eq!(states, ["unlisted"], "absence never cancels");
     assert_eq!(count(&e, "sport_events").await, 9);
-    // It no longer shows as coming up, but the events list says what became of it.
+    // An unlisted event is in no answer at all.
     let (_, v) = get(&e, "/api/v1/feed").await;
     assert_eq!(v["sport"].as_array().unwrap().len(), 8, "{v}");
+    let (_, v) = get(&e, "/api/v1/sport/events").await;
+    assert_eq!(v["events"].as_array().unwrap().len(), 8);
+    assert!(!names(&v["events"]).contains(&"Fulham at Manchester City".to_string()));
+    let (_, v) = get(&e, "/api/v1/sport/league/premier-league").await;
+    assert_eq!(v["upcoming"].as_array().unwrap().len(), 8);
+    let (_, v) = get(&e, "/api/v1/sport/following").await;
+    assert_ne!(
+        v["following"][0]["next_event"]["name"],
+        "Fulham at Manchester City"
+    );
+    // Reading it again changes nothing further.
+    let r = refresh_run(&e, now + time::Duration::hours(14)).await;
+    assert_eq!(r["leagues"][0]["unlisted"], 0, "{r}");
+
+    // When the source lists it again, the same row is back.
+    let mut again = {
+        let m = e.mock.lock().unwrap();
+        m.espn_events[EPL][0].clone()
+    };
+    again["id"] = json!(FULHAM_AT_CITY);
+    again["name"] = json!("Fulham at Manchester City");
+    again["date"] = json!("2026-11-21T12:30Z");
+    again["status"]["type"] = json!({ "name": "STATUS_SCHEDULED", "state": "pre" });
+    e.mock
+        .lock()
+        .unwrap()
+        .espn_events
+        .get_mut(EPL)
+        .unwrap()
+        .push(again);
+    refresh_run(&e, now + time::Duration::hours(21)).await;
+    let states = stored(
+        &e,
+        "SELECT state FROM sport_events WHERE id = 'event:premier-league:401879233'",
+    )
+    .await;
+    assert_eq!(states, ["scheduled"]);
+    assert_eq!(count(&e, "sport_events").await, 9);
+
+    // Only the source can cancel.
+    espn_set_status(&e.mock, EPL, FULHAM_AT_CITY, "STATUS_CANCELED", "post");
+    let r = refresh_run(&e, now + time::Duration::hours(28)).await;
+    assert_eq!(r["leagues"][0]["changed"], 1, "{r}");
     let (_, v) = get(&e, "/api/v1/sport/events").await;
     let cancelled: Vec<&Value> = v["events"]
         .as_array()
@@ -545,17 +588,16 @@ async fn an_event_that_disappears_upstream_is_cancelled_not_deleted() {
         .collect();
     assert_eq!(cancelled.len(), 1);
     assert_eq!(cancelled[0]["name"], "Fulham at Manchester City");
-    // Reading it again does not cancel anything further.
-    let r = refresh_run(&e, now + time::Duration::hours(14)).await;
-    assert_eq!(r["leagues"][0]["cancelled"], 0, "{r}");
+    let (_, v) = get(&e, "/api/v1/feed").await;
+    assert_eq!(v["sport"].as_array().unwrap().len(), 8, "{v}");
 
-    // An empty answer is not taken to mean everything was cancelled.
+    // An empty answer is not taken to mean anything is gone.
     {
         let mut m = e.mock.lock().unwrap();
         m.espn_events.get_mut(EPL).unwrap().clear();
     }
-    let r = refresh_run(&e, now + time::Duration::hours(21)).await;
-    assert_eq!(r["leagues"][0]["cancelled"], 0, "{r}");
+    let r = refresh_run(&e, now + time::Duration::hours(35)).await;
+    assert_eq!(r["leagues"][0]["unlisted"], 0, "{r}");
     let live = stored(
         &e,
         "SELECT COUNT(*) FROM sport_events WHERE state = 'scheduled'",
@@ -1135,4 +1177,410 @@ async fn sport_can_be_turned_off() {
         .find(|c| c["name"] == "sport_schedules")
         .unwrap();
     assert_eq!(cap["configured"], false);
+}
+
+// ------------------------------------------------------------------ review round 1
+
+/// Events pinned to dates of their own (served as given): `(id, date, name)`.
+fn pin_events(e: &Exec, specs: &[(&str, &str, &str)]) {
+    let events: Vec<Value> = specs
+        .iter()
+        .map(|(id, date, name)| espn_event_like(&e.mock, EPL, id, date, name))
+        .collect();
+    espn_use_absolute(&e.mock, EPL, events);
+}
+
+async fn state_of(e: &Exec, espn_id: &str) -> String {
+    let sql: &'static str = Box::leak(
+        format!("SELECT state FROM sport_events WHERE id = 'event:premier-league:{espn_id}'")
+            .into_boxed_str(),
+    );
+    stored(e, sql).await.remove(0)
+}
+
+const MARCH: [(&str, &str, &str); 4] = [
+    ("9001", "2027-03-25T15:00Z", "Alpha at Beta"),
+    ("9002", "2027-03-28T15:00Z", "Gamma at Delta"),
+    ("9003", "2027-04-03T15:00Z", "Epsilon at Zeta"),
+    ("9004", "2027-04-06T15:00Z", "Eta at Theta"),
+];
+
+/// Set up with four pinned events over two months, followed and read once at 20 March 2027.
+async fn two_months() -> (Exec, OffsetDateTime) {
+    let e = start_exec(ExecOptions::default()).await;
+    let now = time::macros::datetime!(2027-03-20 12:00 UTC);
+    pin_events(&e, &MARCH);
+    follow_quietly(&e, "premier-league", now).await;
+    let r = refresh_run(&e, now).await;
+    assert_eq!(r["leagues"][0]["added"], 4, "{r}");
+    (e, now)
+}
+
+#[tokio::test]
+async fn an_empty_month_among_two_unlists_nothing_in_it() {
+    let (e, now) = two_months().await;
+    // April comes back empty while March is as it was: April's events are not judged gone.
+    espn_remove(&e.mock, EPL, "9003");
+    espn_remove(&e.mock, EPL, "9004");
+    let r = refresh_run(&e, now + time::Duration::hours(7)).await;
+    assert_eq!(r["leagues"][0]["status"], "ok", "{r}");
+    assert_eq!(r["leagues"][0]["unlisted"], 0, "{r}");
+    for id in ["9001", "9002", "9003", "9004"] {
+        assert_eq!(state_of(&e, id).await, "scheduled", "{id}");
+    }
+    // March, which answered in full, is judged: an event missing from it is unlisted, while
+    // April's stay put.
+    espn_remove(&e.mock, EPL, "9002");
+    let r = refresh_run(&e, now + time::Duration::hours(14)).await;
+    assert_eq!(r["leagues"][0]["unlisted"], 1, "{r}");
+    assert_eq!(state_of(&e, "9002").await, "unlisted");
+    assert_eq!(state_of(&e, "9003").await, "scheduled");
+    assert_eq!(state_of(&e, "9004").await, "scheduled");
+}
+
+#[tokio::test]
+async fn a_record_that_cannot_be_read_is_not_an_absent_event() {
+    let (e, now) = two_months().await;
+    // 9001 comes back with a broken date while the others parse; 9002 is really gone.
+    espn_set_field(&e.mock, EPL, "9001", "date", json!("garbage"));
+    espn_remove(&e.mock, EPL, "9002");
+    let r = refresh_run(&e, now + time::Duration::hours(7)).await;
+    assert_eq!(r["leagues"][0]["status"], "ok", "{r}");
+    // The answer for March had a record that could not be read, so it is not trusted to say
+    // what is gone: nothing in it is unlisted, and the broken record's event is untouched.
+    assert_eq!(r["leagues"][0]["unlisted"], 0, "{r}");
+    assert_eq!(state_of(&e, "9001").await, "scheduled");
+    assert_eq!(state_of(&e, "9002").await, "scheduled");
+    let date = stored(
+        &e,
+        "SELECT starts_at_utc FROM sport_events WHERE id = 'event:premier-league:9001'",
+    )
+    .await;
+    assert_eq!(date, ["2027-03-25T15:00:00Z"]);
+    // Once the record reads again, the missing one is judged.
+    espn_set_field(&e.mock, EPL, "9001", "date", json!("2027-03-25T15:00Z"));
+    refresh_run(&e, now + time::Duration::hours(14)).await;
+    assert_eq!(state_of(&e, "9001").await, "scheduled");
+    assert_eq!(state_of(&e, "9002").await, "unlisted");
+}
+
+#[tokio::test]
+async fn an_event_that_moves_out_of_the_window_is_unlisted_then_comes_back_in_place() {
+    let (e, now) = two_months().await;
+    // 9001 moves to July: absent from March, which answered in full, and not in April.
+    espn_set_field(&e.mock, EPL, "9001", "date", json!("2027-07-10T15:00Z"));
+    let r = refresh_run(&e, now + time::Duration::hours(7)).await;
+    assert_eq!(r["leagues"][0]["unlisted"], 1, "{r}");
+    assert_eq!(state_of(&e, "9001").await, "unlisted");
+    assert_ne!(state_of(&e, "9001").await, "cancelled");
+    let (_, v) = get(&e, "/api/v1/sport/events?from=2027-03-01&to=2027-04-30").await;
+    let n = names(&v["events"]);
+    assert!(!n.contains(&"Alpha at Beta".to_string()), "{n:?}");
+    assert_eq!(n.len(), 3, "{n:?}");
+    // Three months on, the window reaches July and the source lists it there: the same row
+    // is scheduled again, with its new date.
+    let later = time::macros::datetime!(2027-06-25 12:00 UTC);
+    refresh_run(&e, later).await;
+    assert_eq!(state_of(&e, "9001").await, "scheduled");
+    let date = stored(
+        &e,
+        "SELECT starts_at_utc FROM sport_events WHERE id = 'event:premier-league:9001'",
+    )
+    .await;
+    assert_eq!(date, ["2027-07-10T15:00:00Z"]);
+    assert_eq!(count(&e, "sport_events").await, 4);
+    let (_, v) = get(&e, "/api/v1/sport/events?from=2027-07-01&to=2027-07-31").await;
+    assert_eq!(names(&v["events"]), ["Alpha at Beta"]);
+}
+
+#[tokio::test]
+async fn a_stored_event_is_updated_after_the_clock_moves_on_but_no_backlog_is_added() {
+    let e = start_exec(ExecOptions::default()).await;
+    let now = time::macros::datetime!(2027-03-20 12:00 UTC);
+    pin_events(&e, &[("9001", "2027-03-25T15:00Z", "Alpha at Beta")]);
+    follow_quietly(&e, "premier-league", now).await;
+    refresh_run(&e, now).await;
+    assert_eq!(state_of(&e, "9001").await, "scheduled");
+    // Arr was off for ten days. The game was played, and another one before the window shows
+    // up for the first time.
+    espn_set_status(&e.mock, EPL, "9001", "STATUS_FINAL", "post");
+    let mut old = espn_event_like(&e.mock, EPL, "9005", "2027-03-24T15:00Z", "Old at News");
+    old["status"]["type"] = json!({ "name": "STATUS_FINAL", "state": "post" });
+    e.mock
+        .lock()
+        .unwrap()
+        .espn_events
+        .get_mut(EPL)
+        .unwrap()
+        .push(old);
+    let later = time::macros::datetime!(2027-03-30 12:00 UTC);
+    let r = refresh_run(&e, later).await;
+    assert_eq!(r["leagues"][0]["changed"], 1, "{r}");
+    assert_eq!(state_of(&e, "9001").await, "played");
+    assert_eq!(
+        count(&e, "sport_events").await,
+        1,
+        "the old game is not stored"
+    );
+}
+
+#[test]
+fn only_round_labels_from_the_list_are_kept() {
+    use arr::sport::espn::round_label;
+    for (text, want) in [
+        ("Round 12", Some("Round 12")),
+        ("round 3", Some("Round 3")),
+        ("Matchweek 9", Some("Matchweek 9")),
+        ("MATCHDAY 4", Some("Matchday 4")),
+        ("Week 7", Some("Week 7")),
+        ("Game 5", Some("Game 5")),
+        ("Group b", Some("Group B")),
+        ("Quarter-final", Some("Quarter-final")),
+        ("Quarterfinals", Some("Quarterfinals")),
+        ("Semi final", Some("Semi final")),
+        ("Final", Some("Final")),
+        ("Play-offs", Some("Play-offs")),
+        ("  Round   12 ", Some("Round 12")),
+        ("Manchester City win 4-3 on penalties", None),
+        ("Round 12: Team A beat Team B", None),
+        ("Final: Team A 2-1 Team B", None),
+        ("Game 5 - Lakers win", None),
+        ("NBA Cup - Group Play", None),
+        ("Round", None),
+        ("Round 12345", None),
+        ("", None),
+    ] {
+        assert_eq!(round_label(text).as_deref(), want, "{text:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_note_that_says_how_a_game_went_reaches_neither_the_store_nor_an_answer() {
+    let e = start_exec(ExecOptions::default()).await;
+    let spoiler = "Manchester City win 4-3 on penalties";
+    espn_set_note(&e.mock, EPL, FULHAM_AT_CITY, spoiler);
+    espn_set_note(&e.mock, EPL, ARSENAL_AT_NEWCASTLE, "Round 12");
+    espn_set_note(&e.mock, EPL, "401879238", "Semi-final");
+    espn_set_field(
+        &e.mock,
+        EPL,
+        "401879236",
+        "shortName",
+        json!("LEE beat CHE 2-0"),
+    );
+    follow(&e, json!({ "league": "premier-league" })).await;
+    let rounds = stored(
+        &e,
+        "SELECT id || '=' || COALESCE(round, '-') FROM sport_events WHERE id IN ('event:premier-league:401879233', 'event:premier-league:401879232', 'event:premier-league:401879238') ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rounds,
+        [
+            "event:premier-league:401879232=Round 12",
+            "event:premier-league:401879233=-",
+            "event:premier-league:401879238=Semi-final"
+        ]
+    );
+    let short = stored(
+        &e,
+        "SELECT COALESCE(short_name, '-') FROM sport_events WHERE id = 'event:premier-league:401879236'",
+    )
+    .await;
+    assert_eq!(short, ["-"]);
+    let everything = stored(
+        &e,
+        "SELECT group_concat(COALESCE(round, '') || COALESCE(short_name, '') || name || COALESCE(venue, ''), ' ') FROM sport_events",
+    )
+    .await
+    .join(" ");
+    assert!(!everything.contains("penalties") && !everything.contains("2-0"));
+    let wide = wide_events();
+    for path in [
+        wide.as_str(),
+        "/api/v1/sport/league/premier-league",
+        "/api/v1/sport/following",
+        "/api/v1/feed",
+        "/api/v1/calendar",
+    ] {
+        let (s, _, text) = e.json(e.get(path)).await;
+        assert_eq!(s, 200, "{path}");
+        assert!(
+            !text.contains("penalties") && !text.contains("win 4-3") && !text.contains("2-0"),
+            "{path}: {text}"
+        );
+    }
+    let (_, v) = get(&e, &wide_events()).await;
+    let semi = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == "event:premier-league:401879238")
+        .unwrap();
+    assert_eq!(semi["round"], "Semi-final");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_read_of_a_league_at_a_time_whoever_asks() {
+    for cache in [0, 60] {
+        let e = start_exec(ExecOptions {
+            sports_cache_secs: cache,
+            ..Default::default()
+        })
+        .await;
+        e.mock.lock().unwrap().espn_delay = Some(Duration::from_millis(250));
+        follow_quietly(&e, "premier-league", OffsetDateTime::now_utc()).await;
+        let page = "/api/v1/sport/league/premier-league";
+        let body = json!({ "league": "premier-league" });
+        let post = || e.json(e.post("/api/v1/sport/follow").json(&body));
+        let (a, b, c, d, p1, p2, report) = tokio::join!(
+            post(),
+            post(),
+            post(),
+            post(),
+            get(&e, page),
+            get(&e, page),
+            e.tick_at(OffsetDateTime::now_utc())
+        );
+        for (s, ..) in [&a, &b, &c, &d] {
+            assert!(*s == 200 || *s == 201);
+        }
+        assert_eq!((p1.0, p2.0), (200, 200));
+        assert!(report.tasks.contains(&"sports".to_string()));
+        let log = e.mock.lock().unwrap().espn_log.clone();
+        let distinct: std::collections::HashSet<&String> = log.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            log.len(),
+            "cache {cache}: repeated: {log:?}"
+        );
+        assert!(log.len() <= 3, "cache {cache}: {log:?}");
+        assert_eq!(count(&e, "sport_events").await, 9);
+    }
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_a_schedule_counts_as_a_failure() {
+    for body in ["this is not json", "{\"events\":5}", "{}"] {
+        let e = start_exec(ExecOptions {
+            sports_backoff_secs: 60,
+            ..Default::default()
+        })
+        .await;
+        {
+            let mut m = e.mock.lock().unwrap();
+            m.espn_garbage = vec!["scoreboard".into()];
+            m.espn_garbage_body = body.into();
+        }
+        let (s, v) = follow(&e, json!({ "league": "nba" })).await;
+        assert_eq!(
+            (s, &v["schedule_read"]),
+            (201, &json!(false)),
+            "{body}: {v}"
+        );
+        assert_eq!(espn_requests(&e.mock), 1);
+        // The pause that follows a failure is on, though the source answered 200.
+        let (s, v) = follow(&e, json!({ "league": "premier-league" })).await;
+        assert_eq!((s, &v["schedule_read"]), (201, &json!(false)), "{body}");
+        assert_eq!(espn_requests(&e.mock), 1, "{body}");
+        let (_, v) = get(&e, "/api/v1/sport/league/nba").await;
+        assert!(v["schedule"]["problem"].is_string(), "{body}: {v}");
+        assert_eq!(count(&e, "sport_events").await, 0);
+    }
+}
+
+#[tokio::test]
+async fn a_team_list_that_is_not_json_is_not_asked_for_on_every_page() {
+    let e = start_exec(ExecOptions::default()).await;
+    e.mock.lock().unwrap().espn_garbage = vec!["teams".into()];
+    let teams_asked = |e: &Exec| {
+        e.mock
+            .lock()
+            .unwrap()
+            .espn_log
+            .iter()
+            .filter(|l| l.contains("/teams"))
+            .count()
+    };
+    let (s, v) = follow(&e, json!({ "league": "premier-league" })).await;
+    assert_eq!((s, &v["schedule_read"]), (201, &json!(true)), "{v}");
+    assert_eq!(teams_asked(&e), 1);
+    for _ in 0..3 {
+        let (s, v) = get(&e, "/api/v1/sport/league/premier-league").await;
+        assert_eq!(s, 200, "{v}");
+        assert!(!v["teams"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(teams_asked(&e), 1, "the failure is remembered");
+    // After the wait it is tried once more, and then left alone for longer.
+    let now = OffsetDateTime::now_utc();
+    refresh_run(&e, now + time::Duration::hours(7)).await;
+    assert_eq!(teams_asked(&e), 2);
+    refresh_run(&e, now + time::Duration::hours(14)).await;
+    assert_eq!(teams_asked(&e), 3);
+    // And a team list in the wrong shape is a failure too.
+    e.mock.lock().unwrap().espn_garbage_body = "{\"sports\":[]}".into();
+    refresh_run(&e, now + time::Duration::hours(30)).await;
+    assert_eq!(teams_asked(&e), 4);
+    let failures = stored(
+        &e,
+        "SELECT teams_failures FROM sport_refresh WHERE league = 'premier-league'",
+    )
+    .await;
+    assert_eq!(failures, ["4"]);
+}
+
+#[tokio::test]
+async fn the_events_window_survives_the_ends_of_time() {
+    let e = start_exec(ExecOptions::default()).await;
+    let code = |v: &Value| v["error"]["code"].as_str().map(str::to_string);
+    // No end given: the default is from + 14 days, which does not exist in the last days.
+    let (s, v) = get(&e, "/api/v1/sport/events?from=9999-12-25").await;
+    assert_eq!(
+        (s, code(&v).as_deref()),
+        (400, Some("invalid_query")),
+        "{v}"
+    );
+    // With an end, the same start is fine.
+    let (s, v) = get(&e, "/api/v1/sport/events?from=9999-12-25&to=9999-12-26").await;
+    assert_eq!((s, &v["events"]), (200, &json!([])), "{v}");
+    let (s, v) = get(&e, "/api/v1/sport/events?from=9999-12-31&to=9999-12-31").await;
+    assert_eq!(
+        (s, code(&v).as_deref()),
+        (400, Some("invalid_query")),
+        "{v}"
+    );
+    // An offset that pushes the time past the last year is a bad time, not a crash.
+    let (s, v) = get(
+        &e,
+        "/api/v1/sport/events?from=9999-12-31T23:59:59-05:00&to=9999-12-31T23:59:59-04:00",
+    )
+    .await;
+    assert_eq!(
+        (s, code(&v).as_deref()),
+        (400, Some("invalid_query")),
+        "{v}"
+    );
+    let (s, v) = get(&e, "/api/v1/sport/events?from=0001-01-01&to=0001-01-02").await;
+    assert_eq!((s, &v["events"]), (200, &json!([])), "{v}");
+    let (s, v) = get(&e, "/api/v1/sport/events?from=0001-01-01").await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = get(&e, "/api/v1/sport/events?to=9999-12-31").await;
+    assert_eq!(
+        (s, code(&v).as_deref()),
+        (400, Some("invalid_query")),
+        "{v}"
+    );
+    let (s, v) = get(&e, "/api/v1/sport/events?from=2026-13-01").await;
+    assert_eq!(
+        (s, code(&v).as_deref()),
+        (400, Some("invalid_query")),
+        "{v}"
+    );
+    // The calendar takes the same extremes without trouble.
+    let (s, v) = get(
+        &e,
+        "/api/v1/calendar?start=9999-12-01T00:00:00Z&end=9999-12-31T00:00:00Z",
+    )
+    .await;
+    assert_eq!((s, &v["sport"]), (200, &json!([])), "{v}");
 }
