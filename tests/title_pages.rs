@@ -1714,3 +1714,31 @@ async fn titles_added_with_a_sign_in_link_have_no_requester() {
         "{page}"
     );
 }
+
+#[tokio::test]
+async fn a_slow_tvmaze_does_not_hold_up_a_catalog_show_page() {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    // TVmaze answers after longer than the page waits (the budget is half the 2 s test
+    // timeout) but within the client timeout, so the background lookup still succeeds.
+    e.mock.lock().unwrap().tvmaze_show_delay = Some(std::time::Duration::from_millis(1500));
+    let v = site.show("series:tvdb:372264").await;
+    assert_eq!(v["title"], "Slow Horses", "the catalog's own fields stay");
+    assert_eq!(v["cast"], json!([]), "{v}");
+    assert!(v["summary"].is_null(), "{v}");
+    assert_eq!(season(&v, 1)["episode_count"], 6);
+
+    // The lookup carried on in the background and filled the cache.
+    let mut cast = 0;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        e.mock.lock().unwrap().tvmaze_show_delay = None;
+        let v = site.show("series:tvdb:372264").await;
+        cast = v["cast"].as_array().unwrap().len();
+        if cast > 0 {
+            assert_eq!(v["network"], "Apple TV+");
+            break;
+        }
+    }
+    assert_eq!(cast, 6, "the next visit has the cast");
+}

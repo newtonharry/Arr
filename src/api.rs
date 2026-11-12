@@ -157,7 +157,7 @@ pub struct AppState {
     pub store: Store,
     /// The release search backend: native indexers or Prowlarr (never both, no fallback).
     pub search: Option<Backend>,
-    pub tvmaze: Option<Tvmaze>,
+    pub tvmaze: Option<Arc<Tvmaze>>,
     /// Movie metadata: Plex first, TMDB (when it has a key) as the backup.
     pub movies: Option<Movies>,
     /// The download client ([qbittorrent] or [embedded]); none in shadow mode.
@@ -268,7 +268,7 @@ impl AppState {
         };
         Ok(AppState {
             search,
-            tvmaze: cfg.tvmaze.as_ref().map(Tvmaze::new),
+            tvmaze: cfg.tvmaze.as_ref().map(|c| Arc::new(Tvmaze::new(c))),
             movies: Movies::new(
                 cfg.plex.as_ref().and_then(|p| {
                     crate::plexsignin::client_id(&cfg.state_dir)
@@ -368,7 +368,7 @@ impl AppState {
     fn resolver<'a>(&'a self, index: &'a CatalogIndex, now: OffsetDateTime) -> Resolver<'a> {
         Resolver {
             catalog: Some(index),
-            tvmaze: self.tvmaze.as_ref(),
+            tvmaze: self.tvmaze.as_deref(),
             movies: self.movies.as_ref(),
             now,
             availability_delay_days: self.availability_delay_days(),
@@ -3954,6 +3954,9 @@ pub async fn serve(cfg: RuntimeConfig) -> anyhow::Result<()> {
 pub fn app(state: Arc<AppState>) -> anyhow::Result<(Router, Box<dyn FnOnce() + Send>)> {
     let api = router(state.clone());
     let web = crate::webapp::router(&state, api.clone())?;
+    // gzip for the JSON API and the web app (the default predicate leaves images, event
+    // streams and tiny bodies alone). Not for `/mcp`, whose replies may stream.
+    let (api, web) = (api.layer(compress()), web.layer(compress()));
     match &state.cfg.mcp {
         Some(m) => {
             let (mcp, stop) = crate::mcp::remote(
@@ -3966,6 +3969,13 @@ pub fn app(state: Arc<AppState>) -> anyhow::Result<(Router, Box<dyn FnOnce() + S
         }
         None => Ok((api.merge(web), Box::new(|| {}))),
     }
+}
+
+fn compress() -> tower_http::compression::CompressionLayer {
+    tower_http::compression::CompressionLayer::new()
+        .no_br()
+        .no_deflate()
+        .no_zstd()
 }
 
 async fn shutdown() {

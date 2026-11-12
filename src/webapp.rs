@@ -251,49 +251,49 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
     Ok(Router::new()
         .route(
             "/",
-            get(|| async { asset("text/html; charset=utf-8", INDEX) }),
+            get(|h: HeaderMap| async move { asset(&h, "text/html; charset=utf-8", INDEX) }),
         )
         .route(
             "/app/app.js",
-            get(|| async { asset("text/javascript; charset=utf-8", APP_JS) }),
+            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", APP_JS) }),
         )
         .route(
             "/app/vendor/preact.mjs",
-            get(|| async { asset("text/javascript; charset=utf-8", PREACT_JS) }),
+            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", PREACT_JS) }),
         )
         .route(
             "/app/vendor/hooks.mjs",
-            get(|| async { asset("text/javascript; charset=utf-8", PREACT_HOOKS_JS) }),
+            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", PREACT_HOOKS_JS) }),
         )
         .route(
             "/app/vendor/LICENSE-preact",
-            get(|| async { asset("text/plain; charset=utf-8", PREACT_LICENSE) }),
+            get(|h: HeaderMap| async move { asset(&h, "text/plain; charset=utf-8", PREACT_LICENSE) }),
         )
         .route(
             "/app/app.css",
-            get(|| async { asset("text/css; charset=utf-8", APP_CSS) }),
+            get(|h: HeaderMap| async move { asset(&h, "text/css; charset=utf-8", APP_CSS) }),
         )
         .route(
             "/app/mascot.svg",
-            get(|| async { asset("image/svg+xml", MASCOT) }),
+            get(|h: HeaderMap| async move { asset(&h, "image/svg+xml", MASCOT) }),
         )
         // Browsers ask for /favicon.ico whatever the page says: send them to the mascot.
         .route("/favicon.ico", get(favicon))
         .route(
             "/app/tmdb.svg",
-            get(|| async { asset("image/svg+xml", TMDB_LOGO) }),
+            get(|h: HeaderMap| async move { asset(&h, "image/svg+xml", TMDB_LOGO) }),
         )
         .route(
             "/app/qrcodegen.js",
-            get(|| async { asset("text/javascript; charset=utf-8", QRCODEGEN_JS) }),
+            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", QRCODEGEN_JS) }),
         )
         .route(
             "/app/sw.js",
-            get(|| async { asset("text/javascript; charset=utf-8", SERVICE_WORKER) }),
+            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", SERVICE_WORKER) }),
         )
         .route(
             "/app/manifest.webmanifest",
-            get(|| async { asset("application/manifest+json", MANIFEST) }),
+            get(|h: HeaderMap| async move { asset(&h, "application/manifest+json", MANIFEST) }),
         )
         .route(
             "/app/fonts/nunito-latin.woff2",
@@ -392,12 +392,51 @@ fn secure_headers(r: &mut Response) {
     );
 }
 
-fn asset(content_type: &'static str, body: &'static str) -> Response {
-    let mut r = ([(header::CONTENT_TYPE, content_type)], body).into_response();
+/// A text asset. `no-cache` makes the browser ask every time; the ETag (a hash of the
+/// embedded bytes) lets it be told, with a bodiless 304, that its copy is current.
+fn asset(req: &HeaderMap, content_type: &'static str, body: &'static str) -> Response {
+    let tag = etag(body);
+    let mut r = if if_none_match(req, &tag) {
+        let mut r = Response::new(Body::empty());
+        *r.status_mut() = StatusCode::NOT_MODIFIED;
+        r
+    } else {
+        ([(header::CONTENT_TYPE, content_type)], body).into_response()
+    };
+    r.headers_mut().insert(header::ETAG, tag);
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     secure_headers(&mut r);
     r
+}
+
+/// The strong ETag of an embedded asset, hashed on first use and kept (assets never change
+/// while the program runs).
+fn etag(body: &'static str) -> HeaderValue {
+    static TAGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, HeaderValue>>> =
+        std::sync::OnceLock::new();
+    let mut tags = TAGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    tags.entry(body.as_ptr() as usize)
+        .or_insert_with(|| {
+            let digest = Sha256::digest(body.as_bytes());
+            HeaderValue::from_str(&format!("\"{}\"", hex::encode(&digest[..12])))
+                .expect("hex is a valid header value")
+        })
+        .clone()
+}
+
+/// Whether the request's `If-None-Match` names `tag` (weak or strong, or `*`).
+fn if_none_match(req: &HeaderMap, tag: &HeaderValue) -> bool {
+    let Ok(tag) = tag.to_str() else { return false };
+    req.get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == tag)
 }
 
 /// A file that never changes (a font or an icon), cached for a week.

@@ -2447,3 +2447,71 @@ async fn the_app_finds_people_through_its_proxy_and_has_a_person_page() {
         assert!(js.contains(want), "app.js lacks {want}");
     }
 }
+
+// ------------------------------------------------------------------ caching and compression
+
+#[tokio::test]
+async fn an_asset_has_an_etag_and_a_matching_request_gets_a_304() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = serve(e.state.clone()).await;
+    let r = site.plain(Method::GET, "/app/app.js").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["cache-control"], "no-cache");
+    let tag = r.headers()["etag"].to_str().unwrap().to_string();
+    assert!(tag.starts_with('"') && tag.ends_with('"'), "{tag}");
+    assert!(!r.text().await.unwrap().is_empty());
+
+    for sent in [tag.clone(), format!("W/{tag}"), format!("\"other\", {tag}")] {
+        let r = site
+            .plain(Method::GET, "/app/app.js")
+            .header("if-none-match", sent.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 304, "{sent}");
+        assert_eq!(r.headers()["etag"].to_str().unwrap(), tag);
+        assert_eq!(r.headers()["cache-control"], "no-cache");
+        assert!(r.text().await.unwrap().is_empty());
+    }
+    let r = site
+        .plain(Method::GET, "/app/app.js")
+        .header("if-none-match", "\"stale\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "a different tag gets the full file");
+}
+
+#[tokio::test]
+async fn text_assets_and_json_are_gzipped_on_request_and_images_are_not() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = serve(e.state.clone()).await;
+    // The harness client would decode for us; this one shows what is on the wire.
+    let raw = reqwest::Client::builder().no_gzip().build().unwrap();
+    for path in ["/app/app.js", "/api/v1/openapi.json"] {
+        let get = |gzip: bool| {
+            let rb = raw.get(format!("{}{path}", site.base));
+            if gzip {
+                rb.header("accept-encoding", "gzip")
+            } else {
+                rb
+            }
+        };
+        let plain = get(false).send().await.unwrap();
+        assert!(plain.headers().get("content-encoding").is_none(), "{path}");
+        let plain = plain.bytes().await.unwrap();
+        let zipped = get(true).send().await.unwrap();
+        assert_eq!(zipped.headers()["content-encoding"], "gzip", "{path}");
+        let zipped = zipped.bytes().await.unwrap();
+        assert_eq!(&zipped[..2], &[0x1f, 0x8b], "{path}: gzip magic");
+        assert!(zipped.len() < plain.len() / 2, "{path}");
+    }
+    let r = raw
+        .get(format!("{}/app/icons/icon-192.png", site.base))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.headers().get("content-encoding").is_none());
+}

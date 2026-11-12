@@ -12,6 +12,7 @@ checks that every route is documented.
 - **Format.** Responses are JSON with `Cache-Control: no-store`,
   `X-Content-Type-Options: nosniff` and `x-request-id`. Request bodies must be
   `application/json`.
+  Responses are gzip-compressed when the request sends `Accept-Encoding: gzip`.
 - **Limits.**
   - Bodies are capped at `max_body_bytes` (default 64 KiB). Larger bodies get `413`.
   - At most `max_concurrent_requests` (default 16) are served at once. Requests beyond that
