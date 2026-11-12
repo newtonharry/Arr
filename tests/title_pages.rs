@@ -1742,3 +1742,26 @@ async fn a_slow_tvmaze_does_not_hold_up_a_catalog_show_page() {
     }
     assert_eq!(cast, 6, "the next visit has the cast");
 }
+
+#[tokio::test]
+async fn a_slow_tvmaze_still_gives_a_catalog_show_without_episodes_its_season_page() {
+    let e = exec().await;
+    let site = signed_in(e.state.clone()).await;
+    // A catalog series whose episode rows are gone: its episodes can only come from TVmaze.
+    e.state
+        .store
+        .with(|c| {
+            c.execute(
+                "DELETE FROM episodes WHERE series_id = 'series:tvdb:372264'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    e.mock.lock().unwrap().tvmaze_show_delay = Some(std::time::Duration::from_millis(1500));
+    let (s, eps) = site.get("/show/series:tvdb:372264/season/1").await;
+    assert_eq!(s, 200, "{eps}");
+    assert_eq!(eps["episodes"].as_array().unwrap().len(), 6, "{eps}");
+}

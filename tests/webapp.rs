@@ -2458,10 +2458,11 @@ async fn an_asset_has_an_etag_and_a_matching_request_gets_a_304() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.headers()["cache-control"], "no-cache");
     let tag = r.headers()["etag"].to_str().unwrap().to_string();
-    assert!(tag.starts_with('"') && tag.ends_with('"'), "{tag}");
+    assert!(tag.starts_with("W/\"") && tag.ends_with('"'), "{tag}");
+    let strong = tag.strip_prefix("W/").unwrap().to_string();
     assert!(!r.text().await.unwrap().is_empty());
 
-    for sent in [tag.clone(), format!("W/{tag}"), format!("\"other\", {tag}")] {
+    for sent in [tag.clone(), strong.clone(), format!("\"other\", {tag}")] {
         let r = site
             .plain(Method::GET, "/app/app.js")
             .header("if-none-match", sent.as_str())

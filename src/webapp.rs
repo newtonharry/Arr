@@ -410,7 +410,7 @@ fn asset(req: &HeaderMap, content_type: &'static str, body: &'static str) -> Res
     r
 }
 
-/// The strong ETag of an embedded asset, hashed on first use and kept (assets never change
+/// The weak ETag of an embedded asset (the gzip and plain bodies are equivalent), hashed on first use and kept (assets never change
 /// while the program runs).
 fn etag(body: &'static str) -> HeaderValue {
     static TAGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, HeaderValue>>> =
@@ -422,7 +422,7 @@ fn etag(body: &'static str) -> HeaderValue {
     tags.entry(body.as_ptr() as usize)
         .or_insert_with(|| {
             let digest = Sha256::digest(body.as_bytes());
-            HeaderValue::from_str(&format!("\"{}\"", hex::encode(&digest[..12])))
+            HeaderValue::from_str(&format!("W/\"{}\"", hex::encode(&digest[..12])))
                 .expect("hex is a valid header value")
         })
         .clone()
@@ -436,7 +436,9 @@ fn if_none_match(req: &HeaderMap, tag: &HeaderValue) -> bool {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .map(str::trim)
-        .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == tag)
+        .any(|t| {
+            t == "*" || t.strip_prefix("W/").unwrap_or(t) == tag.strip_prefix("W/").unwrap_or(tag)
+        })
 }
 
 /// A file that never changes (a font or an icon), cached for a week.

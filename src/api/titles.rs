@@ -129,12 +129,25 @@ async fn load_show(st: &Arc<AppState>, key: SeriesKey) -> Result<Show, ApiError>
             (Some(t), s)
         }
         Some(s) => {
-            // Decoration only: a slow TVmaze must not hold the page up (see `decoration`).
+            // With the catalog's own episode list the show is decoration only: a slow TVmaze
+            // must not hold the page up (see `decoration`). Without one, its episodes come
+            // from this lookup, so it is awaited in full.
+            let decor = s.episodes.is_some();
             let looked = match (&st.tvmaze, s.tvmaze_id, key) {
                 (Some(tv), Some(id), _) | (Some(tv), None, SeriesKey::Tvmaze(id)) => {
-                    tv.by_id_decoration(id).await
+                    if decor {
+                        tv.by_id_decoration(id).await
+                    } else {
+                        tv.by_id(id).await.ok().flatten()
+                    }
                 }
-                (Some(tv), None, SeriesKey::Tvdb(id)) => tv.by_tvdb_decoration(id).await,
+                (Some(tv), None, SeriesKey::Tvdb(id)) => {
+                    if decor {
+                        tv.by_tvdb_decoration(id).await
+                    } else {
+                        tv.by_tvdb(id).await.ok().flatten()
+                    }
+                }
                 (None, _, _) => None,
             };
             (None, looked)
