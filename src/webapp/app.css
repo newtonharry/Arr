@@ -4,6 +4,8 @@
 @media (prefers-color-scheme:dark){:root{--bg:#161d1d;--card:#202a2a;--ink:#f1ece2;--muted:#b4c0bd;--line:#334141;--teal:#4fd1bd;--teal-ink:#4fd1bd;--on-teal:#0f1f1d;--coral-ink:#ff9a82;--sun-bg:#3b3316;--sun-ink:#ffd97a;--ring:#8ab4ff;--sel:#1f5c53;--toast-bg:#f1ece2;--toast-ink:#161d1d;--toast-act:#0c6055}}
 *{box-sizing:border-box;margin:0}
 html{-webkit-text-size-adjust:100%;scrollbar-color:var(--line) transparent;scrollbar-width:thin}
+/* Nothing that slides may widen the page: a phone zooms the whole screen out to fit it. Both are needed for the body to clip. */
+html,body{overflow-x:clip}
 body{background:var(--bg);color:var(--ink);font:500 15px/1.4 Nunito,ui-rounded,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums;padding-bottom:calc(var(--tab-h) + env(safe-area-inset-bottom));accent-color:var(--teal);caret-color:var(--teal);-webkit-tap-highlight-color:transparent;overflow-wrap:break-word}
 ::selection{background:var(--sel);color:var(--ink)}
 ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px;border:2px solid var(--bg)}
