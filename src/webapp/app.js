@@ -17,6 +17,130 @@ let V = { t: 'hint', text: '' }; // what the main area shows
 const R = { path: null }; // the screen under the sheet, for the active tab
 const A = new Map(); // add / retry state by id, kept for the session
 const fills = new Map();
+// ---------- motion: it explains what just happened and never makes anyone wait ----------
+// Only transform and opacity move. Nothing here is awaited by an action, and none of it runs when
+// the person asked their device for less motion.
+const RMQ = matchMedia('(prefers-reduced-motion: reduce)');
+const reduced = () => RMQ.matches;
+const EASE = 'cubic-bezier(.16,1,.3,1)', SPRING = 'cubic-bezier(.34,1.56,.64,1)', SOFT = 'cubic-bezier(.3,1.25,.5,1)';
+const NOANIM = { finished: Promise.resolve(), cancel() {}, pause() {}, play() {} };
+function anim(el, kf, opt) {
+  if (!el || reduced() || !el.animate) return NOANIM;
+  try { return el.animate(kf, { easing: EASE, ...opt }); } catch { return NOANIM; }
+}
+const settled = (a, fn) => a.finished.then(fn, fn);
+const M = { fresh: false, drag: 0, tab: 0, celebrate: new Set() }; // fresh: the screen has not drawn its rows yet; drag: how far the sheet was pulled down
+const onScreen = (r) => r.width > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+const wide = () => matchMedia('(min-width:760px)').matches;
+// The poster of the row or card an element sits in.
+const tileOf = (el) => { const r = el && el.closest && (el.closest('li') || el.closest('.idea')); return r && r.querySelector('.tile'); };
+// A copy of a poster flies from one place to another over everything, then goes away.
+function fly(src, a, b) {
+  if (reduced()) return NOANIM;
+  const g = src.cloneNode(true), st = g.style;
+  g.removeAttribute('id'); g.setAttribute('aria-hidden', 'true');
+  Object.assign(st, { position: 'fixed', left: a.left + 'px', top: a.top + 'px', width: a.width + 'px', height: a.height + 'px', margin: '0', zIndex: '70', transformOrigin: '0 0', pointerEvents: 'none', visibility: 'visible', fontSize: a.width * 0.3 + 'px', borderRadius: a.width * 0.16 + 'px' });
+  document.body.append(g);
+  const an = anim(g, [{ transform: 'none' }, { transform: `translate(${b.left - a.left}px,${b.top - a.top}px) scale(${b.width / a.width},${b.height / a.height})` }], { duration: 440, easing: SOFT, fill: 'forwards' });
+  settled(an, () => g.remove());
+  setTimeout(() => g.remove(), 1200);
+  return an;
+}
+// Rows that move (a download arriving, a card going, the list closing the gap) glide from where they
+// were to where they are. bump() notes where the keyed rows are before a redraw, and the redraw plays it.
+let snap = null;
+function measureFlip() {
+  const rects = new Map(), seen = new Map();
+  for (const e of document.querySelectorAll('#view [data-flip]')) {
+    const k = e.dataset.flip, r = e.getBoundingClientRect();
+    seen.set(k, (seen.get(k) || 0) + 1);
+    rects.set(k, { left: r.left, top: r.top + scrollY });
+  }
+  for (const [k, n] of seen) if (n > 1) rects.delete(k); // an id that appears twice can't be followed
+  return { tok: token, t: V.t, rects };
+}
+function playFlip(sn) {
+  const els = [...document.querySelectorAll('#view [data-flip]')];
+  for (const e of els) { e._fl?.cancel(); e._fl = null; }
+  if (sn.tok !== token || sn.t !== V.t) return;
+  for (const e of els) {
+    const a = sn.rects.get(e.dataset.flip);
+    if (!a) continue;
+    const r = e.getBoundingClientRect(), dx = a.left - r.left, dy = a.top - (r.top + scrollY);
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
+    e._fl = anim(e, [{ transform: `translate(${dx}px,${dy}px)` }, { transform: 'none' }], { duration: 480, easing: SOFT });
+  }
+}
+// A card that is going: the page changes at once and an inert copy fades or drops away where it was.
+function outgoing(el, kf, opt) {
+  if (!el || reduced()) return;
+  const r = el.getBoundingClientRect();
+  if (!onScreen(r)) return;
+  const c = el.cloneNode(true);
+  for (const e of [c, ...c.querySelectorAll('*')]) for (const n of ['id', 'data-fk', 'data-flip', 'data-arrived']) e.removeAttribute(n);
+  c.inert = true; c.setAttribute('aria-hidden', 'true');
+  Object.assign(c.style, { position: 'fixed', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', margin: '0', zIndex: '60', pointerEvents: 'none' });
+  document.body.append(c);
+  settled(anim(c, kf, { ...opt, fill: 'forwards' }), () => c.remove());
+  setTimeout(() => c.remove(), 1200);
+}
+// A short burst of confetti. At most 34 pieces, at most two bursts at once, every piece removed when it lands.
+let bursts = 0;
+function confetti(x, y, n = 24) {
+  if (reduced() || bursts >= 2 || !document.body.animate) return;
+  n = Math.min(n, 34); bursts++;
+  const layer = document.createElement('div'), cols = ['#1c8576', '#ff7a5c', '#ffd166', '#4fd1bd', '#8ab4ff'];
+  layer.className = 'cf-layer'; layer.setAttribute('aria-hidden', 'true');
+  document.body.append(layer);
+  let left = n, over = false;
+  const end = () => { if (over) return; over = true; layer.remove(); bursts--; };
+  for (let i = 0; i < n; i++) {
+    const p = document.createElement('i'), a = Math.random() * Math.PI * 2, d = 36 + Math.random() * 74, dx = Math.cos(a) * d, dy = Math.sin(a) * d - 34, r = (Math.random() - 0.5) * 720;
+    p.className = 'cf';
+    Object.assign(p.style, { left: x - 3 + 'px', top: y - 5 + 'px', background: cols[i % 5] });
+    if (i % 3 === 0) Object.assign(p.style, { borderRadius: '50%', height: '7px' });
+    layer.append(p);
+    const an = p.animate([{ transform: 'translate(0,0) rotate(0) scale(.3)', opacity: 1 }, { transform: `translate(${dx}px,${dy}px) rotate(${r}deg) scale(1)`, opacity: 1, offset: 0.55 }, { transform: `translate(${dx * 1.15}px,${dy + 70}px) rotate(${r * 1.5}deg) scale(.9)`, opacity: 0 }], { duration: 900 + Math.random() * 500, easing: 'cubic-bezier(.2,.7,.3,1)' });
+    settled(an, () => { p.remove(); if (--left === 0) end(); });
+  }
+  setTimeout(end, 2600);
+}
+const middle = (el) => { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; };
+// A title that landed in Plex while the app was open: a sweep of light over the poster, a hop, confetti.
+function celebrate(li) {
+  if (li === document.body || !li.isConnected || reduced()) return;
+  const tile = li.querySelector('.tile');
+  if (tile) { tile.classList.remove('sweep'); void tile.offsetWidth; tile.classList.add('sweep'); setTimeout(() => tile.classList.remove('sweep'), 1000); }
+  anim(li, [{ transform: 'none' }, { transform: 'translateY(-8px) scale(1.02)' }, { transform: 'none' }], { duration: 600, easing: SPRING });
+  anim(li.querySelector('.tag'), [{ transform: 'scale(.4)', opacity: 0 }, { transform: 'scale(1)', opacity: 1 }], { duration: 480, easing: SPRING });
+  confetti(...middle(tile || li), 34);
+}
+// Which arrivals have been celebrated: kept in this browser, so a reload never plays one twice.
+const SEEN_KEY = 'arr.celebrated', seen = new Set();
+let seenLoaded = false, liveFeed = false;
+const arrKey = (it) => it.media_id + '|' + it.at;
+function noteArrivals(feed) {
+  if (!seenLoaded) { seenLoaded = true; try { for (const k of JSON.parse(localStorage.getItem(SEEN_KEY) || '[]')) seen.add(k); } catch { /* nothing remembered */ } }
+  const fresh = (feed.arrived || []).map(arrKey).filter((k) => !seen.has(k));
+  const first = !liveFeed;
+  liveFeed = true;
+  if (!fresh.length) return;
+  for (const k of fresh) seen.add(k);
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify([...seen].slice(-200))); } catch { /* storage blocked: this session only */ }
+  if (!first) for (const k of fresh) M.celebrate.add(k); // the first answer of a visit is only a baseline
+}
+// After the redraw that shows them: celebrate on Home, or pulse the Home tab from anywhere else.
+function runCelebrations() {
+  const keys = [...M.celebrate];
+  M.celebrate.clear();
+  if (reduced()) return;
+  const pulse = () => anim($('#tabs a[href="#/"]'), [{ transform: 'scale(1)' }, { transform: 'scale(1.18)' }, { transform: 'scale(1)' }], { duration: 600, easing: SPRING });
+  const homeShowing = () => onHome() && V.t === 'home' && !P.shown;
+  if (!homeShowing()) return pulse();
+  // Home may be covered by then (a title opened): the tab pulses instead, and the item is already counted as seen.
+  keys.slice(0, 3).forEach((k, i) => setTimeout(() => (homeShowing() ? celebrate(document.querySelector(`[data-arrived="${CSS.escape(k)}"]`) || document.body) : i === 0 && pulse()), 480 + i * 200));
+}
+const hideEl = (el, on) => { if (el) el.style.visibility = on ? 'hidden' : ''; };
 // Answers kept in memory so a screen can show the last one at once while a fresh one is fetched.
 // Anything the person changes makes them wrong, so bust() forgets them all.
 const SC = new Map(), LC = new Map(), TC = new Map(); // search, library and title answers
@@ -56,6 +180,7 @@ function focusKey() {
   return { fk, panel: !!(p && p.contains(a)) };
 }
 function bump() {
+  if (!snap && !reduced() && V.t !== 'skel') snap = measureFlip();
   if (!pendingFk) pendingFk = focusKey() || { fk: '' };
   rerender();
 }
@@ -79,6 +204,7 @@ function watchBanner() {
 }
 const say = (m) => { S.live = ''; bump(); setTimeout(() => { S.live = m; bump(); }, 50); };
 const hint = (text, role) => ({ t: 'hint', text, role });
+const skel = (text) => ({ t: 'skel', text });
 
 const ICONS = {
   search: 'M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14zM20 20l-4-4',
@@ -176,16 +302,39 @@ let TOAST = null, toastT = 0, toastN = 0;
 const held = { hover: false, focus: false };
 function toastTimer() {
   clearTimeout(toastT);
-  if (!TOAST || held.hover || held.focus) return;
+  if (!TOAST) return;
+  if (held.hover || held.focus) { ringAn?.pause(); return; }
+  ringTo(true);
   const n = TOAST.n;
   toastT = setTimeout(() => { if (TOAST && TOAST.n === n) closeToast(); }, 6000);
 }
-function closeToast() { TOAST = null; held.hover = held.focus = false; clearTimeout(toastT); bump(); }
+function toastOut() {
+  const el = $('#toast');
+  if (!el || reduced()) return;
+  const c = el.cloneNode(true);
+  c.removeAttribute('id'); c.inert = true; c.setAttribute('aria-hidden', 'true'); c.style.pointerEvents = 'none';
+  el.parentNode.append(c);
+  settled(anim(c, [{ transform: 'none', opacity: 1 }, { transform: 'translateY(140%)', opacity: 0 }], { duration: 240, fill: 'forwards' }), () => c.remove());
+  setTimeout(() => c.remove(), 800);
+}
+// The ring on Undo drains over the time the toast has left, and starts again whenever that time does.
+let ringAn = null;
+function ringTo(run) {
+  ringAn?.cancel(); ringAn = null;
+  const c = $('#toast .ring circle');
+  if (c && run && !reduced()) ringAn = c.animate([{ strokeDashoffset: 0 }, { strokeDashoffset: 44 }], { duration: 6000, easing: 'linear', fill: 'forwards' });
+}
+function closeToast() { toastOut(); ringTo(false); TOAST = null; held.hover = held.focus = false; clearTimeout(toastT); bump(); }
 // `t` is { before, title, after }: "Added " + the title in bold + a tail. `undo` is async and says
 // in a sentence what it did, or returns null if it could not.
 function showToast(t, undo) {
-  TOAST = { ...t, n: ++toastN, undo: undo || null, busy: false };
+  const had = !!TOAST, n = ++toastN;
+  TOAST = { ...t, n, undo: undo || null, busy: false };
   toastTimer(); bump();
+  after(() => {
+    if (!had) anim($('#toast'), [{ transform: 'translateY(140%)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 440, easing: SPRING });
+    if (TOAST && TOAST.n === n && !held.hover && !held.focus) ringTo(true);
+  });
 }
 function toastAdded(title, outcome, detail, undo) {
   if (outcome === 'in_plex') return showToast({ before: '', title, after: ' is already in Plex.' });
@@ -225,7 +374,8 @@ function Toast() {
   const t = TOAST;
   return h('div', { class: 'toast-region', 'aria-live': 'polite' }, t && h('div', { id: 'toast', class: 'toast', tabindex: '-1' },
     h('span', { class: 'toast-t' }, t.before, t.title ? h('b', null, t.title) : null, t.after),
-    t.undo && h('button', { type: 'button', class: 'toast-undo', 'data-s': t.busy ? 'busy' : null, 'aria-disabled': t.busy ? 'true' : 'false', 'aria-keyshortcuts': 'Z', onClick: undoToast }, t.busy ? 'Undoing…' : 'Undo')));
+    t.undo && h('button', { type: 'button', class: 'toast-undo', 'data-s': t.busy ? 'busy' : null, 'aria-disabled': t.busy ? 'true' : 'false', 'aria-keyshortcuts': 'Z', onClick: undoToast }, t.busy ? 'Undoing…' : 'Undo',
+      h('svg', { class: 'ring', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, h('circle', { cx: 9, cy: 9, r: 7 })))));
 }
 // Undo takes the add back by removing the title from Arr (POST /remove): downloads that have not
 // finished are cancelled, a request still retrying ends, and Arr stops tracking it. Files already in
@@ -249,24 +399,40 @@ function addBtn(it) {
   return h('button', {
     type: 'button', class: 'btn', 'data-fk': 'add:' + it.id, 'data-s': s, 'aria-disabled': s === 'add' ? 'false' : 'true',
     'aria-label': s === 'add' ? `Add ${it.title}` : `${L[1]}, ${it.title}`, onClick: () => addOne(it),
-  }, L[0] ? ic(L[0]) : null, L[1]);
+  }, s === 'busy' ? h('span', { class: 'spin', 'aria-hidden': 'true' }) : s === 'added' && st.pop ? tickIc() : L[0] ? ic(L[0]) : null, L[1]);
+}
+// The tick draws itself the moment an add succeeds; in every other place it is simply there.
+const tickIc = () => h('svg', { viewBox: '0 0 24 24', class: 'ic tick', 'aria-hidden': 'true' }, h('path', { d: ICONS.check }));
+const addEl = (id) => document.querySelector(`[data-fk="add:${CSS.escape(id)}"]`);
+// Tap: a squish. Added: the button pops and the poster hops. Failed: a shake, next to the message.
+function addFx(id, kind) {
+  after(() => {
+    const b = addEl(id);
+    if (!b) return;
+    if (kind === 'tap') anim(b, [{ transform: 'scale(1)' }, { transform: 'scale(.88)' }, { transform: 'scale(1)' }], { duration: 260 });
+    else if (kind === 'ok') {
+      anim(b, [{ transform: 'scale(.7)' }, { transform: 'scale(1)' }], { duration: 520, easing: SPRING });
+      confetti(...middle(b));
+      anim(tileOf(b), [{ transform: 'none' }, { transform: 'translateY(-7px) rotate(-4deg)' }, { transform: 'none' }], { duration: 520, easing: SPRING });
+    } else anim(b, [0, -7, 7, -5, 5, -2, 0].map((x) => ({ transform: `translateX(${x}px)` })), { duration: 420, easing: 'linear' });
+  });
 }
 const Msg = ({ st }) => h('p', { class: 'msg', 'data-err': st.err ? '' : null }, st.msg || null);
 const addMsg = (it) => h(Msg, { st: A.get(it.id) || {} });
 async function addOne(it) {
   const st0 = A.get(it.id) || {};
   if ((st0.busy ? 'busy' : st0.state || it.base) !== 'add') return;
-  A.set(it.id, { busy: true }); bump();
+  A.set(it.id, { busy: true }); bump(); addFx(it.id, 'tap');
   let next, got = null;
   try {
     const r = await api('/v1/quick-add', { method: 'POST', body: { media_id: it.id } });
     if (r.ok && r.data) {
       const o = r.data.outcome;
       got = r.data;
-      next = { msg: r.data.message || 'Added.', state: o === 'in_plex' ? 'inplex' : o === 'following' ? 'following' : o === 'movies_off' ? undefined : 'added', err: o === 'movies_off' };
+      next = { msg: r.data.message || 'Added.', state: o === 'in_plex' ? 'inplex' : o === 'following' ? 'following' : o === 'movies_off' ? undefined : 'added', err: o === 'movies_off', pop: o !== 'movies_off' };
     } else next = { msg: "Couldn't add this one. Try again in a moment.", err: true };
   } catch { next = { msg: "Couldn't reach Arr. Try again in a moment.", err: true }; }
-  A.set(it.id, next); bump(); say(next.msg);
+  A.set(it.id, next); bump(); say(next.msg); addFx(it.id, next.err ? 'bad' : 'ok');
   bust();
   if (next.err) return;
   // Undo only for a title Arr did not track at all before this tap (the search result says so).
@@ -318,15 +484,16 @@ const owned = (x) => (x.owned ?? x.in_library) === true;
 async function hideIdea(x) {
   const list = (S.ideas && S.ideas.items) || [], at = list.indexOf(x);
   if (at < 0) return;
-  S.ideas = { ...S.ideas, items: list.filter((i) => i !== x) };
+  const post = api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } }).then((r) => r.ok, () => false); // asked now; the card shrinks meanwhile
+  outgoing(document.querySelector(`[data-fk="hide:${CSS.escape(x.media_id)}"]`)?.closest('li'), [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200 });
+  S.ideas = { ...S.ideas, items: ((S.ideas && S.ideas.items) || list).filter((i) => i.media_id !== x.media_id) };
   const back = () => { S.ideas = { ...S.ideas, items: S.ideas.items.some((i) => i.media_id === x.media_id) ? S.ideas.items : [...S.ideas.items.slice(0, at), x, ...S.ideas.items.slice(at)] }; };
   toast('Hidden', async () => {
     back(); bump();
     try { await api('/v1/ideas/hide/' + encodeURIComponent(x.media_id), { method: 'DELETE' }); } catch { /* shown again for now; hidden again on the next load */ }
     return { ok: true, text: 'It is back in Ideas.' };
   });
-  let ok = false;
-  try { ok = (await api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } })).ok; } catch { /* below */ }
+  const ok = await post;
   if (!ok) { back(); toast("Couldn't hide that. Try again in a moment."); }
 }
 const notInterested = (x) => h('button', { type: 'button', class: 'link quiet', 'data-fk': 'hide:' + x.media_id, 'aria-label': `Not interested in ${x.title}`, onClick: () => hideIdea(x) }, 'Not interested');
@@ -368,13 +535,13 @@ function NeedRow({ it }) {
     ? h('a', { class: 'btn coral', href: titleHref(it.media_id), 'data-fk': id, 'aria-label': `Choose a copy yourself, ${it.title}`, onClick: () => wantCopies(it) }, ic('right'), 'Choose a copy yourself')
     : h('button', { type: 'button', class: 'btn coral', 'data-fk': id, 'aria-disabled': off ? 'true' : 'false', 'aria-label': `Try again, ${it.title}`, onClick: () => retryOne(it) },
       ic('retry'), st.busy ? 'Trying…' : st.state ? 'Trying again' : 'Try again');
-  return h('li', { class: 'item need' }, h(Tile, { title: it.title, mediaId: it.media_id }),
+  return h('li', { class: 'item need', 'data-flip': it.media_id }, h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h(Title, { title: it.title, id: it.media_id }),
       meta(it) && h('p', { class: 'meta' }, meta(it)),
       h('p', { class: 'problem' }, ic('alert'), h('span', null, text)), h(Msg, { st }), btn));
 }
 function ArrivedRow({ it }) {
-  return h('li', { class: 'item arrived' }, h(Tile, { title: it.title, mediaId: it.media_id }),
+  return h('li', { class: 'item arrived', 'data-flip': it.media_id, 'data-arrived': arrKey(it) }, h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h('span', { class: 'tag' }, ic('check'), 'In Plex'),
       h(Title, { title: it.title, id: it.media_id }), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))));
 }
@@ -387,7 +554,7 @@ function fmtLeft(sec) {
 }
 const STAGES = ['Found', 'Downloading', 'Checking', 'In Plex'];
 // The bar slides from where it last was to where it is now.
-function Journey({ stage, p, fkey, paused }) {
+function Journey({ stage, p, fkey, paused, live }) {
   const el = useRef(null);
   const target = stage === 1 ? (1 + (p ?? 0)) / 3 : stage / 3;
   useLayoutEffect(() => {
@@ -398,22 +565,40 @@ function Journey({ stage, p, fkey, paused }) {
     });
     return () => { cancelAnimationFrame(a); cancelAnimationFrame(b); };
   }, [fkey, target]);
-  return h('ol', { class: 'journey' + (paused ? ' paused' : ''), 'aria-label': 'Progress' }, h('i', { class: 'fill', ref: el }),
+  return h('ol', { class: 'journey' + (paused ? ' paused' : ''), 'aria-label': 'Progress' }, h('i', { class: 'fill' + (live ? ' live' : ''), ref: el }),
     STAGES.map((s, i) => h('li', { key: s, class: i <= stage ? 'on' : '', 'aria-current': i === stage ? 'step' : null }, s)));
+}
+// A number that counts up to its new value instead of jumping.
+function Count({ to }) {
+  const [v, setV] = useState(to), cur = useRef(to);
+  useEffect(() => {
+    if (reduced() || cur.current === to) { cur.current = to; setV(to); return; }
+    const a = cur.current, t0 = performance.now();
+    let raf = 0;
+    const f = (t) => {
+      const k = Math.min(1, (t - t0) / 800), n = Math.round(a + (to - a) * (1 - (1 - k) ** 3));
+      cur.current = n; setV(n);
+      if (k < 1) raf = requestAnimationFrame(f);
+    };
+    raf = requestAnimationFrame(f);
+    return () => cancelAnimationFrame(raf);
+  }, [to]);
+  return v;
 }
 function WayRow({ it }) {
   const stage = Math.max(0, ['found', 'downloading', 'checking'].indexOf(it.stage));
   const p = typeof it.progress === 'number' ? Math.min(1, Math.max(0, it.progress)) : null;
   const left = stage === 1 && p != null && !it.paused ? fmtLeft(it.eta_seconds) : '';
-  const status = it.paused ? 'Paused' : stage === 0 ? 'Found, getting ready' : stage === 1 ? (p == null ? 'Downloading' : left ? `${Math.round(p * 100)}% · ${left}` : `${Math.round(p * 100)}% downloaded`) : 'Checking the file';
-  return h('li', { class: 'item' }, h(Tile, { title: it.title, mediaId: it.media_id }),
+  const pc = p == null ? 0 : Math.round(p * 100);
+  const status = it.paused ? 'Paused' : stage === 0 ? 'Found, getting ready' : stage === 1 ? (p == null ? 'Downloading' : [h(Count, { key: 'n', to: pc }), left ? `% · ${left}` : '% downloaded']) : 'Checking the file';
+  return h('li', { class: 'item', 'data-flip': it.media_id }, h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h(Title, { title: it.title, id: it.media_id }),
-      h('p', { class: 'meta status' }, it.paused && ic('pause'), joinDot(meta(it), status)),
-      h(Journey, { stage, p, fkey: it.grab_id, paused: it.paused })));
+      h('p', { class: 'meta status' }, it.paused && ic('pause'), meta(it), meta(it) ? ' · ' : null, status),
+      h(Journey, { stage, p, fkey: it.grab_id, paused: it.paused, live: stage === 1 && !it.paused })));
 }
 function LookRow({ it }) {
   const until = it.until ? parseDate(it.until) : null;
-  return h('li', { class: 'item' }, until ? chip(until, 'month') : h(Tile, { title: it.title, mediaId: it.media_id }),
+  return h('li', { class: 'item', 'data-flip': it.media_id }, until ? chip(until, 'month') : h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h(Title, { title: it.title, id: it.media_id }),
       h('p', { class: 'meta' }, joinDot(meta(it), until ? `Out ${fmtDay(until)}. Arr will get it then.` : 'Arr is looking for a copy'))));
 }
@@ -464,11 +649,11 @@ function ideaMeta(x, ...facts) {
   return [h('p', { class: 'meta' }, r, r && text ? ' · ' : null, text), sc];
 }
 function IdeaCard({ x, plain }) {
-  return h('li', { class: 'idea' }, h(Tile, { title: x.title, mediaId: x.media_id }), h(Title, { title: x.title, id: x.media_id }),
+  return h('li', { class: 'idea', 'data-flip': x.media_id }, h(Tile, { title: x.title, mediaId: x.media_id }), h(Title, { title: x.title, id: x.media_id }),
     ideaMeta(x, x.network || x.year || ''), chooseLink(x), plain ? null : notInterested(x));
 }
 function IdeaRow({ x }) {
-  return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
+  return h('li', { class: 'item top-align', 'data-flip': x.media_id }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }),
       ideaMeta(x, x.year, x.network), x.summary && h('p', { class: 'clamp' }, x.summary), notInterested(x)), chooseLink(x));
 }
@@ -492,7 +677,7 @@ function Home() {
       h('h2', { id: 'h-empty' }, 'Find something to watch'), h('p', null, ideas.length ? 'Search above for a movie or show, or start with one of these.' : 'Search above for a movie or show.')));
   }
   if (ideas.length) secs.push(h(Section, { key: 'ideas', id: 'ideas', title: 'Ideas for you', extra: h('a', { href: '#/ideas' }, 'See all') }, h('ul', { class: 'ideas-row' }, keyed(ideas, (x) => x.media_id, (x, key) => h(IdeaCard, { key, x })))));
-  return h('div', { class: 'stack' }, S.cached && h('p', { class: 'hint upd', role: 'status' }, 'Updating…'), secs);
+  return h('div', { class: 'stack' }, S.cached && h('p', { class: 'hint updating', role: 'status' }, 'Updating…'), secs);
 }
 function paintHome() { if (S.feed) setView({ t: 'home' }); }
 const onHome = () => parseHash().path === '/';
@@ -505,7 +690,7 @@ function loadFeed() {
     try {
       const r = await api('/v1/feed');
       if (ag !== authGen) return false;
-      if (r.ok) { S.feed = r.data; S.cached = false; S.tmdb = !!r.data.tmdb_backup; if (cg === cacheGen) saveFeed(); setSetup(false); if (onHome()) paintHome(); bump(); }
+      if (r.ok) { noteArrivals(r.data); S.feed = r.data; S.cached = false; S.tmdb = !!r.data.tmdb_backup; if (cg === cacheGen) saveFeed(); setSetup(false); if (onHome()) paintHome(); bump(); }
       return r.ok;
     } catch { return false; } finally {
       feedP = null;
@@ -529,7 +714,7 @@ function failed(t) {
   retryT = setTimeout(() => { if (t === token) route(); }, 5000);
 }
 async function renderHome(t) {
-  if (S.feed) paintHome(); else setView(hint('Loading…'));
+  if (S.feed) paintHome(); else setView(skel());
   const had = S.ideas, feed = loadFeed(), ideas = loadIdeas(); // asked together
   const ok = await feed;
   if (t !== token) return;
@@ -538,10 +723,37 @@ async function renderHome(t) {
   if (t === token && S.ideas !== had) paintHome();
 }
 
+// ---------- loading: placeholders shaped like the rows, shimmering ----------
+function SkelRows({ n = 4 }) {
+  return h('ul', { class: 'list', 'aria-hidden': 'true' }, Array.from({ length: n }, (_, i) => h('li', { key: i, class: 'item' },
+    h('div', { class: 'tile sk' }), h('div', { class: 'what' }, h('div', { class: 'sk ln', style: { width: i % 2 ? '48%' : '64%' } }), h('div', { class: 'sk ln s', style: { width: '34%' } })))));
+}
+// The words stay for screen readers; sighted people see the shapes.
+function SkelView({ text }) {
+  return h('div', { class: 'stack', 'aria-busy': 'true' }, h('p', { class: 'sr', role: 'status' }, text || 'Loading…'), h(SkelRows));
+}
+// A thin line across the top while the page on screen is the last answer and a new one is coming.
+function Topline({ on }) {
+  const el = useRef(null), run = useRef(null);
+  useEffect(() => {
+    const e = el.current;
+    if (!e) return;
+    if (on) {
+      run.current?.cancel();
+      run.current = anim(e, [{ transform: 'scaleX(0)', opacity: 1 }, { transform: 'scaleX(.85)', opacity: 1 }], { duration: 1400, easing: 'cubic-bezier(.1,.7,.2,1)', fill: 'forwards' });
+    } else if (run.current) {
+      const before = run.current, out = anim(e, [{ transform: 'scaleX(1)', opacity: 1 }, { transform: 'scaleX(1)', opacity: 0 }], { duration: 320, fill: 'forwards' });
+      run.current = null; before.cancel();
+      settled(out, () => { if (!run.current) out.cancel(); });
+    }
+  }, [on]);
+  return h('div', { class: 'topline', ref: el, 'aria-hidden': 'true' });
+}
+
 // ---------- ideas ----------
 function IdeasPage() {
   const d = S.ideas;
-  if (!d) return h(Hint, { text: 'Loading…' });
+  if (!d) return h(SkelView);
   const all = d.items, have = all.filter(owned).length;
   const base = I.own ? all : all.filter((x) => !owned(x));
   // The six genres most of the ideas share; one at a time, or all.
@@ -559,7 +771,7 @@ function IdeasPage() {
     note ? h(Hint, { text: note }) : h(List, null, keyed(items, (x) => x.media_id, (x, key) => h(IdeaRow, { key, x }))));
 }
 async function renderIdeas(t) {
-  setView(hint('Loading…'));
+  setView(skel());
   const d = await loadIdeas();
   if (t !== token) return;
   if (!d) return failed(t);
@@ -581,14 +793,14 @@ async function renderSearch(q, t) {
   const seq = ++searchSeq;
   searchAbort?.abort();
   const ac = (searchAbort = new AbortController());
-  if (V.t === 'search') { V.busy = true; bump(); } else setView(hint('Searching…', 'status'));
+  if (V.t === 'search') { V.busy = true; bump(); } else setView(skel('Searching…'));
   const key = q.toLowerCase(), hit = SC.get(key), ag = authGen, cg = cacheGen;
   let view = null, pend = null;
   const attach = () => { if (pend && view && V === view && seq === searchSeq) { view.people = pend; bump(); } };
   // Searched a moment ago: shown at once, with the people it found.
   if (hit && Date.now() - hit.at < SEARCH_TTL) {
     view = { t: 'search', q, rows: hit.rows, notes: hit.notes, busy: false, loading: false, people: hit.people || null };
-    setView(view);
+    M.fresh = true; setView(view);
     if (!hit.people) findPeople(q, seq, ac.signal).then((p) => { if (p) hit.people = p; pend = p; attach(); });
     return;
   }
@@ -612,7 +824,7 @@ async function renderSearch(q, t) {
     if (done.m && moviesOff) notes.push("Movie search isn't set up yet.");
     else if (done.m && !ok(done.m)) notes.push("Movie results aren't available right now.");
     if (done.s && !ok(done.s)) notes.push("Show results aren't available right now.");
-    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: null }; setView(view); }
+    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: null }; M.fresh = true; setView(view); }
     attach();
     if (both() && ok(done.m) && ok(done.s) && cg === cacheGen) remember(SC, key, { at: Date.now(), rows, notes, people: pend }, 20);
   };
@@ -651,7 +863,7 @@ function PeopleRow({ names }) {
     h('div', { class: 'chips' }, names.map((n) => h('a', { key: n.person_id, class: 'chip', href: '#/person/' + encodeURIComponent(n.person_id) }, n.name))));
 }
 async function renderPerson(id, t) {
-  setView(hint('Loading…', 'status'));
+  setView(skel());
   try {
     const r = await api('/v1/people/' + encodeURIComponent(id));
     if (t !== token) return;
@@ -765,7 +977,7 @@ function Library({ t }) {
     if (reset) {
       // The last answer for this list shows while the new one is fetched.
       const hit = LC.get(key);
-      m.items = [];
+      m.items = []; m.enter = true;
       setSt(hit ? { items: hit.items, total: hit.total, status: 'Updating…' } : { items: [], total: 0, status: 'Loading…' });
     } else if (m.gen !== cacheGen) {
       // The rows on screen were read before something changed: "Show more" starts over from page one.
@@ -784,6 +996,14 @@ function Library({ t }) {
     } catch { if (my === m.seq && t === token && !S.out) { setSt((s) => ({ ...s, status: '' })); if (!m.items.length) failed(t); } }
   }
   useEffect(() => { load(true); return () => clearTimeout(m.ft); }, []);
+  // Rows come in one after another when a list is first drawn (and when its kind, sort or filter changes).
+  useLayoutEffect(() => { if (m.enter && st.items.length) { m.enter = false; stagger([...document.querySelectorAll('#view .list > li')]); } }, [st.items]);
+  // The top line runs while the list on screen is the last answer.
+  useEffect(() => {
+    const on = st.status === 'Updating…';
+    if (S.libUpd !== on) { S.libUpd = on; bump(); }
+  }, [st.status]);
+  useEffect(() => () => { if (S.libUpd) { S.libUpd = false; bump(); } }, []);
   const mv = kind === 'movies';
   return h(Section, { id: 'lib', title: 'Library' }, h('div', null,
     h(Storage),
@@ -798,7 +1018,8 @@ function Library({ t }) {
       h('label', { class: 'sort' }, h('span', { class: 'sr' }, 'Sort by'),
         h('select', { value: sort, onChange: (e) => { S.sort = e.target.value; saveSort(S.sort); setSort(S.sort); load(true); } },
           SORTS.map(([k, l]) => h('option', { key: k, value: k }, l))))),
-    h('p', { class: 'hint', role: 'status' }, st.status || null),
+    h('p', { class: st.status === 'Loading…' ? 'sr' : 'hint', role: 'status' }, st.status || null),
+    st.status === 'Loading…' && !st.items.length ? h(SkelRows) : null,
     h('ul', { class: 'list', 'aria-busy': st.status === 'Updating…' ? 'true' : null }, keyed(st.items.map((x) => libraryRow(x, mv)), (r) => r.key, (r, key) => r.el(key))),
     h('div', { class: 'more' }, st.items.length < st.total ? [
       h('button', { key: 'b', type: 'button', class: 'btn ghost', onClick: () => load(false) }, 'Show more'),
@@ -833,6 +1054,7 @@ document.addEventListener('click', (e) => {
 function openTitle(t) {
   if (P.shown && P.id === t.id) return;
   const first = !P.shown;
+  const from = first ? tileOf(P.opener) : null;
   if (first) {
     P.canBack = !!bgHash; // came from a screen of the app: closing goes back to it
     if (!bgHash) renderPath('/', '', '#/'); // a link straight to a title: home sits underneath
@@ -851,12 +1073,14 @@ function openTitle(t) {
   after(() => {
     const panel = $('#panel');
     panel.scrollTop = 0;
-    if (first) panel.querySelector('.close')?.focus({ preventScroll: true });
+    if (first) { panel.querySelector('.close')?.focus({ preventScroll: true }); sheetIn(from); }
   });
   loadTitle(false);
 }
 function closeSheet() {
   if (!P.shown) return;
+  sheetOut();
+  P.upd = false;
   clearTimeout(P.pollT); clearTimeout(P.askT);
   P.token++;
   P.shown = false; P.confirm = false; P.del = null;
@@ -948,12 +1172,75 @@ function schedulePoll() {
 function Sheet() {
   const open = P.shown;
   const body = !open ? null : P.data ? (P.kind === 'show' ? showBody() : movieBody()) : P.err ? errorBody() : skeleton();
-  return h('div', { id: 'sheet', class: 'sheet', hidden: !open, onClick: (e) => { if (e.target === e.currentTarget) dismiss(); } },
+  return h('div', { id: 'sheet', class: 'sheet', hidden: !open, onClick: (e) => { if (e.target === e.currentTarget || e.target.classList.contains('scrim')) dismiss(); } },
+    h('div', { class: 'scrim', 'aria-hidden': 'true' }),
     h('div', { class: 'panel', id: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title', 'aria-busy': open && (P.upd || !(P.data || P.err)) ? 'true' : null, tabindex: '-1', inert: open && (P.confirm || !!P.del) },
       open ? [
-        h('div', { key: 'bar', class: 'sheet-bar' }, P.upd ? h('span', { class: 'upd', role: 'status' }, 'Updating…') : null, h('button', { type: 'button', class: 'btn ghost close', 'aria-label': 'Close', 'data-fk': 'close', onClick: dismiss }, ic('close'))),
+        h('div', { key: 'bar', class: 'sheet-bar' }, h(Grab), P.upd ? h('span', { class: 'updating', role: 'status' }, 'Updating…') : null, h('button', { type: 'button', class: 'btn ghost close', 'aria-label': 'Close', 'data-fk': 'close', onClick: dismiss }, ic('close'))),
         h('div', { key: 'body', class: 'sheet-body' }, body)] : null),
     open && P.confirm && P.data ? h(ConfirmRemove) : open && P.del && P.data ? h(ConfirmDelete) : null);
+}
+// The handle at the top: pull the sheet down to close it. Only the handle moves it, so the page inside still scrolls.
+const pull = { on: false, y: 0, dy: 0 };
+function Grab() {
+  const end = () => {
+    if (!pull.on) return;
+    pull.on = false;
+    const dy = pull.dy, panel = $('#panel'), scrim = $('#sheet .scrim');
+    if (dy > 80) { M.drag = dy; dismiss(); return; }
+    if (panel) panel.style.transform = '';
+    if (scrim) scrim.style.opacity = '';
+    if (dy && panel) anim(panel, [{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { duration: 420, easing: SOFT });
+  };
+  return h('div', {
+    class: 'grab', 'aria-hidden': 'true',
+    onPointerDown: (e) => { pull.on = true; pull.y = e.clientY; pull.dy = 0; try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* not a live pointer */ } },
+    onPointerMove: (e) => {
+      if (!pull.on) return;
+      pull.dy = Math.max(0, e.clientY - pull.y);
+      const panel = $('#panel'), scrim = $('#sheet .scrim');
+      if (panel) panel.style.transform = `translateY(${pull.dy}px)`;
+      if (scrim) scrim.style.opacity = String(Math.max(0, 1 - pull.dy / 300));
+    },
+    onPointerUp: end, onPointerCancel: end,
+  });
+}
+// The sheet comes in over the page: the tapped poster grows into the big one, the panel rises.
+function sheetIn(from) {
+  const panel = $('#panel'), scrim = $('#sheet .scrim');
+  if (!panel || reduced()) return;
+  const big = panel.querySelector('.tile.big:not(.sk)'), a = from && from.isConnected ? from.getBoundingClientRect() : null, b = big && big.getBoundingClientRect(), w = wide();
+  anim(scrim, [{ opacity: 0 }, { opacity: 1 }], { duration: 300 });
+  anim(panel, w ? [{ transform: 'translateX(48px)', opacity: 0 }, { transform: 'none', opacity: 1 }] : [{ transform: 'translateY(100%)' }, { transform: 'none' }], { duration: w ? 320 : 440, easing: 'cubic-bezier(.2,.9,.25,1)' });
+  if (a && b && big && onScreen(a) && onScreen(b)) {
+    hideEl(big, true); hideEl(from, true);
+    settled(fly(from, a, b), () => { hideEl(big, false); hideEl(from, false); });
+  }
+}
+// It goes the way it came: a copy of the sheet slides (or is let go) while the real one is already gone.
+function sheetOut() {
+  const sheet = $('#sheet'), panel = $('#panel'), scrim = $('#sheet .scrim'), dy = M.drag;
+  M.drag = 0;
+  if (!sheet || !panel || sheet.hidden) return;
+  const op = scrim ? getComputedStyle(scrim).opacity : '1';
+  panel.style.transform = ''; if (scrim) scrim.style.opacity = '';
+  if (reduced()) return;
+  const c = sheet.cloneNode(true);
+  c.removeAttribute('id'); c.removeAttribute('hidden'); c.querySelectorAll('[id]').forEach((e) => e.removeAttribute('id'));
+  c.inert = true; c.setAttribute('aria-hidden', 'true'); c.style.pointerEvents = 'none';
+  document.body.append(c);
+  const cp = c.querySelector('.panel'), cs = c.querySelector('.scrim'), w = wide();
+  cp.style.transform = ''; cs.style.opacity = '';
+  cp.scrollTop = panel.scrollTop;
+  const out = anim(cp, w ? [{ transform: 'none', opacity: 1 }, { transform: 'translateX(48px)', opacity: 0 }] : [{ transform: `translateY(${dy}px)` }, { transform: 'translateY(110%)' }], { duration: 300, easing: 'cubic-bezier(.4,0,.9,.6)', fill: 'forwards' });
+  anim(cs, [{ opacity: op }, { opacity: 0 }], { duration: 280, fill: 'forwards' });
+  const o = P.opener, small = !dy && o && o.isConnected ? tileOf(o) : null, big = cp.querySelector('.tile.big:not(.sk)');
+  if (small && big) {
+    const a = big.getBoundingClientRect(), b = small.getBoundingClientRect();
+    if (onScreen(a) && onScreen(b)) { hideEl(big, true); hideEl(small, true); settled(fly(big, a, b), () => hideEl(small, false)); }
+  }
+  settled(out, () => c.remove());
+  setTimeout(() => { c.remove(); hideEl(small, false); }, 1200);
 }
 function skeleton() {
   const bar = (w, extra) => h('div', { class: 'sk', style: { width: w, ...extra } }), pk = P.peek;
@@ -1494,7 +1781,7 @@ function movieBody() {
       h('div', { class: 'what' },
         st === 'in_plex' ? h('span', { class: 'tag' }, ic('check'), 'In Plex') : null,
         h('p', { class: 'st' }, st === 'in_plex' ? 'Ready to watch' : line),
-        st === 'on_its_way' ? h(Journey, { stage: p == null ? 0 : 1, p, fkey: 'movie:' + d.media_id }) : null,
+        st === 'on_its_way' ? h(Journey, { stage: p == null ? 0 : 1, p, fkey: 'movie:' + d.media_id, live: p != null }) : null,
         msgFor(key)),
       control && h('div', { class: 'act' }, control)),
     optionsPanel(),
@@ -1543,8 +1830,20 @@ function route() {
   }
   renderPath(path, q, hash);
 }
+// A new screen: tabs slide the way they sit in the bar, any other change is a short rise.
+function enterRoute(prev, path) {
+  if (prev === path) return;
+  M.fresh = true;
+  if (prev === null) return;
+  const a = TABS.findIndex((t) => t[0] === prev), b = TABS.findIndex((t) => t[0] === path), dir = a >= 0 && b >= 0 ? Math.sign(b - a) : 0;
+  after(() => {
+    anim($('#view'), [{ opacity: 0, transform: dir ? `translateX(${dir * 28}px)` : 'translateY(8px)' }, { opacity: 1, transform: 'none' }], { duration: 300 });
+    if (b >= 0) anim($('#tabs a[aria-current] .ic'), [{ transform: 'none' }, { transform: 'translateY(-7px) scale(1.25) rotate(-8deg)', offset: 0.4 }, { transform: 'none' }], { duration: 520, easing: SPRING });
+  });
+}
 function renderPath(path, q, hash) {
   bgHash = hash;
+  enterRoute(R.path, path);
   const t = ++token;
   clearTimeout(retryT); clearTimeout(pollT); clearTimeout(debounceT);
   R.path = path;
@@ -1554,7 +1853,7 @@ function renderPath(path, q, hash) {
   if (path === '/search') renderSearch(q, t);
   else if (personRoute(path)) renderPerson(personRoute(path), t);
   else if (path === '/ideas') renderIdeas(t);
-  else if (path === '/library') { setView({ t: 'library', tok: t }); }
+  else if (path === '/library') { M.fresh = false; setView({ t: 'library', tok: t }); }
   else if (path === '/settings') renderSettings();
   else renderHome(t);
 }
@@ -1562,6 +1861,7 @@ function renderPath(path, q, hash) {
 // ---------- the page ----------
 function View() {
   switch (V.t) {
+    case 'skel': return h(SkelView, { text: V.text });
     case 'home': return h(Home);
     case 'ideas': return h(IdeasPage);
     case 'search': return h(SearchResults);
@@ -1796,11 +2096,18 @@ async function renderSettings() {
   await Promise.all([loadSettings(), loadHealth(), loadUpdate(), loadBin()]);
 }
 // The bin: what "Delete files" moved out of the library, kept for 7 days.
-const B = { entries: [], busy: '', ask: '', msg: '', err: false };
+const B = { entries: [], busy: '', ask: '', msg: '', err: false, loaded: false };
+const binRow = (id) => document.querySelector(`[data-fk="bin-restore:${CSS.escape(id)}"], [data-fk="bin-go:${CSS.escape(id)}"]`)?.closest('li');
 async function loadBin() {
   try {
     const r = await api('/v1/bin');
-    if (r.ok) { B.entries = r.data.entries; bump(); }
+    if (r.ok) {
+      // An entry that turns up while the page is open pops in.
+      const had = new Set(B.entries.map((e) => e.delete_id)), first = !B.loaded;
+      B.entries = r.data.entries; B.loaded = true; bump();
+      const added = first ? [] : B.entries.map((e) => e.delete_id).filter((x) => !had.has(x));
+      if (added.length) after(() => added.forEach((x) => anim(binRow(x), [{ transform: 'scale(.6)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 480, easing: SPRING })));
+    }
   } catch { /* the banner says Arr can't be reached */ }
 }
 async function binAct(id, what) {
@@ -1815,8 +2122,15 @@ async function binAct(id, what) {
     }
   } catch { m = { ok: false, text: "Couldn't reach Arr. Try again in a moment." }; }
   B.busy = ''; B.msg = m.text; B.err = !m.ok; say(m.text);
-  await loadBin();
+  // A deleted row drops away; a restored one pops back out. The list changes at once.
+  if (m.ok) {
+    outgoing(binRow(id), what === 'restore' ? [{ transform: 'none', opacity: 1 }, { transform: 'scale(1.06)', opacity: 0 }] : [{ transform: 'none', opacity: 1 }, { transform: 'translateY(4px) rotate(-3deg) scale(.97)', opacity: 1, offset: 0.3 }, { transform: 'translateY(70px) rotate(-9deg) scale(.8)', opacity: 0 }],
+      { duration: what === 'restore' ? 300 : 440, easing: what === 'restore' ? EASE : 'cubic-bezier(.5,0,.8,.4)' });
+    B.entries = B.entries.filter((e) => e.delete_id !== id);
+  }
   bump();
+  await loadBin();
+
 }
 const binScope = (id) => {
   const s = /^season:[a-z]+:\d+:(\d+)$/.exec(id), e = /^episode:[a-z]+:\d+:(\d+):(\d+)$/.exec(id);
@@ -1827,7 +2141,7 @@ function BinSection() {
   return h(Section, { id: 'bin', title: 'Bin' },
     B.entries.length ? h('p', { class: 'hint' }, 'Files you deleted stay here for 7 days. Put them back, or empty them to free the space now.') : null,
     B.msg ? h('p', { class: 'msg', role: 'status', 'data-err': B.err ? '' : null }, B.msg) : null,
-    h('ul', { class: 'list' }, B.entries.map((e) => h('li', { key: e.delete_id, class: 'item bin' },
+    h('ul', { class: 'list' }, B.entries.map((e) => h('li', { key: e.delete_id, class: 'item bin', 'data-flip': 'bin:' + e.delete_id },
       h('div', { class: 'what' }, h('h3', null, e.title, binScope(e.media_id)),
         h('p', { class: 'meta' }, `${plural(e.files, 'file', 'files')}${fmtSize(e.bytes) ? ` · ${fmtSize(e.bytes)}` : ''} · empties ${fmtDate(e.purge_at)}`)),
       B.ask === e.delete_id
@@ -1991,6 +2305,11 @@ async function signOut() {
   location.hash = ''; location.reload();
 }
 
+const ENTER = new Set(['home', 'ideas', 'search', 'person', 'start']);
+function stagger(els) {
+  els.slice(0, 10).forEach((e, i) => anim(e, [{ opacity: 0, transform: 'translateY(14px) scale(.98)' }, { opacity: 1, transform: 'none' }], { duration: 420, delay: i * 60, fill: 'backwards' }));
+}
+const enterRows = () => stagger([...document.querySelectorAll('#view .item, #view .idea, #view .recent li')]);
 function App() {
   const [, set] = useState(0);
   useLayoutEffect(() => {
@@ -2005,14 +2324,22 @@ function App() {
     if (pk && pk.fk && (!a || a === document.body || !a.isConnected)) {
       $(pk.panel ? '#panel' : '#view')?.querySelector(`[data-fk="${CSS.escape(pk.fk)}"]`)?.focus({ preventScroll: true });
     }
+    // A screen's rows come in one after another, the first time they are drawn and never again.
+    const sn = snap; snap = null;
+    if (M.celebrate.size) runCelebrations();
+    if (M.fresh && ENTER.has(V.t)) { M.fresh = false; enterRows(); } else if (sn) playFlip(sn);
     for (const fn of later.splice(0)) fn();
   });
+  const tabAt = TABS.findIndex((t) => t[0] === R.path);
+  if (tabAt >= 0) M.tab = tabAt;
   const inert = P.shown; // everything behind the sheet: out of reach of the keyboard and assistive tech
   return h(Fragment, null,
     h('a', { class: 'skip', href: '#view', inert }, 'Skip to content'),
     h('header', { class: 'top', id: 'top', inert },
       h('a', { class: 'brand', href: '#/', 'aria-label': 'Arr, home' }, h('img', { src: '/app/mascot.svg', alt: '', width: 34, height: 34 }), h('span', null, 'Arr')),
-      h('nav', { id: 'tabs', 'aria-label': 'Main', hidden: S.out }, TABS.map(([p, l, i]) =>
+      h('nav', { id: 'tabs', 'aria-label': 'Main', hidden: S.out, style: { '--i': M.tab } },
+        h('span', { class: 'pill', 'aria-hidden': 'true', 'data-off': tabAt < 0 ? '' : null }),
+        TABS.map(([p, l, i]) =>
         h('a', { key: p, href: '#' + p, 'aria-current': R.path === p ? 'page' : null }, ic(i), l))),
       h('form', { class: 'search', id: 'search', role: 'search', autocomplete: 'off', hidden: S.out, onSubmit: searchSubmit },
         h('span', { id: 'search-ico', 'aria-hidden': 'true' }, ic('search')),
@@ -2020,6 +2347,7 @@ function App() {
         h('input', { id: 'q', name: 'q', type: 'search', placeholder: 'Find a movie or show', enterkeyhint: 'search', autocapitalize: 'off', spellcheck: false, onInput: searchInput, onFocus: openSearch, onClick: openSearch })),
       h('div', { id: 'banner', class: 'banner', role: 'status' }, S.banner || (S.setup ? SETUP_MSG : null))),
     h(UpdateBar),
+    h(Topline, { on: !!(S.cached || (P.shown && P.upd) || S.libUpd) }),
     h('main', { id: 'view', tabindex: '-1', inert }, h(View)),
     h(Toast),
     h(Footer),
