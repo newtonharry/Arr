@@ -48,6 +48,8 @@ impl EventState {
 pub struct Side {
     pub id: String,
     pub name: String,
+    /// The team's abbreviation ("MNC"), letters and digits only.
+    pub abbreviation: Option<String>,
 }
 
 /// One fixture, as far as Arr cares.
@@ -58,7 +60,9 @@ pub struct Fixture {
     /// Set for multi-day events (a golf tournament).
     pub ends_at: Option<OffsetDateTime>,
     pub season: Option<String>,
-    pub name: String,
+    /// `Away at Home` built from the two teams, or a title that passed `event_title`. `None`
+    /// when a title failed the checks: the store then names the event from its league and date.
+    pub name: Option<String>,
     pub short_name: Option<String>,
     pub home: Option<Side>,
     pub away: Option<Side>,
@@ -110,8 +114,6 @@ struct RawEvent {
     #[serde(rename = "endDate")]
     end_date: Option<String>,
     name: Option<String>,
-    #[serde(rename = "shortName")]
-    short_name: Option<String>,
     season: Option<RawSeason>,
     status: Option<RawStatus>,
     #[serde(default)]
@@ -178,8 +180,8 @@ struct RawTeam {
 
 #[derive(Deserialize)]
 struct RawTeams {
-    #[serde(default)]
-    sports: Vec<RawTeamsSport>,
+    /// Required: an answer without it is not a team list. An empty one is well formed.
+    sports: Option<Vec<RawTeamsSport>>,
 }
 
 #[derive(Deserialize)]
@@ -215,19 +217,51 @@ fn clean(text: Option<&str>, max: usize) -> Option<String> {
     }
 }
 
-/// Text of a fixture (a name, a venue) from the feed. Those are plain names in every recording,
-/// but they are free text, so anything that reads like a result ("3-1", "wins", "beat") is
-/// refused rather than trusted.
-fn fixture_text(text: Option<&str>, max: usize) -> Option<String> {
+/// Words and shapes that tell how a contest went. Matched as whole words (the edges are any
+/// character that is not a letter or digit, so "def." and "Decker" are told apart); "champion"
+/// is here but "Championship" is not, because a tournament's name may say that and a result
+/// ("X, champion") may not.
+fn outcome_like(t: &str) -> bool {
     static RESULT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let t = clean(text, max)?;
     let result = RESULT.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)\b\d{1,3}\s*[-\u{2013}:]\s*\d{1,3}\b|\b(wins?|won|beats?|defeat(s|ed)?|def\.|tko|ko)\b",
-        )
+        regex::Regex::new(concat!(
+            r"(?i)\d{1,3}\s*[-\u{2013}\u{2014}:]\s*\d{1,3}",
+            r"|(?:^|[^\p{L}\p{N}])(?:def|dec|defeats?|defeated|beats?|wins?|won|win over|lost to|lost",
+            r"|loses?|draws?|drew|ko|tko|submission|submitted|decision|forfeit(?:ed)?|walkover",
+            r"|retired|retires|champion|crowned|clinch(?:es|ed)?|victory|victorious|knocked out",
+            r"|stoppage)(?:[^\p{L}\p{N}]|$)"
+        ))
         .expect("static pattern")
     });
-    (!result.is_match(&t)).then_some(t)
+    result.is_match(t)
+}
+
+/// An event's title from the feed, for events with no two sides (a fight card, a tournament).
+/// It is free text, so it must fit a plain grammar: a heading (letters, digits, spaces and
+/// `' & . - + / ( ) # ,`), optionally followed by `: <Name> vs. <Name>` (`vs`, `vs.` or `v`),
+/// and must read like neither a score nor an outcome. A title that does not is dropped; the
+/// event is kept and named from its league and date.
+pub fn event_title(text: Option<&str>) -> Option<String> {
+    static GRAMMAR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let t = clean(text, 200)?;
+    let grammar = GRAMMAR.get_or_init(|| {
+        regex::Regex::new(concat!(
+            r"(?i)^[\p{L}\p{N} '\u{2019}&.\-+/()#,]{2,120}",
+            r"(?::\s[\p{L}\p{N} '\u{2019}.\-]{1,40}\s(?:vs\.?|v)\s[\p{L}\p{N} '\u{2019}.\-]{1,40})?$"
+        ))
+        .expect("static pattern")
+    });
+    (grammar.is_match(&t) && !outcome_like(&t)).then_some(t)
+}
+
+/// A venue's name from the structured venue field: plain characters, nothing that reads like
+/// a result.
+fn venue_name(text: Option<&str>) -> Option<String> {
+    let t = clean(text, 120)?;
+    let plain = t
+        .chars()
+        .all(|c| c.is_alphanumeric() || " '\u{2019}&.-+/()#,".contains(c));
+    (plain && !outcome_like(&t)).then_some(t)
 }
 
 /// An id as the feed writes it, a string or a number, kept only when it is a plain number
@@ -276,6 +310,8 @@ fn side(t: &RawTeam) -> Option<Side> {
     Some(Side {
         id: plain_id(t.id.as_ref())?,
         name: clean(t.display_name.as_deref().or(t.name.as_deref()), 120)?,
+        abbreviation: clean(t.abbreviation.as_deref(), 12)
+            .filter(|a| a.chars().all(|c| c.is_alphanumeric())),
     })
 }
 
@@ -311,14 +347,24 @@ fn fixture(e: RawEvent) -> Option<Fixture> {
     } else {
         (None, None)
     };
-    let name = fixture_text(e.name.as_deref(), 200).or_else(|| {
-        let (h, a) = (home.as_ref()?, away.as_ref()?);
-        Some(format!("{} vs {}", h.name, a.name))
-    })?;
+    // The name never comes from the feed's own `name` or `shortName` when both teams are
+    // known: it is built from the structured team names, away side first ("Fulham at
+    // Manchester City", "Stade Toulousain at Lyon"), and the short name from their
+    // abbreviations ("FUL @ MNC"). `home` and `away` keep their own meaning.
+    let (name, short_name) = match (&home, &away) {
+        (Some(h), Some(a)) => (
+            Some(format!("{} at {}", a.name, h.name)),
+            h.abbreviation
+                .as_ref()
+                .zip(a.abbreviation.as_ref())
+                .map(|(h, a)| format!("{a} @ {h}")),
+        ),
+        _ => (event_title(e.name.as_deref()), None),
+    };
     let venue = comp
         .and_then(|c| c.venue.as_ref())
         .or(e.venues.first())
-        .and_then(|v| fixture_text(v.full_name.as_deref(), 120));
+        .and_then(|v| venue_name(v.full_name.as_deref()));
     // Notes are free text and can say how a game went, so they are never copied: only a
     // headline that is exactly a round label is kept.
     let round = comp.and_then(|c| {
@@ -336,7 +382,7 @@ fn fixture(e: RawEvent) -> Option<Fixture> {
             .filter(|end| *end > starts_at),
         season: e.season.and_then(|s| plain_id_or_text(s.year.as_ref())),
         name,
-        short_name: fixture_text(e.short_name.as_deref(), 60),
+        short_name,
         home,
         away,
         round,
@@ -441,8 +487,10 @@ pub fn parse_teams(body: &[u8]) -> Result<Vec<TeamInfo>, UpstreamError> {
         ),
     })?;
     let mut seen = std::collections::HashSet::new();
-    let teams: Vec<TeamInfo> = raw
-        .sports
+    let sports = raw.sports.ok_or_else(|| UpstreamError::BadResponse {
+        reason: "no list of sports in the answer".into(),
+    })?;
+    let teams: Vec<TeamInfo> = sports
         .into_iter()
         .flat_map(|s| s.leagues)
         .flat_map(|l| l.teams)
@@ -459,11 +507,6 @@ pub fn parse_teams(body: &[u8]) -> Result<Vec<TeamInfo>, UpstreamError> {
         .filter(|t| seen.insert(t.id.clone()))
         .take(MAX_TEAMS)
         .collect();
-    if teams.is_empty() {
-        return Err(UpstreamError::BadResponse {
-            reason: "no teams in the answer".into(),
-        });
-    }
     Ok(teams)
 }
 
@@ -674,8 +717,160 @@ mod tests {
         assert_eq!(m.fixtures[0].away.as_ref().unwrap().name, "Y");
         assert!(m.fixtures[1].home.is_none() && m.fixtures[1].away.is_none());
         assert!(m.fixtures[1].ends_at.unwrap() > m.fixtures[1].starts_at);
-        assert_eq!(m.fixtures[2].name, "Odd name");
+        assert_eq!(m.fixtures[2].name.as_deref(), Some("Odd name"));
         assert!(!m.truncated);
         assert!(parse_month(b"not json").is_err());
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    const SPOILERS: [&str; 16] = [
+        "Smith def. Jones",
+        "Smith def Jones",
+        "Smith lost to Jones",
+        "Jones wins by KO",
+        "Jones wins",
+        "Smith beat Jones",
+        "Smith defeated Jones",
+        "Jones won by submission",
+        "Smith vs Jones 3-1",
+        "UFC 300: Smith vs. Jones (3 - 1)",
+        "Smith vs. Jones: TKO",
+        "Jones via decision",
+        "Smith dec. Jones",
+        "Draw",
+        "Jones, champion",
+        "Smith forfeit",
+    ];
+
+    #[test]
+    fn titles_that_tell_how_it_went_are_refused() {
+        for t in SPOILERS {
+            assert_eq!(event_title(Some(t)), None, "{t}");
+        }
+        for t in [
+            "UFC 300: Smith vs. Jones",
+            "UFC: Smith def. Jones",
+            "UFC: Smith vs. Jones, KO",
+        ] {
+            assert_eq!(
+                event_title(Some(t)).is_some(),
+                t == "UFC 300: Smith vs. Jones",
+                "{t}"
+            );
+        }
+        // Not the grammar of a title at all.
+        for t in [
+            "Smith vs. Jones: Jones vs. Smith: more",
+            "A!",
+            "x",
+            "<b>Open</b>",
+            "Open = 3",
+        ] {
+            assert_eq!(event_title(Some(t)), None, "{t}");
+        }
+        assert_eq!(event_title(None), None);
+    }
+
+    #[test]
+    fn real_titles_and_names_that_only_contain_trigger_letters_pass() {
+        for t in [
+            "UFC Fight Night: Cortes Acosta vs. Walker",
+            "UFC 334: Gane vs. Hokit",
+            "UFC Fight Night: Proch\u{e1}zka vs. Stirling",
+            "PFL Dubai: Nemkov vs. Bilostenniy",
+            "UFC 300",
+            "Abu Dhabi Aldar Championship",
+            "DP World Tour Championship",
+            "BMW Australian PGA Championship",
+            "Tour Championship",
+            "Masters Tournament",
+            "The Open",
+            "U.S. Open",
+            "3M Open",
+            "Rocket Classic",
+            "Zurich Classic of New Orleans",
+            "THE CJ CUP Byron Nelson",
+            "the Memorial Tournament pres. by Workday",
+            "Charles Schwab Challenge",
+            "Genesis Scottish Open",
+            "UFC Fight Night: Decker vs. Winston",
+            "UFC Fight Night: Kowalski vs. Koch",
+            "UFC Fight Night: Tkachenko v Drewry",
+            "UFC Fight Night: Beaton vs. Windsor",
+            "Wincanton Winter Classic",
+            "Kokomo Open",
+            "Wonderland Invitational",
+        ] {
+            assert_eq!(event_title(Some(t)).as_deref(), Some(t), "{t}");
+        }
+        for v in [
+            "Etihad Stadium",
+            "Meta APEX",
+            "Stade de France",
+            "St. Mary's Stadium",
+            "Wincanton Arena",
+            "Decker Park",
+        ] {
+            assert_eq!(venue_name(Some(v)).as_deref(), Some(v), "{v}");
+        }
+        for v in [
+            "Jones wins by KO",
+            "3-1",
+            "Smith def. Jones",
+            "Arena <3",
+            "Smith lost to Jones",
+        ] {
+            assert_eq!(venue_name(Some(v)), None, "{v}");
+        }
+    }
+
+    fn board(name: &str, short: &str, venue: &str, with_sides: bool) -> Fixture {
+        let sides = if with_sides {
+            r#",{"homeAway":"home","team":{"id":"5","displayName":"Lyon","abbreviation":"LYO"}},
+               {"homeAway":"away","team":{"id":"6","displayName":"Stade Toulousain","abbreviation":"TOU"}}"#
+        } else {
+            ""
+        };
+        let body = format!(
+            r#"{{"events":[{{"id":"7","date":"2026-11-21T12:30Z","name":"{name}","shortName":"{short}",
+               "competitions":[{{"venue":{{"fullName":"{venue}"}},"competitors":[{{"athlete":{{"fullName":"x"}}}}{sides}]}}]}}]}}"#
+        );
+        parse_month(body.as_bytes()).unwrap().fixtures.remove(0)
+    }
+
+    #[test]
+    fn a_team_event_is_named_from_its_teams_whatever_the_feed_says() {
+        for spoiler in SPOILERS {
+            let f = board(spoiler, spoiler, spoiler, true);
+            assert_eq!(
+                f.name.as_deref(),
+                Some("Stade Toulousain at Lyon"),
+                "{spoiler}"
+            );
+            assert_eq!(f.short_name.as_deref(), Some("TOU @ LYO"));
+            assert_eq!(f.venue, None, "{spoiler}");
+        }
+        let f = board("Anything", "Anything", "Stade Gerland", true);
+        assert_eq!(f.venue.as_deref(), Some("Stade Gerland"));
+        assert_eq!(f.home.as_ref().unwrap().name, "Lyon");
+        assert_eq!(f.away.as_ref().unwrap().name, "Stade Toulousain");
+    }
+
+    #[test]
+    fn a_card_or_tournament_keeps_a_good_title_and_loses_a_bad_one_not_the_event() {
+        for spoiler in SPOILERS {
+            let f = board(spoiler, spoiler, spoiler, false);
+            assert_eq!(f.name, None, "{spoiler}");
+            assert_eq!(f.short_name, None);
+            assert_eq!(f.venue, None, "{spoiler}");
+            assert_eq!(f.id, "7", "the event itself is kept");
+        }
+        let f = board("UFC 334: Gane vs. Hokit", "UFC 334", "Meta APEX", false);
+        assert_eq!(f.name.as_deref(), Some("UFC 334: Gane vs. Hokit"));
+        assert_eq!(f.venue.as_deref(), Some("Meta APEX"));
     }
 }

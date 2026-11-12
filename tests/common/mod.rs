@@ -556,8 +556,8 @@ pub fn espn_use_absolute(mock: &Mock, path: &str, events: Vec<Value>) {
     m.espn_events.insert(path.to_string(), events);
 }
 
-/// A copy of the first recorded event of a league with another id, date and name, still
-/// carrying the recorded score fields.
+/// A copy of the first recorded event of a league with another id, date and name (and no
+/// teams, so that the title is what the test gave).
 pub fn espn_event_like(mock: &Mock, path: &str, id: &str, date: &str, name: &str) -> Value {
     let m = mock.lock().unwrap();
     let mut e = m.espn_events[path][0].clone();
@@ -567,6 +567,8 @@ pub fn espn_event_like(mock: &Mock, path: &str, id: &str, date: &str, name: &str
     e["status"]["type"] = json!({ "name": "STATUS_SCHEDULED", "state": "pre" });
     e["competitions"][0]["status"]["type"] = json!({ "name": "STATUS_SCHEDULED", "state": "pre" });
     e["competitions"][0]["date"] = json!(date);
+    // No teams: the name stays the title given here.
+    e["competitions"][0]["competitors"] = json!([]);
     e
 }
 

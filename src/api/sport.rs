@@ -269,18 +269,27 @@ pub(super) async fn follow(State(st): St, ApiJson(b): ApiJson<FollowBody>) -> Ap
                     .await
                     .map_err(internal("sport follow"))?;
                 if found.is_none() {
-                    return Err(match read {
-                        Ok(()) => ApiError::not_found(format!(
-                            "{} has no team numbered {id}",
-                            league.name
-                        )),
-                        Err(why) => ApiError::new(
+                    // Only a list that was really read can say a team is not in the league;
+                    // without one (never read, or the source failing and being waited out)
+                    // the answer is "try again", not "no such team".
+                    let listed = st
+                        .store
+                        .with(move |c| Ok(data::refresh_state(c, slug)?.teams.is_some()))
+                        .await
+                        .map_err(internal("sport follow"))?;
+                    return Err(if listed {
+                        ApiError::not_found(format!("{} has no team numbered {id}", league.name))
+                    } else {
+                        let why = read
+                            .err()
+                            .unwrap_or_else(|| "the team list has not been read yet".to_string());
+                        ApiError::new(
                             StatusCode::SERVICE_UNAVAILABLE,
                             ErrorCode::UpstreamUnavailable,
                             format!(
                                 "Arr could not check the team list right now ({why}); try again in a moment"
                             ),
-                        ),
+                        )
                     });
                 }
             }

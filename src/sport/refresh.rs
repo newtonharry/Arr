@@ -100,8 +100,8 @@ fn months(from: OffsetDateTime, to: OffsetDateTime) -> Vec<(i32, u8)> {
 
 /// The span of a month in which an absent event may be called unlisted. The feed's days are
 /// the American ones, so an event on the month's first or last day may be listed under the
-/// neighbouring month: that day is left out of the span unless the neighbour was read too
-/// (`inner_start`, `inner_end`), in which case the event would have shown up there.
+/// neighbouring month: that day is left out of the span unless the neighbour answered in full
+/// too (`inner_start`, `inner_end`), in which case one of the two would list the event.
 fn month_span(
     y: i32,
     m: u8,
@@ -178,7 +178,6 @@ async fn read_league(
     let mut seen: HashSet<String> = HashSet::new();
     // Months whose answer can be trusted to list everything: each is judged on its own.
     let mut complete_months: Vec<(i32, u8)> = vec![];
-    let mut read_months: Vec<(i32, u8)> = vec![];
     let mut failed = None;
     for (y, m) in months(from, to) {
         match sports.espn.month(league.espn, y, m).await {
@@ -186,7 +185,6 @@ async fn read_league(
                 seen.extend(month.fixtures.iter().map(|f| f.id.clone()));
                 seen.extend(month.rejected_ids.iter().cloned());
                 fetched.extend(month.fixtures.iter().cloned());
-                read_months.push((y, m));
                 if month.complete() {
                     complete_months.push((y, m));
                 }
@@ -206,11 +204,12 @@ async fn read_league(
             .filter_map(|&(y, m)| {
                 let before = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
                 let after = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+                // A shared boundary day is only judged when both months answered in full.
                 month_span(
                     y,
                     m,
-                    read_months.contains(&before),
-                    read_months.contains(&after),
+                    complete_months.contains(&before),
+                    complete_months.contains(&after),
                 )
             })
             .collect()
@@ -270,6 +269,15 @@ pub async fn ensure_teams(
         return Ok(());
     }
     match sports.espn.teams(league.espn).await {
+        // Well formed but empty: this league has no team list yet. Its own retry timing, and
+        // nothing for the other leagues (the client saw a good answer).
+        Ok(teams) if teams.is_empty() => {
+            let failures = state.teams_failures;
+            store
+                .with(move |c| data::note_teams_failed(c, slug, now + backoff(failures)))
+                .await?;
+            Ok(())
+        }
         Ok(teams) => {
             store
                 .with(move |c| {
@@ -336,6 +344,17 @@ async fn refresh_when(
 ) -> Freshness {
     let lock = sports.league_lock(league.slug);
     let _turn = lock.lock().await;
+    refresh_locked(store, sports, league, now, need).await
+}
+
+/// `refresh_when` for a caller that already holds the league's turn.
+async fn refresh_locked(
+    store: &Store,
+    sports: &Sports,
+    league: &'static League,
+    now: OffsetDateTime,
+    need: Need,
+) -> Freshness {
     let slug = league.slug;
     let looked = store
         .with(move |c| Ok((data::refresh_state(c, slug)?, is_near(c, slug, now)?)))
@@ -432,25 +451,40 @@ fn due(store_state: &data::RefreshRow, near: bool, now: OffsetDateTime) -> bool 
 
 /// The worker's task: reads the followed leagues that are due. It never returns an error, so
 /// it cannot fail a worker pass; what happened is in the value it returns.
-pub async fn run(store: &Store, sports: &Sports, now: OffsetDateTime) -> Value {
+pub async fn run(store: Store, sports: std::sync::Arc<Sports>, now: OffsetDateTime) -> Value {
+    run_with_budget(store, sports, now, RUN_BUDGET).await
+}
+
+/// `run` with its own limit on how long it may take. A league that is being read already (by a
+/// page or a follow) is skipped, and the wait for a read the worker starts is cut at what is
+/// left of the budget: that read carries on in the background and the pass moves on.
+pub async fn run_with_budget(
+    store: Store,
+    sports: std::sync::Arc<Sports>,
+    now: OffsetDateTime,
+    budget: Duration,
+) -> Value {
     let started = Instant::now();
-    let plan = store
-        .with(move |c| {
-            let mut due_now: Vec<(Option<OffsetDateTime>, &'static League)> = vec![];
-            for slug in data::followed_leagues(c)? {
-                let Some(league) = catalog::find(&slug) else {
-                    continue;
-                };
-                let state = data::refresh_state(c, &slug)?;
-                if due(&state, is_near(c, &slug, now)?, now) {
-                    due_now.push((state.refreshed, league));
+    let plan = {
+        let store = store.clone();
+        store
+            .with(move |c| {
+                let mut due_now: Vec<(Option<OffsetDateTime>, &'static League)> = vec![];
+                for slug in data::followed_leagues(c)? {
+                    let Some(league) = catalog::find(&slug) else {
+                        continue;
+                    };
+                    let state = data::refresh_state(c, &slug)?;
+                    if due(&state, is_near(c, &slug, now)?, now) {
+                        due_now.push((state.refreshed, league));
+                    }
                 }
-            }
-            // Never read first, then the longest ago.
-            due_now.sort_by_key(|(at, l)| (*at, l.slug));
-            Ok(due_now)
-        })
-        .await;
+                // Never read first, then the longest ago.
+                due_now.sort_by_key(|(at, l)| (*at, l.slug));
+                Ok(due_now)
+            })
+            .await
+    };
     let plan = match plan {
         Ok(p) => p,
         Err(e) => return json!({ "error": format!("{e:#}"), "leagues": [] }),
@@ -460,7 +494,8 @@ pub async fn run(store: &Store, sports: &Sports, now: OffsetDateTime) -> Value {
     let mut in_a_row = 0;
     let mut stopped = None;
     for (_, league) in plan.into_iter().take(LEAGUES_PER_RUN) {
-        if started.elapsed() >= RUN_BUDGET {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             stopped = Some("out of time for this run");
             break;
         }
@@ -468,7 +503,28 @@ pub async fn run(store: &Store, sports: &Sports, now: OffsetDateTime) -> Value {
             stopped = Some("the schedule source is failing");
             break;
         }
-        match refresh_when(store, sports, league, now, Need::Due).await {
+        // Someone is reading this league right now: nothing for the worker to add.
+        let Ok(turn) = sports.league_lock(league.slug).try_lock_owned() else {
+            results.push(
+                json!({ "league": league.slug, "status": "skipped", "why": "being read already" }),
+            );
+            continue;
+        };
+        let (store2, sports2) = (store.clone(), sports.clone());
+        let work = tokio::spawn(async move {
+            let _turn = turn;
+            refresh_locked(&store2, &sports2, league, now, Need::Due).await
+        });
+        let outcome = match tokio::time::timeout(remaining, work).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(_)) => Freshness::Failed("the refresh stopped unexpectedly".into()),
+            Err(_) => {
+                results.push(json!({ "league": league.slug, "status": "running", "why": "still being read in the background" }));
+                stopped = Some("out of time for this run");
+                break;
+            }
+        };
+        match outcome {
             Freshness::Refreshed(s) => {
                 in_a_row = 0;
                 results.push(json!({
@@ -480,7 +536,6 @@ pub async fn run(store: &Store, sports: &Sports, now: OffsetDateTime) -> Value {
                 in_a_row += 1;
                 results.push(json!({ "league": league.slug, "status": "failed", "error": why }));
             }
-            // Read by someone else while this run waited its turn, or put off meanwhile.
             Freshness::Fresh | Freshness::Backoff(_) | Freshness::Pending => {
                 results.push(json!({ "league": league.slug, "status": "skipped" }));
             }

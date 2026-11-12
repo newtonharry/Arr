@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 const EPL: &str = "soccer/eng.1";
+const UFC: &str = "mma/ufc";
 
 /// Fulham at Manchester City, nine days after the recording day.
 const FULHAM_AT_CITY: &str = "401879233";
@@ -92,7 +93,7 @@ async fn follow_quietly(e: &Exec, league: &'static str, now: OffsetDateTime) {
 }
 
 async fn refresh_run(e: &Exec, now: OffsetDateTime) -> Value {
-    arr::sport::refresh::run(&e.state.store, e.state.sports.as_ref().unwrap(), now).await
+    arr::sport::refresh::run(e.state.store.clone(), e.state.sports.clone().unwrap(), now).await
 }
 
 fn scoreboard_requests(e: &Exec) -> Vec<String> {
@@ -555,6 +556,7 @@ async fn an_event_that_disappears_upstream_is_unlisted_never_cancelled() {
         let m = e.mock.lock().unwrap();
         m.espn_events[EPL][0].clone()
     };
+    again["competitions"][0]["competitors"] = json!([]);
     again["id"] = json!(FULHAM_AT_CITY);
     again["name"] = json!("Fulham at Manchester City");
     again["date"] = json!("2026-11-21T12:30Z");
@@ -895,7 +897,7 @@ async fn a_fight_card_a_tournament_and_a_rugby_match_have_their_own_shapes() {
 
     let rugby = events
         .iter()
-        .find(|e| e["name"] == "Lyon vs Stade Toulousain")
+        .find(|e| e["name"] == "Stade Toulousain at Lyon")
         .unwrap();
     assert_eq!(rugby["league"]["sport"], "rugby_union");
     assert_eq!(rugby["home"]["name"], "Lyon");
@@ -1365,8 +1367,8 @@ async fn a_note_that_says_how_a_game_went_reaches_neither_the_store_nor_an_answe
         &e.mock,
         EPL,
         "401879236",
-        "shortName",
-        json!("LEE beat CHE 2-0"),
+        "name",
+        json!("Leeds United beat Chelsea 2-0"),
     );
     follow(&e, json!({ "league": "premier-league" })).await;
     let rounds = stored(
@@ -1382,12 +1384,13 @@ async fn a_note_that_says_how_a_game_went_reaches_neither_the_store_nor_an_answe
             "event:premier-league:401879238=Semi-final"
         ]
     );
+    // The name and short name of a game are built from the teams, not copied.
     let short = stored(
         &e,
-        "SELECT COALESCE(short_name, '-') FROM sport_events WHERE id = 'event:premier-league:401879236'",
+        "SELECT name || '|' || COALESCE(short_name, '-') FROM sport_events WHERE id = 'event:premier-league:401879236'",
     )
     .await;
-    assert_eq!(short, ["-"]);
+    assert_eq!(short, ["Leeds United at Chelsea|LEE @ CHE"]);
     let everything = stored(
         &e,
         "SELECT group_concat(COALESCE(round, '') || COALESCE(short_name, '') || name || COALESCE(venue, ''), ' ') FROM sport_events",
@@ -1583,4 +1586,287 @@ async fn the_events_window_survives_the_ends_of_time() {
     )
     .await;
     assert_eq!((s, &v["sport"]), (200, &json!([])), "{v}");
+}
+
+// ------------------------------------------------------------------ review round 2
+
+#[tokio::test]
+async fn titles_that_read_like_results_never_reach_an_answer() {
+    let e = start_exec(ExecOptions::default()).await;
+    // A fight card whose title says how a fight went, and a game whose name, short name and
+    // venue do.
+    espn_set_field(&e.mock, UFC, "600061400", "name", json!("Gane def. Hokit"));
+    espn_set_field(
+        &e.mock,
+        UFC,
+        "600061665",
+        "name",
+        json!("UFC Fight Night: Jones wins by KO"),
+    );
+    espn_set_field(
+        &e.mock,
+        EPL,
+        FULHAM_AT_CITY,
+        "name",
+        json!("Fulham lost to Manchester City"),
+    );
+    espn_set_field(
+        &e.mock,
+        EPL,
+        FULHAM_AT_CITY,
+        "shortName",
+        json!("FUL 3-1 MNC"),
+    );
+    {
+        let mut m = e.mock.lock().unwrap();
+        let ev = m
+            .espn_events
+            .get_mut(EPL)
+            .unwrap()
+            .iter_mut()
+            .find(|x| x["id"] == FULHAM_AT_CITY)
+            .unwrap();
+        ev["competitions"][0]["venue"]["fullName"] = json!("Fulham def. Manchester City");
+    }
+    follow(&e, json!({ "league": "ufc" })).await;
+    follow(&e, json!({ "league": "premier-league" })).await;
+    let (_, v) = get(&e, &wide_events()).await;
+    let events = v["events"].as_array().unwrap();
+    let day = |id: &str| espn_start(&e.mock, UFC, id).date().to_string();
+    let by_id = |id: &str| events.iter().find(|x| x["id"] == id).unwrap();
+    // The events are there, named from their league and date.
+    assert_eq!(
+        by_id("event:ufc:600061400")["name"],
+        format!("UFC event on {}", day("600061400"))
+    );
+    assert_eq!(
+        by_id("event:ufc:600061665")["name"],
+        format!("UFC event on {}", day("600061665"))
+    );
+    let game = by_id(&format!("event:premier-league:{FULHAM_AT_CITY}"));
+    assert_eq!(game["name"], "Fulham at Manchester City");
+    assert_eq!(game["short_name"], "FUL @ MNC");
+    assert_eq!(game["venue"], Value::Null);
+    let (_, text) = {
+        let (s, _, t) = e.json(e.get(&wide_events())).await;
+        (s, t)
+    };
+    for bad in ["def.", "lost to", "wins by", "3-1"] {
+        assert!(!text.contains(bad), "{bad} in {text}");
+    }
+    // A good title is untouched.
+    assert!(
+        events
+            .iter()
+            .any(|x| x["name"] == "DP World Tour Championship")
+            || {
+                follow(&e, json!({ "league": "dp-world-tour" })).await;
+                true
+            }
+    );
+}
+
+#[tokio::test]
+async fn a_shared_boundary_day_is_judged_only_when_both_months_answered_in_full() {
+    let e = start_exec(ExecOptions::default()).await;
+    let now = time::macros::datetime!(2027-03-20 12:00 UTC);
+    // 9010 is at 02:00 UTC on 1 April: the feed (American days) files it under 31 March.
+    pin_events(
+        &e,
+        &[
+            ("9001", "2027-03-25T15:00Z", "Alpha at Beta"),
+            ("9003", "2027-04-03T15:00Z", "Epsilon at Zeta"),
+            ("9010", "2027-04-01T02:00Z", "Night at Game"),
+        ],
+    );
+    follow_quietly(&e, "premier-league", now).await;
+    refresh_run(&e, now).await;
+    assert_eq!(state_of(&e, "9010").await, "scheduled");
+    // March now comes back with a record that cannot be read and has no id (it may well be
+    // 9010), while April is complete and does not list it.
+    espn_remove(&e.mock, EPL, "9010");
+    e.mock
+        .lock()
+        .unwrap()
+        .espn_events
+        .get_mut(EPL)
+        .unwrap()
+        .push(json!({ "date": "2027-03-31T20:00Z", "name": "no id" }));
+    let r = refresh_run(&e, now + time::Duration::hours(7)).await;
+    assert_eq!(r["leagues"][0]["unlisted"], 0, "{r}");
+    assert_eq!(state_of(&e, "9010").await, "scheduled");
+    // Once March is complete as well, the day is judged and the event is unlisted.
+    e.mock
+        .lock()
+        .unwrap()
+        .espn_events
+        .get_mut(EPL)
+        .unwrap()
+        .retain(|x| x.get("id").is_some());
+    let r = refresh_run(&e, now + time::Duration::hours(14)).await;
+    assert_eq!(r["leagues"][0]["unlisted"], 1, "{r}");
+    assert_eq!(state_of(&e, "9010").await, "unlisted");
+}
+
+#[tokio::test]
+async fn a_team_that_cannot_be_checked_is_unavailable_not_missing() {
+    let e = start_exec(ExecOptions::default()).await;
+    e.mock.lock().unwrap().espn_garbage = vec!["teams".into()];
+    let teams_asked = |e: &Exec| {
+        e.mock
+            .lock()
+            .unwrap()
+            .espn_log
+            .iter()
+            .filter(|l| l.contains("/teams"))
+            .count()
+    };
+    // A fresh database and a team list that cannot be read: 503 each time, never 404, even
+    // while the retry pause is on.
+    for _ in 0..2 {
+        let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (503, Some("upstream_unavailable")),
+            "{v}"
+        );
+    }
+    assert_eq!(teams_asked(&e), 1, "the second try waited out the pause");
+    let (_, v) = get(&e, "/api/v1/sport/following").await;
+    assert_eq!(v["following"], json!([]));
+    // The source recovers and the pause has passed.
+    e.mock.lock().unwrap().espn_garbage = vec![];
+    e.state
+        .store
+        .with(|c| {
+            c.execute("UPDATE sport_refresh SET teams_next_try_utc = NULL", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["follow"]["team"]["name"], "Manchester City");
+    // A list that was read is authoritative: a team that is not in it is simply not there.
+    let (s, v) = follow(
+        &e,
+        json!({ "league": "premier-league", "team_id": "999999" }),
+    )
+    .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (404, Some("not_found")),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn a_well_formed_empty_team_list_does_not_pause_other_leagues() {
+    let e = start_exec(ExecOptions {
+        sports_backoff_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    e.mock.lock().unwrap().espn_garbage = vec!["teams".into()];
+    e.mock.lock().unwrap().espn_garbage_body = "{\"sports\":[]}".into();
+    let (s, v) = follow(&e, json!({ "league": "premier-league" })).await;
+    assert_eq!((s, &v["schedule_read"]), (201, &json!(true)), "{v}");
+    // The next league is read at once: nothing paused the client.
+    let before = espn_requests(&e.mock);
+    let (s, v) = follow(&e, json!({ "league": "nba" })).await;
+    assert_eq!((s, &v["schedule_read"]), (201, &json!(true)), "{v}");
+    assert!(espn_requests(&e.mock) > before);
+    // The league has no team list yet: its own retry timing, not authoritative.
+    let rows = stored(
+        &e,
+        "SELECT teams_failures || '|' || COALESCE(teams_utc, '-') FROM sport_refresh WHERE league = 'premier-league'",
+    )
+    .await;
+    assert_eq!(rows, ["1|-"]);
+    // A malformed one still pauses everything.
+    e.mock.lock().unwrap().espn_garbage_body = "{\"sports\":5}".into();
+    follow(&e, json!({ "league": "ufc" })).await;
+    follow(&e, json!({ "league": "pfl" })).await;
+    e.state
+        .store
+        .with(|c| {
+            c.execute("UPDATE sport_refresh SET teams_next_try_utc = NULL", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (s, _) = get(&e, "/api/v1/sport/league/premier-league").await;
+    assert_eq!(s, 200);
+    let after_bad = espn_requests(&e.mock);
+    let (s, v) = follow(&e, json!({ "league": "mls" })).await;
+    assert_eq!((s, &v["schedule_read"]), (201, &json!(false)), "{v}");
+    assert_eq!(
+        espn_requests(&e.mock),
+        after_bad,
+        "paused after the malformed list"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_pass_does_not_wait_on_reads_that_are_in_flight() {
+    let e = start_exec(ExecOptions::default()).await;
+    e.mock.lock().unwrap().espn_delay = Some(Duration::from_millis(800));
+    let now = OffsetDateTime::now_utc();
+    for league in ["ufc", "nba", "premier-league"] {
+        follow_quietly(&e, league, now).await;
+    }
+    let reads = async {
+        // Two cold league pages read a slow source one request at a time.
+        tokio::join!(
+            get(&e, "/api/v1/sport/league/premier-league"),
+            get(&e, "/api/v1/sport/league/nba")
+        )
+    };
+    let pass = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let r = arr::sport::refresh::run_with_budget(
+            e.state.store.clone(),
+            e.state.sports.clone().unwrap(),
+            now,
+            Duration::from_secs(1),
+        )
+        .await;
+        (started.elapsed(), r)
+    };
+    let (_, (took, r)) = tokio::join!(reads, pass);
+    // The pass came back within its budget (the reads take several seconds in all) ...
+    assert!(took < Duration::from_millis(2500), "{took:?} {r}");
+    let by_league = |slug: &str| {
+        r["leagues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["league"] == slug)
+            .cloned()
+    };
+    // ... skipping the leagues a page was already reading, and not waiting out the one it started.
+    assert_eq!(by_league("nba").unwrap()["status"], "skipped", "{r}");
+    assert_eq!(
+        by_league("premier-league").unwrap()["status"],
+        "skipped",
+        "{r}"
+    );
+    assert_eq!(by_league("ufc").unwrap()["status"], "running", "{r}");
+    assert_eq!(r["stopped"], "out of time for this run");
+    // The read the worker started carries on and completes.
+    let mut done = false;
+    for _ in 0..100 {
+        let rows = stored(
+            &e,
+            "SELECT COUNT(*) FROM sport_refresh WHERE league = 'ufc' AND refreshed_utc IS NOT NULL",
+        )
+        .await;
+        if rows == ["1"] {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(done, "the background read of ufc never finished");
 }

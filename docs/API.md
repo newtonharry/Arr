@@ -340,8 +340,21 @@ routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry a
   source's answers is kept internally as `unlisted` and appears in no answer (it comes back, in
   place, if the source lists it again). `round` is kept only when the source's note is exactly a
   round label ("Round 12", "Matchweek 9", "Group B", "Semi-final", ...); any other note is free
-  text that could name a winner, so it is dropped. Names and venues that read like a result are
-  dropped too.
+  text that could name a winner, so it is dropped.
+- **Names are built, not copied, wherever there are two sides.** A game, match or fixture
+  between two teams is named `<Away> at <Home>` from the structured team names ("Fulham at
+  Manchester City", "Charlotte Hornets at Los Angeles Lakers", "Stade Toulousain at Lyon"),
+  for every sport; `home` and `away` say which side is which, and `at` does not claim the game
+  is at the home team's ground in a neutral-venue competition. `short_name` is built from the
+  teams' abbreviations the same way ("FUL @ MNC"), or `null`. The feed's own `name` and
+  `shortName` are never copied for these. Events with no two sides (a fight card, a
+  tournament) keep the feed's title only if it fits a plain grammar: a heading of letters,
+  digits, spaces and `' & . - + / ( ) # ,`, optionally followed by `: <Name> vs. <Name>`
+  (`vs`, `vs.` or `v`), with no score-like pattern (`3-1`) and no outcome word as a whole word
+  (def, dec, beat, wins, won, lost to, draw, KO, TKO, submission, decision, forfeit, walkover,
+  retired, champion, ...; "Championship", "Decker" or "Winston" are fine). Otherwise the event
+  is kept under the name `<League> event on <YYYY-MM-DD>` (UTC). `venue` is kept only from the
+  structured venue name and only if it passes the same character and outcome checks.
 - **Ids.** A league is `league:<slug>` (`league:nba`; routes also accept the bare slug), a game,
   fight card or tournament is `event:<slug>:<number>` (`event:nba:401909999`). Slugs are
   `[a-z0-9-]{2,24}`; the number is the feed's own, digits without leading zeros. A team is the
@@ -412,8 +425,9 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
   real), `upcoming` (events of this follow in the next three weeks) and `next_event` (an event
   or `null`). The follow is recorded even when the feed is down; the schedule is then read later
   by the worker. Refusals: `404 not_found` for an unknown league or a team the league does not
-  have, `400 invalid_request` for a team of golf or MMA or a `team_id` that is not a number, and
-  `503 upstream_unavailable` when the team list is needed and cannot be read.
+  have (only once its team list was really read), `400 invalid_request` for a team of golf or MMA or a `team_id` that is not a number, and
+  `503 upstream_unavailable` while no team list has been read (the source failing, or a retry
+  being waited out): a valid team is never reported as missing because the list is unavailable.
 - **`POST /api/v1/sport/unfollow`** takes the same body and answers `{"removed": true|false}`.
   Unfollowing something not followed is not an error.
 - **`GET /api/v1/sport/following`** lists the follows, each as in `follow` with `next_event`.
@@ -434,8 +448,12 @@ at least `min_interval_ms` (default 500 ms) between them; answers are reused for
 minutes while failures continue) and the league is left alone for 15 minutes (doubling to six
 hours); a worker run stops after two leagues in a row fail, takes at most six leagues and does not
 start new ones after 45 seconds. A league is read by one caller at a time, whoever asks (a page,
-a follow, the worker): the others wait and find it freshly read. An answer that is not a schedule
+a follow, the worker): the others wait and find it freshly read. The worker skips a league that
+is being read already and waits for a read it starts only as long as its budget has left; the
+read carries on in the background. An answer that is not a schedule
 (not JSON, or without a list of events) counts as a failure like any other, for a team list too
+(one without a `sports` list; a well-formed but empty list pauses nothing and only means that
+league has no team list yet, retried on its own timing)
 (retried after 15 minutes, doubling to six hours).
 
 Absence never cancels. An event that is stored as still to come, starts inside a calendar month
@@ -444,7 +462,7 @@ answer shows; if the source lists it again (the same id, possibly a new date) th
 becomes `scheduled` again. An answer is complete only if it was not cut at the page limit, was
 not empty and had no record that could not be read (the ids of such records count as seen).
 Each month is judged on its own, and nothing is judged when any month failed. The first and last
-day of a month are left out of its span unless the neighbouring month was read as well, because
+day of a month are left out of its span unless the neighbouring month answered in full too, because
 the feed's days are the American ones. A new event is stored only if it is not over by the start
 of yesterday (UTC), so there is no backlog; an event already stored is always updated, however
 long Arr was off.

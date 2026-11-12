@@ -433,7 +433,7 @@ pub async fn run_task(st: &AppState, name: &str, now: OffsetDateTime) -> Result<
         "prune" => prune(st, now).await,
         "bin" => crate::trash::purge_due(st, now).await,
         "sports" => match &st.sports {
-            Some(s) => Ok(crate::sport::refresh::run(&st.store, s, now).await),
+            Some(s) => Ok(crate::sport::refresh::run(st.store.clone(), s.clone(), now).await),
             None => Ok(json!({ "note": "sport is turned off" })),
         },
         other => Err(anyhow::anyhow!("unknown task {other}")),

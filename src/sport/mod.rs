@@ -113,7 +113,7 @@ mod tests {
             "events without a usable id or time are skipped"
         );
         let f = &m.fixtures[0];
-        assert_eq!(f.name, "Fulham at Manchester City");
+        assert_eq!(f.name.as_deref(), Some("Fulham at Manchester City"));
         assert_eq!(f.home.as_ref().unwrap().name, "Manchester City");
         assert_eq!(f.away.as_ref().unwrap().id, "160");
         assert_eq!(f.round.as_deref(), Some("Round 12"));

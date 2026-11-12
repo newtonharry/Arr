@@ -113,6 +113,12 @@ pub fn event_id(league: &str, espn_id: &str) -> String {
     format!("event:{league}:{espn_id}")
 }
 
+/// The name of an event whose own title did not pass the checks: the league and the date.
+fn neutral_name(league: &str, starts_at: OffsetDateTime) -> String {
+    let l = super::catalog::find(league).map_or(league, |l| l.name);
+    format!("{l} event on {}", starts_at.date())
+}
+
 fn row_of(league: &str, f: &Fixture) -> EventRow {
     EventRow {
         id: event_id(league, &f.id),
@@ -120,7 +126,10 @@ fn row_of(league: &str, f: &Fixture) -> EventRow {
         season: f.season.clone(),
         starts_at: ts(f.starts_at),
         ends_at: f.ends_at.map(ts),
-        name: f.name.clone(),
+        name: f
+            .name
+            .clone()
+            .unwrap_or_else(|| neutral_name(league, f.starts_at)),
         short_name: f.short_name.clone(),
         home_id: f.home.as_ref().map(|s| s.id.clone()),
         home_name: f.home.as_ref().map(|s| s.name.clone()),
