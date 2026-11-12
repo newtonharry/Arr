@@ -621,7 +621,7 @@ async fn plex_search(
             .into_iter()
             .filter(|(_, name, _, _)| name.to_lowercase().contains(&query))
             .map(|(id, name, known_for, score)| {
-                json!({ "score": score, "Metadata": { "type": "person", "title": name, "key": format!("/library/people/{id}"),
+                json!({ "score": score, "Directory": { "type": "person", "title": name, "key": format!("/library/people/{id}"),
                                                       "thumb": format!("http://127.0.0.1/uploads/{id}.jpg"), "knownFor": known_for } })
             })
             .collect();

@@ -1155,7 +1155,7 @@ struct PlexSearchGroup {
 
 #[derive(Deserialize)]
 struct PlexSearchHit {
-    #[serde(rename = "Metadata")]
+    #[serde(rename = "Metadata", alias = "Directory")]
     metadata: Option<PlexMeta>,
     #[serde(default)]
     score: Option<f64>,
