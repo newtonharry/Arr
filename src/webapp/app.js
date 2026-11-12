@@ -767,6 +767,10 @@ function Library({ t }) {
       const hit = LC.get(key);
       m.items = [];
       setSt(hit ? { items: hit.items, total: hit.total, status: 'Updating…' } : { items: [], total: 0, status: 'Loading…' });
+    } else if (m.gen !== cacheGen) {
+      // The rows on screen were read before something changed: "Show more" starts over from page one.
+      m.items = [];
+      setSt((s) => ({ ...s, status: 'Updating…' }));
     }
     const qs = `limit=50&offset=${m.items.length}&sort=${S.sort}` + (S.filter.trim() ? '&q=' + encodeURIComponent(S.filter.trim()) : '');
     try {
@@ -774,6 +778,7 @@ function Library({ t }) {
       if (my !== m.seq || t !== token || ag !== authGen) return;
       if (!r.ok) { setSt((s) => ({ ...s, status: "Couldn't load the library just now." })); return; }
       m.items = m.items.concat(r.data.items || []);
+      m.gen = cg;
       if (cg === cacheGen) remember(LC, key, { items: m.items, total: r.data.total || 0 }, 12);
       setSt({ items: m.items, total: r.data.total || 0, status: m.items.length ? '' : S.filter.trim() ? `No matches for “${S.filter.trim()}”.` : 'Nothing here yet. Add something from the search above.' });
     } catch { if (my === m.seq && t === token && !S.out) { setSt((s) => ({ ...s, status: '' })); if (!m.items.length) failed(t); } }
