@@ -2703,10 +2703,10 @@ fn credit_json(
     year: Option<u16>,
     role: Option<&str>,
     upcoming: bool,
-    state: Option<(bool, Option<&'static str>)>,
+    state: Option<(bool, bool, Option<&'static str>)>,
 ) -> Value {
-    let (in_catalog, library_state) = state.unwrap_or((false, None));
-    json!({ "media_id": id.to_string(), "kind": if matches!(id, MediaId::Movie { .. }) { "movie" } else { "series" }, "title": title, "year": year, "role": role, "in_catalog": in_catalog, "library_state": library_state, "upcoming": upcoming })
+    let (in_catalog, monitored, library_state) = state.unwrap_or((false, false, None));
+    json!({ "media_id": id.to_string(), "kind": if matches!(id, MediaId::Movie { .. }) { "movie" } else { "series" }, "title": title, "year": year, "role": role, "in_catalog": in_catalog, "monitored": monitored, "library_state": library_state, "upcoming": upcoming })
 }
 
 /// A person and what they made, in groups by job (the one they are best known for first).
@@ -2746,15 +2746,23 @@ async fn person(State(st): St, p: Result<Path<String>, PathRejection>) -> ApiRes
                             let (id, state) = match (c.series, c.tmdb, c.tvdb) {
                                 (false, Some(tmdb), _) => (
                                     MediaId::Movie { tmdb },
-                                    catalog
-                                        .map(|c| c.movie(tmdb))
-                                        .map(|m| (m.is_some(), m.and_then(movie_state))),
+                                    catalog.map(|c| c.movie(tmdb)).map(|m| {
+                                        (
+                                            m.is_some(),
+                                            m.is_some_and(|m| m.monitored),
+                                            m.and_then(movie_state),
+                                        )
+                                    }),
                                 ),
                                 (true, _, Some(tvdb)) => (
                                     MediaId::Series(SeriesKey::Tvdb(tvdb)),
-                                    catalog
-                                        .map(|c| c.series(SeriesKey::Tvdb(tvdb)))
-                                        .map(|s| (s.is_some(), s.and_then(series_state))),
+                                    catalog.map(|c| c.series(SeriesKey::Tvdb(tvdb))).map(|s| {
+                                        (
+                                            s.is_some(),
+                                            s.is_some_and(|s| s.monitored),
+                                            s.and_then(series_state),
+                                        )
+                                    }),
                                 ),
                                 _ => return None,
                             };
@@ -2805,7 +2813,13 @@ async fn person(State(st): St, p: Result<Path<String>, PathRejection>) -> ApiRes
                     t.year,
                     None,
                     upcoming,
-                    catalog.map(|_| (found.is_some(), found.and_then(series_state))),
+                    catalog.map(|_| {
+                        (
+                            found.is_some(),
+                            found.is_some_and(|s| s.monitored),
+                            found.and_then(series_state),
+                        )
+                    }),
                 );
                 match groups.iter_mut().find(|g| g.0 == *job) {
                     Some(g) => g.1.push(entry),

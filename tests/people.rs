@@ -75,6 +75,7 @@ async fn a_persons_credits_resolve_to_media_ids_in_the_right_order() {
         "{show}"
     );
     assert_eq!(show["in_catalog"], true);
+    assert_eq!(show["monitored"], true, "{show}");
     let movie = &groups[0]["credits"][0];
     assert_eq!(
         (
@@ -86,6 +87,7 @@ async fn a_persons_credits_resolve_to_media_ids_in_the_right_order() {
         "{movie}"
     );
     assert!(movie["library_state"].is_null());
+    assert_eq!(movie["monitored"], false, "{movie}");
     let future = &groups[1]["credits"][0];
     assert_eq!(
         (future["role"].as_str(), future["upcoming"].as_bool()),

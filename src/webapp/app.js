@@ -576,14 +576,14 @@ async function renderSearch(q, t) {
 }
 // People matching the search: the person (with their work) when it is clearly who was meant,
 // else a few names. Anything going wrong is no people block, never a failed search.
-const fold = (t) => String(t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const fold = (t) => String(t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/['’]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 async function findPeople(q, seq, signal) {
   try {
     const r = await api('/v1/people?q=' + encodeURIComponent(q), { signal });
     const list = r.ok ? r.data.people || [] : [];
     if (!list.length || seq !== searchSeq) return null;
     const top = list[0];
-    if (top.score >= 0.8 || fold(top.name) === fold(q)) {
+    if (top.score >= 0.8 || (fold(q) && fold(top.name) === fold(q))) {
       const p = await api('/v1/people/' + encodeURIComponent(top.person_id), { signal });
       if (p.ok && (p.data.groups || []).length) return { person: p.data };
     }
