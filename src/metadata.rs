@@ -181,6 +181,40 @@ struct SearchHit {
     show: TvmazeShow,
 }
 
+/// A person on TVmaze.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TvmazePerson {
+    pub id: u32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub image: Option<TvmazeImage>,
+}
+
+#[derive(Deserialize)]
+struct PersonSearchHit {
+    #[serde(default)]
+    score: f64,
+    person: TvmazePerson,
+}
+
+#[derive(Deserialize)]
+struct CreditHit {
+    /// The job, for crew credits.
+    #[serde(rename = "type", default)]
+    job: Option<String>,
+    #[serde(rename = "_embedded")]
+    embedded: Option<CreditEmbedded>,
+}
+
+#[derive(Deserialize)]
+struct CreditEmbedded {
+    show: Option<TvmazeShow>,
+}
+
+/// A TVmaze person with the shows they worked on, as `(job, show)` (acting first).
+pub type TvmazeCredits = (TvmazePerson, Vec<(String, TvmazeShow)>);
+
 /// A popular show with a new episode this week (TVmaze web schedule).
 #[derive(Debug, Clone)]
 pub struct WebShow {
@@ -280,6 +314,7 @@ pub struct Tvmaze {
     http: reqwest::Client,
     shows: TtlCache<String, Option<TvmazeShow>>,
     episodes: TtlCache<u32, Vec<TvmazeEpisode>>,
+    people: TtlCache<u32, TvmazeCredits>,
     ideas: Mutex<Option<(Instant, Vec<WebShow>)>>,
 }
 
@@ -290,6 +325,7 @@ impl Tvmaze {
             http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
             shows: TtlCache::new(METADATA_TTL, 512),
             episodes: TtlCache::new(METADATA_TTL, 128),
+            people: TtlCache::new(METADATA_TTL, 64),
             ideas: Mutex::new(None),
         }
     }
@@ -429,6 +465,57 @@ impl Tvmaze {
     pub async fn search(&self, query: &str) -> Result<Vec<TvmazeShow>, UpstreamError> {
         let hits: Vec<SearchHit> = self.get(self.url("search/shows", &[("q", query)])?).await?;
         Ok(hits.into_iter().map(|h| h.show).collect())
+    }
+
+    /// People matching a name, with TVmaze's score, best first.
+    pub async fn search_people(
+        &self,
+        query: &str,
+    ) -> Result<Vec<(f64, TvmazePerson)>, UpstreamError> {
+        let hits: Vec<PersonSearchHit> = self
+            .get(self.url("search/people", &[("q", query)])?)
+            .await?;
+        Ok(hits.into_iter().map(|h| (h.score, h.person)).collect())
+    }
+
+    /// A person and their shows (cast credits as "Actor", then each crew job). `None` when
+    /// TVmaze has no such person.
+    pub async fn person(&self, id: u32) -> Result<Option<TvmazeCredits>, UpstreamError> {
+        if let Some(hit) = self.people.get(&id) {
+            return Ok(Some(hit));
+        }
+        let (who, cast, crew) = tokio::join!(
+            self.get::<TvmazePerson>(self.url(&format!("people/{id}"), &[])?),
+            self.get::<Vec<CreditHit>>(
+                self.url(&format!("people/{id}/castcredits"), &[("embed", "show")])?
+            ),
+            self.get::<Vec<CreditHit>>(
+                self.url(&format!("people/{id}/crewcredits"), &[("embed", "show")])?
+            ),
+        );
+        let who = match who {
+            Ok(w) => w,
+            Err(UpstreamError::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let or_none = |r: Result<Vec<CreditHit>, UpstreamError>| match r {
+            Err(UpstreamError::NotFound) => Ok(vec![]),
+            other => other,
+        };
+        let credits: Vec<(String, TvmazeShow)> = or_none(cast)?
+            .into_iter()
+            .map(|c| ("Actor".to_string(), c))
+            .chain(
+                or_none(crew)?
+                    .into_iter()
+                    .map(|c| (c.job.clone().unwrap_or_default(), c)),
+            )
+            .filter(|(job, _)| !job.is_empty())
+            .filter_map(|(job, c)| Some((job, c.embedded?.show?)))
+            .collect();
+        let found = (who, credits);
+        self.people.insert(id, found.clone());
+        Ok(Some(found))
     }
 
     async fn cached_show(
@@ -1009,6 +1096,32 @@ struct PlexSearchGroup {
 struct PlexSearchHit {
     #[serde(rename = "Metadata")]
     metadata: Option<PlexMeta>,
+    #[serde(default)]
+    score: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+struct PlexCreditsContainer {
+    #[serde(rename = "CreditGroup", default)]
+    groups: Vec<PlexCreditGroup>,
+}
+
+#[derive(Deserialize)]
+struct PlexCreditGroup {
+    #[serde(default)]
+    title: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(rename = "Credit", default)]
+    credits: Vec<PlexCredit>,
+}
+
+#[derive(Deserialize)]
+struct PlexCredit {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(rename = "Metadata")]
+    metadata: Option<PlexMeta>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1067,6 +1180,12 @@ struct PlexMeta {
     genres: Vec<PlexTag>,
     #[serde(rename = "Role", default)]
     roles: Vec<PlexTag>,
+    /// `/library/people/<id>` or `/library/metadata/<ratingKey>`.
+    #[serde(rename = "key", default)]
+    path: Option<String>,
+    /// A person's main job ("Acting", "Directing").
+    #[serde(rename = "knownFor", default)]
+    known_for: Option<String>,
 }
 
 /// A Plex tag: a genre, or an actor (`tag`) with the character they play (`role`).
@@ -1159,6 +1278,57 @@ struct PlexInner {
     shows: TtlCache<String, Option<Scores>>,
     /// Bounds the show lookups in flight.
     lookups: tokio::sync::Semaphore,
+    /// Resolved people pages by Plex person id.
+    people: TtlCache<String, PersonPage>,
+}
+
+/// Most credits resolved for one person page, and the longest the page waits for them.
+const PERSON_CREDITS_MAX: usize = 40;
+const PERSON_BUDGET: Duration = Duration::from_secs(4);
+
+/// A person a search found. `score` is the provider's, 0 to 1.
+#[derive(Debug, Clone)]
+pub struct PersonHit {
+    pub id: String,
+    pub name: String,
+    pub known_for: Option<String>,
+    pub thumb: Option<String>,
+    pub score: f64,
+}
+
+/// One movie or show a person worked on, with the id Arr knows it by.
+#[derive(Debug, Clone)]
+pub struct Credit {
+    pub series: bool,
+    pub tmdb: Option<u32>,
+    pub tvdb: Option<u32>,
+    pub title: String,
+    pub year: Option<u16>,
+    pub role: Option<String>,
+    pub upcoming: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreditGroup {
+    pub job: String,
+    pub credits: Vec<Credit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonPage {
+    pub name: String,
+    pub known_for: Option<String>,
+    pub thumb: Option<String>,
+    pub groups: Vec<CreditGroup>,
+}
+
+/// Whether something has not come out yet: a release date after today, else a later year.
+pub fn not_out_yet(date: Option<&str>, year: Option<u16>) -> bool {
+    let today = time::OffsetDateTime::now_utc().date();
+    match date.filter(|d| d.len() >= 10) {
+        Some(d) => d[..10] > *today.to_string(),
+        None => year.is_some_and(|y| i32::from(y) > today.year()),
+    }
 }
 
 /// A Plex key is letters and digits only; anything else is never put in a path.
@@ -1180,6 +1350,7 @@ impl PlexMovies {
                 movies: TtlCache::new(METADATA_TTL, 512),
                 shows: TtlCache::new(METADATA_TTL, 512),
                 lookups: tokio::sync::Semaphore::new(PLEX_LOOKUPS),
+                people: TtlCache::new(METADATA_TTL, 64),
             }),
         }
     }
@@ -1216,10 +1387,16 @@ impl PlexMovies {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<Option<PlexMeta>, UpstreamError> {
-        match self
-            .get::<PlexMetaContainer>(&self.inner.metadata, path, query)
-            .await
-        {
+        self.first_meta_on(&self.inner.metadata, path, query).await
+    }
+
+    async fn first_meta_on(
+        &self,
+        base: &Url,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Option<PlexMeta>, UpstreamError> {
+        match self.get::<PlexMetaContainer>(base, path, query).await {
             Ok(c) => Ok(c.items.into_iter().next()),
             Err(UpstreamError::NotFound) => Ok(None),
             Err(e) => Err(e),
@@ -1383,6 +1560,176 @@ impl PlexMovies {
             .collect()
     }
 
+    /// People matching a name, best first (at most five).
+    pub async fn people(&self, query: &str) -> Result<Vec<PersonHit>, UpstreamError> {
+        let found: PlexSearchContainer = self
+            .get(
+                &self.inner.discover,
+                "library/search",
+                &[
+                    ("query", query),
+                    ("searchTypes", "people"),
+                    ("searchProviders", "discover"),
+                    ("includeMetadata", "1"),
+                    ("limit", "10"),
+                ],
+            )
+            .await?;
+        let mut hits: Vec<PersonHit> = found
+            .groups
+            .into_iter()
+            .flat_map(|g| g.hits)
+            .filter_map(|h| {
+                let m = h.metadata.filter(|m| m.kind.as_deref() == Some("person"))?;
+                let id = m.path.as_deref()?.rsplit('/').next().and_then(plex_key)?;
+                Some(PersonHit {
+                    id: id.to_string(),
+                    name: m.title.trim().to_string(),
+                    known_for: m.known_for.clone().filter(|k| !k.is_empty()),
+                    thumb: m.thumb.clone().filter(|t| !t.is_empty()),
+                    score: h.score.unwrap_or(0.0),
+                })
+            })
+            .filter(|p| !p.name.is_empty())
+            .collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.truncate(5);
+        Ok(hits)
+    }
+
+    /// A person and what they made: the group they are known for first, "appearances" and
+    /// "additional credits" left out, a title listed once, and at most `PERSON_CREDITS_MAX`
+    /// credits looked up (a few at a time, for at most `PERSON_BUDGET`). A credit Arr cannot
+    /// name by TMDB or TVDB id is dropped. `None` when Plex has no such person.
+    pub async fn person(&self, id: &str) -> Result<Option<PersonPage>, UpstreamError> {
+        let Some(id) = plex_key(id) else {
+            return Ok(None);
+        };
+        if let Some(hit) = self.inner.people.get(&id.to_string()) {
+            return Ok(Some(hit));
+        }
+        let (who_path, credits_path) = (
+            format!("library/people/{id}"),
+            format!("library/people/{id}/credits"),
+        );
+        let (who, credits) = tokio::join!(
+            self.first_meta_on(&self.inner.discover, &who_path, &[]),
+            self.get::<PlexCreditsContainer>(&self.inner.discover, &credits_path, &[]),
+        );
+        let Some(who) = who? else {
+            return Ok(None);
+        };
+        let groups = match credits {
+            Ok(c) => c.groups,
+            Err(UpstreamError::NotFound) => vec![],
+            Err(e) => return Err(e),
+        };
+        let first = match who.known_for.as_deref().map(str::to_lowercase) {
+            Some(k) if k.starts_with("direct") => "director",
+            Some(k) if k.starts_with("writ") => "writer",
+            Some(k) if k.starts_with("act") => "actor",
+            _ => "",
+        };
+        let mut groups: Vec<PlexCreditGroup> = groups
+            .into_iter()
+            .filter(|g| matches!(g.kind.as_str(), "actor" | "director" | "writer"))
+            .collect();
+        groups.sort_by_key(|g| g.kind != first);
+        let mut seen = std::collections::HashSet::new();
+        let mut picked: Vec<(usize, PlexMeta, Option<String>, String)> = vec![];
+        'groups: for (gi, g) in groups.iter().enumerate() {
+            for c in &g.credits {
+                if picked.len() >= PERSON_CREDITS_MAX {
+                    break 'groups;
+                }
+                let Some(m) = c.metadata.clone() else {
+                    continue;
+                };
+                if !matches!(m.kind.as_deref(), Some("movie" | "show")) {
+                    continue;
+                }
+                let key = if m.rating_key.is_empty() {
+                    m.path
+                        .as_deref()
+                        .and_then(|p| p.rsplit('/').next())
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    m.rating_key.clone()
+                };
+                if plex_key(&key).is_some() && seen.insert(key.clone()) {
+                    picked.push((gi, m, c.role.clone().filter(|r| !r.trim().is_empty()), key));
+                }
+            }
+        }
+        let tasks: Vec<_> = picked
+            .iter()
+            .map(|(_, _, _, key)| {
+                let (this, key) = (self.clone(), key.clone());
+                tokio::spawn(async move {
+                    let Ok(_slot) = this.inner.lookups.acquire().await else {
+                        return false;
+                    };
+                    this.meta_by_key(&key).await.is_ok()
+                })
+            })
+            .collect();
+        let complete = tokio::time::timeout(PERSON_BUDGET, async {
+            let mut all = true;
+            for t in tasks {
+                all &= t.await.unwrap_or(false);
+            }
+            all
+        })
+        .await
+        .unwrap_or(false);
+        let mut out: Vec<CreditGroup> = groups
+            .iter()
+            .map(|g| CreditGroup {
+                job: g.title.clone(),
+                credits: vec![],
+            })
+            .collect();
+        let mut named = std::collections::HashSet::new();
+        for (gi, m, role, key) in picked {
+            let Some(Some(meta)) = self.inner.metas.get(&key) else {
+                continue;
+            };
+            let series = m.kind.as_deref() == Some("show");
+            let (tmdb, tvdb) = if series {
+                let tvdb: Option<u32> = meta.guid("tvdb").and_then(|t| t.parse().ok());
+                (None, tvdb.filter(|t| *t > 0))
+            } else {
+                (meta.tmdb_id(), None)
+            };
+            if (tmdb.is_none() && tvdb.is_none()) || !named.insert((series, tmdb, tvdb)) {
+                continue;
+            }
+            let date = m.originally_available_at.as_deref();
+            let year = m.year.or_else(|| year_of(date));
+            out[gi].credits.push(Credit {
+                series,
+                tmdb,
+                tvdb,
+                title: m.title.clone(),
+                year,
+                role,
+                upcoming: not_out_yet(date, year),
+            });
+        }
+        out.retain(|g| !g.credits.is_empty());
+        let page = PersonPage {
+            name: who.title.trim().to_string(),
+            known_for: who.known_for.clone().filter(|k| !k.is_empty()),
+            thumb: who.thumb.clone().filter(|t| !t.is_empty()),
+            groups: out,
+        };
+        if complete {
+            self.inner.people.insert(id.to_string(), page.clone());
+        }
+        Ok(Some(page))
+    }
+
     pub async fn find_imdb(&self, imdb: &str) -> Result<Option<u32>, UpstreamError> {
         if !imdb_shape(imdb) {
             return Ok(None);
@@ -1518,6 +1865,10 @@ impl Movies {
 
     pub fn has_plex(&self) -> bool {
         self.plex.is_some()
+    }
+
+    pub fn plex(&self) -> Option<&PlexMovies> {
+        self.plex.as_ref()
     }
 
     /// Show scores (see `PlexMovies::show_scores`); all unknown without a Plex sign-in.

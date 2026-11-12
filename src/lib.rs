@@ -4,6 +4,7 @@
 //! TVmaze/TMDB metadata, Plex (library bootstrap and refreshes), and, only with
 //! `[execution] enabled`, the embedded BitTorrent engine (or qBittorrent) and the configured
 //! library roots. Shadow mode (the default) makes no writes outside its own private state.
+#![recursion_limit = "256"]
 
 pub mod api;
 pub mod art;

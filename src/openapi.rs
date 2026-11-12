@@ -167,6 +167,22 @@ pub fn document() -> Value {
         m.insert("/api/v1/system/health".into(), json!({ "get": op("Health in plain words: Plex, library folders, downloads, search sites, disk space, remote access and updates, each green (ok), amber (warn) or red (bad) with one sentence, and the last 50 warnings and errors Arr logged (newest first; kept in memory, scrubbed of names, paths, addresses and tokens). No paths, addresses or secrets", json!([]), vec![("200", ok(json!({ "type": "object", "required": ["items", "problems"], "properties": {
                 "items": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "label": { "type": "string" }, "level": { "type": "string", "enum": ["ok", "warn", "bad"] }, "text": { "type": "string" } } } },
                 "problems": { "type": "array", "items": { "type": "object", "properties": { "at": { "type": "string" }, "level": { "type": "string", "enum": ["warning", "error"] }, "component": { "type": "string" }, "message": { "type": "string" } } } } } }), "the summary"))], &[401, 503]) }));
+        let text_or_null = json!({ "type": ["string", "null"] });
+        let person = obj(
+            json!({ "person_id": { "type": "string", "description": "plex:<id> or tvmaze:<n>" }, "name": { "type": "string" }, "known_for": text_or_null, "thumb": text_or_null, "score": { "type": "number", "description": "0 to 1" } }),
+        );
+        let found = obj(
+            json!({ "query": { "type": "string" }, "people": { "type": "array", "items": person }, "providers": { "type": "array" } }),
+        );
+        m.insert("/api/v1/people".into(), json!({ "get": op("Search people (cast, directors, writers) by name: Plex when set up, else TVmaze. A provider failing is reported in providers, not as an error", json!([q("q", json!({ "type": "string", "minLength": 1, "maxLength": 100 }), "name query", true)]), vec![("200", ok(found, "up to five people, best match first"))], &[400, 401]) }));
+        let group = obj(
+            json!({ "job": { "type": "string" }, "credits": { "type": "array", "items": { "type": "object" } } }),
+        );
+        let page = obj(
+            json!({ "person_id": { "type": "string" }, "name": { "type": "string" }, "known_for": text_or_null, "thumb": text_or_null, "groups": { "type": "array", "items": group } }),
+        );
+        let person_id = json!({ "name": "person_id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "plex:<id> or tvmaze:<n>, as /people gives it" });
+        m.insert("/api/v1/people/{person_id}".into(), json!({ "get": op("A person and their movies and shows in groups by job (the one they are known for first). Each credit has media_id, kind, title, year, role, in_catalog, library_state and upcoming; credits Arr cannot identify are left out", json!([person_id]), vec![("200", ok(page, "person with credits"))], &[400, 401, 404, 502, 504]) }));
         m.insert("/api/v1/show/{media_id}".into(), json!({ "get": op("A show's page: details (summary, runtime_minutes, genres, up to six cast names with their characters), whether new episodes are followed, and each season with its counts and one-word state (in_plex, partly, on_its_way, wanted, upcoming, none). Works for shows outside the catalog (TVmaze). scores holds IMDb and Rotten Tomatoes scores from Plex, or null", json!([media_param.clone()]), vec![("200", ok(json!({ "type": "object", "required": ["media_id", "title", "following", "seasons"] }), "show"))], &[400, 401, 404, 409, 502, 503, 504]) }));
         m.insert("/api/v1/show/{media_id}/season/{n}".into(), json!({ "get": op("The episodes of one season of a show with each one's state and download progress", json!([media_param.clone(), json!({ "name": "n", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 } })]), vec![("200", ok(json!({ "type": "object", "required": ["number", "episodes"] }), "season"))], &[400, 401, 404, 409, 502, 503, 504]) }));
         m.insert("/api/v1/movie/{media_id}".into(), json!({ "get": op("A movie's page: details, summary when Plex or TMDB has one, genres, up to six cast names with their characters (cast: [{name, character}]), and its state (in_plex, on_its_way, waiting, wanted, none). scores holds IMDb and Rotten Tomatoes scores from Plex, or null", json!([media_param.clone()]), vec![("200", ok(json!({ "type": "object", "required": ["media_id", "title", "state"] }), "movie"))], &[400, 401, 404, 502, 503, 504]) }));

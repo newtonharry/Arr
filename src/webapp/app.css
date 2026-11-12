@@ -265,6 +265,8 @@ body.sheet-open{overflow:hidden}
 .chips{display:flex;gap:8px;overflow-x:auto;margin:0 -20px 10px;padding:2px 20px 6px;scroll-padding-inline:20px}
 .chip{flex:none;min-height:44px;padding:0 16px;border:2px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);font-weight:800;font-size:14px;cursor:pointer;white-space:nowrap}
 .chip:hover{border-color:var(--teal)}
+a.chip{display:inline-flex;align-items:center;text-decoration:none}
+.person-name{margin:0}
 .chip[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:var(--on-teal)}
 h2 .link[aria-pressed]{display:inline-flex;align-items:center;gap:4px;padding:0}
 h2 .link .ic{width:16px;height:16px;stroke-width:3}

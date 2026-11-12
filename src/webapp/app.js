@@ -553,6 +553,7 @@ async function renderSearch(q, t) {
   const ac = (searchAbort = new AbortController());
   if (V.t === 'search') { V.busy = true; bump(); } else setView(hint('Searching…', 'status'));
   const get = (kind) => api(`/v1/discover?kind=${kind}&q=${encodeURIComponent(q)}`, { signal: ac.signal });
+  const found = findPeople(q, seq, ac.signal); // never waited for: titles show as soon as they arrive
   const [m, s] = await Promise.allSettled([get('movie'), get('series')]);
   if (seq !== searchSeq || t !== token) return;
   const ok = (r) => r.status === 'fulfilled' && r.value.ok;
@@ -569,7 +570,55 @@ async function renderSearch(q, t) {
   if (moviesOff) notes.push("Movie search isn't set up yet.");
   else if (!ok(m)) notes.push("Movie results aren't available right now.");
   if (!ok(s)) notes.push("Show results aren't available right now.");
-  setView({ t: 'search', q, rows, notes, busy: false });
+  const view = { t: 'search', q, rows, notes, busy: false, people: null };
+  setView(view);
+  found.then((people) => { if (people && V === view && seq === searchSeq) { view.people = people; bump(); } });
+}
+// People matching the search: the person (with their work) when it is clearly who was meant,
+// else a few names. Anything going wrong is no people block, never a failed search.
+const fold = (t) => String(t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+async function findPeople(q, seq, signal) {
+  try {
+    const r = await api('/v1/people?q=' + encodeURIComponent(q), { signal });
+    const list = r.ok ? r.data.people || [] : [];
+    if (!list.length || seq !== searchSeq) return null;
+    const top = list[0];
+    if (top.score >= 0.8 || fold(top.name) === fold(q)) {
+      const p = await api('/v1/people/' + encodeURIComponent(top.person_id), { signal });
+      if (p.ok && (p.data.groups || []).length) return { person: p.data };
+    }
+    return { names: list.slice(0, 3) };
+  } catch { return null; }
+}
+const creditRows = (groups) => keyed(groups.flatMap((g) => g.credits.map((c) => ({ c, job: g.job }))), (r) => r.c.media_id,
+  (r, key) => h(SearchRow, { key, x: r.c, label: r.c.kind === 'movie' ? 'Movie' : 'Show' }));
+const PERSON_ROWS = 12;
+function PersonBlock({ person }) {
+  const all = person.groups.flatMap((g) => g.credits), more = all.length > PERSON_ROWS;
+  const shown = [{ job: '', credits: all.slice(0, PERSON_ROWS) }];
+  return h(Section, { id: 'person', title: person.name, extra: more ? h('a', { href: '#/person/' + encodeURIComponent(person.person_id) }, 'Show all ' + all.length) : null },
+    person.known_for && h('p', { class: 'meta' }, person.known_for), h(List, null, creditRows(shown)));
+}
+function PeopleRow({ names }) {
+  return h(Section, { id: 'people', title: 'People' },
+    h('div', { class: 'chips' }, names.map((n) => h('a', { key: n.person_id, class: 'chip', href: '#/person/' + encodeURIComponent(n.person_id) }, n.name))));
+}
+async function renderPerson(id, t) {
+  setView(hint('Loading…', 'status'));
+  try {
+    const r = await api('/v1/people/' + encodeURIComponent(id));
+    if (t !== token) return;
+    if (r.status === 404) return setView(hint('Arr could not find that person.', 'status'));
+    if (!r.ok) return failed(t);
+    document.title = r.data.name + ' · Arr';
+    setView({ t: 'person', person: r.data });
+  } catch { if (t === token) failed(t); }
+}
+function PersonPage() {
+  const p = V.person;
+  return h('div', { class: 'stack' }, h('h1', { class: 'person-name' }, p.name), p.known_for && h('p', { class: 'meta' }, p.known_for),
+    p.groups.length ? p.groups.map((g, i) => h(Section, { key: g.job, id: 'job' + i, title: g.job }, h(List, null, creditRows([g]))))
+      : h(Hint, { text: 'Nothing Arr can get for this person yet.' }));
 }
 // What a person searched lately, on this device only.
 function recents() {
@@ -601,20 +650,22 @@ function SearchRow({ x, label }) {
   // A movie is one tap; a show opens its page to pick what to get.
   if (label === 'Show') {
     return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
-      h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), haveBadge(x, label)),
+      h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label)),
       chooseLink({ media_id: x.media_id, title: x.title, in_library: (x.in_catalog && x.monitored) || !!x.library_state }));
   }
   // fresh: not in Plex; addOne also asks the movie page whether Arr tracked it, before offering Undo.
   const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add', fresh: !x.has_file && !x.library_state };
   return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
-    h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label)), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
+    h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
 function SearchResults() {
-  const { q, rows, notes, busy } = V;
+  const { q, rows, notes, busy, people } = V;
   // Opening or adding a result counts the search as one worth keeping.
   return h('div', { 'data-results': '', class: busy ? 'busy' : null, onClick: (e) => { if (e.target.closest('a,button')) noteSearch(q); } },
+    people && people.person ? h(PersonBlock, { person: people.person }) : null,
     h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label })))
       : h(Hint, { text: `Nothing found for “${q}”. Check the spelling or try fewer words.` })),
+    people && people.names ? h(PeopleRow, { names: people.names }) : null,
     notes.map((t) => h(Hint, { key: t, text: t })));
 }
 
@@ -1299,7 +1350,11 @@ function parseHash(hash = location.hash) {
   const [path, qs] = (hash.slice(1) || '/').split('?');
   return { path, q: new URLSearchParams(qs || '').get('q') || '' };
 }
-const pageName = (path) => (path === '/search' ? 'Search' : path === '/ideas' ? 'Ideas' : path === '/library' ? 'Library' : path === '/settings' ? 'Settings' : 'Home');
+const personRoute = (path) => {
+  const m = /^\/person\/(.+)$/.exec(path);
+  try { const id = m && decodeURIComponent(m[1]); return id && /^(plex:[A-Za-z0-9]+|tvmaze:\d+)$/.test(id) ? id : null; } catch { return null; }
+};
+const pageName = (path) => (path === '/search' || personRoute(path) ? 'Search' : path === '/ideas' ? 'Ideas' : path === '/library' ? 'Library' : path === '/settings' ? 'Settings' : 'Home');
 const TABS = [['/', 'Home', 'home'], ['/ideas', 'Ideas', 'ideas'], ['/library', 'Library', 'library'], ['/settings', 'Settings', 'settings']];
 function route() {
   if (S.out) return;
@@ -1326,6 +1381,7 @@ function renderPath(path, q, hash) {
   document.title = pageName(path) + ' · Arr';
   $('#q').value = path === '/search' ? q : '';
   if (path === '/search') renderSearch(q, t);
+  else if (personRoute(path)) renderPerson(personRoute(path), t);
   else if (path === '/ideas') renderIdeas(t);
   else if (path === '/library') { setView({ t: 'library', tok: t }); }
   else if (path === '/settings') renderSettings();
@@ -1338,6 +1394,7 @@ function View() {
     case 'home': return h(Home);
     case 'ideas': return h(IdeasPage);
     case 'search': return h(SearchResults);
+    case 'person': return h(PersonPage);
     case 'start': return h(SearchStart);
     case 'library': return h(Library, { key: V.tok, t: V.tok });
     case 'settings': return h(Settings);
