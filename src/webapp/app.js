@@ -23,7 +23,10 @@ const SC = new Map(), LC = new Map(), TC = new Map(); // search, library and tit
 let driveC = null; // the drives line of the library: { drives, at }
 const SEARCH_TTL = 3 * 60e3;
 function remember(m, k, v, max) { m.delete(k); m.set(k, v); if (m.size > max) m.delete(m.keys().next().value); }
-function bust() { SC.clear(); LC.clear(); TC.clear(); driveC = null; }
+// A read that started before authentication ended (authGen) paints and stores nothing; one that
+// started before the last change (cacheGen) may still paint but stores nothing.
+let authGen = 0, cacheGen = 0, feedGen = 0;
+function bust() { cacheGen++; SC.clear(); LC.clear(); TC.clear(); driveC = null; dropFeed(); }
 // The last feed, kept in this browser for the person who saw it, so opening Arr paints at once.
 const FEED_KEY = 'arr.feed';
 function saveFeed() {
@@ -496,10 +499,13 @@ const onHome = () => parseHash().path === '/';
 // One feed read at a time: asking while one is on its way waits for that answer.
 function loadFeed() {
   if (S.out) return Promise.resolve(false);
+  if (feedP && feedGen !== cacheGen) return feedP.then(loadFeed); // that read began before a change
   return (feedP ||= (async () => {
+    const ag = authGen, cg = (feedGen = cacheGen);
     try {
       const r = await api('/v1/feed');
-      if (r.ok) { S.feed = r.data; S.cached = false; S.tmdb = !!r.data.tmdb_backup; saveFeed(); setSetup(false); if (onHome()) paintHome(); bump(); }
+      if (ag !== authGen) return false;
+      if (r.ok) { S.feed = r.data; S.cached = false; S.tmdb = !!r.data.tmdb_backup; if (cg === cacheGen) saveFeed(); setSetup(false); if (onHome()) paintHome(); bump(); }
       return r.ok;
     } catch { return false; } finally {
       feedP = null;
@@ -512,7 +518,8 @@ function loadFeed() {
 function loadIdeas() {
   if (S.ideas && Date.now() - S.ideasAt < 6e5) return Promise.resolve(S.ideas);
   return (ideasP ||= (async () => {
-    try { const r = await api('/v1/ideas'); if (r.ok) { S.ideas = r.data; S.ideasAt = Date.now(); } } catch { /* optional */ } finally { ideasP = null; }
+    const ag = authGen;
+    try { const r = await api('/v1/ideas'); if (r.ok && ag === authGen) { S.ideas = r.data; S.ideasAt = Date.now(); } } catch { /* optional */ } finally { ideasP = null; }
     return S.ideas;
   })());
 }
@@ -575,7 +582,7 @@ async function renderSearch(q, t) {
   searchAbort?.abort();
   const ac = (searchAbort = new AbortController());
   if (V.t === 'search') { V.busy = true; bump(); } else setView(hint('Searching…', 'status'));
-  const key = q.toLowerCase(), hit = SC.get(key);
+  const key = q.toLowerCase(), hit = SC.get(key), ag = authGen, cg = cacheGen;
   let view = null, pend = null;
   const attach = () => { if (pend && view && V === view && seq === searchSeq) { view.people = pend; bump(); } };
   // Searched a moment ago: shown at once, with the people it found.
@@ -595,7 +602,7 @@ async function renderSearch(q, t) {
   let rows = null;
   // Each half is drawn as it arrives and the rows already there stay put: a later half goes below.
   const paint = () => {
-    if (seq !== searchSeq || t !== token) return;
+    if (seq !== searchSeq || t !== token || ag !== authGen) return;
     if (!ok(done.m) && !ok(done.s)) { if (both()) setView(hint('Search will work again as soon as Arr is back.', 'status')); return; }
     const m = done.m && !shown.m && ok(done.m) ? rowsOf(done.m, 'Movie') : [], sh = done.s && !shown.s && ok(done.s) ? rowsOf(done.s, 'Show') : [];
     shown.m = !!done.m; shown.s = !!done.s;
@@ -607,7 +614,7 @@ async function renderSearch(q, t) {
     if (done.s && !ok(done.s)) notes.push("Show results aren't available right now.");
     if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: null }; setView(view); }
     attach();
-    if (both() && ok(done.m) && ok(done.s)) remember(SC, key, { at: Date.now(), rows, notes, people: pend }, 20);
+    if (both() && ok(done.m) && ok(done.s) && cg === cacheGen) remember(SC, key, { at: Date.now(), rows, notes, people: pend }, 20);
   };
   await Promise.race([pm, ps]);
   if (!both()) await Promise.race([Promise.all([pm, ps]), new Promise((r) => setTimeout(r, 120))]); // near-simultaneous halves are mixed together
@@ -693,8 +700,8 @@ function SearchRow({ x, label }) {
       h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label)),
       chooseLink({ media_id: x.media_id, title: x.title, in_library: (x.in_catalog && x.monitored) || !!x.library_state }));
   }
-  // fresh: Arr does not have it at all, so the add can be undone.
-  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add', fresh: !x.has_file && !x.library_state };
+  // fresh: the result says Arr did not have it at all, so the add can be undone.
+  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add', fresh: x.in_catalog === false && !x.has_file && !x.library_state };
   return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
@@ -723,10 +730,11 @@ function Storage() {
   useEffect(() => {
     let live = true;
     if (driveC && Date.now() - driveC.at < 60e3) return; // read a moment ago
+    const ag = authGen, cg = cacheGen;
     api('/v1/storage').then((r) => {
-      if (!r.ok) return;
+      if (!r.ok || ag !== authGen) return;
       const ds = (r.data.drives || []).filter((d) => d.total_bytes > 0);
-      driveC = { drives: ds, at: Date.now() };
+      if (cg === cacheGen) driveC = { drives: ds, at: Date.now() };
       if (live) setDrives(ds);
     }).catch(() => {});
     return () => { live = false; };
@@ -753,7 +761,7 @@ function Library({ t }) {
   const [st, setSt] = useState({ items: [], total: 0, status: 'Loading…' });
   const m = useRef({ seq: 0, items: [], ft: 0 }).current;
   async function load(reset) {
-    const my = ++m.seq, key = `${S.kind}|${S.sort}|${S.filter.trim()}`;
+    const ag = authGen, cg = cacheGen, my = ++m.seq, key = `${S.kind}|${S.sort}|${S.filter.trim()}`;
     if (reset) {
       // The last answer for this list shows while the new one is fetched.
       const hit = LC.get(key);
@@ -763,10 +771,10 @@ function Library({ t }) {
     const qs = `limit=50&offset=${m.items.length}&sort=${S.sort}` + (S.filter.trim() ? '&q=' + encodeURIComponent(S.filter.trim()) : '');
     try {
       const r = await api(`/v1/library/${S.kind}?${qs}`);
-      if (my !== m.seq || t !== token) return;
+      if (my !== m.seq || t !== token || ag !== authGen) return;
       if (!r.ok) { setSt((s) => ({ ...s, status: "Couldn't load the library just now." })); return; }
       m.items = m.items.concat(r.data.items || []);
-      remember(LC, key, { items: m.items, total: r.data.total || 0 }, 12);
+      if (cg === cacheGen) remember(LC, key, { items: m.items, total: r.data.total || 0 }, 12);
       setSt({ items: m.items, total: r.data.total || 0, status: m.items.length ? '' : S.filter.trim() ? `No matches for “${S.filter.trim()}”.` : 'Nothing here yet. Add something from the search above.' });
     } catch { if (my === m.seq && t === token && !S.out) { setSt((s) => ({ ...s, status: '' })); if (!m.items.length) failed(t); } }
   }
@@ -888,7 +896,7 @@ function errText(r) {
 }
 // Reads are numbered: a newer read, or the start of an action, makes an older answer stale.
 async function loadTitle(quiet) {
-  const tk = P.token, sq = ++P.seq, stale = () => tk !== P.token || sq !== P.seq;
+  const tk = P.token, sq = ++P.seq, ag = authGen, cg = cacheGen, stale = () => tk !== P.token || sq !== P.seq || ag !== authGen;
   // Expanded seasons reload on their own, so a failed title read can't leave one loading forever.
   const seasons = P.kind === 'show' ? Promise.all([...P.open].map((n) => loadSeason(n, tk, sq))) : null;
   try {
@@ -897,7 +905,7 @@ async function loadTitle(quiet) {
     P.upd = false;
     if (!r.ok) { TC.delete(P.id); if (!P.data || r.status === 404) { P.data = null; P.err = errText(r); } await seasons; if (!stale()) bump(); return; }
     P.data = r.data; P.err = '';
-    remember(TC, P.id, r.data, 30);
+    if (cg === cacheGen) remember(TC, P.id, r.data, 30);
     document.title = `${r.data.title} · Arr`;
     if (P.opt.fetch) { P.opt.fetch = false; loadCopies(); }
   } catch {
@@ -1307,6 +1315,7 @@ async function pickCopy(c) {
     if (r.ok) res = { text: r.data.message || 'Arr is getting that copy now.' };
     else res = { text: PICK_ERRORS[r.data && r.data.error && r.data.error.code] || "Couldn't start that one just now. Try again in a moment.", err: true };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  bust();
   if (tk !== P.token) return;
   o.picking = '';
   if (!res.err) {
@@ -1490,7 +1499,7 @@ function movieBody() {
 
 // ---------- sign in ----------
 function showSignin(data) {
-  S.out = true; token++; dropFeed();
+  S.out = true; authGen++; token++; dropFeed();
   clearTimeout(pollT); clearTimeout(retryT);
   setBanner(''); S.setup = false;
   document.title = 'Sign in · Arr';
@@ -1972,7 +1981,7 @@ function Footer() {
       ', show details and posters from ', h('a', { href: 'https://www.tvmaze.com', target: '_blank', rel: 'noopener noreferrer' }, 'TVmaze'), '.'));
 }
 async function signOut() {
-  dropFeed();
+  authGen++; dropFeed();
   try { await api('/signout', { method: 'POST' }); } catch { /* signed out anyway */ }
   location.hash = ''; location.reload();
 }
