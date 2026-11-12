@@ -497,7 +497,7 @@ follows:
   ("d'Ivoire") or a possessive `s` ("Children's"), or the whole word is a sponsor web address
   such as "crypto.com"; so lowercase prose is not a name, whatever it is prefixed or joined with.
   Tournament titles and fighters' names are judged by the same segment rule; a game between two teams is named by Arr from the two
-  team names (`<Away> at <Home>`), its short name from the abbreviations; a fight card's title
+  team names (`<Away> at <Home>` for basketball, `<Home> v <Away>` for soccer and rugby), its short name from the abbreviations; a fight card's title
   begins with one of the league's own names and has a small tail and optionally
   `: <Name> vs. <Name>`; a tournament title is capitalised words, numbers and a few small
   connectors. A string that does not fit becomes a neutral value made from Arr's own data

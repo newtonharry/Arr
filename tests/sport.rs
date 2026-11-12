@@ -14,9 +14,9 @@ use time::OffsetDateTime;
 const EPL: &str = "soccer/eng.1";
 const UFC: &str = "mma/ufc";
 
-/// Fulham at Manchester City, nine days after the recording day.
+/// Manchester City v Fulham, nine days after the recording day.
 const FULHAM_AT_CITY: &str = "401879233";
-/// Arsenal at Newcastle United, the same day.
+/// Newcastle United v Arsenal, the same day.
 const ARSENAL_AT_NEWCASTLE: &str = "401879232";
 
 async fn follow(e: &Exec, body: Value) -> (u16, Value) {
@@ -226,7 +226,7 @@ async fn following_a_league_shows_its_upcoming_events_at_once() {
     assert!(v["follow"]["since"].as_str().unwrap().ends_with('Z'));
     // Fixtures nine and ten days ahead: nine of them, inside the next three weeks.
     assert_eq!(v["upcoming"], 9, "{v}");
-    assert_eq!(v["next_event"]["name"], "Fulham at Manchester City");
+    assert_eq!(v["next_event"]["name"], "Manchester City v Fulham");
 
     let (s, v) = get(&e, "/api/v1/sport/events").await;
     assert_eq!(s, 200, "{v}");
@@ -241,7 +241,7 @@ async fn following_a_league_shows_its_upcoming_events_at_once() {
         first["id"],
         format!("event:premier-league:{FULHAM_AT_CITY}")
     );
-    assert_eq!(first["name"], "Fulham at Manchester City");
+    assert_eq!(first["name"], "Manchester City v Fulham");
     assert_eq!(
         first["home"],
         json!({ "id": "382", "name": "Manchester City" })
@@ -278,7 +278,7 @@ async fn following_a_league_shows_its_upcoming_events_at_once() {
     assert_eq!(v["following"].as_array().unwrap().len(), 1);
     assert_eq!(
         v["following"][0]["next_event"]["name"],
-        "Fulham at Manchester City"
+        "Manchester City v Fulham"
     );
 }
 
@@ -476,7 +476,7 @@ async fn nothing_before_the_follow_time_is_wanted() {
     assert!(
         !stored_names
             .iter()
-            .any(|n| n == "Brentford at Brighton & Hove Albion")
+            .any(|n| n == "Brighton & Hove Albion v Brentford")
     );
 }
 
@@ -539,13 +539,13 @@ async fn an_event_that_disappears_upstream_is_unlisted_never_cancelled() {
     assert_eq!(v["sport"].as_array().unwrap().len(), 8, "{v}");
     let (_, v) = get(&e, "/api/v1/sport/events").await;
     assert_eq!(v["events"].as_array().unwrap().len(), 8);
-    assert!(!names(&v["events"]).contains(&"Fulham at Manchester City".to_string()));
+    assert!(!names(&v["events"]).contains(&"Manchester City v Fulham".to_string()));
     let (_, v) = get(&e, "/api/v1/sport/league/premier-league").await;
     assert_eq!(v["upcoming"].as_array().unwrap().len(), 8);
     let (_, v) = get(&e, "/api/v1/sport/following").await;
     assert_ne!(
         v["following"][0]["next_event"]["name"],
-        "Fulham at Manchester City"
+        "Manchester City v Fulham"
     );
     // Reading it again changes nothing further.
     let r = refresh_run(&e, now + time::Duration::hours(14)).await;
@@ -631,7 +631,7 @@ async fn a_postponed_event_says_so_and_comes_back_when_it_is_scheduled_again() {
         "a postponed game is still listed, as postponed"
     );
     let postponed = sport.iter().find(|e| e["state"] == "postponed").unwrap();
-    assert_eq!(postponed["name"], "Arsenal at Newcastle United");
+    assert_eq!(postponed["name"], "Newcastle United v Arsenal");
     espn_set_status(
         &e.mock,
         EPL,
@@ -897,7 +897,7 @@ async fn a_fight_card_a_tournament_and_a_rugby_match_have_their_own_shapes() {
 
     let rugby = events
         .iter()
-        .find(|e| e["name"] == "Stade Toulousain at Lyon")
+        .find(|e| e["name"] == "Lyon v Stade Toulousain")
         .unwrap();
     assert_eq!(rugby["league"]["sport"], "rugby_union");
     assert_eq!(rugby["home"]["name"], "Lyon");
@@ -1390,7 +1390,7 @@ async fn a_note_that_says_how_a_game_went_reaches_neither_the_store_nor_an_answe
         "SELECT name || '|' || COALESCE(short_name, '-') FROM sport_events WHERE id = 'event:premier-league:401879236'",
     )
     .await;
-    assert_eq!(short, ["Leeds United at Chelsea|LEE @ CHE"]);
+    assert_eq!(short, ["Chelsea v Leeds United|CHE v LEE"]);
     let everything = stored(
         &e,
         "SELECT group_concat(COALESCE(round, '') || COALESCE(short_name, '') || name || COALESCE(venue, ''), ' ') FROM sport_events",
@@ -1644,8 +1644,8 @@ async fn titles_that_read_like_results_never_reach_an_answer() {
         format!("UFC event on {}", day("600061665"))
     );
     let game = by_id(&format!("event:premier-league:{FULHAM_AT_CITY}"));
-    assert_eq!(game["name"], "Fulham at Manchester City");
-    assert_eq!(game["short_name"], "FUL @ MNC");
+    assert_eq!(game["name"], "Manchester City v Fulham");
+    assert_eq!(game["short_name"], "MNC v FUL");
     assert_eq!(game["venue"], Value::Null);
     let (_, text) = {
         let (s, _, t) = e.json(e.get(&wide_events())).await;
@@ -1950,7 +1950,7 @@ async fn every_text_field_that_carries_a_result_is_neutral_in_the_store_and_ever
             assert!(!text.contains(bad), "{bad} in {text}");
         }
     }
-    assert!(rows.contains("Fulham at Team 382"), "{rows}");
+    assert!(rows.contains("Team 382 v Fulham"), "{rows}");
     assert!(teams.contains("Team 382|"), "{teams}");
     // The season is dropped, the venue too; the event and the team are still there.
     assert!(!rows.contains("Smith") && !rows.contains("Etihad"));
@@ -1961,7 +1961,7 @@ async fn every_text_field_that_carries_a_result_is_neutral_in_the_store_and_ever
         .iter()
         .find(|x| x["id"] == format!("event:premier-league:{FULHAM_AT_CITY}"))
         .unwrap();
-    assert_eq!(game["name"], "Fulham at Team 382");
+    assert_eq!(game["name"], "Team 382 v Fulham");
     assert_eq!(game["home"], json!({ "id": "382", "name": "Team 382" }));
     assert_eq!(game["short_name"], Value::Null);
     assert_eq!(

@@ -334,7 +334,7 @@ and is not an official API; it is the one outside service sport adds (see
 routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry an empty `sport`.
 
 - **No spoilers.** Arr never reads, stores or shows scores, winners or result text. An event's
-  name is the fixture ("Fulham at Manchester City", "UFC 334: Gane vs. Hokit"), and its state is
+  name is the fixture ("Manchester City v Fulham", "UFC 334: Gane vs. Hokit"), and its state is
   one of `scheduled`, `postponed`, `cancelled` or `played`, with nothing about how it went.
   `cancelled` is only ever what the schedule source says. An event that merely drops out of the
   source's answers is kept internally as `unlisted` and appears in no answer (it comes back, in
@@ -342,11 +342,13 @@ routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry a
   round label ("Round 12", "Matchweek 9", "Group B", "Semi-final", ...); any other note is free
   text that could name a winner, so it is dropped.
 - **Names are built, not copied, wherever there are two sides.** A game, match or fixture
-  between two teams is named `<Away> at <Home>` from the structured team names ("Fulham at
-  Manchester City", "Charlotte Hornets at Los Angeles Lakers", "Stade Toulousain at Lyon"),
-  for every sport; `home` and `away` say which side is which, and `at` does not claim the game
-  is at the home team's ground in a neutral-venue competition. `short_name` is built from the
-  teams' abbreviations the same way ("FUL @ MNC"), or `null`. The feed's own `name` and
+  between two teams is named from the structured team names in the order its sport reads them:
+  basketball puts the away side first, `<Away> at <Home>` ("Charlotte Hornets at Los Angeles
+  Lakers", short "CHA @ LAL"); soccer, rugby union and rugby league put the home side first,
+  `<Home> v <Away>` ("Manchester City v Fulham", "Lyon v Stade Toulousain", short "MNC v FUL").
+  `home` and `away` say which side is which whatever the order of the name, and neither form
+  claims the game is at the home team's ground in a neutral-venue competition. `short_name` is
+  built from the teams' abbreviations the same way, or `null`. The feed's own `name` and
   `shortName` are never copied for these. Events with no two sides (a fight card, a
   tournament) keep the feed's title only if it fits the grammar of its kind. A fight card must
   begin with one of its league's own names ("UFC", "PFL", ...), then a small tail (a number,
@@ -394,8 +396,8 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
   "id": "event:premier-league:401879233",
   "league": { "id": "league:premier-league", "slug": "premier-league", "name": "Premier League",
               "sport": "soccer", "sport_label": "Soccer", "has_teams": true },
-  "name": "Fulham at Manchester City",
-  "short_name": "FUL @ MNC",
+  "name": "Manchester City v Fulham",
+  "short_name": "MNC v FUL",
   "starts_at": "2026-11-21T12:30:00Z",
   "ends_at": null,
   "state": "scheduled",

@@ -541,6 +541,17 @@ fn side(t: &RawTeam) -> Option<Side> {
     })
 }
 
+/// A game between two teams as the sport reads it: basketball puts the away side first with
+/// "at" (or "@" in the short form), soccer and rugby the home side first with "v". Other sports
+/// have no sides, so the choice does not matter there.
+fn fixture_name(sport: Sport, home: &str, away: &str, short: bool) -> String {
+    match (sport, short) {
+        (Sport::Basketball, false) => format!("{away} at {home}"),
+        (Sport::Basketball, true) => format!("{away} @ {home}"),
+        _ => format!("{home} v {away}"),
+    }
+}
+
 fn fixture(e: RawEvent, league: &League) -> Option<Fixture> {
     let id = plain_id(e.id.as_ref())?;
     let starts_at = parse_time(e.date.as_deref()?)?;
@@ -574,16 +585,17 @@ fn fixture(e: RawEvent, league: &League) -> Option<Fixture> {
         (None, None)
     };
     // The name never comes from the feed's own `name` or `shortName` when both teams are
-    // known: it is built from the structured team names, away side first ("Fulham at
-    // Manchester City", "Stade Toulousain at Lyon"), and the short name from their
-    // abbreviations ("FUL @ MNC"). `home` and `away` keep their own meaning.
+    // known: it is built from the structured team names in the order the sport reads them:
+    // away side first for basketball ("Charlotte Hornets at Los Angeles Lakers", short
+    // "CHA @ LAL"), home side first for soccer and rugby ("Manchester City v Fulham", short
+    // "MNC v FUL"). `home` and `away` keep their own meaning.
     let (name, short_name) = match (&home, &away) {
         (Some(h), Some(a)) => (
-            Some(format!("{} at {}", a.name, h.name)),
+            Some(fixture_name(league.sport, &h.name, &a.name, false)),
             h.abbreviation
                 .as_ref()
                 .zip(a.abbreviation.as_ref())
-                .map(|(h, a)| format!("{a} @ {h}")),
+                .map(|(h, a)| fixture_name(league.sport, h, a, true)),
         ),
         _ => (event_title(e.name.as_deref(), league), None),
     };
@@ -1205,16 +1217,35 @@ mod title_tests {
             let f = board(spoiler, spoiler, spoiler, true);
             assert_eq!(
                 f.name.as_deref(),
-                Some("Stade Toulousain at Lyon"),
+                Some("Lyon v Stade Toulousain"),
                 "{spoiler}"
             );
-            assert_eq!(f.short_name.as_deref(), Some("TOU @ LYO"));
+            assert_eq!(f.short_name.as_deref(), Some("LYO v TOU"));
             assert_eq!(f.venue, None, "{spoiler}");
         }
         let f = board("Anything", "Anything", "Stade Gerland", true);
         assert_eq!(f.venue.as_deref(), Some("Stade Gerland"));
         assert_eq!(f.home.as_ref().unwrap().name, "Lyon");
         assert_eq!(f.away.as_ref().unwrap().name, "Stade Toulousain");
+    }
+
+    #[test]
+    fn the_order_of_a_team_event_name_follows_the_sport() {
+        let body = br#"{"events":[{"id":"7","date":"2026-11-21T12:30Z","competitions":[{"competitors":[
+            {"homeAway":"home","team":{"id":"5","displayName":"Lyon","abbreviation":"LYO"}},
+            {"homeAway":"away","team":{"id":"6","displayName":"Toulouse","abbreviation":"TOU"}}]}]}]}"#;
+        for (slug, name, short) in [
+            ("nba", "Toulouse at Lyon", "TOU @ LYO"),
+            ("premier-league", "Lyon v Toulouse", "LYO v TOU"),
+            ("top-14", "Lyon v Toulouse", "LYO v TOU"),
+            ("nrl", "Lyon v Toulouse", "LYO v TOU"),
+        ] {
+            let f = &parse_month(body, league(slug)).unwrap().fixtures[0];
+            assert_eq!(f.name.as_deref(), Some(name), "{slug}");
+            assert_eq!(f.short_name.as_deref(), Some(short), "{slug}");
+            assert_eq!(f.home.as_ref().unwrap().name, "Lyon", "{slug}");
+            assert_eq!(f.away.as_ref().unwrap().name, "Toulouse", "{slug}");
+        }
     }
 
     #[test]
@@ -1243,7 +1274,7 @@ mod title_tests {
         .unwrap();
         let f = &m.fixtures[0];
         assert_eq!(f.home.as_ref().unwrap().name, "Team 5");
-        assert_eq!(f.name.as_deref(), Some("Away FC at Team 5"));
+        assert_eq!(f.name.as_deref(), Some("Team 5 v Away FC"));
         assert_eq!(f.short_name, None, "one side has no usable abbreviation");
         assert_eq!(f.season, None);
         let teams = parse_teams(
