@@ -25,6 +25,10 @@ button,input{font:inherit;color:inherit}
 #tabs{position:fixed;left:0;right:0;bottom:0;z-index:10;display:flex;background:var(--card);border-top:2px solid var(--line);padding:6px 8px calc(6px + env(safe-area-inset-bottom))}
 #tabs a{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-height:56px;color:var(--muted);text-decoration:none;font-size:12px;font-weight:800;border-radius:12px}
 #tabs a[aria-current]{color:var(--teal-ink)}
+#tabs a{position:relative}
+/* the pill behind the current tab slides to the next one (phones; wider screens fill the tab instead) */
+.pill{position:absolute;top:6px;bottom:calc(6px + env(safe-area-inset-bottom));left:8px;width:calc((100% - 16px)/4);border-radius:12px;background:var(--sel);transform:translateX(calc(var(--i,0)*100%));transition:transform .42s cubic-bezier(.34,1.4,.64,1),opacity .2s;pointer-events:none}
+.pill[data-off]{opacity:0}
 .banner{grid-column:1/-1;margin:-6px 0 14px;padding:10px 14px;border:2px solid var(--line);border-radius:12px;background:var(--sun-bg);color:var(--sun-ink);font-weight:700}
 .banner:empty{display:none}
 main{padding-bottom:24px;outline:0}
@@ -128,6 +132,7 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
   #tabs{position:static;grid-column:2;grid-row:1;background:none;border:0;padding:0;gap:6px;align-items:center}
   #tabs a{flex:none;flex-direction:row;gap:6px;min-height:44px;padding:0 14px;font-size:15px;border:2px solid transparent}
   #tabs a:hover{color:var(--teal)}
+  .pill{display:none}
   #tabs a[aria-current]{background:var(--teal);color:var(--on-teal)}
   .search{margin-top:10px}
   .foot{padding-top:12px}
@@ -154,7 +159,8 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 @media (prefers-color-scheme:dark){:root{--scrim:rgba(0,0,0,.6)}}
 body.sheet-open{overflow:hidden}
 .sheet{position:fixed;inset:0;z-index:30}
-.panel{position:absolute;inset:0;overflow-y:auto;overscroll-behavior:contain;background:var(--bg);outline:0;padding:0 20px calc(28px + env(safe-area-inset-bottom));animation:rise .3s cubic-bezier(.16,1,.3,1)}
+.panel{position:absolute;inset:0;overflow-y:auto;overscroll-behavior:contain;background:var(--bg);outline:0;padding:0 20px calc(28px + env(safe-area-inset-bottom))}
+.scrim{position:absolute;inset:0;background:var(--scrim)}
 @keyframes rise{from{transform:translateY(40px);opacity:0}to{transform:none;opacity:1}}
 .sheet-bar{position:sticky;top:0;z-index:2;display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:calc(10px + env(safe-area-inset-top)) 0 10px;background:var(--bg)}
 .sheet-body{padding-top:2px}
@@ -202,10 +208,19 @@ body.sheet-open{overflow:hidden}
 .item.state .what{min-width:160px}
 .st{font-size:16px;font-weight:800;line-height:1.3}
 .item.state .act:has(.ask){flex-basis:100%}
-.sk{height:14px;border-radius:8px;background:var(--line);animation:pulse 1.4s ease-in-out infinite}
+.sk{height:14px;border-radius:8px;background:linear-gradient(100deg,var(--line) 35%,var(--card) 50%,var(--line) 65%) 110% 0/220% 100%;animation:shim 1.1s linear infinite}
+@keyframes shim{to{background-position:-110% 0}}
+.ln{height:13px;border-radius:7px;margin:5px 0}.ln.s{height:10px}
+.tile.sk{height:68px;border-radius:10px}
 .sk-tile{background:var(--line)}
 /* Shown while the last answer is on screen and a fresh one is on its way. */
-.upd{color:var(--muted);font-size:13px;animation:pulse 1.4s ease-in-out infinite}
+.updating{color:var(--muted);font-size:13px;animation:pulse 1.4s ease-in-out infinite}
+/* the thin line across the top while the page shows the last answer */
+.topline{position:fixed;top:0;left:0;right:0;height:3px;background:var(--teal);transform-origin:left;transform:scaleX(0);opacity:0;pointer-events:none;z-index:50}
+/* the handle that pulls a sheet down (phones) */
+.sheet-bar>*{position:relative}
+.grab{position:absolute!important;inset:0 76px 0 76px;display:flex;justify-content:center;align-items:flex-start;padding-top:calc(10px + env(safe-area-inset-top));touch-action:none;cursor:grab}
+.grab::before{content:"";width:40px;height:5px;border-radius:3px;background:var(--line)}
 @keyframes pulse{50%{opacity:.45}}
 .stretch{color:inherit;text-decoration:none}
 .stretch::after{content:"";position:absolute;inset:0;border-radius:18px}
@@ -217,9 +232,8 @@ body.sheet-open{overflow:hidden}
 .item .btn,.item .link,.idea .btn,.idea .link{position:relative;z-index:1}
 .item:has(.stretch:hover) h3 .stretch,.idea:has(.stretch:hover) h3 .stretch{text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:2px;text-decoration-color:var(--line)}
 @media (min-width:760px){
-  .sheet{background:var(--scrim)}
-  .panel{left:auto;width:min(540px,100%);border-left:2px solid var(--line);animation-name:slide}
-  @keyframes slide{from{transform:translateX(40px);opacity:0}to{transform:none;opacity:1}}
+  .panel{left:auto;width:min(540px,100%);border-left:2px solid var(--line)}
+  .grab{display:none}
 }
 .sbtn .meta{white-space:normal}
 .what .st{color:var(--ink);font-size:16px}
