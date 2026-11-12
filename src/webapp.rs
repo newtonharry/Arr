@@ -783,6 +783,8 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | ["storage"]
                 | ["ideas"]
                 | ["discover"]
+                | ["people"]
+                | ["people", _]
                 | ["library", "movies" | "series"]
                 | ["show", _]
                 | ["show", _, "season", _]

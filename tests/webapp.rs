@@ -2400,3 +2400,50 @@ async fn health_is_plain_words_with_recent_problems_scrubbed() {
     }
     assert!(OffsetDateTime::parse(ours["at"].as_str().unwrap(), &Rfc3339).is_ok());
 }
+
+#[tokio::test]
+async fn the_app_finds_people_through_its_proxy_and_has_a_person_page() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/people?q=dana", c))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["people"][0]["person_id"], "plex:dir0001", "{v}");
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/people/plex:dir0001", c))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["groups"][0]["job"], "Director", "{v}");
+    // Reading only: nothing else under /people is the app's to call.
+    let (s, _) = site
+        .json(site.app(Method::POST, "/app/api/v1/people/plex:dir0001", c))
+        .await;
+    assert_eq!(s, 404);
+    let (s, _) = site
+        .json(site.app(Method::GET, "/app/api/v1/people/plex:dir0001/credits", c))
+        .await;
+    assert_eq!(s, 404);
+
+    // The app has the person block in search, a People row, and the #/person/<id> page.
+    let js = site
+        .plain(Method::GET, "/app/app.js")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for want in [
+        "/v1/people?q=",
+        "function PersonBlock(",
+        "function PeopleRow(",
+        "function PersonPage(",
+        "/^\\/person\\/(.+)$/",
+        "case 'person'",
+    ] {
+        assert!(js.contains(want), "app.js lacks {want}");
+    }
+}

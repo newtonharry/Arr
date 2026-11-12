@@ -67,6 +67,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/wanted"),
     ("get", "/api/v1/calendar"),
     ("get", "/api/v1/discover"),
+    ("get", "/api/v1/people"),
+    ("get", "/api/v1/people/{person_id}"),
     ("get", "/api/v1/media/{media_id}"),
     ("get", "/api/v1/media/{media_id}/releases"),
     ("post", "/api/v1/plans"),
@@ -793,6 +795,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/wanted", get(wanted))
         .route("/api/v1/calendar", get(calendar))
         .route("/api/v1/discover", get(discover))
+        .route("/api/v1/people", get(people))
+        .route("/api/v1/people/{person_id}", get(person))
         .route("/api/v1/media/{media_id}", get(media))
         .route("/api/v1/media/{media_id}/releases", get(releases))
         .route("/api/v1/plans", post(create_plan).get(list_plans))
@@ -2635,6 +2639,212 @@ async fn discover(State(st): St, ApiQuery(q): ApiQuery<DiscoverQuery>) -> ApiRes
     }
     ok(
         json!({ "query": text, "kind": match q.kind { DiscoverKind::Movie => "movie", DiscoverKind::Series => "series" }, "results": list, "providers": providers }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeopleQuery {
+    q: Option<String>,
+}
+
+fn provider_failed(name: &str, e: &crate::upstream::UpstreamError) -> Value {
+    json!({ "name": name, "status": "failed", "error": { "code": e.code(), "message": format!("{name} {}", e.describe()) } })
+}
+
+/// People whose names match: Plex when it is set up (TVmaze if Plex fails), else TVmaze.
+/// A provider failing is a status here, never an error.
+async fn people(State(st): St, ApiQuery(q): ApiQuery<PeopleQuery>) -> ApiResult {
+    let text = text_query(q.q.as_deref(), true)?.expect("required");
+    let mut providers = vec![];
+    let mut found: Vec<Value> = vec![];
+    let mut answered = false;
+    if let Some(plex) = st.movies.as_ref().and_then(Movies::plex) {
+        match plex.people(&text).await {
+            Ok(hits) => {
+                answered = true;
+                providers.push(json!({ "name": "plex", "status": "ok", "results": hits.len() }));
+                found = hits
+                    .into_iter()
+                    .map(|p| json!({ "person_id": format!("plex:{}", p.id), "name": p.name, "known_for": p.known_for, "thumb": p.thumb, "score": p.score }))
+                    .collect();
+            }
+            Err(e) => providers.push(provider_failed("plex", &e)),
+        }
+    } else {
+        providers.push(json!({ "name": "plex", "status": "not_configured" }));
+    }
+    if !answered {
+        match &st.tvmaze {
+            None => providers.push(json!({ "name": "tvmaze", "status": "disabled" })),
+            Some(tv) => {
+                match tv.search_people(&text).await {
+                    Ok(mut hits) => {
+                        hits.sort_by(|a, b| b.0.total_cmp(&a.0));
+                        providers.push(json!({ "name": "tvmaze", "status": "ok", "results": hits.len().min(5) }));
+                        found = hits
+                        .into_iter()
+                        .take(5)
+                        .map(|(score, p)| json!({ "person_id": format!("tvmaze:{}", p.id), "name": p.name, "known_for": null, "thumb": p.image.and_then(|i| i.medium), "score": score.clamp(0.0, 1.0) }))
+                        .collect();
+                    }
+                    Err(e) => providers.push(provider_failed("tvmaze", &e)),
+                }
+            }
+        }
+    }
+    ok(json!({ "query": text, "people": found, "providers": providers }))
+}
+
+/// One credit, with where it stands in the library (as discover says it).
+fn credit_json(
+    id: MediaId,
+    title: &str,
+    year: Option<u16>,
+    role: Option<&str>,
+    upcoming: bool,
+    state: Option<(bool, bool, Option<&'static str>)>,
+) -> Value {
+    let (in_catalog, monitored, library_state) = state.unwrap_or((false, false, None));
+    json!({ "media_id": id.to_string(), "kind": if matches!(id, MediaId::Movie { .. }) { "movie" } else { "series" }, "title": title, "year": year, "role": role, "in_catalog": in_catalog, "monitored": monitored, "library_state": library_state, "upcoming": upcoming })
+}
+
+/// A person and what they made, in groups by job (the one they are best known for first).
+async fn person(State(st): St, p: Result<Path<String>, PathRejection>) -> ApiResult {
+    let Path(raw) =
+        p.map_err(|e| ApiError::bad_request(ErrorCode::InvalidRequest, e.body_text()))?;
+    let index = st.index();
+    let catalog = st.current().map(|_| index.as_ref());
+    let upstream = |e: crate::upstream::UpstreamError| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            e.code(),
+            format!("people {}", e.describe()),
+        )
+    };
+    let missing = || ApiError::not_found("no such person");
+    let (name, known_for, thumb, groups) = match raw.split_once(':') {
+        Some(("plex", id)) => {
+            let plex = st
+                .movies
+                .as_ref()
+                .and_then(Movies::plex)
+                .ok_or_else(missing)?;
+            let page = plex
+                .person(id)
+                .await
+                .map_err(upstream)?
+                .ok_or_else(missing)?;
+            let groups: Vec<Value> = page
+                .groups
+                .iter()
+                .map(|g| {
+                    let credits: Vec<Value> = g
+                        .credits
+                        .iter()
+                        .filter_map(|c| {
+                            let (id, state) = match (c.series, c.tmdb, c.tvdb) {
+                                (false, Some(tmdb), _) => (
+                                    MediaId::Movie { tmdb },
+                                    catalog.map(|c| c.movie(tmdb)).map(|m| {
+                                        (
+                                            m.is_some(),
+                                            m.is_some_and(|m| m.monitored),
+                                            m.and_then(movie_state),
+                                        )
+                                    }),
+                                ),
+                                (true, _, Some(tvdb)) => (
+                                    MediaId::Series(SeriesKey::Tvdb(tvdb)),
+                                    catalog.map(|c| c.series(SeriesKey::Tvdb(tvdb))).map(|s| {
+                                        (
+                                            s.is_some(),
+                                            s.is_some_and(|s| s.monitored),
+                                            s.and_then(series_state),
+                                        )
+                                    }),
+                                ),
+                                _ => return None,
+                            };
+                            Some(credit_json(
+                                id,
+                                &c.title,
+                                c.year,
+                                c.role.as_deref(),
+                                c.upcoming,
+                                state,
+                            ))
+                        })
+                        .collect();
+                    json!({ "job": g.job, "credits": credits })
+                })
+                .collect();
+            (page.name, page.known_for, page.thumb, groups)
+        }
+        Some(("tvmaze", id)) => {
+            let id: u32 = id.parse().map_err(|_| {
+                ApiError::bad_request(ErrorCode::InvalidRequest, "invalid person id")
+            })?;
+            let tv = st.tvmaze.as_ref().ok_or_else(missing)?;
+            let (who, credits) = tv.person(id).await.map_err(upstream)?.ok_or_else(missing)?;
+            let mut seen = HashSet::new();
+            let mut groups: Vec<(String, Vec<Value>)> = vec![];
+            for (job, show) in credits
+                .iter()
+                .filter(|(_, s)| !s.name.is_empty())
+                .filter(|(_, s)| seen.insert(s.id))
+                .take(40)
+            {
+                let t = crate::target::series_from_tvmaze(show);
+                let found = catalog.and_then(|c| {
+                    t.tvdb_id
+                        .and_then(|id| c.series(SeriesKey::Tvdb(id)))
+                        .or_else(|| c.series(SeriesKey::Tvmaze(show.id)))
+                });
+                let media = match (t.tvdb_id, found) {
+                    (Some(tvdb), _) => MediaId::Series(SeriesKey::Tvdb(tvdb)),
+                    (None, Some(s)) => s.id,
+                    (None, None) => t.id,
+                };
+                let upcoming = metadata::not_out_yet(show.premiered.as_deref(), t.year);
+                let entry = credit_json(
+                    media,
+                    &show.name,
+                    t.year,
+                    None,
+                    upcoming,
+                    catalog.map(|_| {
+                        (
+                            found.is_some(),
+                            found.is_some_and(|s| s.monitored),
+                            found.and_then(series_state),
+                        )
+                    }),
+                );
+                match groups.iter_mut().find(|g| g.0 == *job) {
+                    Some(g) => g.1.push(entry),
+                    None => groups.push((job.clone(), vec![entry])),
+                }
+            }
+            (
+                who.name,
+                None,
+                who.image.and_then(|i| i.medium),
+                groups
+                    .into_iter()
+                    .map(|(job, credits)| json!({ "job": job, "credits": credits }))
+                    .collect(),
+            )
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                ErrorCode::InvalidRequest,
+                "a person id looks like plex:<id> or tvmaze:<n>",
+            ));
+        }
+    };
+    ok(
+        json!({ "person_id": raw, "name": name, "known_for": known_for, "thumb": thumb, "groups": groups }),
     )
 }
 

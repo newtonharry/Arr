@@ -594,6 +594,18 @@ async fn plex_search(
         return plex_denied(&m);
     }
     let query = q.get("query").map(|s| s.to_lowercase()).unwrap_or_default();
+    if q.get("searchTypes").map(String::as_str) == Some("people") {
+        let hits: Vec<Value> = plex_people()
+            .into_iter()
+            .filter(|(_, name, _, _)| name.to_lowercase().contains(&query))
+            .map(|(id, name, known_for, score)| {
+                json!({ "score": score, "Metadata": { "type": "person", "title": name, "key": format!("/library/people/{id}"),
+                                                      "thumb": format!("http://127.0.0.1/uploads/{id}.jpg"), "knownFor": known_for } })
+            })
+            .collect();
+        return axum::Json(json!({ "MediaContainer": { "SearchResults": [{ "id": "people", "SearchResult": hits }] } }))
+            .into_response();
+    }
     let hits: Vec<Value> = plex_fixtures()
         .into_iter()
         .filter(|f| {
@@ -610,6 +622,112 @@ async fn plex_search(
         .collect();
     axum::Json(json!({ "MediaContainer": { "SearchResults": [{ "SearchResult": hits }] } }))
         .into_response()
+}
+
+/// People Plex knows: id, name, what they are known for, and the search score.
+fn plex_people() -> Vec<(&'static str, &'static str, &'static str, f64)> {
+    vec![
+        ("dir0001", "Dana Director", "Directing", 0.92),
+        ("act0001", "Dana Performer", "Acting", 0.2),
+    ]
+}
+
+async fn plex_person(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    uri: Uri,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !plex_meta_seen(&m, &headers, &uri) {
+        return plex_denied(&m);
+    }
+    match plex_people().into_iter().find(|p| p.0 == id) {
+        Some((id, name, known_for, _)) => axum::Json(json!({ "MediaContainer": { "Metadata": [
+            { "type": "person", "title": name, "key": format!("/library/people/{id}"), "knownFor": known_for, "thumb": format!("http://127.0.0.1/uploads/{id}.jpg") }] } }))
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Dana Director's credits, listed the way Plex does (acting first, newest first): a movie
+/// twice (kept in the group they are known for), a show Arr has, a movie Plex has no TMDB id
+/// for, one Plex cannot find, an unreleased movie, and appearances that are skipped.
+async fn plex_credits(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    uri: Uri,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !plex_meta_seen(&m, &headers, &uri) {
+        return plex_denied(&m);
+    }
+    let credit = |kind: &str, key: &str, title: &str, role: Option<&str>| {
+        let mut c = json!({ "order": 1, "Metadata": { "type": kind, "title": title, "year": 2024, "ratingKey": key,
+                                                      "key": format!("/library/metadata/{key}"), "originallyAvailableAt": if key == "fut0001" { "2099-01-01" } else { "2024-05-01" } } });
+        if let Some(r) = role {
+            c["role"] = json!(r);
+        }
+        c
+    };
+    let groups = match id.as_str() {
+        "dir0001" => json!([
+            { "title": "Actor", "type": "actor", "Credit": [
+                credit("movie", "fut0001", "Plex Future Movie", Some("Mayor")),
+                credit("movie", "rel0001", "Plex Released Movie", Some("Clerk"))] },
+            { "title": "Director", "type": "director", "Credit": [
+                credit("movie", "rel0001", "Plex Released Movie", None),
+                credit("show", "shw0001", "Slow Horses", None),
+                credit("movie", "nog0001", "Plex Unmatched Movie", None)] },
+            { "title": "Writer", "type": "writer", "Credit": [credit("movie", "zzz9999", "Lost Movie", None)] },
+            { "title": "Appearances", "type": "appeared", "Credit": [credit("movie", "for0001", "Plex Foreign Movie", Some("Self"))] },
+            { "title": "Additional Credits", "type": "other", "Credit": [credit("movie", "for0001", "Plex Foreign Movie", None)] },
+        ]),
+        _ => json!([]),
+    };
+    axum::Json(json!({ "MediaContainer": { "CreditGroup": groups } })).into_response()
+}
+
+async fn tvmaze_people_search(Query(q): Query<HashMap<String, String>>) -> Response {
+    let needle = q.get("q").cloned().unwrap_or_default().to_lowercase();
+    let hits: Vec<Value> = [(7001, "Fargo Fan", 0.9), (7002, "Fargo Other", 0.3)]
+        .into_iter()
+        .filter(|p| p.1.to_lowercase().contains(&needle))
+        .map(|(id, name, score)| json!({ "score": score, "person": { "id": id, "name": name, "image": { "medium": "http://127.0.0.1/uploads/p.jpg" } } }))
+        .collect();
+    axum::Json(hits).into_response()
+}
+
+async fn tvmaze_person(axum::extract::Path(id): axum::extract::Path<u32>) -> Response {
+    match id {
+        7001 => axum::Json(json!({ "id": 7001, "name": "Fargo Fan", "image": { "medium": "http://127.0.0.1/uploads/p.jpg" } })).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn tvmaze_credits(id: u32, ids: &[u32], job: Option<&str>) -> Response {
+    if id != 7001 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let hits: Vec<Value> = ids
+        .iter()
+        .filter_map(|sid| shows().into_iter().find(|s| s["id"] == *sid))
+        .map(|show| {
+            let mut c = json!({ "_embedded": { "show": show } });
+            if let Some(j) = job {
+                c["type"] = json!(j);
+            }
+            c
+        })
+        .collect();
+    axum::Json(hits).into_response()
+}
+
+async fn tvmaze_cast_credits(axum::extract::Path(id): axum::extract::Path<u32>) -> Response {
+    tvmaze_credits(id, &[9002, 9001], None)
+}
+
+async fn tvmaze_crew_credits(axum::extract::Path(id): axum::extract::Path<u32>) -> Response {
+    tvmaze_credits(id, &[9001, 9006], Some("Creator"))
 }
 
 async fn plex_matches(
@@ -650,6 +768,7 @@ async fn plex_details(
     }
     match plex_fixtures()
         .into_iter()
+        .chain(plex_show_fixtures())
         .find(|f| f["ratingKey"] == key.as_str())
     {
         Some(f) => axum::Json(json!({ "MediaContainer": { "Metadata": [f] } })).into_response(),
@@ -1042,6 +1161,12 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         .route("/tmdb/3/search/movie", get(tmdb_search))
         .route("/tmdb/3/movie/{id}", get(tmdb_details))
         .route("/plexmeta/library/search", get(plex_search))
+        .route("/plexmeta/library/people/{id}", get(plex_person))
+        .route("/plexmeta/library/people/{id}/credits", get(plex_credits))
+        .route("/tvmaze/search/people", get(tvmaze_people_search))
+        .route("/tvmaze/people/{id}", get(tvmaze_person))
+        .route("/tvmaze/people/{id}/castcredits", get(tvmaze_cast_credits))
+        .route("/tvmaze/people/{id}/crewcredits", get(tvmaze_crew_credits))
         .route("/plexmeta/library/metadata/matches", get(plex_matches))
         .route("/plexmeta/library/metadata/{key}", get(plex_details))
         .route(

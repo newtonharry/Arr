@@ -240,6 +240,19 @@ have none. The plain API does not return it. The movie and show pages also carry
   status: `ok`, `failed` (with `error`), `disabled`, `not_configured` or `not_imported`. When
   neither Plex nor TMDB can answer, the `plex` provider is `not_configured` and its message says
   the install needs to sign in to Plex.
+- **`GET /api/v1/people?q=`** finds people (cast, directors, writers) by name:
+  `{query, people: [{person_id, name, known_for, thumb, score}], providers}`, at most five, best
+  first. `person_id` is `plex:<id>` (Plex's metadata service, when it is set up) or `tvmaze:<n>`
+  (TVmaze, when Plex is not set up or fails). `score` is 0 to 1; `known_for` is null for TVmaze.
+  A failing provider shows as `failed` in `providers`; the answer is still 200.
+- **`GET /api/v1/people/{person_id}`** is a person with their work:
+  `{person_id, name, known_for, thumb, groups: [{job, credits}]}`. `job` is `Director`, `Actor`,
+  `Writer` (Plex), or `Actor` and TVmaze's crew jobs; the job the person is known for comes first.
+  Each credit has `media_id`, `kind` (`movie` or `series`), `title`, `year`, `role`, `in_catalog`,
+  `library_state` (as in discover) and `upcoming` (not out yet). Appearances (talk shows,
+  specials) and additional credits are left out, a title is listed once, at most 40 credits are
+  looked up, and a credit Arr cannot identify (no TMDB or TVDB id) is dropped. Answers are cached
+  for an hour. 404 for an unknown person, 502/504 when the provider fails.
 - **Review scores.** Plex's metadata service (needs the Plex sign-in) gives IMDb and Rotten
   Tomatoes scores. `scores` is present on `/discover` results, the web app's `/ideas` items,
   `/show/{media_id}` and `/movie/{media_id}`, and is `null` when Plex has none (no sign-in, an
