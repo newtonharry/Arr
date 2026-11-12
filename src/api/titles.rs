@@ -1,6 +1,7 @@
 //! The pages of one show or one movie in the web app: what is in Plex, what is on its way,
 //! and the safe actions (get, stop, follow new episodes, remove). Nothing here deletes a file:
 //! a stop unmonitors and cancels downloads that have not finished, never an imported file.
+//! Deleting files is `delete.rs`.
 
 use super::*;
 use crate::catalog::{Availability, Episode, SeasonInfo, Series};
@@ -605,11 +606,11 @@ pub(super) async fn follow(State(st): St, ApiJson(body): ApiJson<FollowBody>) ->
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StopBody {
-    media_id: String,
+    pub(super) media_id: String,
 }
 
 /// Whether a download target lies inside the stopped scope.
-fn within(scope: MediaId, t: MediaId) -> bool {
+pub(super) fn within(scope: MediaId, t: MediaId) -> bool {
     match (scope, t) {
         (MediaId::Season(k, n), MediaId::Season(k2, n2) | MediaId::Episode(k2, n2, _)) => {
             k == k2 && n == n2
@@ -621,7 +622,7 @@ fn within(scope: MediaId, t: MediaId) -> bool {
 /// Cancels the given active downloads that lie entirely inside a scope and have not finished
 /// (a season pack that also holds other episodes is left to finish). Returns how many were
 /// cancelled and how many were left because their data is all there and they are being added.
-async fn cancel_unfinished(
+pub(super) async fn cancel_unfinished(
     st: &Arc<AppState>,
     grabs: Vec<downloads::Grab>,
     inside: impl Fn(MediaId) -> bool,
@@ -750,7 +751,7 @@ pub(super) async fn quick_scope(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RemoveBody {
-    media_id: String,
+    pub(super) media_id: String,
 }
 
 /// `POST /remove`: Arr stops tracking a movie or show. Downloads that have not finished are

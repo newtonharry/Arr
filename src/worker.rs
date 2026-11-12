@@ -45,6 +45,7 @@ pub const TASKS: &[&str] = &[
     "refresh_metadata",
     "rescan",
     "prune",
+    "bin",
 ];
 const COMMAND_LEASE: Duration = Duration::from_secs(15 * 60);
 const MAX_COMMAND_ATTEMPTS: i64 = 3;
@@ -360,6 +361,7 @@ pub async fn tick(st: &AppState, now: OffsetDateTime) -> Result<TickReport> {
         "refresh_metadata",
         "rescan",
         "prune",
+        "bin",
     ] {
         if due(st, name, now).await? {
             run_task(st, name, now).await?;
@@ -379,6 +381,7 @@ fn interval(st: &AppState, name: &str) -> Option<Duration> {
         "refresh_metadata" => Some(a.metadata_refresh),
         "rescan" => Some(a.rescan),
         "prune" => Some(Duration::from_secs(86_400)),
+        "bin" => Some(Duration::from_secs(3_600)),
         _ => None,
     }
 }
@@ -424,6 +427,7 @@ pub async fn run_task(st: &AppState, name: &str, now: OffsetDateTime) -> Result<
         "refresh_metadata" => refresh_metadata(st, None, now).await,
         "rescan" => crate::scan::scan(st, now, false).await.map(|r| json!(r)),
         "prune" => prune(st, now).await,
+        "bin" => crate::trash::purge_due(st, now).await,
         other => Err(anyhow::anyhow!("unknown task {other}")),
     };
     let (status, value) = match &result {

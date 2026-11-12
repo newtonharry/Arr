@@ -97,10 +97,13 @@ background worker. (`STATE/verification.toml` is no longer read.)
   `Series Title/Season N/`, the folders recorded in the import when known. With rename off,
   file names follow native rules: a single-file or single-episode download takes the
   download title plus the file's extension, and a season pack keeps the original file names.
-- Library files are never deleted. The only exception is a native revision upgrade, which
+- Library files are never deleted on their own. The exceptions are a native revision upgrade, which
   replaces the managed file of the same item: the old file is moved to a sidecar backup until
   the new file is published and committed. Removing an item from management keeps its files.
-  Cancelling keeps the torrent and its data, and stops an incomplete torrent.
+  Cancelling keeps the torrent and its data, and stops an incomplete torrent. The one other
+  way a library file leaves is a person's "Delete files" (`POST /api/v1/delete`): a rename
+  into `<root>/.arr-bin/` on the same drive (never a copy), refused for symlinks, non-regular
+  files and anything that resolves outside the root, kept 7 days and restorable.
 
 ## 4. API flow (sandbox walkthrough)
 

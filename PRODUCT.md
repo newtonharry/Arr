@@ -28,7 +28,10 @@ JSON API. The web interface adds a direct way to find and add movies and shows, 
 its way, see what's coming up, and browse ideas and the library, without an assistant. Ideas leave out what the household already has and can drop a show with "Not interested" (for everyone using that Arr); search shows recent and popular titles before typing and marks what is already in Plex; show and movie pages carry the summary, genres and top cast. The library sorts by recently added, title or
 size, shows how much space the drive has left (and says so when it runs low), shows who added
 each title, and lets a person make Arr stop tracking a title. That last one never deletes files:
-anything already in Plex stays, and deleting is left to Plex.
+anything already in Plex stays. To free space, a person can instead delete a movie's, show's,
+season's or episode's files from Arr. They go to a bin for 7 days and can be put back from the
+toast that follows or from Settings; the downloads that only seed them go too, so the space is
+really freed. Nothing is deleted without a preview of exactly what goes.
 
 Success: someone who has never seen Arr finds a film, taps once, and later finds it in Plex,
 without learning any media-server vocabulary.

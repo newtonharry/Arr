@@ -44,6 +44,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
+mod delete;
 mod options;
 mod system;
 mod titles;
@@ -102,6 +103,11 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("post", "/api/v1/follow"),
     ("post", "/api/v1/stop"),
     ("post", "/api/v1/remove"),
+    ("post", "/api/v1/delete/preview"),
+    ("post", "/api/v1/delete"),
+    ("get", "/api/v1/bin"),
+    ("post", "/api/v1/bin/{delete_id}/restore"),
+    ("delete", "/api/v1/bin/{delete_id}"),
     ("post", "/api/v1/quality"),
     ("get", "/api/v1/copies/{media_id}"),
     ("post", "/api/v1/copies/{media_id}/get"),
@@ -828,6 +834,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/follow", post(titles::follow))
         .route("/api/v1/stop", post(titles::stop))
         .route("/api/v1/remove", post(titles::remove))
+        .route("/api/v1/delete/preview", post(delete::preview))
+        .route("/api/v1/delete", post(delete::delete))
+        .route("/api/v1/bin", get(delete::bin))
+        .route("/api/v1/bin/{delete_id}/restore", post(delete::restore))
+        .route("/api/v1/bin/{delete_id}", delete(delete::purge))
         .route("/api/v1/quality", post(options::quality))
         .route("/api/v1/copies/{media_id}", get(options::copies))
         .route("/api/v1/copies/{media_id}/get", post(options::copies_get))

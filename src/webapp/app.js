@@ -740,7 +740,7 @@ function Library({ t }) {
 }
 
 // ---------- title pages (a show or a movie, as a sheet over the current screen) ----------
-const P = { confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null };
+const P = { del: null, confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null };
 let bgHash = '';
 const enc = encodeURIComponent;
 const pct = (p) => Math.round(p * 100);
@@ -774,7 +774,7 @@ function openTitle(t) {
     P.shown = true; // the page behind goes inert with the same redraw
   }
   clearTimeout(P.pollT); clearTimeout(P.askT);
-  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, removing: false, opt: freshOpt() });
+  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, del: null, removing: false, opt: freshOpt() });
   if (W.id === t.id) Object.assign(P.opt, { open: true, copiesOpen: true, season: W.season, fetch: true }); // from Needs you
   W.id = '';
   after(() => {
@@ -788,7 +788,7 @@ function closeSheet() {
   if (!P.shown) return;
   clearTimeout(P.pollT); clearTimeout(P.askT);
   P.token++;
-  P.shown = false; P.confirm = false;
+  P.shown = false; P.confirm = false; P.del = null;
   document.title = pageName(parseHash(bgHash).path) + ' · Arr';
   after(() => {
     window.scrollTo(0, P.scrollY);
@@ -805,7 +805,7 @@ function dismiss() {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape' || !P.shown) return;
   e.preventDefault();
-  if (P.confirm) { if (!P.removing) closeConfirm(); } else if (P.ask) { P.ask = ''; bump(); } else dismiss();
+  if (P.del) { if (!P.del.busy) closeDelete(); } else if (P.confirm) { if (!P.removing) closeConfirm(); } else if (P.ask) { P.ask = ''; bump(); } else dismiss();
 });
 // Tab and Shift-Tab stay inside the sheet.
 document.addEventListener('keydown', (e) => {
@@ -875,11 +875,11 @@ function Sheet() {
   const open = P.shown;
   const body = !open ? null : P.data ? (P.kind === 'show' ? showBody() : movieBody()) : P.err ? errorBody() : skeleton();
   return h('div', { id: 'sheet', class: 'sheet', hidden: !open, onClick: (e) => { if (e.target === e.currentTarget) dismiss(); } },
-    h('div', { class: 'panel', id: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title', tabindex: '-1', inert: open && P.confirm },
+    h('div', { class: 'panel', id: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title', tabindex: '-1', inert: open && (P.confirm || !!P.del) },
       open ? [
         h('div', { key: 'bar', class: 'sheet-bar' }, h('button', { type: 'button', class: 'btn ghost close', 'aria-label': 'Close', 'data-fk': 'close', onClick: dismiss }, ic('close'))),
         h('div', { key: 'body', class: 'sheet-body' }, body)] : null),
-    open && P.confirm && P.data ? h(ConfirmRemove) : null);
+    open && P.confirm && P.data ? h(ConfirmRemove) : open && P.del && P.data ? h(ConfirmDelete) : null);
 }
 function skeleton() {
   const bar = (w, extra) => h('div', { class: 'sk', style: { width: w, ...extra } });
@@ -1018,12 +1018,98 @@ async function toggleFollow() {
   await loadTitle(true);
 }
 
-// ----- remove a title from Arr (files are never touched)
+// ----- remove a title from Arr (files are never touched), or delete its files (into the bin)
 function removeNode() {
-  if (!P.data.removable) return null;
+  const d = P.data, files = P.kind === 'movie' ? d.state === 'in_plex' : (d.seasons || []).some((s) => s.in_plex > 0);
+  if (!d.removable && !files) return null;
   return h('div', { class: 'remove' },
-    h('button', { type: 'button', class: 'link danger', 'data-fk': 'remove', onClick: () => { P.confirm = true; P.msg.delete('remove'); after(() => $('#confirm [data-fk="rm-cancel"]')?.focus({ preventScroll: true })); } }, 'Remove from Arr'),
-    msgFor('remove'));
+    d.removable && h('button', { type: 'button', class: 'link danger', 'data-fk': 'remove', onClick: () => { P.confirm = true; P.msg.delete('remove'); after(() => $('#confirm [data-fk="rm-cancel"]')?.focus({ preventScroll: true })); } }, 'Remove from Arr'),
+    files && deleteLink('delete', 'Delete files…', d.media_id, d.title, `Delete the files of ${d.title}`),
+    msgFor('remove'), msgFor('delete'));
+}
+const deleteLink = (fk, text, scope, noun, label) =>
+  h('button', { type: 'button', class: 'link danger', 'data-fk': fk, 'aria-label': label, onClick: () => openDelete(fk, scope, noun) }, text);
+// The question: what would go (read fresh from Arr), then Cancel or Delete. Nothing is deleted
+// until the person taps Delete, and the files go to the bin, where they stay for 7 days.
+async function openDelete(fk, scope, noun) {
+  const tk = P.token;
+  P.del = { fk, scope, noun, st: 'loading', pv: null, keep: false, busy: false, err: '' };
+  P.msg.delete('delete');
+  after(() => $('#confirm [data-fk="del-cancel"]')?.focus({ preventScroll: true }));
+  let st = 'err', pv = null, err = "Couldn't look at the files just now. Try again in a moment.";
+  try {
+    const r = await api('/v1/delete/preview', { method: 'POST', body: { media_id: scope } });
+    if (r.ok) { st = 'ready'; pv = r.data; err = ''; } else if (r.status === 409 && r.data && r.data.error) err = "Arr won't delete these: " + r.data.error.message;
+  } catch { err = "Couldn't reach Arr. Try again in a moment."; }
+  if (tk !== P.token || !P.del || P.del.scope !== scope) return;
+  Object.assign(P.del, { st, pv, err });
+  bump();
+}
+function closeDelete() {
+  const fk = P.del && P.del.fk;
+  P.del = null;
+  after(() => $(`#panel [data-fk="${fk}"]`)?.focus({ preventScroll: true }));
+}
+async function restoreEntry(id) {
+  const r = await api('/v1/bin/' + enc(id) + '/restore', { method: 'POST' });
+  if (!r.ok) return { ok: false, text: "Couldn't put the files back just now. Try again in a moment." };
+  S.stale = true; loadFeed();
+  const n = r.data.restored, left = (r.data.skipped || []).length;
+  return { ok: true, text: left ? `${plural(n, 'file is', 'files are')} back. ${plural(left, 'file', 'files')} could not go back because something is already there.` : `${plural(n, 'file is', 'files are')} back.` };
+}
+async function doDelete() {
+  const dl = P.del;
+  if (!dl || dl.busy || dl.st !== 'ready' || !dl.pv.files.length) return;
+  const tk = P.token, d = P.data, scope = dl.scope, whole = scope === d.media_id;
+  dl.busy = true; bump();
+  let res;
+  try {
+    const r = await api('/v1/delete', { method: 'POST', body: { media_id: scope, token: dl.pv.token, keep_wanted: dl.keep } });
+    const code = r.data && r.data.error && r.data.error.code;
+    if (r.ok) res = { ok: true, id: r.data.delete_id };
+    else if (code === 'active_downloads') res = { text: 'A download is nearly done and is being added to Plex. Try again in a minute.', err: true };
+    else if (code === 'changed') res = { text: 'Something changed in the files. Look again before deleting.', err: true };
+    else if (code === 'move_failed') res = { text: "A file couldn't be moved, so nothing was deleted.", err: true };
+    else if (code === 'delete_refused') res = { text: "Arr won't delete these: " + r.data.error.message, err: true };
+    else res = { text: "Couldn't delete the files just now. Try again in a moment.", err: true };
+  } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  if (tk !== P.token) return;
+  P.del = null;
+  if (!res.ok) { P.msg.set('delete', res); say(res.text); bump(); after(() => $(`#panel [data-fk="${dl.fk}"]`)?.focus({ preventScroll: true })); return; }
+  forget(d.media_id);
+  S.stale = true; loadFeed();
+  say(`${dl.noun} deleted. It stays in the bin for 7 days.`);
+  const undo = async () => {
+    const m = await restoreEntry(res.id);
+    if (tk === P.token && P.shown) loadTitle(true);
+    return m;
+  };
+  showToast({ before: 'Deleted ', title: dl.noun, after: '. Undo within 7 days.' }, undo);
+  // A whole show leaves Arr unless a new copy is wanted; the page is then closed like Remove does.
+  if (whole && P.kind === 'show' && !dl.keep) dismiss(); else await loadTitle(true);
+}
+function ConfirmDelete() {
+  const dl = P.del, pv = dl.pv, busy = dl.busy, files = pv ? pv.files.length : 0;
+  const shared = pv ? pv.downloads.filter((x) => !x.removed) : [];
+  const parts = [];
+  if (dl.st === 'loading') parts.push(h('p', { key: 'l', role: 'status' }, 'Looking at the files…'));
+  else if (dl.st === 'err') parts.push(h('p', { key: 'e', class: 'msg', role: 'alert', 'data-err': '' }, dl.err));
+  else if (!files) parts.push(h('p', { key: 'n' }, 'Arr has no files of ', h('em', null, dl.noun), ' that it can delete.'));
+  else {
+    parts.push(h('p', { key: 'f' }, `${plural(files, 'file', 'files')}${fmtSize(pv.library_bytes) ? ` (${fmtSize(pv.library_bytes)})` : ''} of `, h('em', null, dl.noun), " will move to Arr's bin. They stay there for 7 days, and the space comes back then or when you empty the bin in Settings."));
+    if (pv.downloads.some((x) => x.removed)) parts.push(h('p', { key: 'd', class: 'hint' }, 'Arr also removes the finished download, so the space is really freed.'));
+    if (shared.length) parts.push(h('p', { key: 's', class: 'hint' }, 'A download also holds episodes you are keeping. It stays, so some space stays used.'));
+    if (pv.unknown) parts.push(h('p', { key: 'u', class: 'hint' }, `Arr couldn't find the file for ${plural(pv.unknown, 'item', 'items')}, so ${pv.unknown === 1 ? 'it stays' : 'they stay'}.`));
+    parts.push(h('label', { key: 'k', class: 'chk' }, h('input', { type: 'checkbox', checked: dl.keep, disabled: busy, onChange: (e) => { dl.keep = e.target.checked; bump(); } }), h('span', null, 'Get a new copy afterwards')));
+  }
+  const ready = dl.st === 'ready' && files > 0;
+  return h('div', { class: 'confirm-back', onClick: (e) => { if (e.target === e.currentTarget && !dl.busy) closeDelete(); } },
+    h('div', { id: 'confirm', class: 'confirm', role: 'alertdialog', 'aria-modal': 'true', 'aria-labelledby': 'confirm-t', 'aria-busy': dl.st === 'loading' ? 'true' : 'false' },
+      h('h2', { id: 'confirm-t' }, `Delete the files of ${dl.noun}?`),
+      parts,
+      h('div', { class: 'confirm-act' },
+        h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'del-cancel', 'aria-disabled': busy ? 'true' : 'false', onClick: () => { if (!dl.busy) closeDelete(); } }, 'Cancel'),
+        h('button', { type: 'button', class: 'btn danger', 'data-fk': 'del-go', 'data-s': busy ? 'busy' : null, 'aria-disabled': ready && !busy ? 'false' : 'true', onClick: doDelete }, busy ? 'Deleting…' : 'Delete'))));
 }
 function closeConfirm() {
   P.confirm = false;
@@ -1061,7 +1147,7 @@ function ConfirmRemove() {
   return h('div', { class: 'confirm-back', onClick: (e) => { if (e.target === e.currentTarget && !P.removing) closeConfirm(); } },
     h('div', { id: 'confirm', class: 'confirm', role: 'alertdialog', 'aria-modal': 'true', 'aria-labelledby': 'confirm-t', 'aria-describedby': 'confirm-d' },
       h('h2', { id: 'confirm-t' }, `Remove ${d.title} from Arr?`),
-      h('p', { id: 'confirm-d' }, 'Arr will stop getting new copies and episodes of ', h('em', null, d.title), '. Anything already in Plex stays there. To delete files, use Plex.'),
+      h('p', { id: 'confirm-d' }, 'Arr will stop getting new copies and episodes of ', h('em', null, d.title), '. Anything already in Plex stays there. To delete files, use “Delete files…”.'),
       h('div', { class: 'confirm-act' },
         h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'rm-cancel', 'aria-disabled': busy ? 'true' : 'false', onClick: () => { if (!P.removing) closeConfirm(); } }, 'Cancel'),
         h('button', { type: 'button', class: 'btn danger', 'data-fk': 'rm-go', 'data-s': busy ? 'busy' : null, 'aria-disabled': busy ? 'true' : 'false', onClick: doRemove }, busy ? 'Removing…' : 'Remove'))));
@@ -1275,7 +1361,9 @@ function episodeRow(e) {
           : e.air_date ? `Aired ${fmtDate(e.air_date)}` : '';
   return h('li', { key: e.media_id, class: 'ep' }, h('span', { class: 'num', 'aria-hidden': 'true' }, e.number),
     h('div', { class: 'what' }, h('h4', { title }, title), fact && h('div', { class: 'meta' }, fact), msgFor(key)),
-    kind && h('div', { class: 'act' }, actionNode(key, kind, kind === 'get' ? 'Get' : 'Stop', `episode ${e.number}, ${title}`, e.media_id)));
+    (kind || e.state === 'in_plex') && h('div', { class: 'act' },
+      kind && actionNode(key, kind, kind === 'get' ? 'Get' : 'Stop', `episode ${e.number}, ${title}`, e.media_id),
+      e.state === 'in_plex' && deleteLink('del:' + e.media_id, 'Delete…', e.media_id, `${P.data.title}, episode ${e.number}`, `Delete the file of episode ${e.number}, ${title}`)));
 }
 function seasonItem(s) {
   const n = s.number, key = 's:' + n, open = P.open.has(n), a = seasonAction(s);
@@ -1286,7 +1374,9 @@ function seasonItem(s) {
         h('span', { class: 'what' }, h('span', { class: 't' }, 'Season ' + n), h('span', { class: 'meta' }, seasonFact(s))), ic('down')),
       a && h('div', { class: 'act' }, actionNode(key, a[0], a[1], 'Season ' + n, scope))),
     msgFor(key),
-    open && h('div', { id: 'eps-' + n }, episodesNode(n)));
+    open && h('div', { id: 'eps-' + n },
+      episodesNode(n),
+      s.in_plex > 0 && h('div', { class: 'sea-del' }, deleteLink('del:' + scope, 'Delete this season’s files…', scope, `${P.data.title}, season ${n}`, `Delete the files of season ${n}`))));
 }
 function showBody() {
   const d = P.data, on = d.following;
@@ -1608,7 +1698,50 @@ async function renderSettings() {
   setView({ t: 'settings' });
   // Open at the top, where "You" and Sign out are, not where the last screen was scrolled to.
   window.scrollTo(0, 0);
-  await Promise.all([loadSettings(), loadHealth(), loadUpdate()]);
+  await Promise.all([loadSettings(), loadHealth(), loadUpdate(), loadBin()]);
+}
+// The bin: what "Delete files" moved out of the library, kept for 7 days.
+const B = { entries: [], busy: '', ask: '', msg: '', err: false };
+async function loadBin() {
+  try {
+    const r = await api('/v1/bin');
+    if (r.ok) { B.entries = r.data.entries; bump(); }
+  } catch { /* the banner says Arr can't be reached */ }
+}
+async function binAct(id, what) {
+  if (B.busy) return;
+  B.busy = id; B.ask = ''; B.msg = ''; bump();
+  let m;
+  try {
+    if (what === 'restore') m = await restoreEntry(id);
+    else {
+      const r = await api('/v1/bin/' + enc(id), { method: 'DELETE' });
+      m = r.ok ? { ok: true, text: 'Deleted for good. The space is free.' } : { ok: false, text: "Couldn't empty that just now. Try again in a moment." };
+    }
+  } catch { m = { ok: false, text: "Couldn't reach Arr. Try again in a moment." }; }
+  B.busy = ''; B.msg = m.text; B.err = !m.ok; say(m.text);
+  await loadBin();
+  bump();
+}
+const binScope = (id) => {
+  const s = /^season:[a-z]+:\d+:(\d+)$/.exec(id), e = /^episode:[a-z]+:\d+:(\d+):(\d+)$/.exec(id);
+  return s ? ` · Season ${s[1]}` : e ? ` · Season ${e[1]}, episode ${e[2]}` : '';
+};
+function BinSection() {
+  if (!B.entries.length && !B.msg) return null;
+  return h(Section, { id: 'bin', title: 'Bin' },
+    B.entries.length ? h('p', { class: 'hint' }, 'Files you deleted stay here for 7 days. Put them back, or empty them to free the space now.') : null,
+    B.msg ? h('p', { class: 'msg', role: 'status', 'data-err': B.err ? '' : null }, B.msg) : null,
+    h('ul', { class: 'list' }, B.entries.map((e) => h('li', { key: e.delete_id, class: 'item bin' },
+      h('div', { class: 'what' }, h('h3', null, e.title, binScope(e.media_id)),
+        h('p', { class: 'meta' }, `${plural(e.files, 'file', 'files')}${fmtSize(e.bytes) ? ` · ${fmtSize(e.bytes)}` : ''} · empties ${fmtDate(e.purge_at)}`)),
+      B.ask === e.delete_id
+        ? h('span', { class: 'ask' }, h('span', { class: 'ask-t' }, 'Delete for good?'),
+          h('button', { type: 'button', class: 'btn danger', 'data-fk': 'bin-go:' + e.delete_id, 'aria-label': `Confirm: delete ${e.title} for good`, onClick: () => binAct(e.delete_id, 'purge') }, 'Delete'),
+          h('button', { type: 'button', class: 'btn ghost', 'aria-label': 'Keep it in the bin', onClick: () => { B.ask = ''; bump(); } }, 'Keep'))
+        : h('div', { class: 'act' },
+          h('button', { type: 'button', class: 'btn', 'data-fk': 'bin-restore:' + e.delete_id, 'data-s': B.busy === e.delete_id ? 'busy' : null, 'aria-disabled': B.busy ? 'true' : 'false', 'aria-label': `Restore ${e.title}${binScope(e.media_id)}`, onClick: () => binAct(e.delete_id, 'restore') }, 'Restore'),
+          h('button', { type: 'button', class: 'link danger', 'data-fk': 'bin-purge:' + e.delete_id, 'aria-disabled': B.busy ? 'true' : 'false', 'aria-label': `Delete ${e.title}${binScope(e.media_id)} now`, onClick: () => { if (!B.busy) { B.ask = e.delete_id; bump(); } } }, 'Delete now'))))));
 }
 async function applySetting(name, value) {
   if (G.busy || G.restarting) return;
@@ -1728,6 +1861,7 @@ function Settings() {
         placeholder: d.tmdb_key_set ? '••••••••' : 'Paste your key', saveLabel: busy('tmdb-key') ? 'Checking…' : d.tmdb_key_set ? 'Replace key' : 'Save key',
         onInput: (v) => { G.draft.key = v; bump(); }, onSave: () => { if (G.draft.key.trim()) applySetting('tmdb-key', G.draft.key.trim()); } })),
     d.can_restart ? h('p', { class: 'hint' }, 'Changing a setting restarts Arr. It’s back in about a minute.') : null,
+    h(BinSection),
     h(UpdatesSection),
     h(HealthSection));
 }
