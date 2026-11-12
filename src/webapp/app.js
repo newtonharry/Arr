@@ -1059,7 +1059,7 @@ async function restoreEntry(id) {
 }
 async function doDelete() {
   const dl = P.del;
-  if (!dl || dl.busy || dl.st !== 'ready' || !dl.pv.files.length) return;
+  if (!dl || dl.busy || dl.st !== 'ready' || !dl.pv.files.length || (dl.pv.blocked && !dl.keep)) return;
   const tk = P.token, d = P.data, scope = dl.scope, whole = scope === d.media_id;
   dl.busy = true; bump();
   let res;
