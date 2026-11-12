@@ -186,7 +186,9 @@ response bodies or credentials.
   that are not being downloaded, with their search schedule. These are searched only on
   request (`search_missing`); routine acquisition is RSS.
 - **`GET /api/v1/calendar?start=&end=`** lists episodes in a window (at most 92 days), each
-  with `owned`, `queued`, `missing`, `unknown` or `upcoming`.
+  with `owned`, `queued`, `missing`, `unknown` or `upcoming`. The reply also has `sport`, the
+  followed sport events in the window ([Sport](#sport-schedules-and-follows)); `items` is
+  unchanged.
 
 The web app's proxy (`/app/api/v1/...`, signed-in browsers only) adds one key to these replies:
 `requested_by`, the name of the person who first added the title from the web app, or `null`
@@ -236,7 +238,9 @@ have none. The plain API does not return it. The movie and show pages also carry
   No notifications are sent.
 - **`GET /api/v1/feed`** is what the web app's home shows, in plain words: `needs_you`,
   `on_its_way`, `arrived` (imports of the last 24 hours, newest first, at most 20), `looking`
-  and `coming_up`. Catalog and state only, no network calls. Two things in it help a client explain itself:
+  and `coming_up`, and `sport` (followed sport events coming in the next 14 days, separate from
+  `coming_up`; see [Sport](#sport-schedules-and-follows)). Catalog and state only, no network
+  calls. Two things in it help a client explain itself:
   - each `needs_you` item has `problem` (a short sentence), plus `kind` (`download_failed`,
     `import_blocked` or `request_expired`) and `failure` (why a download failed, for example
     `stalled`, `no_metadata` or `wrong_quality`; null otherwise), and `count`, how many
@@ -319,6 +323,117 @@ have none. The plain API does not return it. The movie and show pages also carry
 - **`GET /api/v1/media/{media_id}`** resolves a target. For a season or episode it returns the
   episode list with `aired` and `ownership` (`owned` / `missing` / `unknown`), plus
   `ownership_source` and `episode_list_source`.
+
+### Sport: schedules and follows
+
+Follow a league or a team and Arr keeps its schedule. This is the first part of sport support:
+schedules and follows only. Nothing is searched for, downloaded or filed for sport yet, and
+Plex is not touched. The schedules come from ESPN's public scoreboard feed, which needs no key
+and is not an official API; it is the one outside service sport adds (see
+[`PRIVACY.md`](PRIVACY.md)). `[sports] enabled = false` in `config.toml` turns sport off: its
+routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry an empty `sport`.
+
+- **No spoilers.** Arr never reads, stores or shows scores, winners or result text. An event's
+  name is the fixture ("Fulham at Manchester City", "UFC 334: Gane vs. Hokit"), and its state is
+  one of `scheduled`, `postponed`, `cancelled` or `played`, with nothing about how it went.
+- **Ids.** A league is `league:<slug>` (`league:nba`; routes also accept the bare slug), a game,
+  fight card or tournament is `event:<slug>:<number>` (`event:nba:401909999`). Slugs are
+  `[a-z0-9-]{2,24}`; the number is the feed's own, digits without leading zeros. A team is the
+  feed's team number inside its league (`team_id`), as a string.
+- **Times** are UTC (`2026-11-21T12:30:00Z`). Show them in the viewer's own time.
+- **Following starts from now.** An event counts for a follow only if it had not ended when the
+  follow began (a game that already started does not; a golf tournament still under way does).
+  Stopping a follow keeps what was stored. Following a league and one of its teams is allowed;
+  an event is never listed twice.
+- **Leagues.** The list is built into Arr and each path was checked against the live feed:
+
+  | sport | slugs |
+  |---|---|
+  | soccer | `premier-league`, `a-league-men`, `champions-league`, `europa-league`, `la-liga`, `bundesliga`, `serie-a`, `ligue-1`, `fa-cup`, `mls` |
+  | basketball | `nba`, `nbl`, `wnba` |
+  | rugby union | `super-rugby-pacific`, `urc`, `gallagher-premiership`, `top-14`, `champions-cup`, `six-nations`, `rugby-championship`, `rugby-internationals`, `rugby-world-cup` |
+  | rugby league | `nrl` |
+  | golf | `pga-tour` (the four majors are events in it), `dp-world-tour`, `liv-golf`, `lpga-tour` |
+  | MMA | `ufc`, `pfl` |
+
+  Golf and MMA have no teams. Leagues the feed does not carry fixtures for (Super League,
+  State of Origin, EuroLeague, Bellator, ONE Championship) are not in the list.
+
+A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport": "basketball",
+"sport_label": "Basketball", "has_teams": true}` (`sport` is one of `soccer`, `basketball`,
+`rugby_union`, `rugby_league`, `golf`, `mma`). An event looks like:
+
+```json
+{
+  "id": "event:premier-league:401879233",
+  "league": { "id": "league:premier-league", "slug": "premier-league", "name": "Premier League",
+              "sport": "soccer", "sport_label": "Soccer", "has_teams": true },
+  "name": "Fulham at Manchester City",
+  "short_name": "FUL @ MNC",
+  "starts_at": "2026-11-21T12:30:00Z",
+  "ends_at": null,
+  "state": "scheduled",
+  "home": { "id": "382", "name": "Manchester City" },
+  "away": { "id": "370", "name": "Fulham" },
+  "round": null,
+  "venue": "Etihad Stadium",
+  "season": "2026"
+}
+```
+
+`home` and `away` are `null` for golf and MMA; `ends_at` is set for events that run for days
+(a golf tournament); `round` and `venue` are `null` when the feed does not say.
+
+- **`GET /api/v1/sport/leagues`** lists every league, each with `followed` (the whole league)
+  and `followed_teams` (how many of its teams). Answers from the store.
+- **`GET /api/v1/sport/search?q=`** finds leagues by name, alias ("EPL"), sport or the start of a
+  word, and teams (name, short name or abbreviation) of the leagues Arr has read so far. Teams
+  are learnt when a league is opened or followed, so search does not ask the feed for anything:
+  `{"q", "leagues": [league + followed], "teams": [{"league", "team": {"id", "name",
+  "short_name", "abbreviation", "followed"}}]}`.
+- **`GET /api/v1/sport/league/{slug}`** is a league's page: `league` (with `followed`),
+  `following_teams`, `teams` (each with `followed`), `upcoming` (soonest first, at most 30),
+  `recent` (played, latest first, at most 10) and `schedule`. If the stored schedule is older
+  than six hours, the feed is read first, for a few seconds at most (the read carries on in the
+  background and `schedule.updating` says so). A feed that is down never fails this route: the
+  stored schedule is served and `schedule.problem` says what is wrong (`schedule.updated_at` is
+  when it was last read, or `null`).
+- **`POST /api/v1/sport/follow`** with `{"league": "nba"}` or `{"league": "nba", "team_id":
+  "13"}` follows a league or a team in it. The reply is `201`, or `200` if it was already
+  followed: `created`, `follow` (`{"league", "team": {"id", "name"} | null, "since"}`),
+  `schedule_read` (the league's schedule was read just now or a moment ago, so `upcoming` is
+  real), `upcoming` (events of this follow in the next three weeks) and `next_event` (an event
+  or `null`). The follow is recorded even when the feed is down; the schedule is then read later
+  by the worker. Refusals: `404 not_found` for an unknown league or a team the league does not
+  have, `400 invalid_request` for a team of golf or MMA or a `team_id` that is not a number, and
+  `503 upstream_unavailable` when the team list is needed and cannot be read.
+- **`POST /api/v1/sport/unfollow`** takes the same body and answers `{"removed": true|false}`.
+  Unfollowing something not followed is not an error.
+- **`GET /api/v1/sport/following`** lists the follows, each as in `follow` with `next_event`.
+- **`GET /api/v1/sport/events?from=&to=&league=`** lists events of what is followed that are not
+  over by `from` and start before `to` (RFC 3339 or `YYYY-MM-DD`; default now to 14 days later;
+  at most 92 days), whatever their state, soonest first, at most 500. `league` limits it to one
+  league.
+
+How the schedule is kept (worker task `sports`, listed in `/system/tasks`; in shadow mode there is no worker, so a followed league is read when its page is opened or it is followed): a followed league is
+read once it is six hours old, or every twenty minutes within two hours before a followed game
+and four hours after its start, and a first follow reads it at once. A read is at most two
+requests (the calendar months around yesterday to three weeks ahead; the feed refuses day ranges
+for team sports and is asked for whole months with a page limit) plus, for leagues with teams,
+one request for the team list the first time and then weekly. Requests go one at a time with
+at least `min_interval_ms` (default 500 ms) between them; answers are reused for `cache_secs`
+(default 300). After a failure all requests pause for `backoff_secs` (default 60, doubling to 15
+minutes while failures continue) and the league is left alone for 15 minutes (doubling to six
+hours); a worker run stops after two leagues in a row fail, takes at most six leagues and does not
+start new ones after 45 seconds. An event that is stored as still to come, starts inside a window
+that was read in full, and is no longer in the feed becomes `cancelled`; it is never deleted, and
+an empty answer, a failed month or an answer cut off at the page limit cancels nothing. An event
+the feed moves to another date is updated in place. Only events not over by the start of
+yesterday (UTC) are stored, so there is no backlog.
+
+`/feed` has a `sport` list (followed events in the next 14 days that are `scheduled` or
+`postponed`, at most 20, soonest first) and `/calendar` has one for its window (every state but
+`cancelled`). Both are separate from `coming_up` and `items`, which are unchanged.
 
 ### Release search (no state change)
 
@@ -598,7 +713,7 @@ Queue actions:
   Commands are leased, retried up to 3 times on outages, and requeued after a restart.
   Follow them with `GET /api/v1/commands` and `GET /api/v1/commands/{id}` (`state`, `result`).
 - **`GET /api/v1/system/tasks`** shows each scheduled task (`downloads`, `rss_sync`,
-  `requests`, `refresh_metadata`, `rescan`, `prune`, `bin`) with its last start, finish, status and
+  `requests`, `refresh_metadata`, `rescan`, `prune`, `bin`, `sports`) with its last start, finish, status and
   result, and its next run.
 - **`GET /api/v1/requests`** lists explicit requests that are still owed something: a wanted
   unit was unplanned, or its candidate was refused and no active download covers it. It shows

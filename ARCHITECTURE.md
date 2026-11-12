@@ -46,6 +46,10 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
     goes in `X-Api-Key`, and also in the Torznab query of a URL that is never logged.
   - **qBittorrent WebUI API v2:** WebAPI 2.8.2 (4.3.9) to 2.11+ (5.x).
   - **TVmaze/TMDB:** when enabled.
+  - **Sport schedules:** ESPN's public scoreboard feed (`GET {base}/{sport}/{league}/scoreboard?dates=YYYYMM&limit=400`
+    and `.../teams`), unauthenticated, with a plain `Arr` user agent, one request at a time.
+    On by default (nothing is asked until a league is opened or followed); `[sports] enabled = false`
+    turns it off.
   - **Plex:** a section or folder refresh (`?path=` from `movies_path`/`tv_path`); read-only
     `GET /library/sections`, paginated `/library/sections/{id}/all?includeGuids=1` and
     `/library/metadata/{key}/allLeaves` for discovery and the library bootstrap.
@@ -78,6 +82,7 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
 | `ingest`, `probe` | completed-download import with a journal and crash recovery; the bounded ffprobe media probe |
 | `scan` | per-root library reconciliation |
 | `rss` | Torznab parsing, matching and RSS sync |
+| `sport` | sport schedules and follows, a module of its own beside movies and series (`catalog`: the built-in leagues; `espn`: the schedule client and the fixtures-only parser; `data`: the `sport_*` tables; `refresh`: keeping followed leagues current, and the worker's `sports` task). The HTTP handlers are `api/sport.rs` |
 | `worker` | background loop: commands (leased), downloads pass, scheduled tasks, request retries, metadata refresh, startup recovery |
 | `api`, `openapi`, `error` | axum router, auth, limits, typed errors, OpenAPI document |
 | `mcp` | the MCP adapter: six tools over the REST API (stdio over HTTP, or remote over the in-process router), closed input schemas, typed errors with their outcome, no fallback; the remote `/mcp` mount |
@@ -414,7 +419,9 @@ pass:
    later passes, so user requests never starve;
 2. runs the downloads pass: submit, poll, import, cleanup, plan states;
 3. runs due tasks: `rss_sync`, `requests`, `refresh_metadata` (fresh TVmaze episode
-   lists and TMDB movie release evidence, 25 items per run each), `rescan`, `prune`.
+   lists and TMDB movie release evidence, 25 items per run each), `rescan`, `prune`, `bin`,
+   and last `sports` (every 15 minutes it looks at which followed sport leagues are due; it
+   never fails the pass and stops early when the schedule source is failing).
 
 Task status is in `tasks`. At startup the worker rolls back the import journal, returns
 `importing` grabs to `completed`, reconciles `unconfirmed` adds first, and requeues commands
@@ -446,6 +453,32 @@ observation is:
   `empty_unconfirmed`, an unusable mapping is `indexer_unavailable` — else `incomplete`.
 
 RSS reports retrieval status separately and never promises gap-free coverage.
+
+## Sport
+
+Sport is a module (`src/sport/`) and a set of tables (`sport_follows`, `sport_events`,
+`sport_teams`, `sport_refresh`, added with `CREATE TABLE IF NOT EXISTS` inside schema 3, so an
+older release ignores them) that sits beside movies and series. It is **not** a third media kind:
+no `MediaId` variant, no search, no download, no import and no Plex call exists for sport yet.
+
+What exists (phase one: schedules and follows):
+
+- a built-in catalogue of leagues (soccer, basketball, rugby union and league, golf, MMA), each
+  with its schedule-source path checked live, whether it has teams, and the names release titles
+  use for it (recorded now, unused until release matching exists);
+- following a league, or a team of a league that has teams, from now on; follows and events
+  survive restarts and are available in shadow mode (the immediate read on follow works
+  without the worker);
+- events with a fixed state vocabulary (`scheduled`, `postponed`, `cancelled`, `played`). The
+  schedule parser has no field for scores, winners or result text, so none can be stored or
+  served; a test keeps real recordings that carry them and proves none gets through;
+- a worker task and on-demand reads that keep followed leagues current within a strict request
+  budget (see the Sport section of [`docs/API.md`](docs/API.md)), and the `/api/v1/sport/*`
+  routes, plus a `sport` field on `/feed` and `/calendar`.
+
+What does not exist yet: release matching for events, downloading, filing and Plex refresh for
+sport, automatic pickup, any web app page for sport (the app's proxy already allows the routes),
+and a stored history older than yesterday.
 
 ## Not implemented
 

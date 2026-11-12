@@ -386,6 +386,9 @@ struct SportsSection {
     /// up to 15 minutes), so a source that is down is not asked again at once.
     #[serde(default = "d_sports_backoff")]
     backoff_secs: u64,
+    /// How long an answer is reused (0: never).
+    #[serde(default = "d_sports_cache")]
+    cache_secs: u64,
 }
 
 impl Default for SportsSection {
@@ -396,6 +399,7 @@ impl Default for SportsSection {
             timeout_secs: d_sports_timeout(),
             min_interval_ms: d_sports_spacing(),
             backoff_secs: d_sports_backoff(),
+            cache_secs: d_sports_cache(),
         }
     }
 }
@@ -411,6 +415,9 @@ fn d_sports_spacing() -> u64 {
 }
 fn d_sports_backoff() -> u64 {
     60
+}
+fn d_sports_cache() -> u64 {
+    300
 }
 
 #[derive(Deserialize)]
@@ -1033,6 +1040,7 @@ pub struct SportsConfig {
     pub timeout: Duration,
     pub min_interval: Duration,
     pub backoff: Duration,
+    pub cache: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1322,6 +1330,7 @@ pub fn parse_config(
                 0,
                 3600,
             )?),
+            cache: Duration::from_secs(within("sports.cache_secs", fc.sports.cache_secs, 0, 3600)?),
         })
     } else {
         None

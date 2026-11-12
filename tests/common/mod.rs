@@ -1632,6 +1632,8 @@ pub struct ExecOptions {
     pub sports: bool,
     /// `[sports] backoff_secs` (0 by default, so a failure never pauses later requests).
     pub sports_backoff_secs: u64,
+    /// `[sports] cache_secs` (0 by default, so every read asks the fake again).
+    pub sports_cache_secs: u64,
     /// Extra TOML appended (whole sections only).
     pub extra: String,
     /// Configure [tmdb] against the mock (v3 key).
@@ -1678,6 +1680,7 @@ impl Default for ExecOptions {
             tvmaze: true,
             sports: true,
             sports_backoff_secs: 0,
+            sports_cache_secs: 0,
             extra: String::new(),
             tmdb: false,
             categories: None,
@@ -1956,8 +1959,8 @@ fn managed_config(
     };
     let sports = if o.sports {
         format!(
-            "[sports]\nbase_url = \"http://{mock}/espn\"\ntimeout_secs = 2\nmin_interval_ms = 0\nbackoff_secs = {}\n",
-            o.sports_backoff_secs
+            "[sports]\nbase_url = \"http://{mock}/espn\"\ntimeout_secs = 2\nmin_interval_ms = 0\nbackoff_secs = {}\ncache_secs = {}\n",
+            o.sports_backoff_secs, o.sports_cache_secs
         )
     } else {
         "[sports]\nenabled = false\n".to_string()

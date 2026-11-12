@@ -61,6 +61,12 @@ base_url = "https://api.knaben.org/"
 enabled = true
 base_url = "https://api.tvmaze.com"
 
+# Sport schedules (ESPN's public feed, no key). On by default; nothing is asked until a league is
+# opened or followed. Set enabled = false to turn the feature off.
+[sports]
+enabled = true
+base_url = "https://site.api.espn.com/apis/site/v2/sports/"
+
 # Optional backup for movies (movies come from the Plex sign-in): add a free TMDB key.
 [tmdb]
 enabled = true

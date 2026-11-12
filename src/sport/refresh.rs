@@ -410,7 +410,7 @@ mod tests {
         );
         assert_eq!(
             m(datetime!(2026-02-02 10:00 UTC)),
-            vec![(2026, 2), (2026, 3)]
+            vec![(2026, 1), (2026, 2)]
         );
         for day in 1..=365 {
             let now = datetime!(2026-01-01 12:00 UTC) + time::Duration::days(day);

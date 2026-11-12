@@ -46,7 +46,7 @@ fn team_id_of(raw: &str) -> Result<&str, ApiError> {
     let ok = !raw.is_empty() && raw.len() <= 18 && raw.bytes().all(|b| b.is_ascii_digit());
     ok.then_some(raw).ok_or_else(|| {
         ApiError::bad_request(
-            ErrorCode::InvalidBody,
+            ErrorCode::InvalidRequest,
             "team_id must be the number of a team",
         )
     })
@@ -200,10 +200,15 @@ pub(super) async fn league(State(st): St, p: Result<Path<String>, PathRejection>
         .iter()
         .filter_map(|f| Some(json!({ "id": f.team_id.as_ref()?, "name": f.team_name })))
         .collect();
-    let problem = match &fresh {
-        refresh::Freshness::Failed(why) => Some(why.clone()),
-        _ => state.last_error.clone().filter(|_| state.failures > 0),
-    };
+    // What went wrong on the last try, as the refresh recorded it.
+    let problem = state
+        .last_error
+        .clone()
+        .filter(|_| state.failures > 0)
+        .or(match &fresh {
+            refresh::Freshness::Failed(why) => Some(why.clone()),
+            _ => None,
+        });
     ok(json!({
         "league": league_with_follow(league, &follows),
         "following_teams": following_teams,

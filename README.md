@@ -474,5 +474,6 @@ right to.
 ## Credits
 
 Movie details come from Plex's metadata service and, if you add a key, from
-[TMDB](https://www.themoviedb.org); TV details come from [TVmaze](https://www.tvmaze.com).
+[TMDB](https://www.themoviedb.org); TV details come from [TVmaze](https://www.tvmaze.com); sport
+schedules come from ESPN's public scoreboard feed.
 Arr uses TMDB and the TMDB APIs but is not endorsed, certified or otherwise approved by TMDB.

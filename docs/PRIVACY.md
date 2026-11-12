@@ -3,7 +3,8 @@
 Arr runs on your computer and talks to Plex, your torrent sources (by default The Pirate Bay's
 API and Knaben's search) and, only if you add a key, TMDB.
 Movie searches and lookups go to Plex's metadata service with your Plex sign-in; TV searches go to
-TVmaze; a movie's details go to TMDB only if you've added a TMDB key. It doesn't send
+TVmaze; a movie's details go to TMDB only if you've added a TMDB key; sport schedules come from
+ESPN's public feed once you open or follow a league. It doesn't send
 anything about you or your library to its developer, with one optional exception: error reports.
 
 ## Error reports are off unless you turn them on
@@ -35,6 +36,17 @@ and the User-Agent `arr/<version>`. Knaben, or its host, can log the search text
 at most one request per source per search, caches answers for 15 minutes, and waits at least
 two seconds between requests to the same source. To stop using Knaben, delete its
 `[[indexer]]` entry from `config.toml` and restart Arr.
+
+## What the sport schedule source sees
+
+Sport schedules (following a league or a team; see [`API.md`](API.md#sport-schedules-and-follows))
+come from ESPN's public scoreboard feed (`site.api.espn.com`). Arr asks it only after someone
+opens or follows a league, and then again to keep followed leagues current (every six hours,
+more often around a followed game). A request names a league and a month, or a league's team
+list, and nothing else: no Plex data, library, token or account, and no search text. ESPN sees
+your IP address, as any website does, and the User-Agent `Arr`. Arr makes one request at a time
+with half a second between them and pauses after a failure. Arr never reads scores or results
+from it. To turn it off, add `[sports]` with `enabled = false` to `config.toml` and restart Arr.
 
 ## What a report contains
 

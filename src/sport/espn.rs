@@ -20,8 +20,6 @@ use time::OffsetDateTime;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Asked for on every month request; the feed's default of 100 cuts a busy month short.
 pub const PAGE_LIMIT: usize = 400;
-const MONTH_TTL: Duration = Duration::from_secs(5 * 60);
-const TEAMS_TTL: Duration = Duration::from_secs(3600);
 const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
 const MAX_TEAMS: usize = 400;
 
@@ -418,8 +416,9 @@ impl Espn {
                 failures: 0,
                 blocked_until: None,
             }),
-            months: TtlCache::new(MONTH_TTL, 64),
-            teams: TtlCache::new(TEAMS_TTL, 64),
+            months: TtlCache::new(cfg.cache, 64),
+            // A team list changes rarely: kept twelve times as long (an hour by default).
+            teams: TtlCache::new(cfg.cache.saturating_mul(12), 64),
         }
     }
 
@@ -539,5 +538,57 @@ impl Espn {
                 Ok(parsed)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(name: &str, st: &str) -> EventState {
+        let body = format!(
+            r#"{{"events":[{{"id":"7","date":"2026-11-21T12:30Z","name":"A at B",
+               "status":{{"type":{{"name":"{name}","state":"{st}"}}}}}}]}}"#
+        );
+        parse_month(body.as_bytes()).unwrap().fixtures[0].state
+    }
+
+    #[test]
+    fn the_feeds_statuses_become_the_four_states() {
+        assert_eq!(state("STATUS_SCHEDULED", "pre"), EventState::Scheduled);
+        assert_eq!(state("STATUS_IN_PROGRESS", "in"), EventState::Scheduled);
+        assert_eq!(state("STATUS_HALFTIME", "in"), EventState::Scheduled);
+        assert_eq!(state("STATUS_POSTPONED", "post"), EventState::Postponed);
+        assert_eq!(state("STATUS_CANCELED", "post"), EventState::Cancelled);
+        assert_eq!(state("STATUS_FINAL", "post"), EventState::Played);
+        assert_eq!(state("STATUS_FULL_TIME", "post"), EventState::Played);
+        assert_eq!(state("STATUS_FORFEIT", "post"), EventState::Played);
+        // No status at all reads as still to come.
+        let m =
+            parse_month(br#"{"events":[{"id":"7","date":"2026-11-21T12:30Z","name":"A at B"}]}"#)
+                .unwrap();
+        assert_eq!(m.fixtures[0].state, EventState::Scheduled);
+    }
+
+    #[test]
+    fn sides_and_dates_are_read_defensively() {
+        // No home/away flags: the feed's order stands. Individual sports have no sides.
+        let m = parse_month(
+            br#"{"events":[
+              {"id":"1","date":"2026-11-21T12:30:00Z","name":"X vs Y","competitions":[{"competitors":[
+                {"team":{"id":"5","displayName":"X"}},{"team":{"id":"6","displayName":"Y"}}]}]},
+              {"id":"2","date":"2026-11-21T12:30Z","endDate":"2026-11-25T12:30Z","name":"A Open","competitions":[{"competitors":[
+                {"athlete":{"fullName":"Someone"},"score":"-12"}]}]},
+              {"id":"3","date":"2026-11-21T12:30Z","name":"  Odd \n name  ","competitions":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.fixtures.len(), 3);
+        assert_eq!(m.fixtures[0].home.as_ref().unwrap().name, "X");
+        assert_eq!(m.fixtures[0].away.as_ref().unwrap().name, "Y");
+        assert!(m.fixtures[1].home.is_none() && m.fixtures[1].away.is_none());
+        assert!(m.fixtures[1].ends_at.unwrap() > m.fixtures[1].starts_at);
+        assert_eq!(m.fixtures[2].name, "Odd name");
+        assert!(!m.truncated);
+        assert!(parse_month(b"not json").is_err());
     }
 }
