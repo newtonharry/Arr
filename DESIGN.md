@@ -302,7 +302,19 @@ The drive meter is a text line ("Movies drive: 1.2 TB free of 4 TB") over a 10px
 Centred mascot (96px empty, 120px sign-in), a heading, one muted line (max 30ch) and at most one teal button. The mascot (`src/webapp/mascot.svg`) is the brand mark at 34px beside "Arr" and as the favicon (a `<link rel="icon">` on every page, and `/favicon.ico` redirects to it for browsers that ask anyway).
 
 ### Motion
-Short and meaningful only: the journey fill (0.9s expo-out), 0.2s opacity on busy lists, 1px press. Everything is disabled under `prefers-reduced-motion`. The website's mascot bob is not in the app.
+Motion explains what just happened and never makes you wait. Only `transform` and `opacity` move. Interface changes take about 300ms or less; a playful spring (up to about 600ms) is kept for the moments that are good news: an add, an arrival, a restore. No animation is ever awaited by an action, delays an input, or blocks a tap. Easings: expo-out `cubic-bezier(.16,1,.3,1)` for most things, a spring `cubic-bezier(.34,1.56,.64,1)` for pops, a softer spring `cubic-bezier(.3,1.25,.5,1)` for things that glide and settle. The mascot never animates in the app.
+
+What animates:
+- **Screens:** the tab bar has a pill that slides behind the current tab (springy, phones only) and the tapped icon bounces; the page slides in 28px the way the tabs sit in the bar, or rises 8px for any other change. Opening a title grows the tapped poster into the sheet's big one (a flying copy, 440ms) while the sheet rises over a fading scrim; closing reverses it. On phones the sheet can be pulled down by its handle: past 80px it closes, under that it springs back. Only the handle moves it, so the page inside still scrolls.
+- **Loading:** shimmering placeholders shaped like the rows (the words stay for screen readers in a status line). A 3px teal line runs across the top while the screen shows its last answer ("Updating…").
+- **Add and Get:** a squish on tap, a spinner while it works, a drawn tick and a pop when it lands, a shake beside the error when it fails.
+- **Lists:** rows rise in one after another (60ms apart, first ten) the first time a screen is drawn, never on a poll or a later redraw. Rows that move (a download arriving, a card going, a gap closing) glide from where they were. A dismissed card shrinks away first.
+- **Toasts:** slide up, slide out. Undo has a ring that drains over the toast's real time and starts again when that time does.
+- **Progress:** the percentage counts up between updates; a download that is moving has a sheen along its bar, a paused one does not. The journey fill keeps its 0.9s expo-out.
+- **Arrived:** when a title lands in Plex while Arr is open, a sweep of light crosses its poster, the card hops and confetti bursts (about 34 pieces). It plays once per item (remembered in this browser, so a reload does not repeat it), never for what had already arrived when Arr opened, and from another tab it pulses the Home tab instead. A successful Add throws a smaller burst. Never more than two bursts at once.
+- **Small things:** the search bar lifts a little when focused; switches snap with a small overshoot; in the Bin a deleted row drops away, a restored one pops back out and an entry that turns up pops in.
+
+Everything is off under `prefers-reduced-motion`: the stylesheet turns off every transition and animation, and the script does not start any animation, flying poster, count-up or confetti.
 
 ## Do's and Don'ts
 

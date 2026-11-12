@@ -29,7 +29,7 @@ function anim(el, kf, opt) {
   try { return el.animate(kf, { easing: EASE, ...opt }); } catch { return NOANIM; }
 }
 const settled = (a, fn) => a.finished.then(fn, fn);
-const M = { fresh: false, drag: 0, tab: 0 }; // fresh: the screen has not drawn its rows yet; drag: how far the sheet was pulled down
+const M = { fresh: false, drag: 0, tab: 0, celebrate: new Set() }; // fresh: the screen has not drawn its rows yet; drag: how far the sheet was pulled down
 const onScreen = (r) => r.width > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
 const wide = () => matchMedia('(min-width:760px)').matches;
 // The poster of the row or card an element sits in.
@@ -73,6 +73,62 @@ function playFlip(sn) {
 }
 // A card that is going: it shrinks away first, then the others close the gap.
 function leave(el) { return el ? settled(anim(el, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200, fill: 'forwards' }), () => {}) : Promise.resolve(); }
+// A short burst of confetti. At most 34 pieces, at most two bursts at once, every piece removed when it lands.
+let bursts = 0;
+function confetti(x, y, n = 24) {
+  if (reduced() || bursts >= 2 || !document.body.animate) return;
+  n = Math.min(n, 34); bursts++;
+  const layer = document.createElement('div'), cols = ['#1c8576', '#ff7a5c', '#ffd166', '#4fd1bd', '#8ab4ff'];
+  layer.className = 'cf-layer'; layer.setAttribute('aria-hidden', 'true');
+  document.body.append(layer);
+  let left = n, over = false;
+  const end = () => { if (over) return; over = true; layer.remove(); bursts--; };
+  for (let i = 0; i < n; i++) {
+    const p = document.createElement('i'), a = Math.random() * Math.PI * 2, d = 36 + Math.random() * 74, dx = Math.cos(a) * d, dy = Math.sin(a) * d - 34, r = (Math.random() - 0.5) * 720;
+    p.className = 'cf';
+    Object.assign(p.style, { left: x - 3 + 'px', top: y - 5 + 'px', background: cols[i % 5] });
+    if (i % 3 === 0) Object.assign(p.style, { borderRadius: '50%', height: '7px' });
+    layer.append(p);
+    const an = p.animate([{ transform: 'translate(0,0) rotate(0) scale(.3)', opacity: 1 }, { transform: `translate(${dx}px,${dy}px) rotate(${r}deg) scale(1)`, opacity: 1, offset: 0.55 }, { transform: `translate(${dx * 1.15}px,${dy + 70}px) rotate(${r * 1.5}deg) scale(.9)`, opacity: 0 }], { duration: 900 + Math.random() * 500, easing: 'cubic-bezier(.2,.7,.3,1)' });
+    settled(an, () => { p.remove(); if (--left === 0) end(); });
+  }
+  setTimeout(end, 2600);
+}
+const middle = (el) => { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; };
+// A title that landed in Plex while the app was open: a sweep of light over the poster, a hop, confetti.
+function celebrate(li) {
+  if (li === document.body || !li.isConnected || reduced()) return;
+  const tile = li.querySelector('.tile');
+  if (tile) { tile.classList.remove('sweep'); void tile.offsetWidth; tile.classList.add('sweep'); setTimeout(() => tile.classList.remove('sweep'), 1000); }
+  anim(li, [{ transform: 'none' }, { transform: 'translateY(-8px) scale(1.02)' }, { transform: 'none' }], { duration: 600, easing: SPRING });
+  anim(li.querySelector('.tag'), [{ transform: 'scale(.4)', opacity: 0 }, { transform: 'scale(1)', opacity: 1 }], { duration: 480, easing: SPRING });
+  confetti(...middle(tile || li), 34);
+}
+// Which arrivals have been celebrated: kept in this browser, so a reload never plays one twice.
+const SEEN_KEY = 'arr.celebrated', seen = new Set();
+let seenLoaded = false, liveFeed = false;
+const arrKey = (it) => it.media_id + '|' + it.at;
+function noteArrivals(feed) {
+  if (!seenLoaded) { seenLoaded = true; try { for (const k of JSON.parse(localStorage.getItem(SEEN_KEY) || '[]')) seen.add(k); } catch { /* nothing remembered */ } }
+  const fresh = (feed.arrived || []).map(arrKey).filter((k) => !seen.has(k));
+  const first = !liveFeed;
+  liveFeed = true;
+  if (!fresh.length) return;
+  for (const k of fresh) seen.add(k);
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify([...seen].slice(-200))); } catch { /* storage blocked: this session only */ }
+  if (!first) for (const k of fresh) M.celebrate.add(k); // the first answer of a visit is only a baseline
+}
+// After the redraw that shows them: celebrate on Home, or pulse the Home tab from anywhere else.
+function runCelebrations() {
+  const keys = [...M.celebrate];
+  M.celebrate.clear();
+  if (reduced()) return;
+  if (!onHome() || V.t !== 'home') {
+    anim($('#tabs a[href="#/"]'), [{ transform: 'scale(1)' }, { transform: 'scale(1.18)' }, { transform: 'scale(1)' }], { duration: 600, easing: SPRING });
+    return;
+  }
+  keys.slice(0, 3).forEach((k, i) => setTimeout(() => celebrate(document.querySelector(`[data-arrived="${CSS.escape(k)}"]`) || document.body), 480 + i * 200));
+}
 const hideEl = (el, on) => { if (el) el.style.visibility = on ? 'hidden' : ''; };
 // Answers kept in memory so a screen can show the last one at once while a fresh one is fetched.
 // Anything the person changes makes them wrong, so bust() forgets them all.
@@ -345,6 +401,7 @@ function addFx(id, kind) {
     if (kind === 'tap') anim(b, [{ transform: 'scale(1)' }, { transform: 'scale(.88)' }, { transform: 'scale(1)' }], { duration: 260 });
     else if (kind === 'ok') {
       anim(b, [{ transform: 'scale(.7)' }, { transform: 'scale(1)' }], { duration: 520, easing: SPRING });
+      confetti(...middle(b));
       anim(tileOf(b), [{ transform: 'none' }, { transform: 'translateY(-7px) rotate(-4deg)' }, { transform: 'none' }], { duration: 520, easing: SPRING });
     } else anim(b, [0, -7, 7, -5, 5, -2, 0].map((x) => ({ transform: `translateX(${x}px)` })), { duration: 420, easing: 'linear' });
   });
@@ -473,7 +530,7 @@ function NeedRow({ it }) {
       h('p', { class: 'problem' }, ic('alert'), h('span', null, text)), h(Msg, { st }), btn));
 }
 function ArrivedRow({ it }) {
-  return h('li', { class: 'item arrived', 'data-flip': it.media_id }, h(Tile, { title: it.title, mediaId: it.media_id }),
+  return h('li', { class: 'item arrived', 'data-flip': it.media_id, 'data-arrived': arrKey(it) }, h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h('span', { class: 'tag' }, ic('check'), 'In Plex'),
       h(Title, { title: it.title, id: it.media_id }), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))));
 }
@@ -622,7 +679,7 @@ function loadFeed() {
     try {
       const r = await api('/v1/feed');
       if (ag !== authGen) return false;
-      if (r.ok) { S.feed = r.data; S.cached = false; S.tmdb = !!r.data.tmdb_backup; if (cg === cacheGen) saveFeed(); setSetup(false); if (onHome()) paintHome(); bump(); }
+      if (r.ok) { noteArrivals(r.data); S.feed = r.data; S.cached = false; S.tmdb = !!r.data.tmdb_backup; if (cg === cacheGen) saveFeed(); setSetup(false); if (onHome()) paintHome(); bump(); }
       return r.ok;
     } catch { return false; } finally {
       feedP = null;
@@ -2027,11 +2084,18 @@ async function renderSettings() {
   await Promise.all([loadSettings(), loadHealth(), loadUpdate(), loadBin()]);
 }
 // The bin: what "Delete files" moved out of the library, kept for 7 days.
-const B = { entries: [], busy: '', ask: '', msg: '', err: false };
+const B = { entries: [], busy: '', ask: '', msg: '', err: false, loaded: false };
+const binRow = (id) => document.querySelector(`[data-fk="bin-restore:${CSS.escape(id)}"], [data-fk="bin-go:${CSS.escape(id)}"]`)?.closest('li');
 async function loadBin() {
   try {
     const r = await api('/v1/bin');
-    if (r.ok) { B.entries = r.data.entries; bump(); }
+    if (r.ok) {
+      // An entry that turns up while the page is open pops in.
+      const had = new Set(B.entries.map((e) => e.delete_id)), first = !B.loaded;
+      B.entries = r.data.entries; B.loaded = true; bump();
+      const added = first ? [] : B.entries.map((e) => e.delete_id).filter((x) => !had.has(x));
+      if (added.length) after(() => added.forEach((x) => anim(binRow(x), [{ transform: 'scale(.6)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 480, easing: SPRING })));
+    }
   } catch { /* the banner says Arr can't be reached */ }
 }
 async function binAct(id, what) {
@@ -2046,7 +2110,11 @@ async function binAct(id, what) {
     }
   } catch { m = { ok: false, text: "Couldn't reach Arr. Try again in a moment." }; }
   B.busy = ''; B.msg = m.text; B.err = !m.ok; say(m.text);
+  // A deleted row drops away; a restored one pops back out. Then the list closes the gap.
+  const gone = m.ok ? anim(binRow(id), what === 'restore' ? [{ transform: 'none', opacity: 1 }, { transform: 'scale(1.06)', opacity: 0 }] : [{ transform: 'none', opacity: 1 }, { transform: 'translateY(4px) rotate(-3deg) scale(.97)', opacity: 1, offset: 0.3 }, { transform: 'translateY(70px) rotate(-9deg) scale(.8)', opacity: 0 }], { duration: what === 'restore' ? 300 : 440, easing: what === 'restore' ? EASE : 'cubic-bezier(.5,0,.8,.4)', fill: 'forwards' }) : NOANIM;
+  await settled(gone, () => {});
   await loadBin();
+  gone.cancel();
   bump();
 }
 const binScope = (id) => {
@@ -2058,7 +2126,7 @@ function BinSection() {
   return h(Section, { id: 'bin', title: 'Bin' },
     B.entries.length ? h('p', { class: 'hint' }, 'Files you deleted stay here for 7 days. Put them back, or empty them to free the space now.') : null,
     B.msg ? h('p', { class: 'msg', role: 'status', 'data-err': B.err ? '' : null }, B.msg) : null,
-    h('ul', { class: 'list' }, B.entries.map((e) => h('li', { key: e.delete_id, class: 'item bin' },
+    h('ul', { class: 'list' }, B.entries.map((e) => h('li', { key: e.delete_id, class: 'item bin', 'data-flip': 'bin:' + e.delete_id },
       h('div', { class: 'what' }, h('h3', null, e.title, binScope(e.media_id)),
         h('p', { class: 'meta' }, `${plural(e.files, 'file', 'files')}${fmtSize(e.bytes) ? ` · ${fmtSize(e.bytes)}` : ''} · empties ${fmtDate(e.purge_at)}`)),
       B.ask === e.delete_id
@@ -2243,6 +2311,7 @@ function App() {
     }
     // A screen's rows come in one after another, the first time they are drawn and never again.
     const sn = snap; snap = null;
+    if (M.celebrate.size) runCelebrations();
     if (M.fresh && ENTER.has(V.t)) { M.fresh = false; enterRows(); } else if (sn) playFlip(sn);
     for (const fn of later.splice(0)) fn();
   });

@@ -18,7 +18,8 @@ button,input{font:inherit;color:inherit}
 .top{padding-top:calc(18px + env(safe-area-inset-top));display:grid;grid-template-columns:1fr auto}
 .brand{display:flex;align-items:center;gap:10px;color:var(--ink);text-decoration:none;font-size:24px;font-weight:800;min-height:44px}
 .search{grid-column:1/-1;display:flex;align-items:center;gap:10px;margin:6px 0 18px;background:var(--card);border:2px solid var(--line);border-radius:18px;padding:0 16px;min-height:56px;box-shadow:0 5px 0 var(--line)}
-.search:focus-within{outline:3px solid var(--ring);outline-offset:3px}
+.search:focus-within{outline:3px solid var(--ring);outline-offset:3px;transform:translateY(-2px) scale(1.012)}
+.search{transition:transform .32s cubic-bezier(.34,1.56,.64,1)}
 .search svg{color:var(--teal)}
 .search input{flex:1;min-width:0;border:0;background:none;outline:0;font-size:17px;font-weight:600;padding:14px 0;-webkit-appearance:none;appearance:none}
 .search input::placeholder{color:var(--muted);opacity:1;font-weight:500}
@@ -181,8 +182,9 @@ body.sheet-open{overflow:hidden}
 .switch .what{flex:1;min-width:0}
 .sw-t{display:block;font-weight:800;font-size:16px;line-height:1.3}
 .sw-m{display:block;color:var(--muted);font-size:14px}
-.track{flex:none;width:52px;height:32px;border-radius:999px;border:2px solid var(--line);background:var(--bg);position:relative;transition:background .2s,border-color .2s}
-.track i{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:var(--muted);transition:transform .2s cubic-bezier(.16,1,.3,1),background .2s}
+.track{flex:none;width:52px;height:32px;border-radius:999px;border:2px solid var(--line);background:var(--bg);position:relative;transition:background .12s,border-color .12s,transform .12s}
+.switch:active .track{transform:scale(.95)}
+.track i{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:var(--muted);transition:transform .2s cubic-bezier(.34,1.56,.64,1),background .12s}
 .switch[aria-checked=true] .track{background:var(--teal);border-color:var(--teal)}
 .switch[aria-checked=true] .track i{transform:translateX(20px);background:var(--on-teal)}
 .item.sea{display:block;padding:0;overflow:hidden}
@@ -220,6 +222,11 @@ body.sheet-open{overflow:hidden}
 .sk-tile{background:var(--line)}
 /* Shown while the last answer is on screen and a fresh one is on its way. */
 .updating{color:var(--muted);font-size:13px;animation:pulse 1.4s ease-in-out infinite}
+/* confetti and the light that sweeps over a poster when a title lands in Plex */
+.cf-layer{position:fixed;inset:0;pointer-events:none;z-index:80;overflow:hidden}
+.cf{position:absolute;width:7px;height:10px;border-radius:2px}
+.tile.sweep::after{content:"";position:absolute;inset:-20%;background:linear-gradient(105deg,transparent 35%,rgba(255,255,255,.8) 50%,transparent 65%);transform:translateX(-120%);animation:sweep .8s ease-out}
+@keyframes sweep{to{transform:translateX(120%)}}
 /* the thin line across the top while the page shows the last answer */
 .topline{position:fixed;top:0;left:0;right:0;height:3px;background:var(--teal);transform-origin:left;transform:scaleX(0);opacity:0;pointer-events:none;z-index:50}
 /* the handle that pulls a sheet down (phones) */
