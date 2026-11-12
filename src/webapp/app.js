@@ -471,9 +471,10 @@ function titleHref(id) {
   return m ? `#/show/series:${m[1]}:${m[2]}` : null;
 }
 // A title that opens its page; the link covers the whole row (see .stretch).
-function stretch(text, id) {
-  const href = titleHref(id);
-  return href ? h('a', { class: 'stretch', href, 'data-fk': 'open:' + href }, text) : text;
+function stretch(text, id) { return stretchTo(text, titleHref(id)); }
+// `lg` is a league's name: its page can show it before it has loaded.
+function stretchTo(text, href, lg) {
+  return href ? h('a', { class: 'stretch', href, 'data-fk': 'open:' + href, 'data-lg': lg || null }, text) : text;
 }
 const Title = ({ title, id }) => h('h3', { title }, stretch(title, id));
 
@@ -658,6 +659,254 @@ function IdeaRow({ x }) {
       ideaMeta(x, x.year, x.network), x.summary && h('p', { class: 'clamp' }, x.summary), notInterested(x)), chooseLink(x));
 }
 
+// ---------- sport: the schedules of leagues and teams that are followed ----------
+// Schedules only: nothing here promises a download, and there are no scores. Sport is optional, so
+// its requests never raise the "can't reach Arr" banner; if it fails or is switched off, the
+// screens simply have no sport on them.
+const SPT = { off: 0 }; // off: until when sport counts as switched off (asked again after that)
+const FOL = new Map(), FBUSY = new Set(), FMSG = new Map(), POP = new Set(); // set by a tap until a fresh read says it; taps in flight; notes; just followed
+const SF = { rows: null, state: 'loading', seq: 0 }; // what is followed, as the Library lists it
+const lkey = (slug) => 'l:' + slug, tkey = (slug, id) => `t:${slug}:${id}`;
+const folOn = (key, server) => (FOL.has(key) ? FOL.get(key) : !!server);
+const sportOff = () => Date.now() < SPT.off;
+const nameOf = (d) => (d.league && d.league.name) || d.title || '';
+const leagueHref = (slug) => '#/league/' + slug;
+async function sportReq(path, { method = 'GET', body, signal } = {}) {
+  try {
+    const r = await fetch('/app/api/v1/sport' + path, {
+      method, signal, credentials: 'same-origin',
+      headers: { 'X-Arr-App': '1', ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    let data = null;
+    try { data = await r.json(); } catch { /* empty body */ }
+    if (r.status === 401) { showSignin(data); return null; }
+    if (r.status === 503 && data && data.error && data.error.code === 'provider_not_configured') SPT.off = Date.now() + 5 * 60e3;
+    else if (r.ok) SPT.off = 0;
+    return { ok: r.ok, status: r.status, data };
+  } catch { return null; }
+}
+// A fresh read says what is followed: the taps it already includes are forgotten. A read that began
+// before the last change (cacheGen) may be older than a tap and says nothing.
+function settle(keys) { for (const k of keys) if (!FBUSY.has(k)) FOL.delete(k); }
+function settleLeague(d) {
+  const l = d.league;
+  settle([lkey(l.slug), ...(d.teams || []).map((t) => tkey(l.slug, t.id))]);
+}
+
+// ----- times: the server speaks UTC, the page speaks the viewer's own clock
+const dayOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+const noComma = (s) => s.replace(',', '');
+const clock = (d) => d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }).replace(/[  ]/g, ' ').replace(/ ?([AP])M$/i, (_, a) => ' ' + a.toLowerCase() + 'm');
+// "Today", "Tomorrow", "Sat" within the week, else "Sat 14 Nov" (with the year when it isn't this one).
+function dayWord(d, now = new Date()) {
+  const n = Math.round((dayOf(d) - dayOf(now)) / 864e5);
+  if (n === 0) return 'Today';
+  if (n === 1) return 'Tomorrow';
+  if (n === -1) return 'Yesterday';
+  if (n > 1 && n < 7) return d.toLocaleDateString(undefined, { weekday: 'short' });
+  return noComma(d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', ...(d.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}) }));
+}
+// When an event is: "Today 7:30 pm"; a tournament that runs for days gives its span; a postponed one has no time.
+function whenOf(e) {
+  const s = new Date(e.starts_at), en = e.ends_at ? new Date(e.ends_at) : null, now = new Date();
+  if (isNaN(s)) return '';
+  if (en && !isNaN(en) && dayOf(en) > dayOf(s)) {
+    const part = (d, mon) => noComma(d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', ...(mon ? { month: 'short' } : {}) }));
+    return s < now ? `Under way, until ${part(en, true)}` : `${part(s, s.getMonth() !== en.getMonth())} – ${part(en, true)}`;
+  }
+  return e.state === 'postponed' ? dayWord(s, now) : `${dayWord(s, now)} ${clock(s)}`;
+}
+const stateMark = (e) => (e.state === 'postponed' ? h('span', { class: 'pp' }, 'Postponed') : e.state === 'cancelled' ? h('span', { class: 'pp' }, 'Cancelled') : null);
+
+// ----- follow and unfollow: the button changes at once, and goes back with a plain note if it fails
+function sportFx(key, kind) {
+  after(() => {
+    for (const b of document.querySelectorAll(`[data-fk="fol:${CSS.escape(key)}"]`)) {
+      if (kind === 'tap') anim(b, [{ transform: 'scale(1)' }, { transform: 'scale(.88)' }, { transform: 'scale(1)' }], { duration: 260 });
+      else if (kind === 'ok') anim(b, [{ transform: 'scale(.8)' }, { transform: 'scale(1)' }], { duration: 480, easing: SPRING });
+      else anim(b, [0, -7, 7, -5, 5, -2, 0].map((x) => ({ transform: `translateX(${x}px)` })), { duration: 420, easing: 'linear' });
+    }
+  });
+}
+// `sp` is { key, league, team_id?, name }. Answers { ok, text, data }, or null if one is already under way.
+async function sportSet(sp, want, { keep } = {}) {
+  if (FBUSY.has(sp.key)) return null;
+  const was = folOn(sp.key, !want);
+  FBUSY.add(sp.key); FOL.set(sp.key, want); FMSG.delete(sp.key);
+  if (want) POP.add(sp.key); else POP.delete(sp.key);
+  bump(); sportFx(sp.key, 'tap');
+  const r = await sportReq(want ? '/follow' : '/unfollow', { method: 'POST', body: { league: sp.league, ...(sp.team_id ? { team_id: sp.team_id } : {}) } });
+  FBUSY.delete(sp.key);
+  bust();
+  if (!r || !r.ok) {
+    FOL.set(sp.key, was); POP.delete(sp.key);
+    const text = sportOff() ? "Sport isn't switched on for this Arr." : `Couldn't ${want ? 'follow' : 'stop following'} ${sp.name}. Try again in a moment.`;
+    FMSG.set(sp.key, { msg: text, err: true }); say(text); bump(); sportFx(sp.key, 'bad');
+    return { ok: false, text };
+  }
+  // The Library list is out of date: a follow has no next event in it yet, an unfollow is just gone.
+  if (!want && SF.rows) SF.rows = SF.rows.filter((f) => folKey(f) !== sp.key);
+  else if (want && !keep) SF.rows = null;
+  if (P.shown && /^\/library/.test(parseHash(bgHash).path)) S.stale = true;
+  bump(); sportFx(sp.key, 'ok'); say(want ? `Following ${sp.name}.` : `Stopped following ${sp.name}.`);
+  loadFeed(); // Home's Coming up changes with what is followed
+  return { ok: true, data: r.data };
+}
+// A tap on a follow control: the change, then the note with Undo.
+async function toggleSport(sp, want) {
+  const r = await sportSet(sp, want);
+  if (!r || !r.ok) return;
+  const d = r.data || {};
+  const tail = want && d.schedule_read === true && d.upcoming === 0 ? '. Nothing is scheduled right now.' : want && d.schedule_read === false ? '. Arr will check its schedule again soon.' : '';
+  showToast({ before: want ? 'Following ' : 'Stopped following ', title: sp.name, after: tail }, async () => {
+    const u = await sportSet(sp, !want);
+    return u && u.ok ? { ok: true, text: want ? `Stopped following ${sp.name}.` : `Following ${sp.name} again.` } : null;
+  });
+}
+function followBtn(sp, on, onTap) {
+  const busy = FBUSY.has(sp.key);
+  return h('button', {
+    type: 'button', class: 'btn', 'data-fk': 'fol:' + sp.key, 'data-s': on ? 'following' : 'add', 'aria-pressed': String(on), 'aria-disabled': busy ? 'true' : 'false',
+    'aria-label': `Follow ${sp.name}`, onClick: () => { if (onTap) onTap(); toggleSport(sp, !on); },
+  }, on ? (POP.has(sp.key) ? tickIc() : ic('check')) : ic('plus'), on ? 'Following' : 'Follow');
+}
+const folMsg = (key) => h(Msg, { st: FMSG.get(key) || {} });
+
+// ----- an event: its day as a chip, its name, and when
+function EventRow({ e, home }) {
+  const s = new Date(e.starts_at), fact = joinDot(e.round, e.venue);
+  return h('li', { class: 'item sport', 'data-flip': e.id }, chip(s, 'day'),
+    h('div', { class: 'what' },
+      home ? h('p', { class: 'lg' }, e.league.name) : null,
+      h('h3', { title: e.name }, home ? stretchTo(e.name, leagueHref(e.league.slug), e.league.name) : e.name),
+      h('p', { class: 'meta' }, whenOf(e), stateMark(e)),
+      !home && fact ? h('p', { class: 'meta' }, fact) : null));
+}
+// What happened lately is only a name and a day.
+function EarlierRow({ e }) {
+  const s = new Date(e.starts_at);
+  return h('li', { class: 'item sport' }, h('div', { class: 'what' }, h('h3', { title: e.name }, e.name), h('p', { class: 'meta' }, isNaN(s) ? '' : dayWord(s))));
+}
+
+// ----- search: leagues and teams that match, each a row you can follow in place
+const SPORT_ROWS = 6;
+async function findSport(q, signal) {
+  if (sportOff()) return null;
+  const r = await sportReq('/search?q=' + encodeURIComponent(q), { signal });
+  if (!r || !r.ok || !r.data) return null;
+  settle([...(r.data.leagues || []).map((l) => lkey(l.slug)), ...(r.data.teams || []).map((x) => tkey(x.league.slug, x.team.id))]);
+  return { leagues: r.data.leagues || [], teams: r.data.teams || [] };
+}
+function SportHit({ l, t }) {
+  const sp = t ? { key: tkey(l.slug, t.id), league: l.slug, team_id: t.id, name: t.name } : { key: lkey(l.slug), league: l.slug, name: l.name };
+  return h('li', { class: 'item top-align sport' }, h(Tile, { title: sp.name }),
+    h('div', { class: 'what' }, h('h3', { title: sp.name }, stretchTo(sp.name, leagueHref(l.slug), l.name)),
+      h('p', { class: 'meta' }, t ? joinDot('Team', l.name) : joinDot('League', l.sport_label)), folMsg(sp.key)),
+    followBtn(sp, folOn(sp.key, (t || l).followed)));
+}
+function SportHits({ sport }) {
+  const all = [...sport.leagues.map((l) => ({ k: lkey(l.slug), l })), ...sport.teams.map((x) => ({ k: tkey(x.league.slug, x.team.id), l: x.league, t: x.team }))];
+  const shown = V.sportAll ? all : all.slice(0, SPORT_ROWS);
+  const more = all.length > SPORT_ROWS && h('button', { type: 'button', class: 'link', 'aria-expanded': String(!!V.sportAll), 'data-fk': 'sport-all', onClick: () => { V.sportAll = !V.sportAll; bump(); } }, V.sportAll ? 'Show fewer' : `See all ${all.length}`);
+  return h('div', { class: 'sport-sec' }, h(Section, { id: 'sport', title: 'Sport', extra: more }, h(List, null, keyed(shown, (r) => r.k, (r, key) => h(SportHit, { key, l: r.l, t: r.t })))));
+}
+
+// ----- the league page (a sheet, like a title's)
+function TeamRow({ t, L }) {
+  const sp = { key: tkey(L.slug, t.id), league: L.slug, team_id: t.id, name: t.name };
+  return h('li', { class: 'item team' }, h('div', { class: 'what' }, h('h3', { title: t.name }, t.name), folMsg(sp.key)),
+    followBtn(sp, folOn(sp.key, t.followed), () => P.touched.add(t.id)));
+}
+function teamsNode(d, L) {
+  const all = [...(d.teams || [])].sort((a, b) => a.name.localeCompare(b.name)), many = all.length > 8, q = P.tf.trim().toLowerCase();
+  if (!all.length) return h(Section, { id: 'teams', title: 'Teams' }, h(Hint, { text: "The team list isn't available yet. Check back in a moment." }));
+  const hits = q ? all.filter((t) => [t.name, t.short_name, t.abbreviation].some((n) => n && n.toLowerCase().includes(q))) : all;
+  // Collapsed, the first eight and any the person has followed or just tapped; nothing jumps under a finger.
+  const shown = q || P.tall || !many ? hits : hits.filter((t, i) => i < 8 || P.touched.has(t.id) || folOn(tkey(L.slug, t.id), t.followed));
+  return h(Section, { id: 'teams', title: 'Teams' },
+    many ? h('input', { type: 'search', class: 'filter team-filter', placeholder: 'Find a team', 'aria-label': `Find a team in ${L.name}`, autocomplete: 'off', value: P.tf, onInput: (e) => { P.tf = e.target.value; bump(); } }) : null,
+    shown.length ? h(List, null, keyed(shown, (t) => t.id, (t, key) => h(TeamRow, { key, t, L }))) : h(Hint, { text: `No team matches “${P.tf.trim()}”.` }),
+    many && !q ? h('div', { class: 'more' }, h('button', { type: 'button', class: 'link', 'aria-expanded': String(P.tall), 'data-fk': 'teams-all', onClick: () => { P.tall = !P.tall; bump(); } }, P.tall ? 'Show fewer teams' : `Show all ${all.length} teams`)) : null);
+}
+const LG_ROWS = 5; // the first few events: the teams are below, not a long scroll away
+function leagueBody() {
+  const d = P.data, L = d.league, sc = d.schedule || {}, up = d.upcoming || [], earlier = (d.recent || []).slice(0, 5);
+  const sp = { key: lkey(L.slug), league: L.slug, name: L.name }, on = folOn(sp.key, L.followed);
+  const word = { golf: 'tournaments', mma: 'fights' }[L.sport] || 'games';
+  const note = sc.updating ? 'Updating the schedule…' : sc.problem ? (sc.updated_at ? 'Couldn’t update the schedule just now. Showing what Arr had.' : 'Couldn’t get the schedule just now. Try again in a moment.') : null;
+  const none = sc.updating || (sc.problem && !sc.updated_at) ? null : 'Nothing is scheduled right now. It may be the off season.';
+  return h('div', { key: 'league', class: 'stack' },
+    hero(L.name, L.sport_label, null, null),
+    h('div', null, h('button', { type: 'button', role: 'switch', class: 'switch', 'aria-checked': String(on), 'aria-labelledby': 'sw-t', 'data-fk': 'fol:' + sp.key, onClick: () => toggleSport(sp, !on) },
+      h('span', { class: 'what' }, h('span', { class: 'sw-t', id: 'sw-t' }, `Follow ${L.name}`),
+        h('span', { class: 'sw-m' }, on ? `Its ${word} show up under Coming up on Home.` : `Off. Follow it to see its ${word} on Home.`)),
+      h('span', { class: 'track', 'aria-hidden': 'true' }, h('i'))), folMsg(sp.key)),
+    note ? h(Hint, { text: note, role: 'status' }) : null,
+    h(Section, { id: 'lg-up', title: 'Coming up', extra: up.length > LG_ROWS ? h('button', { type: 'button', class: 'link', 'aria-expanded': String(P.upAll), 'data-fk': 'up-all', onClick: () => { P.upAll = !P.upAll; bump(); } }, P.upAll ? 'Show fewer' : `See all ${up.length}`) : null },
+      up.length ? h(List, null, keyed(P.upAll ? up : up.slice(0, LG_ROWS), (e) => e.id, (e, key) => h(EventRow, { key, e }))) : none ? h(Hint, { text: none }) : null),
+    L.has_teams ? teamsNode(d, L) : null,
+    earlier.length ? h(Section, { id: 'lg-earlier', title: 'Earlier' }, h(List, null, keyed(earlier, (e) => e.id, (e, key) => h(EarlierRow, { key, e })))) : null);
+}
+
+// ----- Library > Sport: what is followed, its next event, and a way to stop
+const folKey = (f) => (f.team ? tkey(f.league.slug, f.team.id) : lkey(f.league.slug));
+const folSpec = (f) => ({ key: folKey(f), league: f.league.slug, ...(f.team ? { team_id: f.team.id } : {}), name: f.team ? f.team.name : f.league.name || f.league.slug });
+async function loadFollowing() {
+  const my = ++SF.seq, ag = authGen, cg = cacheGen;
+  if (!SF.rows) { SF.state = 'loading'; bump(); }
+  const r = await sportReq('/following');
+  if (my !== SF.seq || ag !== authGen) return;
+  if (r && r.ok && r.data) {
+    SF.rows = r.data.following || []; SF.state = 'ok';
+    if (cg === cacheGen) settle(SF.rows.map(folKey));
+  } else if (!SF.rows) SF.state = sportOff() ? 'off' : 'err';
+  bump();
+}
+function FollowRow({ f }) {
+  const sp = folSpec(f), ne = f.next_event, l = f.league;
+  return h('li', { class: 'item top-align sport', 'data-flip': sp.key }, h(Tile, { title: sp.name }),
+    h('div', { class: 'what' }, h('h3', { title: sp.name }, stretchTo(sp.name, leagueHref(l.slug), l.name)),
+      h('p', { class: 'meta' }, f.team ? joinDot('Team', l.name) : joinDot('League', l.sport_label)),
+      h('p', { class: 'meta wrap' }, ne ? `Next ${whenOf(ne)}${ne.state === 'postponed' ? ' postponed' : ''}` : 'Nothing scheduled right now'),
+      ne ? h('p', { class: 'meta wrap' }, ne.name) : null,
+      folMsg(sp.key)),
+    h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'unf:' + sp.key, 'aria-label': `Stop following ${sp.name}`, onClick: () => stopFollowing(f) }, 'Unfollow'));
+}
+// The row goes at once. If that fails it comes back with a plain note; Undo puts it back the same way.
+async function stopFollowing(f) {
+  const sp = folSpec(f), at = (SF.rows || []).indexOf(f);
+  if (at < 0 || FBUSY.has(sp.key)) return;
+  outgoing(document.querySelector(`[data-fk="unf:${CSS.escape(sp.key)}"]`)?.closest('li'), [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200 });
+  SF.rows = SF.rows.filter((x) => x !== f);
+  // The button that had the focus is gone: the first row's takes it, else the choice above the list.
+  after(() => (document.querySelector('[data-fk^="unf:"]') || document.querySelector('.seg [aria-pressed="true"]'))?.focus({ preventScroll: true }));
+  const put = () => { SF.rows = SF.rows.includes(f) ? SF.rows : [...SF.rows.slice(0, at), f, ...SF.rows.slice(at)]; };
+  const r = await sportSet(sp, false);
+  if (!r) return;
+  if (!r.ok) { FMSG.delete(sp.key); put(); bump(); return toast(r.text); }
+  showToast({ before: 'Stopped following ', title: sp.name, after: '' }, async () => {
+    put(); bump();
+    after(() => { const li = document.querySelector(`[data-fk="unf:${CSS.escape(sp.key)}"]`)?.closest('li'); anim(li, [{ transform: 'scale(.6)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 480, easing: SPRING }); });
+    const u = await sportSet(sp, true, { keep: true });
+    if (u && u.ok) return { ok: true, text: `Following ${sp.name} again.` };
+    SF.rows = SF.rows.filter((x) => x !== f); bump();
+    return null;
+  });
+}
+function SportFollowing() {
+  const m = useRef({ enter: true }).current;
+  useEffect(() => { loadFollowing(); }, []);
+  // The rows come in one after another the first time the list is drawn.
+  useLayoutEffect(() => { if (m.enter && SF.rows && SF.rows.length) { m.enter = false; stagger([...document.querySelectorAll('#view .list > li')]); } });
+  if (!SF.rows) {
+    return SF.state === 'loading' ? h('div', { 'aria-busy': 'true' }, h('p', { class: 'sr', role: 'status' }, 'Loading…'), h(SkelRows, { n: 3 }))
+      : h(Hint, { text: SF.state === 'off' ? "Sport isn't switched on for this Arr." : "Couldn't load what you follow just now.", role: 'status' });
+  }
+  if (!SF.rows.length) return h(Hint, { text: 'You’re not following any sport yet. Search for a league above, like “NBA” or “Premier League”, then follow it or one of its teams.' });
+  return h('ul', { class: 'list' }, keyed(SF.rows, folKey, (f, key) => h(FollowRow, { key, f })));
+}
+
 // ---------- home ----------
 function Home() {
   const f = S.feed, n = (k) => f[k] || [];
@@ -670,7 +919,11 @@ function Home() {
     secs.push(h(Section, { key: 'way', id: 'way', title: 'On its way', extra: more }, h(List, null, keyed(shown, (it) => it.grab_id, (it, key) => h(WayRow, { key, it })))));
   }
   if (n('looking').length) secs.push(h(Section, { key: 'look', id: 'look', title: 'Looking' }, h(List, null, keyed(n('looking'), (it) => it.media_id, (it, key) => h(LookRow, { key, it })))));
-  if (n('coming_up').length) secs.push(h(Section, { key: 'soon', id: 'soon', title: 'Coming up' }, h(List, null, keyed(n('coming_up'), (it) => it.media_id + '|' + it.at, (it, key) => h(SoonRow, { key, it })))));
+  // Episodes and the games, fights and tournaments of what is followed, in the order they happen.
+  const soon = [...n('coming_up').map((it) => ({ at: new Date(it.at).getTime(), k: it.media_id + '|' + it.at, el: (key) => h(SoonRow, { key, it }) })),
+    ...n('sport').map((e) => ({ at: Date.parse(e.starts_at), k: e.id, el: (key) => h(EventRow, { key, e, home: true }) }))];
+  if (n('sport').length) soon.sort((a, b) => (a.at || 0) - (b.at || 0));
+  if (soon.length) secs.push(h(Section, { key: 'soon', id: 'soon', title: 'Coming up' }, h(List, null, keyed(soon, (x) => x.k, (x, key) => x.el(key)))));
   const ideas = ((S.ideas && S.ideas.items) || []).filter((x) => !owned(x)).slice(0, 6);
   if (!secs.length) {
     secs.push(h('section', { key: 'empty', class: 'empty', 'aria-labelledby': 'h-empty' }, h('img', { src: '/app/mascot.svg', alt: '' }),
@@ -795,16 +1048,27 @@ async function renderSearch(q, t) {
   const ac = (searchAbort = new AbortController());
   if (V.t === 'search') { V.busy = true; bump(); } else setView(skel('Searching…'));
   const key = q.toLowerCase(), hit = SC.get(key), ag = authGen, cg = cacheGen;
-  let view = null, pend = null;
-  const attach = () => { if (pend && view && V === view && seq === searchSeq) { view.people = pend; bump(); } };
-  // Searched a moment ago: shown at once, with the people it found.
+  let view = null, pend = null, pendS = null;
+  const attach = () => {
+    if ((pend || pendS) && view && V === view && seq === searchSeq) {
+      const late = pendS && !view.sport && !M.fresh;
+      if (pend) view.people = pend;
+      if (pendS) view.sport = pendS;
+      bump();
+      // Sport that turns up after the rest rises in the same way.
+      if (late && (pendS.leagues.length || pendS.teams.length)) after(() => stagger([...document.querySelectorAll('#view .sport-sec .item')]));
+    }
+  };
+  // Searched a moment ago: shown at once, with the people and the sport it found.
   if (hit && Date.now() - hit.at < SEARCH_TTL) {
-    view = { t: 'search', q, rows: hit.rows, notes: hit.notes, busy: false, loading: false, people: hit.people || null };
+    view = { t: 'search', q, rows: hit.rows, notes: hit.notes, busy: false, loading: false, people: hit.people || null, sport: hit.sport || null };
     M.fresh = true; setView(view);
     if (!hit.people) findPeople(q, seq, ac.signal).then((p) => { if (p) hit.people = p; pend = p; attach(); });
+    if (!hit.sport) findSport(q, ac.signal).then((s) => { if (s) hit.sport = s; pendS = s; attach(); });
     return;
   }
   findPeople(q, seq, ac.signal).then((p) => { pend = p; attach(); }); // never waited for
+  findSport(q, ac.signal).then((s) => { pendS = s; attach(); }); // nor is sport: it only adds a section, or nothing
   const ok = (r) => r && r.ok;
   const part = (kind) => api(`/v1/discover?kind=${kind}&q=${encodeURIComponent(q)}`, { signal: ac.signal }).then((r) => ({ ok: r.ok, data: r.data }), () => ({ ok: false }));
   const done = {}, shown = {};
@@ -824,9 +1088,9 @@ async function renderSearch(q, t) {
     if (done.m && moviesOff) notes.push("Movie search isn't set up yet.");
     else if (done.m && !ok(done.m)) notes.push("Movie results aren't available right now.");
     if (done.s && !ok(done.s)) notes.push("Show results aren't available right now.");
-    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: null }; M.fresh = true; setView(view); }
+    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: null, sport: null }; M.fresh = true; setView(view); }
     attach();
-    if (both() && ok(done.m) && ok(done.s) && cg === cacheGen) remember(SC, key, { at: Date.now(), rows, notes, people: pend }, 20);
+    if (both() && ok(done.m) && ok(done.s) && cg === cacheGen) remember(SC, key, { at: Date.now(), rows, notes, people: pend, sport: pendS }, 20);
   };
   await Promise.race([pm, ps]);
   if (!both()) await Promise.race([Promise.all([pm, ps]), new Promise((r) => setTimeout(r, 120))]); // near-simultaneous halves are mixed together
@@ -918,12 +1182,14 @@ function SearchRow({ x, label }) {
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
 function SearchResults() {
-  const { q, rows, notes, busy, loading, people } = V;
+  const { q, rows, notes, busy, loading, people, sport } = V;
+  const hits = !!(sport && (sport.leagues.length || sport.teams.length));
   // Opening or adding a result counts the search as one worth keeping.
   return h('div', { 'data-results': '', class: busy ? 'busy' : null, 'aria-busy': loading ? 'true' : null, onClick: (e) => { if (e.target.closest('a,button')) noteSearch(q); } },
     people && people.person ? h(PersonBlock, { person: people.person }) : null,
-    h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label })))
-      : h(Hint, { text: `Nothing found for “${q}”. Check the spelling or try fewer words.` })),
+    rows.length || !hits ? h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label })))
+      : h(Hint, { text: `Nothing found for “${q}”. Check the spelling or try fewer words.` })) : null,
+    hits ? h(SportHits, { sport }) : null,
     people && people.names ? h(PeopleRow, { names: people.names }) : null,
     loading ? h(Hint, { key: 'more', text: 'Still looking…', role: 'status' }) : null,
     notes.map((t) => h(Hint, { key: t, text: t })));
@@ -995,7 +1261,12 @@ function Library({ t }) {
       setSt({ items: m.items, total: r.data.total || 0, status: m.items.length ? '' : S.filter.trim() ? `No matches for “${S.filter.trim()}”.` : 'Nothing here yet. Add something from the search above.' });
     } catch { if (my === m.seq && t === token && !S.out) { setSt((s) => ({ ...s, status: '' })); if (!m.items.length) failed(t); } }
   }
-  useEffect(() => { load(true); return () => clearTimeout(m.ft); }, []);
+  useEffect(() => {
+    // Sport is asked about once, so the Sport choice only shows where it is switched on.
+    if (S.kind !== 'sport') { load(true); loadFollowing(); } // the Sport list loads itself
+    return () => clearTimeout(m.ft);
+  }, []);
+  useEffect(() => { if (S.kind === 'sport' && SF.state === 'off') { S.kind = 'movies'; setKind('movies'); load(true); } }, [SF.state]);
   // Rows come in one after another when a list is first drawn (and when its kind, sort or filter changes).
   useLayoutEffect(() => { if (m.enter && st.items.length) { m.enter = false; stagger([...document.querySelectorAll('#view .list > li')]); } }, [st.items]);
   // The top line runs while the list on screen is the last answer.
@@ -1004,13 +1275,15 @@ function Library({ t }) {
     if (S.libUpd !== on) { S.libUpd = on; bump(); }
   }, [st.status]);
   useEffect(() => () => { if (S.libUpd) { S.libUpd = false; bump(); } }, []);
-  const mv = kind === 'movies';
+  const mv = kind === 'movies', sp = kind === 'sport';
+  const kinds = [['movies', 'Movies'], ['series', 'Shows']];
+  if (sp || ((SF.state === 'ok' || SF.state === 'err') && !sportOff())) kinds.push(['sport', 'Sport']);
+  const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'What to show' },
+    kinds.map(([k, l]) => h('button', { key: k, type: 'button', 'aria-pressed': String(kind === k), onClick: () => { S.kind = k; setKind(k); if (k !== 'sport') load(true); } }, l)));
+  if (sp) return h(Section, { id: 'lib', title: 'Library' }, h('div', null, h('div', { class: 'bar' }, seg), h(SportFollowing)));
   return h(Section, { id: 'lib', title: 'Library' }, h('div', null,
     h(Storage),
-    h('div', { class: 'bar' },
-      h('div', { class: 'seg', role: 'group', 'aria-label': 'What to show' },
-        [['movies', 'Movies'], ['series', 'Shows']].map(([k, l]) =>
-          h('button', { key: k, type: 'button', 'aria-pressed': String(kind === k), onClick: () => { S.kind = k; setKind(k); load(true); } }, l))),
+    h('div', { class: 'bar' }, seg,
       h('input', {
         type: 'search', class: 'filter', placeholder: 'Filter your library', 'aria-label': 'Filter your library', autocomplete: 'off', value: fv,
         onInput: (e) => { const v = e.target.value; setFv(v); clearTimeout(m.ft); m.ft = setTimeout(() => { S.filter = v; load(true); }, 250); },
@@ -1027,7 +1300,7 @@ function Library({ t }) {
 }
 
 // ---------- title pages (a show or a movie, as a sheet over the current screen) ----------
-const P = { del: null, confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null, peek: null, upd: false };
+const P = { del: null, confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null, peek: null, upd: false, tf: '', tall: false, upAll: false, touched: new Set(), polls: 0 };
 let bgHash = '';
 const enc = encodeURIComponent;
 const pct = (p) => Math.round(p * 100);
@@ -1039,15 +1312,15 @@ const fmtRuntime = (m) => (m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 6
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 function titleRoute(path) {
-  const m = /^\/(show|movie)\/(.+)$/.exec(path);
+  const m = /^\/(show|movie|league)\/(.+)$/.exec(path);
   if (!m) return null;
   let id;
   try { id = decodeURIComponent(m[2]); } catch { return null; }
-  const ok = m[1] === 'show' ? /^series:(tvdb|tvmaze):\d+$/.test(id) : /^movie:tmdb:\d+$/.test(id);
+  const ok = m[1] === 'show' ? /^series:(tvdb|tvmaze):\d+$/.test(id) : m[1] === 'league' ? /^[a-z0-9-]{2,24}$/.test(id) : /^movie:tmdb:\d+$/.test(id);
   return ok ? { kind: m[1], id } : null;
 }
 document.addEventListener('click', (e) => {
-  const a = e.target.closest && e.target.closest('a[href^="#/show/"],a[href^="#/movie/"]');
+  const a = e.target.closest && e.target.closest('a[href^="#/show/"],a[href^="#/movie/"],a[href^="#/league/"]');
   if (a) P.opener = a;
 }, true);
 
@@ -1066,8 +1339,10 @@ function openTitle(t) {
   const hit = TC.get(t.id), o = P.opener, tr = o && o.getAttribute && titleRoute(parseHash(o.getAttribute('href') || '').path);
   const row = tr && tr.id === t.id && o.isConnected ? o.closest('li') : null;
   const peek = row && o.textContent ? { title: o.textContent, year: ((row.querySelector('.meta') || {}).textContent || '').match(/\b(?:19|20)\d\d\b/)?.[0] || '' } : null;
-  if (hit) document.title = `${hit.title} · Arr`;
-  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: hit || null, peek, upd: !!hit, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, del: null, removing: false, opt: freshOpt() });
+  if (hit) document.title = `${nameOf(hit)} · Arr`;
+  // A league has no year to show; its name is on the link that was tapped, when there is one.
+  const lead = t.kind === 'league' ? (o && o.dataset && o.dataset.lg ? { title: o.dataset.lg, year: '' } : null) : peek;
+  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: hit || null, peek: lead, upd: !!hit, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, del: null, removing: false, opt: freshOpt(), tf: '', tall: false, upAll: false, touched: new Set(), polls: 0 });
   if (W.id === t.id) Object.assign(P.opt, { open: true, copiesOpen: true, season: W.season, fetch: true }); // from Needs you
   W.id = '';
   after(() => {
@@ -1120,6 +1395,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 function errText(r) {
+  if (P.kind === 'league') return r && r.status === 404 ? "Arr doesn't know that league." : r && r.status === 503 ? "Sport isn't switched on for this Arr." : "Couldn't load this league just now.";
   if (P.kind === 'movie') return r && r.status === 404 ? (S.feed && S.feed.movies_enabled === false ? "Movie details need movie search, which isn't set up yet." : "Arr doesn't have details for this movie right now.") : "Couldn't load this movie just now.";
   return r && r.status === 404 ? "Arr doesn't have an episode list for this show right now." : "Couldn't load this show just now.";
 }
@@ -1129,13 +1405,14 @@ async function loadTitle(quiet) {
   // Expanded seasons reload on their own, so a failed title read can't leave one loading forever.
   const seasons = P.kind === 'show' ? Promise.all([...P.open].map((n) => loadSeason(n, tk, sq))) : null;
   try {
-    const r = await api(`/v1/${P.kind}/${enc(P.id)}`);
+    const r = await api(P.kind === 'league' ? `/v1/sport/league/${enc(P.id)}` : `/v1/${P.kind}/${enc(P.id)}`);
     if (stale()) return;
     P.upd = false;
     if (!r.ok) { TC.delete(P.id); if (!P.data || r.status === 404) { P.data = null; P.err = errText(r); } await seasons; if (!stale()) bump(); return; }
     P.data = r.data; P.err = '';
     if (cg === cacheGen) remember(TC, P.id, r.data, 30);
-    document.title = `${r.data.title} · Arr`;
+    document.title = `${nameOf(r.data)} · Arr`;
+    if (P.kind === 'league' && cg === cacheGen) settleLeague(r.data);
     if (P.opt.fetch) { P.opt.fetch = false; loadCopies(); }
   } catch {
     if (stale()) return;
@@ -1160,7 +1437,8 @@ async function loadSeason(n, tk, sq) {
 function schedulePoll() {
   clearTimeout(P.pollT);
   if (!P.shown || document.hidden || !P.data) return;
-  const moving = P.kind === 'movie' ? P.data.state === 'on_its_way' : P.data.seasons.some((s) => s.state === 'on_its_way');
+  // A league whose schedule is being read is asked again a few times.
+  const moving = P.kind === 'league' ? !!(P.data.schedule && P.data.schedule.updating) && P.polls++ < 6 : P.kind === 'movie' ? P.data.state === 'on_its_way' : P.data.seasons.some((s) => s.state === 'on_its_way');
   if (!moving) return;
   const tk = P.token;
   P.pollT = setTimeout(() => {
@@ -1171,7 +1449,7 @@ function schedulePoll() {
 
 function Sheet() {
   const open = P.shown;
-  const body = !open ? null : P.data ? (P.kind === 'show' ? showBody() : movieBody()) : P.err ? errorBody() : skeleton();
+  const body = !open ? null : P.data ? (P.kind === 'show' ? showBody() : P.kind === 'league' ? leagueBody() : movieBody()) : P.err ? errorBody() : skeleton();
   return h('div', { id: 'sheet', class: 'sheet', hidden: !open, onClick: (e) => { if (e.target === e.currentTarget || e.target.classList.contains('scrim')) dismiss(); } },
     h('div', { class: 'scrim', 'aria-hidden': 'true' }),
     h('div', { class: 'panel', id: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title', 'aria-busy': open && (P.upd || !(P.data || P.err)) ? 'true' : null, tabindex: '-1', inert: open && (P.confirm || !!P.del) },

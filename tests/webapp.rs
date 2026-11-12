@@ -602,6 +602,161 @@ async fn the_app_has_the_delete_controls_and_reaches_the_bin_routes() {
     }
 }
 
+// ------------------------------------------------------------------ sport
+
+#[tokio::test]
+async fn the_app_has_its_sport_screens_and_promises_nothing_it_does_not_do() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let js = site
+        .plain(Method::GET, "/app/app.js")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // The league page opens like a title's, search, Home and the Library list sport, and a follow
+    // changes at once and goes back when it fails.
+    for want in [
+        "|league)\\/(.+)$/",
+        "function leagueBody()",
+        "function SportHits(",
+        "function SportFollowing()",
+        "function EventRow(",
+        "sportReq('/search?q='",
+        "'/follow' : '/unfollow'",
+        "n('sport')",
+        "['sport', 'Sport']",
+        "'Unfollow'",
+        "Updating the schedule…",
+        "Showing what Arr had.",
+        "Nothing is scheduled right now. It may be the off season.",
+        "Sport isn't switched on for this Arr.",
+        "Search for a league above",
+    ] {
+        assert!(js.contains(want), "app.js lacks {want}");
+    }
+    // What a person reads about sport says nothing of downloading, results or Plex: sport is a
+    // schedule, and there are no scores. (Comments are left out; they say why, in the open.)
+    let start = js.find("// ---------- sport:").unwrap();
+    let end = js.find("// ---------- home ----------").unwrap();
+    let comments = regex::Regex::new(r"//[^\n]*").unwrap();
+    let copy = comments.replace_all(&js[start..end], "").to_lowercase();
+    for word in [
+        "download", "score", "result", "winner", "won ", "plex", "watch", "record",
+    ] {
+        assert!(!copy.contains(word), "sport copy mentions {word}");
+    }
+    // Sport is not in the search box's words, so nothing about it shows when it is off.
+    assert!(js.contains("placeholder: 'Find a movie or show'"));
+}
+
+#[tokio::test]
+async fn the_app_follows_a_league_and_reads_its_schedule_through_the_proxy() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    let get = |path: &'static str| site.json(site.app(Method::GET, path, c));
+    let post =
+        |path: &'static str, body: Value| site.json(site.app(Method::POST, path, c).json(&body));
+    let (s, v) = get("/app/api/v1/sport/search?q=premier").await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["leagues"][0]["slug"], "premier-league");
+    assert_eq!(v["leagues"][0]["followed"], false);
+    // Following answers at once with what the app needs for its note; soccer reads home v away.
+    let (s, v) = post(
+        "/app/api/v1/sport/follow",
+        json!({ "league": "premier-league" }),
+    )
+    .await;
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["follow"]["league"]["slug"], "premier-league");
+    assert_eq!(v["schedule_read"], true, "{v}");
+    assert!(v["upcoming"].as_u64().unwrap() > 0, "{v}");
+    assert_eq!(v["next_event"]["name"], "Manchester City v Fulham", "{v}");
+    let (s, v) = get("/app/api/v1/sport/league/premier-league").await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["league"]["followed"], true);
+    assert_eq!(v["schedule"]["updating"], false);
+    assert!(
+        v["upcoming"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["name"] == "Manchester City v Fulham" && x["state"] == "scheduled"),
+        "{v}"
+    );
+    assert!(
+        v["teams"].as_array().unwrap().len() > 8,
+        "a long list to filter"
+    );
+    // Home's Coming up and the Library list.
+    let (_, v) = get("/app/api/v1/feed").await;
+    assert!(!v["sport"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!(v["sport"][0]["league"]["slug"], "premier-league");
+    let (_, v) = get("/app/api/v1/sport/following").await;
+    assert_eq!(v["following"][0]["league"]["name"], "Premier League");
+    assert_eq!(
+        v["following"][0]["next_event"]["name"],
+        "Manchester City v Fulham"
+    );
+    // A team can be followed too, then both stop.
+    let (s, v) = post(
+        "/app/api/v1/sport/follow",
+        json!({ "league": "premier-league", "team_id": "382" }),
+    )
+    .await;
+    assert_eq!(s, 201, "{v}");
+    let (_, v) = post(
+        "/app/api/v1/sport/unfollow",
+        json!({ "league": "premier-league", "team_id": "382" }),
+    )
+    .await;
+    assert_eq!(v["removed"], true);
+    let (_, v) = post(
+        "/app/api/v1/sport/unfollow",
+        json!({ "league": "premier-league" }),
+    )
+    .await;
+    assert_eq!(v["removed"], true);
+    let (_, v) = get("/app/api/v1/sport/following").await;
+    assert_eq!(v["following"], json!([]));
+    // An unknown league is a plain 404, which the page words as "doesn't know that league".
+    let (s, v) = get("/app/api/v1/sport/league/no-such-league").await;
+    assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
+}
+
+#[tokio::test]
+async fn with_sport_off_the_app_gets_the_answer_it_hides_sport_on() {
+    let e = start_exec(ExecOptions {
+        tmdb: true,
+        sports: false,
+        ..Default::default()
+    })
+    .await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    for path in [
+        "/app/api/v1/sport/search?q=premier",
+        "/app/api/v1/sport/following",
+        "/app/api/v1/sport/league/nba",
+    ] {
+        let (s, v) = site.json(site.app(Method::GET, path, c)).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (503, Some("provider_not_configured")),
+            "{path}"
+        );
+    }
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/feed", c))
+        .await;
+    assert_eq!((s, v["sport"].clone()), (200, json!([])), "{v}");
+}
+
 // ------------------------------------------------------------------ feed
 
 fn matrix_files() -> Vec<(String, Vec<u8>)> {
