@@ -2321,7 +2321,7 @@ function App() {
   }, []);
   // After every redraw: the sheet's scroll lock, focus a redraw took away, then what was waiting.
   useLayoutEffect(() => {
-    document.body.classList.toggle('sheet-open', P.shown);
+    document.documentElement.classList.toggle('sheet-open', P.shown);
     const pk = pendingFk, a = document.activeElement;
     pendingFk = null;
     if (pk && pk.fk && (!a || a === document.body || !a.isConnected)) {

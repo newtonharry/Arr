@@ -167,7 +167,7 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 /* show and movie pages: a sheet over the current screen */
 :root{--scrim:rgba(35,48,47,.45)}
 @media (prefers-color-scheme:dark){:root{--scrim:rgba(0,0,0,.6)}}
-body.sheet-open{overflow:hidden}
+html.sheet-open{overflow:hidden}
 .sheet{position:fixed;inset:0;z-index:30}
 .panel{position:absolute;inset:0;overflow-y:auto;overscroll-behavior:contain;background:var(--bg);outline:0;padding:0 20px calc(28px + env(safe-area-inset-bottom))}
 .scrim{position:absolute;inset:0;background:var(--scrim)}
