@@ -793,9 +793,10 @@ function EarlierRow({ e }) {
 const SPORT_ROWS = 6;
 async function findSport(q, signal) {
   if (sportOff()) return null;
+  const cg = cacheGen;
   const r = await sportReq('/search?q=' + encodeURIComponent(q), { signal });
   if (!r || !r.ok || !r.data) return null;
-  settle([...(r.data.leagues || []).map((l) => lkey(l.slug)), ...(r.data.teams || []).map((x) => tkey(x.league.slug, x.team.id))]);
+  if (cg === cacheGen) settle([...(r.data.leagues || []).map((l) => lkey(l.slug)), ...(r.data.teams || []).map((x) => tkey(x.league.slug, x.team.id))]);
   return { leagues: r.data.leagues || [], teams: r.data.teams || [] };
 }
 function SportHit({ l, t }) {
