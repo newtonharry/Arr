@@ -46,6 +46,33 @@ function fly(src, a, b) {
   setTimeout(() => g.remove(), 1200);
   return an;
 }
+// Rows that move (a download arriving, a card going, the list closing the gap) glide from where they
+// were to where they are. bump() notes where the keyed rows are before a redraw, and the redraw plays it.
+let snap = null;
+function measureFlip() {
+  const rects = new Map(), seen = new Map();
+  for (const e of document.querySelectorAll('#view [data-flip]')) {
+    const k = e.dataset.flip, r = e.getBoundingClientRect();
+    seen.set(k, (seen.get(k) || 0) + 1);
+    rects.set(k, { left: r.left, top: r.top + scrollY });
+  }
+  for (const [k, n] of seen) if (n > 1) rects.delete(k); // an id that appears twice can't be followed
+  return { tok: token, t: V.t, rects };
+}
+function playFlip(sn) {
+  const els = [...document.querySelectorAll('#view [data-flip]')];
+  for (const e of els) { e._fl?.cancel(); e._fl = null; }
+  if (sn.tok !== token || sn.t !== V.t) return;
+  for (const e of els) {
+    const a = sn.rects.get(e.dataset.flip);
+    if (!a) continue;
+    const r = e.getBoundingClientRect(), dx = a.left - r.left, dy = a.top - (r.top + scrollY);
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
+    e._fl = anim(e, [{ transform: `translate(${dx}px,${dy}px)` }, { transform: 'none' }], { duration: 480, easing: SOFT });
+  }
+}
+// A card that is going: it shrinks away first, then the others close the gap.
+function leave(el) { return el ? settled(anim(el, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200, fill: 'forwards' }), () => {}) : Promise.resolve(); }
 const hideEl = (el, on) => { if (el) el.style.visibility = on ? 'hidden' : ''; };
 // Answers kept in memory so a screen can show the last one at once while a fresh one is fetched.
 // Anything the person changes makes them wrong, so bust() forgets them all.
@@ -86,6 +113,7 @@ function focusKey() {
   return { fk, panel: !!(p && p.contains(a)) };
 }
 function bump() {
+  if (!snap && !reduced() && V.t !== 'skel') snap = measureFlip();
   if (!pendingFk) pendingFk = focusKey() || { fk: '' };
   rerender();
 }
@@ -207,16 +235,39 @@ let TOAST = null, toastT = 0, toastN = 0;
 const held = { hover: false, focus: false };
 function toastTimer() {
   clearTimeout(toastT);
-  if (!TOAST || held.hover || held.focus) return;
+  if (!TOAST) return;
+  if (held.hover || held.focus) { ringAn?.pause(); return; }
+  ringTo(true);
   const n = TOAST.n;
   toastT = setTimeout(() => { if (TOAST && TOAST.n === n) closeToast(); }, 6000);
 }
-function closeToast() { TOAST = null; held.hover = held.focus = false; clearTimeout(toastT); bump(); }
+function toastOut() {
+  const el = $('#toast');
+  if (!el || reduced()) return;
+  const c = el.cloneNode(true);
+  c.removeAttribute('id'); c.inert = true; c.setAttribute('aria-hidden', 'true'); c.style.pointerEvents = 'none';
+  el.parentNode.append(c);
+  settled(anim(c, [{ transform: 'none', opacity: 1 }, { transform: 'translateY(140%)', opacity: 0 }], { duration: 240, fill: 'forwards' }), () => c.remove());
+  setTimeout(() => c.remove(), 800);
+}
+// The ring on Undo drains over the time the toast has left, and starts again whenever that time does.
+let ringAn = null;
+function ringTo(run) {
+  ringAn?.cancel(); ringAn = null;
+  const c = $('#toast .ring circle');
+  if (c && run && !reduced()) ringAn = c.animate([{ strokeDashoffset: 0 }, { strokeDashoffset: 44 }], { duration: 6000, easing: 'linear', fill: 'forwards' });
+}
+function closeToast() { toastOut(); ringTo(false); TOAST = null; held.hover = held.focus = false; clearTimeout(toastT); bump(); }
 // `t` is { before, title, after }: "Added " + the title in bold + a tail. `undo` is async and says
 // in a sentence what it did, or returns null if it could not.
 function showToast(t, undo) {
-  TOAST = { ...t, n: ++toastN, undo: undo || null, busy: false };
+  const had = !!TOAST, n = ++toastN;
+  TOAST = { ...t, n, undo: undo || null, busy: false };
   toastTimer(); bump();
+  after(() => {
+    if (!had) anim($('#toast'), [{ transform: 'translateY(140%)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 440, easing: SPRING });
+    if (TOAST && TOAST.n === n && !held.hover && !held.focus) ringTo(true);
+  });
 }
 function toastAdded(title, outcome, detail, undo) {
   if (outcome === 'in_plex') return showToast({ before: '', title, after: ' is already in Plex.' });
@@ -256,7 +307,8 @@ function Toast() {
   const t = TOAST;
   return h('div', { class: 'toast-region', 'aria-live': 'polite' }, t && h('div', { id: 'toast', class: 'toast', tabindex: '-1' },
     h('span', { class: 'toast-t' }, t.before, t.title ? h('b', null, t.title) : null, t.after),
-    t.undo && h('button', { type: 'button', class: 'toast-undo', 'data-s': t.busy ? 'busy' : null, 'aria-disabled': t.busy ? 'true' : 'false', 'aria-keyshortcuts': 'Z', onClick: undoToast }, t.busy ? 'Undoing…' : 'Undo')));
+    t.undo && h('button', { type: 'button', class: 'toast-undo', 'data-s': t.busy ? 'busy' : null, 'aria-disabled': t.busy ? 'true' : 'false', 'aria-keyshortcuts': 'Z', onClick: undoToast }, t.busy ? 'Undoing…' : 'Undo',
+      h('svg', { class: 'ring', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, h('circle', { cx: 9, cy: 9, r: 7 })))));
 }
 // Undo takes the add back by removing the title from Arr (POST /remove): downloads that have not
 // finished are cancelled, a request still retrying ends, and Arr stops tracking it. Files already in
@@ -280,24 +332,39 @@ function addBtn(it) {
   return h('button', {
     type: 'button', class: 'btn', 'data-fk': 'add:' + it.id, 'data-s': s, 'aria-disabled': s === 'add' ? 'false' : 'true',
     'aria-label': s === 'add' ? `Add ${it.title}` : `${L[1]}, ${it.title}`, onClick: () => addOne(it),
-  }, L[0] ? ic(L[0]) : null, L[1]);
+  }, s === 'busy' ? h('span', { class: 'spin', 'aria-hidden': 'true' }) : s === 'added' && st.pop ? tickIc() : L[0] ? ic(L[0]) : null, L[1]);
+}
+// The tick draws itself the moment an add succeeds; in every other place it is simply there.
+const tickIc = () => h('svg', { viewBox: '0 0 24 24', class: 'ic tick', 'aria-hidden': 'true' }, h('path', { d: ICONS.check }));
+const addEl = (id) => document.querySelector(`[data-fk="add:${CSS.escape(id)}"]`);
+// Tap: a squish. Added: the button pops and the poster hops. Failed: a shake, next to the message.
+function addFx(id, kind) {
+  after(() => {
+    const b = addEl(id);
+    if (!b) return;
+    if (kind === 'tap') anim(b, [{ transform: 'scale(1)' }, { transform: 'scale(.88)' }, { transform: 'scale(1)' }], { duration: 260 });
+    else if (kind === 'ok') {
+      anim(b, [{ transform: 'scale(.7)' }, { transform: 'scale(1)' }], { duration: 520, easing: SPRING });
+      anim(tileOf(b), [{ transform: 'none' }, { transform: 'translateY(-7px) rotate(-4deg)' }, { transform: 'none' }], { duration: 520, easing: SPRING });
+    } else anim(b, [0, -7, 7, -5, 5, -2, 0].map((x) => ({ transform: `translateX(${x}px)` })), { duration: 420, easing: 'linear' });
+  });
 }
 const Msg = ({ st }) => h('p', { class: 'msg', 'data-err': st.err ? '' : null }, st.msg || null);
 const addMsg = (it) => h(Msg, { st: A.get(it.id) || {} });
 async function addOne(it) {
   const st0 = A.get(it.id) || {};
   if ((st0.busy ? 'busy' : st0.state || it.base) !== 'add') return;
-  A.set(it.id, { busy: true }); bump();
+  A.set(it.id, { busy: true }); bump(); addFx(it.id, 'tap');
   let next, got = null;
   try {
     const r = await api('/v1/quick-add', { method: 'POST', body: { media_id: it.id } });
     if (r.ok && r.data) {
       const o = r.data.outcome;
       got = r.data;
-      next = { msg: r.data.message || 'Added.', state: o === 'in_plex' ? 'inplex' : o === 'following' ? 'following' : o === 'movies_off' ? undefined : 'added', err: o === 'movies_off' };
+      next = { msg: r.data.message || 'Added.', state: o === 'in_plex' ? 'inplex' : o === 'following' ? 'following' : o === 'movies_off' ? undefined : 'added', err: o === 'movies_off', pop: o !== 'movies_off' };
     } else next = { msg: "Couldn't add this one. Try again in a moment.", err: true };
   } catch { next = { msg: "Couldn't reach Arr. Try again in a moment.", err: true }; }
-  A.set(it.id, next); bump(); say(next.msg);
+  A.set(it.id, next); bump(); say(next.msg); addFx(it.id, next.err ? 'bad' : 'ok');
   bust();
   if (next.err) return;
   // Undo only for a title Arr did not track at all before this tap (the search result says so).
@@ -349,15 +416,16 @@ const owned = (x) => (x.owned ?? x.in_library) === true;
 async function hideIdea(x) {
   const list = (S.ideas && S.ideas.items) || [], at = list.indexOf(x);
   if (at < 0) return;
-  S.ideas = { ...S.ideas, items: list.filter((i) => i !== x) };
+  const post = api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } }).then((r) => r.ok, () => false); // asked now; the card shrinks meanwhile
+  await leave(document.querySelector(`[data-fk="hide:${CSS.escape(x.media_id)}"]`)?.closest('li'));
+  S.ideas = { ...S.ideas, items: ((S.ideas && S.ideas.items) || list).filter((i) => i.media_id !== x.media_id) };
   const back = () => { S.ideas = { ...S.ideas, items: S.ideas.items.some((i) => i.media_id === x.media_id) ? S.ideas.items : [...S.ideas.items.slice(0, at), x, ...S.ideas.items.slice(at)] }; };
   toast('Hidden', async () => {
     back(); bump();
     try { await api('/v1/ideas/hide/' + encodeURIComponent(x.media_id), { method: 'DELETE' }); } catch { /* shown again for now; hidden again on the next load */ }
     return { ok: true, text: 'It is back in Ideas.' };
   });
-  let ok = false;
-  try { ok = (await api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } })).ok; } catch { /* below */ }
+  const ok = await post;
   if (!ok) { back(); toast("Couldn't hide that. Try again in a moment."); }
 }
 const notInterested = (x) => h('button', { type: 'button', class: 'link quiet', 'data-fk': 'hide:' + x.media_id, 'aria-label': `Not interested in ${x.title}`, onClick: () => hideIdea(x) }, 'Not interested');
@@ -399,13 +467,13 @@ function NeedRow({ it }) {
     ? h('a', { class: 'btn coral', href: titleHref(it.media_id), 'data-fk': id, 'aria-label': `Choose a copy yourself, ${it.title}`, onClick: () => wantCopies(it) }, ic('right'), 'Choose a copy yourself')
     : h('button', { type: 'button', class: 'btn coral', 'data-fk': id, 'aria-disabled': off ? 'true' : 'false', 'aria-label': `Try again, ${it.title}`, onClick: () => retryOne(it) },
       ic('retry'), st.busy ? 'Trying…' : st.state ? 'Trying again' : 'Try again');
-  return h('li', { class: 'item need' }, h(Tile, { title: it.title, mediaId: it.media_id }),
+  return h('li', { class: 'item need', 'data-flip': it.media_id }, h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h(Title, { title: it.title, id: it.media_id }),
       meta(it) && h('p', { class: 'meta' }, meta(it)),
       h('p', { class: 'problem' }, ic('alert'), h('span', null, text)), h(Msg, { st }), btn));
 }
 function ArrivedRow({ it }) {
-  return h('li', { class: 'item arrived' }, h(Tile, { title: it.title, mediaId: it.media_id }),
+  return h('li', { class: 'item arrived', 'data-flip': it.media_id }, h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h('span', { class: 'tag' }, ic('check'), 'In Plex'),
       h(Title, { title: it.title, id: it.media_id }), h('p', { class: 'meta' }, joinDot(it.detail, ago(it.at)))));
 }
@@ -418,7 +486,7 @@ function fmtLeft(sec) {
 }
 const STAGES = ['Found', 'Downloading', 'Checking', 'In Plex'];
 // The bar slides from where it last was to where it is now.
-function Journey({ stage, p, fkey, paused }) {
+function Journey({ stage, p, fkey, paused, live }) {
   const el = useRef(null);
   const target = stage === 1 ? (1 + (p ?? 0)) / 3 : stage / 3;
   useLayoutEffect(() => {
@@ -429,22 +497,40 @@ function Journey({ stage, p, fkey, paused }) {
     });
     return () => { cancelAnimationFrame(a); cancelAnimationFrame(b); };
   }, [fkey, target]);
-  return h('ol', { class: 'journey' + (paused ? ' paused' : ''), 'aria-label': 'Progress' }, h('i', { class: 'fill', ref: el }),
+  return h('ol', { class: 'journey' + (paused ? ' paused' : ''), 'aria-label': 'Progress' }, h('i', { class: 'fill' + (live ? ' live' : ''), ref: el }),
     STAGES.map((s, i) => h('li', { key: s, class: i <= stage ? 'on' : '', 'aria-current': i === stage ? 'step' : null }, s)));
+}
+// A number that counts up to its new value instead of jumping.
+function Count({ to }) {
+  const [v, setV] = useState(to), cur = useRef(to);
+  useEffect(() => {
+    if (reduced() || cur.current === to) { cur.current = to; setV(to); return; }
+    const a = cur.current, t0 = performance.now();
+    let raf = 0;
+    const f = (t) => {
+      const k = Math.min(1, (t - t0) / 800), n = Math.round(a + (to - a) * (1 - (1 - k) ** 3));
+      cur.current = n; setV(n);
+      if (k < 1) raf = requestAnimationFrame(f);
+    };
+    raf = requestAnimationFrame(f);
+    return () => cancelAnimationFrame(raf);
+  }, [to]);
+  return v;
 }
 function WayRow({ it }) {
   const stage = Math.max(0, ['found', 'downloading', 'checking'].indexOf(it.stage));
   const p = typeof it.progress === 'number' ? Math.min(1, Math.max(0, it.progress)) : null;
   const left = stage === 1 && p != null && !it.paused ? fmtLeft(it.eta_seconds) : '';
-  const status = it.paused ? 'Paused' : stage === 0 ? 'Found, getting ready' : stage === 1 ? (p == null ? 'Downloading' : left ? `${Math.round(p * 100)}% · ${left}` : `${Math.round(p * 100)}% downloaded`) : 'Checking the file';
-  return h('li', { class: 'item' }, h(Tile, { title: it.title, mediaId: it.media_id }),
+  const pc = p == null ? 0 : Math.round(p * 100);
+  const status = it.paused ? 'Paused' : stage === 0 ? 'Found, getting ready' : stage === 1 ? (p == null ? 'Downloading' : [h(Count, { key: 'n', to: pc }), left ? `% · ${left}` : '% downloaded']) : 'Checking the file';
+  return h('li', { class: 'item', 'data-flip': it.media_id }, h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h(Title, { title: it.title, id: it.media_id }),
-      h('p', { class: 'meta status' }, it.paused && ic('pause'), joinDot(meta(it), status)),
-      h(Journey, { stage, p, fkey: it.grab_id, paused: it.paused })));
+      h('p', { class: 'meta status' }, it.paused && ic('pause'), meta(it), meta(it) ? ' · ' : null, status),
+      h(Journey, { stage, p, fkey: it.grab_id, paused: it.paused, live: stage === 1 && !it.paused })));
 }
 function LookRow({ it }) {
   const until = it.until ? parseDate(it.until) : null;
-  return h('li', { class: 'item' }, until ? chip(until, 'month') : h(Tile, { title: it.title, mediaId: it.media_id }),
+  return h('li', { class: 'item', 'data-flip': it.media_id }, until ? chip(until, 'month') : h(Tile, { title: it.title, mediaId: it.media_id }),
     h('div', { class: 'what' }, h(Title, { title: it.title, id: it.media_id }),
       h('p', { class: 'meta' }, joinDot(meta(it), until ? `Out ${fmtDay(until)}. Arr will get it then.` : 'Arr is looking for a copy'))));
 }
@@ -495,11 +581,11 @@ function ideaMeta(x, ...facts) {
   return [h('p', { class: 'meta' }, r, r && text ? ' · ' : null, text), sc];
 }
 function IdeaCard({ x, plain }) {
-  return h('li', { class: 'idea' }, h(Tile, { title: x.title, mediaId: x.media_id }), h(Title, { title: x.title, id: x.media_id }),
+  return h('li', { class: 'idea', 'data-flip': x.media_id }, h(Tile, { title: x.title, mediaId: x.media_id }), h(Title, { title: x.title, id: x.media_id }),
     ideaMeta(x, x.network || x.year || ''), chooseLink(x), plain ? null : notInterested(x));
 }
 function IdeaRow({ x }) {
-  return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
+  return h('li', { class: 'item top-align', 'data-flip': x.media_id }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }),
       ideaMeta(x, x.year, x.network), x.summary && h('p', { class: 'clamp' }, x.summary), notInterested(x)), chooseLink(x));
 }
@@ -1626,7 +1712,7 @@ function movieBody() {
       h('div', { class: 'what' },
         st === 'in_plex' ? h('span', { class: 'tag' }, ic('check'), 'In Plex') : null,
         h('p', { class: 'st' }, st === 'in_plex' ? 'Ready to watch' : line),
-        st === 'on_its_way' ? h(Journey, { stage: p == null ? 0 : 1, p, fkey: 'movie:' + d.media_id }) : null,
+        st === 'on_its_way' ? h(Journey, { stage: p == null ? 0 : 1, p, fkey: 'movie:' + d.media_id, live: p != null }) : null,
         msgFor(key)),
       control && h('div', { class: 'act' }, control)),
     optionsPanel(),
@@ -2156,7 +2242,8 @@ function App() {
       $(pk.panel ? '#panel' : '#view')?.querySelector(`[data-fk="${CSS.escape(pk.fk)}"]`)?.focus({ preventScroll: true });
     }
     // A screen's rows come in one after another, the first time they are drawn and never again.
-    if (M.fresh && ENTER.has(V.t)) { M.fresh = false; enterRows(); }
+    const sn = snap; snap = null;
+    if (M.fresh && ENTER.has(V.t)) { M.fresh = false; enterRows(); } else if (sn) playFlip(sn);
     for (const fn of later.splice(0)) fn();
   });
   const tabAt = TABS.findIndex((t) => t[0] === R.path);
