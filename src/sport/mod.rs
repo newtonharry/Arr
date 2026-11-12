@@ -93,6 +93,7 @@ pub fn follow_json(f: &FollowRow) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::catalog;
     use super::espn::parse_month;
 
     /// The feed's scoreboard shape, with the fields that give a result away.
@@ -106,7 +107,7 @@ mod tests {
 
     #[test]
     fn a_scoreboard_is_read_without_its_result() {
-        let m = parse_month(BOARD.as_bytes()).unwrap();
+        let m = parse_month(BOARD.as_bytes(), catalog::find("premier-league").unwrap()).unwrap();
         assert_eq!(
             m.fixtures.len(),
             1,

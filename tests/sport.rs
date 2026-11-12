@@ -1870,3 +1870,160 @@ async fn a_worker_pass_does_not_wait_on_reads_that_are_in_flight() {
     }
     assert!(done, "the background read of ufc never finished");
 }
+
+// ------------------------------------------------------------------ review round 3
+
+#[tokio::test]
+async fn every_text_field_that_carries_a_result_is_neutral_in_the_store_and_every_answer() {
+    let e = start_exec(ExecOptions::default()).await;
+    {
+        let mut m = e.mock.lock().unwrap();
+        for ev in m.espn_events.get_mut(EPL).unwrap().iter_mut() {
+            ev["season"]["year"] = json!("Smith def. Jones");
+            for comp in ev["competitions"].as_array_mut().unwrap() {
+                comp["venue"]["fullName"] = json!("Jones wins by KO");
+                for c in comp["competitors"].as_array_mut().unwrap() {
+                    if c["team"]["id"] == "382" {
+                        c["team"]["displayName"] = json!("Manchester City def. Fulham");
+                        c["team"]["shortDisplayName"] = json!("Man City 3-1");
+                        c["team"]["abbreviation"] = json!("MNC 3-1 FUL");
+                    }
+                }
+            }
+        }
+        let list = m.espn_teams.get_mut(EPL).unwrap();
+        for t in list["sports"][0]["leagues"][0]["teams"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if t["team"]["id"] == "382" {
+                t["team"]["displayName"] = json!("Jones wins by KO");
+                t["team"]["shortDisplayName"] = json!("3-1");
+                t["team"]["abbreviation"] = json!("3-1");
+            }
+        }
+    }
+    follow(&e, json!({ "league": "premier-league" })).await;
+    let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!(s, 201, "{v}");
+    // What a follow stores for a team whose name did not fit.
+    assert_eq!(
+        v["follow"]["team"],
+        json!({ "id": "382", "name": "Team 382" })
+    );
+    let rows = stored(
+        &e,
+        "SELECT group_concat(COALESCE(name, '') || '|' || COALESCE(short_name, '') || '|' || COALESCE(home_name, '') || '|' || COALESCE(away_name, '') || '|' || COALESCE(venue, '') || '|' || COALESCE(season, ''), ' ; ') FROM sport_events",
+    )
+    .await
+    .join(" ");
+    let teams = stored(
+        &e,
+        "SELECT group_concat(name || '|' || COALESCE(short_name, '') || '|' || COALESCE(abbreviation, ''), ' ; ') FROM sport_teams",
+    )
+    .await
+    .join(" ");
+    let follows = stored(
+        &e,
+        "SELECT group_concat(COALESCE(team_name, ''), ' ; ') FROM sport_follows",
+    )
+    .await
+    .join(" ");
+    let wide = wide_events();
+    let mut seen = vec![rows.clone(), teams.clone(), follows.clone()];
+    for path in [
+        wide.as_str(),
+        "/api/v1/sport/league/premier-league",
+        "/api/v1/sport/following",
+        "/api/v1/sport/search?q=Team",
+        "/api/v1/feed",
+        "/api/v1/calendar",
+    ] {
+        let (s, _, text) = e.json(e.get(path)).await;
+        assert_eq!(s, 200, "{path}");
+        seen.push(text);
+    }
+    for text in &seen {
+        for bad in ["def.", "3-1", "wins by", "Smith", "Jones", "KO"] {
+            assert!(!text.contains(bad), "{bad} in {text}");
+        }
+    }
+    assert!(rows.contains("Fulham at Team 382"), "{rows}");
+    assert!(teams.contains("Team 382|"), "{teams}");
+    // The season is dropped, the venue too; the event and the team are still there.
+    assert!(!rows.contains("Smith") && !rows.contains("Etihad"));
+    let (_, v) = get(&e, &wide_events()).await;
+    let game = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == format!("event:premier-league:{FULHAM_AT_CITY}"))
+        .unwrap();
+    assert_eq!(game["name"], "Fulham at Team 382");
+    assert_eq!(game["home"], json!({ "id": "382", "name": "Team 382" }));
+    assert_eq!(game["short_name"], Value::Null);
+    assert_eq!(
+        (&game["venue"], &game["season"]),
+        (&Value::Null, &Value::Null)
+    );
+}
+
+#[tokio::test]
+async fn a_team_is_missing_only_by_a_current_list_and_unavailable_by_a_stale_one() {
+    let e = start_exec(ExecOptions::default()).await;
+    // A list read last season: it has no team 382 (newly promoted), and it is old.
+    follow(&e, json!({ "league": "premier-league" })).await;
+    e.state
+        .store
+        .with(|c| {
+            let old = "2026-01-01T00:00:00Z";
+            c.execute(
+                "UPDATE sport_refresh SET teams_utc = ?1, teams_next_try_utc = NULL",
+                [old],
+            )?;
+            c.execute("DELETE FROM sport_teams WHERE team_id = '382'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // The refresh that is due fails: 503, not 404.
+    e.mock.lock().unwrap().espn_garbage = vec!["teams".into()];
+    let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (503, Some("upstream_unavailable")),
+        "{v}"
+    );
+    // While it is waited out, still 503. A team that the stored list has can be followed.
+    let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!(s, 503, "{v}");
+    let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "359" })).await;
+    assert_eq!(
+        s, 201,
+        "the source is down but Arsenal is in the stored list: {v}"
+    );
+    // The source recovers with the team in it.
+    e.mock.lock().unwrap().espn_garbage = vec![];
+    e.state
+        .store
+        .with(|c| {
+            c.execute("UPDATE sport_refresh SET teams_next_try_utc = NULL", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["follow"]["team"]["name"], "Manchester City");
+    // A current list that does not have the team says so.
+    let (s, v) = follow(
+        &e,
+        json!({ "league": "premier-league", "team_id": "999999" }),
+    )
+    .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (404, Some("not_found")),
+        "{v}"
+    );
+}

@@ -180,7 +180,7 @@ async fn read_league(
     let mut complete_months: Vec<(i32, u8)> = vec![];
     let mut failed = None;
     for (y, m) in months(from, to) {
-        match sports.espn.month(league.espn, y, m).await {
+        match sports.espn.month(league, y, m).await {
             Ok(month) => {
                 seen.extend(month.fixtures.iter().map(|f| f.id.clone()));
                 seen.extend(month.rejected_ids.iter().cloned());
@@ -237,6 +237,14 @@ async fn read_league(
         Some(e) => Err(e.into()),
         None => Ok(stats),
     }
+}
+
+/// Whether the league's team list was read successfully and recently enough to say who is in
+/// the league. Only such a list may answer "no such team".
+pub fn teams_current(state: &data::RefreshRow, now: OffsetDateTime) -> bool {
+    state
+        .teams
+        .is_some_and(|t| now - t < time::Duration::try_from(TEAMS_STALE).unwrap_or_default())
 }
 
 /// Reads the league's team list unless it was read within the week (or never produced a team).

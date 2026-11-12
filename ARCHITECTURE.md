@@ -478,6 +478,34 @@ What exists (phase one: schedules and follows):
   budget (see the Sport section of [`docs/API.md`](docs/API.md)), and the `/api/v1/sport/*`
   routes, plus a `sport` field on `/feed` and `/calendar`.
 
+### No results
+
+Sport never keeps or shows how a contest went. The contract, which `src/sport/espn.rs`
+follows:
+
+- **Structural.** Score, winner, status-text and record fields are never parsed: no struct has a
+  place for them (the status is read only as the name and state that become `scheduled`,
+  `postponed`, `cancelled` or `played`). Athletes' names are not parsed at all.
+- **Positive rules.** Every string taken from the schedule source is accepted by a positive rule
+  for its kind, never by "anything except a denylist": ids are digits; times are parsed;
+  a season is `YYYY`, `YYYY-YY` or `YYYY-YYYY`; a round is exactly one of a list of labels
+  ("Round 12", "Group B", "Semi-final", ...) rebuilt by Arr; an abbreviation is up to six
+  letters, digits or `&`; a team, short or venue name is letters, digits, spaces and
+  `. ' & - / ( )` within a length bound; a game between two teams is named by Arr from the two
+  team names (`<Away> at <Home>`), its short name from the abbreviations; a fight card's title
+  begins with one of the league's own names and has a small tail and optionally
+  `: <Name> vs. <Name>`; a tournament title is capitalised words, numbers and a few small
+  connectors. A string that does not fit becomes a neutral value made from Arr's own data
+  (`Team <id>`, `<League> event on <date>`) or null. The event or team itself is never hidden
+  because of it.
+- **Reject list.** On top of each positive rule, text that reads like a score (`3-1`) or contains
+  an outcome word as a whole word (def, beat, wins, winner, won, lost to, draw, ko, tko,
+  submits, taps, stops, decision, forfeit, champion, upset, ...; "Championship" and
+  "Decker" are not outcome words) is refused.
+- **Known limit.** A positive rule for names cannot prove that a proper noun is not a result
+  written in title case ("Smith Overcomes Jones" is made of capitalised words); the reject list is
+  what stands behind that case, and a result phrased without any listed word would pass it.
+
 What does not exist yet: release matching for events, downloading, filing and Plex refresh for
 sport, automatic pickup, any web app page for sport (the app's proxy already allows the routes),
 and a stored history older than yesterday.

@@ -269,12 +269,18 @@ pub(super) async fn follow(State(st): St, ApiJson(b): ApiJson<FollowBody>) -> Ap
                     .await
                     .map_err(internal("sport follow"))?;
                 if found.is_none() {
-                    // Only a list that was really read can say a team is not in the league;
-                    // without one (never read, or the source failing and being waited out)
-                    // the answer is "try again", not "no such team".
+                    // Only a list that was read successfully and is still current can say a
+                    // team is not in the league; without one (never read, stale and the
+                    // refresh failing, slow or being waited out) the answer is "try again",
+                    // not "no such team".
                     let listed = st
                         .store
-                        .with(move |c| Ok(data::refresh_state(c, slug)?.teams.is_some()))
+                        .with(move |c| {
+                            Ok(refresh::teams_current(
+                                &data::refresh_state(c, slug)?,
+                                OffsetDateTime::now_utc(),
+                            ))
+                        })
                         .await
                         .map_err(internal("sport follow"))?;
                     return Err(if listed {

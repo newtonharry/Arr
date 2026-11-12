@@ -348,13 +348,20 @@ routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry a
   is at the home team's ground in a neutral-venue competition. `short_name` is built from the
   teams' abbreviations the same way ("FUL @ MNC"), or `null`. The feed's own `name` and
   `shortName` are never copied for these. Events with no two sides (a fight card, a
-  tournament) keep the feed's title only if it fits a plain grammar: a heading of letters,
-  digits, spaces and `' & . - + / ( ) # ,`, optionally followed by `: <Name> vs. <Name>`
-  (`vs`, `vs.` or `v`), with no score-like pattern (`3-1`) and no outcome word as a whole word
-  (def, dec, beat, wins, won, lost to, draw, KO, TKO, submission, decision, forfeit, walkover,
-  retired, champion, ...; "Championship", "Decker" or "Winston" are fine). Otherwise the event
-  is kept under the name `<League> event on <YYYY-MM-DD>` (UTC). `venue` is kept only from the
-  structured venue name and only if it passes the same character and outcome checks.
+  tournament) keep the feed's title only if it fits the grammar of its kind. A fight card must
+  begin with one of its league's own names ("UFC", "PFL", ...), then a small tail (a number,
+  "Fight Night", "on ESPN 61", up to five capitalised place words), then optionally `: <Name>
+  vs. <Name>` (`vs`, `vs.` or `v`; one to four capitalised name tokens each). A tournament
+  title is capitalised words, all-caps words, numbers and a few small connectors (the, of, in,
+  at, by, and, de, del, la, presented, pres., for, on). Both must also read like no score
+  (`3-1`) and contain no outcome word as a whole word (def, dec, beat, wins, winner, won, lost
+  to, draw, KO, TKO, submits, taps, stops, decision, forfeit, champion, upset, ...;
+  "Championship", "Decker" or "Winston" are fine). Otherwise the event is kept under the name
+  `<League> event on <YYYY-MM-DD>` (UTC). Every other text from the feed follows the same
+  idea: team names, short names and venues are plain names (letters, digits, spaces and
+  `. ' & - / ( )`, bounded) that pass the reject list, and a team whose name does not is called
+  `Team <id>`; an abbreviation is up to six letters, digits or `&`; a `season` is `2026`,
+  `2026-27` or `2026-2027`, else `null`. See "No results" in `ARCHITECTURE.md`.
 - **Ids.** A league is `league:<slug>` (`league:nba`; routes also accept the bare slug), a game,
   fight card or tournament is `event:<slug>:<number>` (`event:nba:401909999`). Slugs are
   `[a-z0-9-]{2,24}`; the number is the feed's own, digits without leading zeros. A team is the
@@ -425,9 +432,11 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
   real), `upcoming` (events of this follow in the next three weeks) and `next_event` (an event
   or `null`). The follow is recorded even when the feed is down; the schedule is then read later
   by the worker. Refusals: `404 not_found` for an unknown league or a team the league does not
-  have (only once its team list was really read), `400 invalid_request` for a team of golf or MMA or a `team_id` that is not a number, and
-  `503 upstream_unavailable` while no team list has been read (the source failing, or a retry
-  being waited out): a valid team is never reported as missing because the list is unavailable.
+  have (only when a team list that was read successfully, within the last week, does not have it), `400 invalid_request` for a team of golf or MMA or a `team_id` that is not a number, and
+  `503 upstream_unavailable` while no current team list exists (never read, or stale and the
+  refresh failing, slow or being waited out): a valid team is never reported as missing because
+  the list is unavailable. A team that the stored list has can be followed while the source is
+  down.
 - **`POST /api/v1/sport/unfollow`** takes the same body and answers `{"removed": true|false}`.
   Unfollowing something not followed is not an error.
 - **`GET /api/v1/sport/following`** lists the follows, each as in `follow` with `next_event`.
