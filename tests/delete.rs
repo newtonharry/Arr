@@ -763,3 +763,201 @@ async fn a_restored_file_with_an_unnumbered_name_is_owned_again() {
     assert_eq!((s, r["restored"].clone()), (200, json!(1)), "{r}");
     assert_eq!(owned(&preview(&e, ep).await.1), 1, "owned again");
 }
+
+#[tokio::test]
+async fn stopping_what_was_deleted_leaves_a_torrent_other_grabs_still_use() {
+    let e = start_exec(ExecOptions::default()).await;
+    // E02 is being downloaded on its own, then a file for it turns up in the library.
+    let t = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
+    let (single_hash, r) = e.publish(t, t, vec![(format!("{t}.mkv"), mkv(1))], 1.5, false);
+    e.search_results("Slow Horses S01E02", vec![r]);
+    let (_, v, _) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "episode:tvdb:372264:1:2", "execute": true })),
+        )
+        .await;
+    let single = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    let rel = "Slow Horses/Season 1/Slow.Horses.S01E02.1080p.WEB-DL.x264-OLD.mkv";
+    put(&e.tv, rel, &mkv(1));
+    e.state
+        .store
+        .blocking(move |c| {
+            let ev = arr::scan::file_evidence(rel, 5, "2020-01-01T00:00:00Z");
+            arr::library::insert_file(
+                c,
+                "series:tvdb:372264",
+                &ev,
+                &["episode:tvdb:372264:1:2".parse().unwrap()],
+                None,
+                None,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // The season pack for the rest is downloading too, and is the same torrent as the single.
+    let name = "Slow.Horses.S01.1080p.WEB-DL.x264-PACK";
+    let files: Vec<(String, Vec<u8>)> = (1..=6)
+        .map(|n| {
+            (
+                format!("Slow.Horses.S01E{n:02}.1080p.WEB-DL.x264-PACK.mkv"),
+                mkv(1),
+            )
+        })
+        .collect();
+    let (pack_hash, r) = e.publish(name, name, files, 12.0, false);
+    e.search_results("Slow Horses S01", vec![r]);
+    let (_, v, text) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": SEASON, "execute": true, "replan": true })),
+        )
+        .await;
+    let pack = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("{text}"))
+        .to_string();
+    e.tick().await;
+    e.complete(&pack_hash);
+    e.tick().await;
+    assert_eq!(e.grab_row(&pack).state, "imported");
+    // The finished pack and the single are one torrent in the client.
+    let (p, h) = (pack.clone(), single_hash.clone());
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute("UPDATE grabs SET info_hash = ?2 WHERE id = ?1", [&p, &h])?;
+            Ok(())
+        })
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    // Deleting E02 (keep_wanted false, so Arr also stops it) must not take the shared torrent.
+    remove(&e, "episode:tvdb:372264:1:2", false).await;
+    e.tick().await;
+    assert!(e.fake.lock().unwrap().torrents.contains_key(&single_hash));
+    assert_eq!(e.grab_row(&pack).state, "imported");
+    assert!(
+        e.grab_row(&single).active,
+        "its grab is not cancelled either"
+    );
+}
+
+#[tokio::test]
+async fn a_purged_bin_entry_does_not_keep_the_pack_from_going() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (_, pack_hash) = imported_pack(&e).await;
+    let first = remove(&e, "episode:tvdb:372264:1:2", false).await;
+    let id = first["delete_id"].as_str().unwrap();
+    let (s, _) = call(&e, e.delete(&format!("/api/v1/bin/{id}"))).await;
+    assert_eq!(s, 200);
+    let v = remove(&e, SEASON, false).await;
+    assert_eq!(v["downloads_kept"], 0, "{v}");
+    e.tick().await;
+    assert!(!e.fake.lock().unwrap().torrents.contains_key(&pack_hash));
+}
+
+#[tokio::test]
+async fn a_file_with_the_same_path_in_another_bin_does_not_excuse_a_missing_import() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (_, pack_hash) = imported_pack(&e).await;
+    // The person deleted E02's file themselves; a movie bin holds a file of the same name.
+    let rel = "Slow Horses/Season 1/Slow.Horses.S01E02.1080p.WEB-DL.x264-PACK.mkv";
+    std::fs::remove_file(e.tv.join(rel)).unwrap();
+    e.state
+        .store
+        .blocking(move |c| {
+            arr::trash::insert(
+                c,
+                &arr::trash::Entry {
+                    delete_id: "0000000000000000".into(),
+                    media_id: "movie:tmdb:603".into(),
+                    title: "Other".into(),
+                    media: "movie".into(),
+                    files: vec![arr::trash::BinFile {
+                        path: rel.into(),
+                        bytes: 1,
+                        kind: "video".into(),
+                        ..Default::default()
+                    }],
+                    bytes: 1,
+                    deleted_at: "2020-01-01T00:00:00Z".into(),
+                    purge_at: "2030-01-01T00:00:00Z".into(),
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let v = remove(&e, SEASON, false).await;
+    assert_eq!(v["downloads_kept"], 1, "{v}");
+    e.tick().await;
+    assert!(
+        e.fake.lock().unwrap().torrents.contains_key(&pack_hash),
+        "a missing import that Arr did not delete still blocks removing its source"
+    );
+}
+
+#[tokio::test]
+async fn restore_revives_the_rows_its_own_delete_retired() {
+    let e = start_exec(ExecOptions::default()).await;
+    let old = "Slow Horses/Season 1/Slow.Horses.S01E01.1080p.WEB-DL.x264-OLD.mkv";
+    let odd = "Slow Horses/Season 1/Untitled recording.mkv";
+    std::fs::rename(e.tv.join(old), e.tv.join(odd)).unwrap();
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute(
+                "UPDATE files SET path = ?1 WHERE path = ?2 AND present = 1",
+                [odd, old],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    let ep = "episode:tvdb:372264:1:1";
+    let sizes = |e: &Exec| -> Vec<i64> {
+        e.state
+            .store
+            .blocking(|c| {
+                let mut s = c.prepare(
+                    "SELECT size FROM files WHERE path LIKE '%Untitled%' AND present = 1",
+                )?;
+                Ok(s.query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?)
+            })
+            .unwrap()
+    };
+    let original = sizes(&e)[0];
+    let first = remove(&e, ep, false).await;
+    // A different file is recorded at the same path later, and deleted too.
+    put(&e.tv, odd, b"a different, longer replacement");
+    e.state
+        .store
+        .blocking(move |c| {
+            let ev = arr::scan::file_evidence(odd, 31, "2020-01-01T00:00:00Z");
+            arr::library::insert_file(
+                c,
+                "series:tvdb:372264",
+                &ev,
+                &[ep.parse().unwrap()],
+                None,
+                None,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    remove(&e, ep, false).await;
+    assert!(sizes(&e).is_empty());
+    let id = first["delete_id"].as_str().unwrap();
+    let (s, r) = call(&e, e.post(&format!("/api/v1/bin/{id}/restore"))).await;
+    assert_eq!((s, r["restored"].clone()), (200, json!(1)), "{r}");
+    assert_eq!(
+        sizes(&e),
+        [original],
+        "the first file's own row is the present one"
+    );
+}

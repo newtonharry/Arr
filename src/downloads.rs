@@ -2767,7 +2767,7 @@ async fn prepare_removal(
         .ok_or("the torrent's save path is outside the mapped download directory")?;
     // Imported library copies must be committed and present before their source goes.
     let gid = g.id.clone();
-    let (pending, committed, binned): (i64, Vec<(String, String, i64)>, std::collections::HashSet<String>) = st
+    let (pending, committed): (i64, Vec<(String, String, i64, bool)>) = st
         .store
         .with(move |c| {
             let pending: i64 = c.query_row(
@@ -2775,9 +2775,9 @@ async fn prepare_removal(
                 [&gid],
                 |r| r.get(0),
             )?;
-            let mut stmt = c.prepare("SELECT root, dest, size FROM import_journal WHERE grab_id = ?1 AND state IN ('committed', 'backup_removed')")?;
-            let rows = stmt.query_map([&gid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((pending, rows, crate::trash::binned(c)?))
+            let mut stmt = c.prepare("SELECT root, dest, size, deleted_at IS NOT NULL FROM import_journal WHERE grab_id = ?1 AND state IN ('committed', 'backup_removed')")?;
+            let rows = stmt.query_map([&gid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((pending, rows))
         })
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -2787,7 +2787,11 @@ async fn prepare_removal(
     if g.state == "imported" && committed.is_empty() {
         return Err("no committed library file is recorded for this download".into());
     }
-    for (root, dest, size) in &committed {
+    for (root, dest, size, deleted) in &committed {
+        // Arr's own delete moved this copy to its bin on purpose (restoring clears the mark).
+        if *deleted {
+            continue;
+        }
         let p = Path::new(root).join(dest);
         match std::fs::symlink_metadata(&p) {
             Ok(m) if m.file_type().is_file() && m.len() == *size as u64 => {}
@@ -2796,11 +2800,15 @@ async fn prepare_removal(
                     "the imported library file {dest} changed; refusing to remove its source"
                 ));
             }
-            // Arr itself moved it to its bin: the copy is kept there for a week.
-            Err(_) if binned.contains(dest.as_str()) => {}
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(format!(
                     "the imported library file {dest} is missing; refusing to remove its source"
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "the imported library file {dest} cannot be checked ({}); refusing to remove its source",
+                    e.kind()
                 ));
             }
         }

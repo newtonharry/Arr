@@ -31,7 +31,7 @@ const SIDECARS: &[&str] = &[
 ];
 
 /// A file a delete takes: its path relative to its root, its size and `video` or `extra`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BinFile {
     pub path: String,
     pub bytes: u64,
@@ -39,6 +39,12 @@ pub struct BinFile {
     /// Modified time in nanoseconds, for the token. Not stored.
     #[serde(skip)]
     pub stamp: u128,
+    /// The `files` rows a delete retired for this video, and the imports it marked deleted,
+    /// so a restore revives exactly those.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub journal: Vec<i64>,
 }
 
 #[derive(Debug)]
@@ -119,6 +125,7 @@ pub fn list(root: &Path, videos: &[String]) -> Result<(Vec<BinFile>, usize), Str
             bytes: meta.len(),
             kind: "video".into(),
             stamp: stamp(&meta),
+            ..Default::default()
         });
         let (Some(dir), Some(name), Some(stem)) = (
             abs.parent(),
@@ -150,6 +157,7 @@ pub fn list(root: &Path, videos: &[String]) -> Result<(Vec<BinFile>, usize), Str
                     bytes: m.len(),
                     kind: "extra".into(),
                     stamp: stamp(&m),
+                    ..Default::default()
                 });
             }
         }
@@ -367,13 +375,9 @@ fn entry_row(r: &rusqlite::Row) -> rusqlite::Result<Entry> {
     })
 }
 
-/// The paths (relative to their root) of every file now in the bin.
-pub fn binned(c: &Connection) -> Result<std::collections::HashSet<String>> {
-    Ok(entries(c)?
-        .into_iter()
-        .flat_map(|e| e.files)
-        .map(|f| f.path)
-        .collect())
+/// Whether two folders are the same one (as written, or once resolved).
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
 pub fn insert(c: &Connection, e: &Entry) -> Result<()> {
@@ -481,6 +485,7 @@ mod tests {
             bytes: m.len(),
             kind: "video".into(),
             stamp: stamp(&m),
+            ..Default::default()
         }
     }
 

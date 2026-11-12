@@ -517,6 +517,9 @@ impl Store {
                 purge_at TEXT NOT NULL
             );",
         )?;
+        // Set when Arr's own delete moved the imported file to the bin; its download may then
+        // be removed although the file is no longer in the library. Restoring clears it.
+        ensure_column(&conn, "import_journal", "deleted_at", "TEXT")?;
         // Added within schema 3 after the table's first build (idempotent).
         // A full piece check binds to the run that started it.
         ensure_column(&conn, "embedded_torrents", "verify_token", "TEXT")?;

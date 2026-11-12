@@ -3,12 +3,12 @@
 //! the delete must present it and is refused when anything changed since. Downloads that
 //! only seed those files go with them (their data is what keeps a hardlinked copy's space).
 
-use super::titles::{RemoveBody, StopBody, within};
+use super::titles::within;
 use super::*;
 use crate::scan;
 use crate::trash::{self, BinFile, Entry, Fail};
 use rusqlite::params;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -365,7 +365,8 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     };
     let owner = sc.owner().to_string();
     let plex = st.plex.is_some();
-    let (entry2, owner2, id2) = (entry.clone(), owner.clone(), id_s.clone());
+    let (mut entry2, owner2, id2) = (entry.clone(), owner.clone(), id_s.clone());
+    let root2 = sc.root.clone();
     let recorded = st
         .store
         .with(move |c| {
@@ -373,11 +374,35 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
             let at = &entry2.deleted_at;
             // The files are gone from the library: no longer owned, and the item counts as
             // scanned so an older snapshot's flag cannot bring the ownership back.
-            for f in entry2.files.iter().filter(|f| f.kind == "video") {
-                tx.execute(
-                    "UPDATE files SET present = 0 WHERE media_id = ?1 AND present = 1 AND path = ?2",
-                    params![owner2, f.path],
+            // The exact rows retired and the exact imports marked deleted are kept with the
+            // entry, so a restore brings back those and no others.
+            for f in entry2.files.iter_mut().filter(|f| f.kind == "video") {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM files WHERE media_id = ?1 AND present = 1 AND path = ?2",
                 )?;
+                f.rows = stmt
+                    .query_map(params![owner2, f.path], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                drop(stmt);
+                for id in &f.rows {
+                    tx.execute("UPDATE files SET present = 0 WHERE id = ?1", [id])?;
+                }
+                let mut stmt = tx.prepare(
+                    "SELECT id, root FROM import_journal WHERE dest = ?1 AND deleted_at IS NULL AND state IN ('committed', 'backup_removed')",
+                )?;
+                let imports: Vec<(i64, String)> = stmt
+                    .query_map([&f.path], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                drop(stmt);
+                for (id, root) in imports {
+                    if crate::trash::same_dir(FsPath::new(&root), &root2) {
+                        tx.execute(
+                            "UPDATE import_journal SET deleted_at = ?2 WHERE id = ?1",
+                            params![id, at],
+                        )?;
+                        f.journal.push(id);
+                    }
+                }
             }
             tx.execute(
                 "UPDATE media SET scanned_at = ?2 WHERE id = ?1",
@@ -412,24 +437,8 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     // Stop wanting it, unless a new copy is wanted.
     if !body.keep_wanted {
         let r = match sc.id {
-            MediaId::Series(_) => {
-                super::titles::remove(
-                    State(st.clone()),
-                    ApiJson(RemoveBody {
-                        media_id: id_s.clone(),
-                    }),
-                )
-                .await
-            }
-            _ => {
-                super::titles::stop(
-                    State(st.clone()),
-                    ApiJson(StopBody {
-                        media_id: id_s.clone(),
-                    }),
-                )
-                .await
-            }
+            MediaId::Series(_) => super::titles::remove_title(&st, &id_s, false).await,
+            _ => super::titles::stop_scope(&st, &id_s, false).await,
         };
         // Not tracked any more is the end state wanted.
         if let Err(e) = r
@@ -510,14 +519,22 @@ pub(super) async fn restore(State(st): St, Path(delete_id): Path<String>) -> Api
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             trash::keep(&tx, &did, &left2)?;
             // Own them again as they were: a scan cannot find a file whose name says nothing
-            // about what it is. The newest retired row of each path comes back.
+            // about what it is. The very rows the delete retired come back.
             if let Some(o) = &owner_s {
                 for f in back.iter().filter(|f| f.kind == "video") {
-                    tx.execute(
-                        "UPDATE files SET present = 1 WHERE id = (SELECT MAX(id) FROM files WHERE media_id = ?1 AND path = ?2 AND present = 0)
-                         AND NOT EXISTS (SELECT 1 FROM files WHERE media_id = ?1 AND path = ?2 AND present = 1)",
-                        params![o, f.path],
-                    )?;
+                    for id in &f.rows {
+                        tx.execute(
+                            "UPDATE files SET present = 1 WHERE id = ?1
+                             AND NOT EXISTS (SELECT 1 FROM files WHERE media_id = ?2 AND path = ?3 AND present = 1)",
+                            params![id, o, f.path],
+                        )?;
+                    }
+                    for id in &f.journal {
+                        tx.execute(
+                            "UPDATE import_journal SET deleted_at = NULL WHERE id = ?1",
+                            [id],
+                        )?;
+                    }
                 }
             }
             if n > 0 {
