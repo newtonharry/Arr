@@ -608,3 +608,158 @@ async fn it_needs_the_same_sign_in_and_a_known_title() {
         "{v}"
     );
 }
+
+/// Slow Horses S01E02 downloaded and imported on its own; the grab id and hash.
+async fn imported_single(e: &Exec) -> (String, String) {
+    let t = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(t, t, vec![(format!("{t}.mkv"), mkv(1))], 1.5, false);
+    e.search_results("Slow Horses S01E02", vec![r]);
+    let (_, v, _) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "episode:tvdb:372264:1:2", "execute": true })),
+        )
+        .await;
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    e.complete(&hash);
+    e.tick().await;
+    assert_eq!(e.grab_row(&id).state, "imported");
+    (id, hash)
+}
+
+#[tokio::test]
+async fn a_torrent_shared_by_two_grabs_stays_while_one_still_needs_it() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (single, _) = imported_single(&e).await;
+    let (pack, pack_hash) = imported_pack(&e).await;
+    // Both grabs are one torrent in the client.
+    let (s, h) = (single.clone(), pack_hash.clone());
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute("UPDATE grabs SET info_hash = ?2 WHERE id = ?1", [&s, &h])?;
+            Ok(())
+        })
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    let (s, p) = preview(&e, "episode:tvdb:372264:1:2").await;
+    assert_eq!(s, 200, "{p}");
+    assert!(
+        p["downloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["removed"] == false),
+        "{p}"
+    );
+    remove(&e, "episode:tvdb:372264:1:2", false).await;
+    e.tick().await;
+    assert!(
+        e.fake.lock().unwrap().torrents.contains_key(&pack_hash),
+        "the pack still serves other episodes"
+    );
+    assert_eq!(e.grab_row(&pack).state, "imported");
+}
+
+#[tokio::test]
+async fn a_title_from_another_root_is_refused() {
+    let e = start_exec(ExecOptions::default()).await;
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute(
+                "UPDATE media SET data = json_set(data, '$.root_folder', '/somewhere/else') WHERE id = 'movie:tmdb:604'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    let (s, v) = preview(&e, "movie:tmdb:604").await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("delete_refused")),
+        "{v}"
+    );
+    assert!(e.movies.join(RELOADED).is_file());
+}
+
+#[tokio::test]
+async fn every_present_copy_of_the_item_goes() {
+    let e = start_exec(ExecOptions::default()).await;
+    let alt = "The Matrix Reloaded (2003)/The.Matrix.Reloaded.2003.720p.WEB-DL.x264-ALT.mkv";
+    put(&e.movies, alt, &mkv(1));
+    let alt2 = alt.to_string();
+    e.state
+        .store
+        .blocking(move |c| {
+            let ev = arr::scan::file_evidence(&alt2, 5, "2020-01-01T00:00:00Z");
+            arr::library::insert_file(
+                c,
+                "movie:tmdb:604",
+                &ev,
+                &["movie:tmdb:604".parse().unwrap()],
+                None,
+                None,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    let (s, p) = preview(&e, "movie:tmdb:604").await;
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(p["files"].as_array().unwrap().len(), 2, "{p}");
+    remove(&e, "movie:tmdb:604", false).await;
+    assert!(!e.movies.join(alt).exists() && !e.movies.join(RELOADED).exists());
+    let m = movie(&e, "reloaded").await;
+    assert_eq!(m["has_file"], false, "{m}");
+}
+
+#[tokio::test]
+async fn the_rest_of_a_season_takes_the_pack_after_one_episode_went_first() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (_, pack_hash) = imported_pack(&e).await;
+    remove(&e, "episode:tvdb:372264:1:2", false).await;
+    e.tick().await;
+    assert!(e.fake.lock().unwrap().torrents.contains_key(&pack_hash));
+    let v = remove(&e, SEASON, false).await;
+    assert_eq!(v["downloads_kept"], 0, "{v}");
+    e.tick().await;
+    assert!(
+        !e.fake.lock().unwrap().torrents.contains_key(&pack_hash),
+        "the pack goes although episode 2 is in the bin"
+    );
+}
+
+#[tokio::test]
+async fn a_restored_file_with_an_unnumbered_name_is_owned_again() {
+    let e = start_exec(ExecOptions::default()).await;
+    // A file Plex identified, whose name carries no episode numbering a scan could use.
+    let old = "Slow Horses/Season 1/Slow.Horses.S01E01.1080p.WEB-DL.x264-OLD.mkv";
+    let odd = "Slow Horses/Season 1/Untitled recording.mkv";
+    std::fs::rename(e.tv.join(old), e.tv.join(odd)).unwrap();
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute(
+                "UPDATE files SET path = ?1 WHERE path = ?2 AND present = 1",
+                [odd, old],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    e.state.reload_index().await.unwrap();
+    let ep = "episode:tvdb:372264:1:1";
+    let owned = |p: &Value| p["files"].as_array().unwrap().len();
+    assert_eq!(owned(&preview(&e, ep).await.1), 1);
+    let v = remove(&e, ep, false).await;
+    assert_eq!(owned(&preview(&e, ep).await.1), 0);
+    let id = v["delete_id"].as_str().unwrap();
+    let (s, r) = call(&e, e.post(&format!("/api/v1/bin/{id}/restore"))).await;
+    assert_eq!((s, r["restored"].clone()), (200, json!(1)), "{r}");
+    assert_eq!(owned(&preview(&e, ep).await.1), 1, "owned again");
+}

@@ -2399,6 +2399,11 @@ pub struct CancelOptions {
 
 pub async fn cancel(st: &AppState, id: &str, o: CancelOptions) -> Result<Grab, ActionError> {
     let _guard = st.worker.grabs.lock().await;
+    cancel_locked(st, id, o).await
+}
+
+/// `cancel` for a caller that already holds `st.worker.grabs`.
+pub async fn cancel_locked(st: &AppState, id: &str, o: CancelOptions) -> Result<Grab, ActionError> {
     let g = load(st, id).await?;
     if o.only_unfinished && !matches!(g.state.as_str(), "queued" | "unconfirmed" | "downloading") {
         return Err(ActionError::Conflict(
@@ -2762,7 +2767,7 @@ async fn prepare_removal(
         .ok_or("the torrent's save path is outside the mapped download directory")?;
     // Imported library copies must be committed and present before their source goes.
     let gid = g.id.clone();
-    let (pending, committed): (i64, Vec<(String, String, i64)>) = st
+    let (pending, committed, binned): (i64, Vec<(String, String, i64)>, std::collections::HashSet<String>) = st
         .store
         .with(move |c| {
             let pending: i64 = c.query_row(
@@ -2772,7 +2777,7 @@ async fn prepare_removal(
             )?;
             let mut stmt = c.prepare("SELECT root, dest, size FROM import_journal WHERE grab_id = ?1 AND state IN ('committed', 'backup_removed')")?;
             let rows = stmt.query_map([&gid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((pending, rows))
+            Ok((pending, rows, crate::trash::binned(c)?))
         })
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -2791,6 +2796,8 @@ async fn prepare_removal(
                     "the imported library file {dest} changed; refusing to remove its source"
                 ));
             }
+            // Arr itself moved it to its bin: the copy is kept there for a week.
+            Err(_) if binned.contains(dest.as_str()) => {}
             Err(_) => {
                 return Err(format!(
                     "the imported library file {dest} is missing; refusing to remove its source"

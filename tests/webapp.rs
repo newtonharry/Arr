@@ -553,6 +553,7 @@ async fn the_app_has_the_delete_controls_and_reaches_the_bin_routes() {
         "function BinSection()",
         "'Delete now'",
         "restoreEntry(res.id)",
+        "A download is still being shared",
     ] {
         assert!(js.contains(want), "app.js lacks {want}");
     }

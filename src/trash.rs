@@ -367,6 +367,15 @@ fn entry_row(r: &rusqlite::Row) -> rusqlite::Result<Entry> {
     })
 }
 
+/// The paths (relative to their root) of every file now in the bin.
+pub fn binned(c: &Connection) -> Result<std::collections::HashSet<String>> {
+    Ok(entries(c)?
+        .into_iter()
+        .flat_map(|e| e.files)
+        .map(|f| f.path)
+        .collect())
+}
+
 pub fn insert(c: &Connection, e: &Entry) -> Result<()> {
     c.execute(
         &format!("INSERT INTO bin_entries ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),

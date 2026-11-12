@@ -1066,7 +1066,7 @@ async function doDelete() {
   try {
     const r = await api('/v1/delete', { method: 'POST', body: { media_id: scope, token: dl.pv.token, keep_wanted: dl.keep } });
     const code = r.data && r.data.error && r.data.error.code;
-    if (r.ok) res = { ok: true, id: r.data.delete_id };
+    if (r.ok) res = { ok: true, id: r.data.delete_id, kept: r.data.downloads_kept > 0 };
     else if (code === 'active_downloads') res = { text: 'A download is nearly done and is being added to Plex. Try again in a minute.', err: true };
     else if (code === 'changed') res = { text: 'Something changed in the files. Look again before deleting.', err: true };
     else if (code === 'move_failed') res = { text: "A file couldn't be moved, so nothing was deleted.", err: true };
@@ -1084,7 +1084,7 @@ async function doDelete() {
     if (tk === P.token && P.shown) loadTitle(true);
     return m;
   };
-  showToast({ before: 'Deleted ', title: dl.noun, after: '. Undo within 7 days.' }, undo);
+  showToast({ before: 'Deleted ', title: dl.noun, after: '. Undo within 7 days.' + (res.kept ? ' A download is still being shared, so some space stays used.' : '') }, undo);
   // A whole show leaves Arr unless a new copy is wanted; the page is then closed like Remove does.
   if (whole && P.kind === 'show' && !dl.keep) dismiss(); else await loadTitle(true);
 }

@@ -3,9 +3,8 @@
 //! the delete must present it and is refused when anything changed since. Downloads that
 //! only seed those files go with them (their data is what keeps a hardlinked copy's space).
 
-use super::titles::{RemoveBody, StopBody, cancel_unfinished, within};
+use super::titles::{RemoveBody, StopBody, within};
 use super::*;
-use crate::catalog::Episode;
 use crate::scan;
 use crate::trash::{self, BinFile, Entry, Fail};
 use rusqlite::params;
@@ -40,10 +39,7 @@ struct Scope {
 
 impl Scope {
     fn inside(&self, t: MediaId) -> bool {
-        match self.id {
-            MediaId::Series(k) => t.series_key() == Some(k),
-            scope => within(scope, t),
-        }
+        inside_of(self.id, t)
     }
 
     /// The title the scope belongs to (a show for a season or an episode).
@@ -52,11 +48,18 @@ impl Scope {
     }
 }
 
+fn inside_of(scope: MediaId, t: MediaId) -> bool {
+    match scope {
+        MediaId::Series(k) => t.series_key() == Some(k),
+        scope => within(scope, t),
+    }
+}
+
 fn refused(message: impl Into<String>) -> ApiError {
     ApiError::conflict(ErrorCode::DeleteRefused, message)
 }
 
-fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
+async fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
     let id = parse_media_id(raw)?;
     let Some(root) = st
         .cfg
@@ -75,12 +78,12 @@ fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
             format!("{id} is not something Arr knows"),
         )
     };
-    let (id, title, videos, unknown) = match id {
+    let (id, title, unknown, item_root) = match id {
         MediaId::Movie { tmdb } => {
             let m = index.movie(tmdb).ok_or_else(missing)?;
-            let path = m.file.as_ref().and_then(|f| f.path.clone());
-            let unknown = usize::from(m.has_file && path.is_none());
-            (id, m.title.clone(), path.into_iter().collect(), unknown)
+            let unknown =
+                usize::from(m.has_file && m.file.as_ref().is_none_or(|f| f.path.is_none()));
+            (id, m.title.clone(), unknown, m.root_folder.clone())
         }
         MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, ..) => {
             let s = index.series(k).ok_or_else(missing)?;
@@ -91,34 +94,60 @@ fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
                 MediaId::Episode(_, n, e) => MediaId::Episode(key, n, e),
                 _ => s.id,
             };
-            let probe = Scope {
-                id,
-                title: String::new(),
-                media: MediaKind::Series,
-                root: PathBuf::new(),
-                videos: vec![],
-                unknown: 0,
-            };
-            let mine = |e: &Episode| probe.inside(library::episode_id(s.id, e.season, e.number));
-            let (mut videos, mut unknown, mut kept) = (vec![], 0, vec![]);
-            for e in s.episodes.iter().flatten().filter(|e| e.has_file) {
-                let path = e.file.as_ref().and_then(|f| f.path.clone());
-                match (mine(e), path) {
-                    (true, Some(p)) => videos.push(p),
-                    (true, None) => unknown += 1,
-                    (false, Some(p)) => kept.push(p),
-                    (false, None) => {}
-                }
-            }
-            // One file can hold several episodes; it cannot go while one of them stays.
-            if let Some(p) = videos.iter().find(|p| kept.contains(p)) {
-                return Err(refused(format!(
-                    "{p} also holds episodes that are staying, so it cannot go on its own"
-                )));
-            }
-            (id, s.title.clone(), videos, unknown)
+            let unknown = s
+                .episodes
+                .iter()
+                .flatten()
+                .filter(|e| {
+                    e.has_file
+                        && e.file.as_ref().is_none_or(|f| f.path.is_none())
+                        && inside_of(id, library::episode_id(s.id, e.season, e.number))
+                })
+                .count();
+            (id, s.title.clone(), unknown, s.root_folder.clone())
         }
     };
+    // The same root check import and scan make: evidence from another root must not be
+    // resolved against this one.
+    let media = crate::downloads::media_kind(id);
+    if !crate::ingest::root_matches(st, media, item_root.as_deref()) {
+        return Err(refused(
+            "this title's folder is not the library folder Arr is set up to use",
+        ));
+    }
+    // Every present file row of the title, whichever copy the catalog shows.
+    let owner = plan_media(id).to_string();
+    let rows: Vec<(String, String)> = st
+        .store
+        .with(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT f.path, t.target FROM files f JOIN file_targets t ON t.file_id = f.id
+                 WHERE f.present = 1 AND f.media_id = ?1 AND f.path IS NOT NULL ORDER BY f.id",
+            )?;
+            let rows = stmt.query_map([owner], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .map_err(internal("delete"))?;
+    let (mut videos, mut kept) = (vec![], vec![]);
+    for (path, target) in rows {
+        let Ok(t) = target.parse::<MediaId>() else {
+            continue;
+        };
+        if inside_of(id, t) {
+            if !videos.contains(&path) {
+                videos.push(path);
+            }
+        } else {
+            kept.push(path);
+        }
+    }
+    // One file can hold several episodes; it cannot go while one of them stays.
+    if let Some(p) = videos.iter().find(|p| kept.contains(p)) {
+        return Err(refused(format!(
+            "{p} also holds episodes that are staying, so it cannot go on its own"
+        )));
+    }
     Ok(Scope {
         id,
         title,
@@ -162,30 +191,77 @@ fn covers(g: &downloads::Grab) -> Vec<MediaId> {
     }
 }
 
-/// `POST /delete/preview`: what a delete of this movie, show, season or episode would take.
-pub(super) async fn preview(State(st): St, ApiJson(body): ApiJson<PreviewBody>) -> ApiResult {
-    st.loaded()?;
-    let sc = scope(&st, &body.media_id)?;
-    let files = files_of(&sc).await?;
-    let mut shown = vec![];
-    for g in downloads_of(&st, &sc).await? {
-        let (removed, reason) = if !covers(&g).into_iter().all(|t| sc.inside(t)) {
+/// What a delete does with one of the title's downloads.
+struct DownloadPlan {
+    grab: downloads::Grab,
+    removed: bool,
+    reason: Option<&'static str>,
+    /// Everything it holds is inside the delete, but it is being added to Plex.
+    finishing: bool,
+}
+
+/// Several grabs can be one torrent in the client, so a torrent goes only when every grab
+/// that uses it (going or finished) lies wholly inside the delete and none is being added.
+async fn plan_downloads(st: &AppState, sc: &Scope) -> Result<Vec<DownloadPlan>, ApiError> {
+    let mut out = vec![];
+    for grab in downloads_of(st, sc).await? {
+        let hash = grab.info_hash.clone();
+        let group = if hash.is_empty() {
+            vec![grab.clone()]
+        } else {
+            st.store
+                .with(move |c| {
+                    downloads::select(
+                        c,
+                        "info_hash = ?1 AND (active = 1 OR (state = 'imported' AND cleanup NOT IN ('removing', 'cleaned', 'client_removed')))",
+                        &[&hash],
+                    )
+                })
+                .await
+                .map_err(internal("downloads"))?
+        };
+        let inside = group
+            .iter()
+            .all(|x| covers(x).into_iter().all(|t| sc.inside(t)));
+        let adding = group.iter().any(|x| {
+            x.active && !matches!(x.state.as_str(), "queued" | "unconfirmed" | "downloading")
+        });
+        let (removed, reason, finishing) = if !inside {
             (
                 false,
                 Some("It also holds episodes that are staying, so it stays too."),
+                false,
             )
-        } else if g.active && !matches!(g.state.as_str(), "queued" | "unconfirmed" | "downloading")
-        {
+        } else if adding {
             (
                 false,
                 Some("It is being added to Plex right now. Try again in a minute."),
+                true,
             )
         } else {
-            (true, None)
+            (true, None, false)
         };
+        out.push(DownloadPlan {
+            grab,
+            removed,
+            reason,
+            finishing,
+        });
+    }
+    Ok(out)
+}
+
+/// `POST /delete/preview`: what a delete of this movie, show, season or episode would take.
+pub(super) async fn preview(State(st): St, ApiJson(body): ApiJson<PreviewBody>) -> ApiResult {
+    st.loaded()?;
+    let sc = scope(&st, &body.media_id).await?;
+    let files = files_of(&sc).await?;
+    let mut shown = vec![];
+    for p in plan_downloads(&st, &sc).await? {
+        let g = p.grab;
         let mut row =
-            json!({ "grab_id": g.id, "title": g.title, "bytes": g.size, "removed": removed });
-        if let Some(r) = reason {
+            json!({ "grab_id": g.id, "title": g.title, "bytes": g.size, "removed": p.removed });
+        if let Some(r) = p.reason {
             row["reason"] = json!(r);
         }
         shown.push(row);
@@ -203,7 +279,7 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     st.loaded()?;
     let _guard = trash::LOCK.lock().await;
     let now = OffsetDateTime::now_utc();
-    let sc = scope(&st, &body.media_id)?;
+    let sc = scope(&st, &body.media_id).await?;
     let files = files_of(&sc).await?;
     let id_s = sc.id.to_string();
     if files.is_empty() {
@@ -215,38 +291,52 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
             "The files changed since you looked. Look again before deleting.",
         ));
     }
-    // Downloads still going end, with their data; one that is being added to Plex is left
-    // to finish and the delete waits.
-    let grabs = downloads_of(&st, &sc).await?;
-    let going = grabs.iter().filter(|g| g.active).cloned().collect();
-    let (_, finishing) = cancel_unfinished(&st, going, |t| sc.inside(t)).await?;
-    if finishing > 0 {
-        return Err(ApiError::conflict(
-            ErrorCode::ActiveDownloads,
-            "A download is nearly done and is being added to Plex. Try again in a minute.",
-        ));
-    }
-    // Finished downloads whose data is all inside this delete go with it, before the files:
-    // removing a download checks that the library copy it came from is still there. One that
-    // cannot be removed (or holds other episodes) stays and keeps seeding.
+    // Downloads whose torrent is wanted by nothing outside this delete end, with their data,
+    // before the files move (removing one checks that the library copy it came from is still
+    // there). A download being added to Plex is left to finish and the delete waits. One that
+    // cannot be removed stays and keeps seeding. Decided and done under the grabs lock.
     let mut seeding = 0;
-    for g in grabs.iter().filter(|g| !g.active) {
-        if !covers(g).into_iter().all(|t| sc.inside(t)) {
-            continue;
+    {
+        let _grabs = st.worker.grabs.lock().await;
+        let plans = plan_downloads(&st, &sc).await?;
+        if plans.iter().any(|p| p.finishing) {
+            return Err(ApiError::conflict(
+                ErrorCode::ActiveDownloads,
+                "A download is nearly done and is being added to Plex. Try again in a minute.",
+            ));
         }
-        let r = downloads::cancel(
-            &st,
-            &g.id,
-            CancelOptions {
-                blocklist: false,
-                removal: Removal::TorrentAndData,
-                ignore_seed_criteria: true,
-                research: false,
-                only_unfinished: false,
-            },
-        )
-        .await;
-        seeding += usize::from(r.is_err());
+        let going = plans.iter().filter(|p| p.removed && p.grab.active);
+        let done = plans.iter().filter(|p| p.removed && !p.grab.active);
+        for p in going.chain(done) {
+            let r = downloads::cancel_locked(
+                &st,
+                &p.grab.id,
+                CancelOptions {
+                    blocklist: false,
+                    removal: Removal::TorrentAndData,
+                    ignore_seed_criteria: true,
+                    research: false,
+                    only_unfinished: p.grab.active,
+                },
+            )
+            .await;
+            match r {
+                Ok(_) => {}
+                Err(downloads::ActionError::Conflict("finishing", _)) => {
+                    return Err(ApiError::conflict(
+                        ErrorCode::ActiveDownloads,
+                        "A download is nearly done and is being added to Plex. Try again in a minute.",
+                    ));
+                }
+                Err(e) if p.grab.active => {
+                    return Err(action_error(
+                        e,
+                        st.cfg.download_backend().unwrap_or("download_client"),
+                    ));
+                }
+                Err(_) => seeding += 1,
+            }
+        }
     }
     // The files move, or none do.
     let delete_id = crate::fsutil::random_hex(8).map_err(internal("delete"))?;
@@ -408,6 +498,7 @@ pub(super) async fn restore(State(st): St, Path(delete_id): Path<String>) -> Api
         owner.map(|o| o.to_string()),
         done.restored.len(),
     );
+    let back = done.restored.clone();
     let (left2, plex, title, bytes) = (
         left,
         st.plex.is_some(),
@@ -418,6 +509,17 @@ pub(super) async fn restore(State(st): St, Path(delete_id): Path<String>) -> Api
         .with(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             trash::keep(&tx, &did, &left2)?;
+            // Own them again as they were: a scan cannot find a file whose name says nothing
+            // about what it is. The newest retired row of each path comes back.
+            if let Some(o) = &owner_s {
+                for f in back.iter().filter(|f| f.kind == "video") {
+                    tx.execute(
+                        "UPDATE files SET present = 1 WHERE id = (SELECT MAX(id) FROM files WHERE media_id = ?1 AND path = ?2 AND present = 0)
+                         AND NOT EXISTS (SELECT 1 FROM files WHERE media_id = ?1 AND path = ?2 AND present = 1)",
+                        params![o, f.path],
+                    )?;
+                }
+            }
             if n > 0 {
                 let at = rfc3339(now);
                 library::event(
