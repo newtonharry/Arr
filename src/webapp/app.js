@@ -71,8 +71,19 @@ function playFlip(sn) {
     e._fl = anim(e, [{ transform: `translate(${dx}px,${dy}px)` }, { transform: 'none' }], { duration: 480, easing: SOFT });
   }
 }
-// A card that is going: it shrinks away first, then the others close the gap.
-function leave(el) { return el ? settled(anim(el, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200, fill: 'forwards' }), () => {}) : Promise.resolve(); }
+// A card that is going: the page changes at once and an inert copy fades or drops away where it was.
+function outgoing(el, kf, opt) {
+  if (!el || reduced()) return;
+  const r = el.getBoundingClientRect();
+  if (!onScreen(r)) return;
+  const c = el.cloneNode(true);
+  for (const e of [c, ...c.querySelectorAll('*')]) for (const n of ['id', 'data-fk', 'data-flip', 'data-arrived']) e.removeAttribute(n);
+  c.inert = true; c.setAttribute('aria-hidden', 'true');
+  Object.assign(c.style, { position: 'fixed', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', margin: '0', zIndex: '60', pointerEvents: 'none' });
+  document.body.append(c);
+  settled(anim(c, kf, { ...opt, fill: 'forwards' }), () => c.remove());
+  setTimeout(() => c.remove(), 1200);
+}
 // A short burst of confetti. At most 34 pieces, at most two bursts at once, every piece removed when it lands.
 let bursts = 0;
 function confetti(x, y, n = 24) {
@@ -123,11 +134,11 @@ function runCelebrations() {
   const keys = [...M.celebrate];
   M.celebrate.clear();
   if (reduced()) return;
-  if (!onHome() || V.t !== 'home') {
-    anim($('#tabs a[href="#/"]'), [{ transform: 'scale(1)' }, { transform: 'scale(1.18)' }, { transform: 'scale(1)' }], { duration: 600, easing: SPRING });
-    return;
-  }
-  keys.slice(0, 3).forEach((k, i) => setTimeout(() => celebrate(document.querySelector(`[data-arrived="${CSS.escape(k)}"]`) || document.body), 480 + i * 200));
+  const pulse = () => anim($('#tabs a[href="#/"]'), [{ transform: 'scale(1)' }, { transform: 'scale(1.18)' }, { transform: 'scale(1)' }], { duration: 600, easing: SPRING });
+  const homeShowing = () => onHome() && V.t === 'home' && !P.shown;
+  if (!homeShowing()) return pulse();
+  // Home may be covered by then (a title opened): the tab pulses instead, and the item is already counted as seen.
+  keys.slice(0, 3).forEach((k, i) => setTimeout(() => (homeShowing() ? celebrate(document.querySelector(`[data-arrived="${CSS.escape(k)}"]`) || document.body) : i === 0 && pulse()), 480 + i * 200));
 }
 const hideEl = (el, on) => { if (el) el.style.visibility = on ? 'hidden' : ''; };
 // Answers kept in memory so a screen can show the last one at once while a fresh one is fetched.
@@ -474,7 +485,7 @@ async function hideIdea(x) {
   const list = (S.ideas && S.ideas.items) || [], at = list.indexOf(x);
   if (at < 0) return;
   const post = api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } }).then((r) => r.ok, () => false); // asked now; the card shrinks meanwhile
-  await leave(document.querySelector(`[data-fk="hide:${CSS.escape(x.media_id)}"]`)?.closest('li'));
+  outgoing(document.querySelector(`[data-fk="hide:${CSS.escape(x.media_id)}"]`)?.closest('li'), [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200 });
   S.ideas = { ...S.ideas, items: ((S.ideas && S.ideas.items) || list).filter((i) => i.media_id !== x.media_id) };
   const back = () => { S.ideas = { ...S.ideas, items: S.ideas.items.some((i) => i.media_id === x.media_id) ? S.ideas.items : [...S.ideas.items.slice(0, at), x, ...S.ideas.items.slice(at)] }; };
   toast('Hidden', async () => {
@@ -1069,6 +1080,7 @@ function openTitle(t) {
 function closeSheet() {
   if (!P.shown) return;
   sheetOut();
+  P.upd = false;
   clearTimeout(P.pollT); clearTimeout(P.askT);
   P.token++;
   P.shown = false; P.confirm = false; P.del = null;
@@ -2110,12 +2122,15 @@ async function binAct(id, what) {
     }
   } catch { m = { ok: false, text: "Couldn't reach Arr. Try again in a moment." }; }
   B.busy = ''; B.msg = m.text; B.err = !m.ok; say(m.text);
-  // A deleted row drops away; a restored one pops back out. Then the list closes the gap.
-  const gone = m.ok ? anim(binRow(id), what === 'restore' ? [{ transform: 'none', opacity: 1 }, { transform: 'scale(1.06)', opacity: 0 }] : [{ transform: 'none', opacity: 1 }, { transform: 'translateY(4px) rotate(-3deg) scale(.97)', opacity: 1, offset: 0.3 }, { transform: 'translateY(70px) rotate(-9deg) scale(.8)', opacity: 0 }], { duration: what === 'restore' ? 300 : 440, easing: what === 'restore' ? EASE : 'cubic-bezier(.5,0,.8,.4)', fill: 'forwards' }) : NOANIM;
-  await settled(gone, () => {});
-  await loadBin();
-  gone.cancel();
+  // A deleted row drops away; a restored one pops back out. The list changes at once.
+  if (m.ok) {
+    outgoing(binRow(id), what === 'restore' ? [{ transform: 'none', opacity: 1 }, { transform: 'scale(1.06)', opacity: 0 }] : [{ transform: 'none', opacity: 1 }, { transform: 'translateY(4px) rotate(-3deg) scale(.97)', opacity: 1, offset: 0.3 }, { transform: 'translateY(70px) rotate(-9deg) scale(.8)', opacity: 0 }],
+      { duration: what === 'restore' ? 300 : 440, easing: what === 'restore' ? EASE : 'cubic-bezier(.5,0,.8,.4)' });
+    B.entries = B.entries.filter((e) => e.delete_id !== id);
+  }
   bump();
+  await loadBin();
+
 }
 const binScope = (id) => {
   const s = /^season:[a-z]+:\d+:(\d+)$/.exec(id), e = /^episode:[a-z]+:\d+:(\d+):(\d+)$/.exec(id);
@@ -2332,7 +2347,7 @@ function App() {
         h('input', { id: 'q', name: 'q', type: 'search', placeholder: 'Find a movie or show', enterkeyhint: 'search', autocapitalize: 'off', spellcheck: false, onInput: searchInput, onFocus: openSearch, onClick: openSearch })),
       h('div', { id: 'banner', class: 'banner', role: 'status' }, S.banner || (S.setup ? SETUP_MSG : null))),
     h(UpdateBar),
-    h(Topline, { on: !!(S.cached || P.upd || S.libUpd) }),
+    h(Topline, { on: !!(S.cached || (P.shown && P.upd) || S.libUpd) }),
     h('main', { id: 'view', tabindex: '-1', inert }, h(View)),
     h(Toast),
     h(Footer),

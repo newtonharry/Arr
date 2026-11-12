@@ -69,8 +69,8 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 .btn[data-s=busy]{opacity:.7;cursor:progress}
 .spin{width:16px;height:16px;border-radius:50%;border:2.5px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.tick path{stroke-dasharray:22;stroke-dashoffset:22;animation:draw .35s .12s ease-out forwards}
-@keyframes draw{to{stroke-dashoffset:0}}
+.tick path{stroke-dasharray:22;animation:draw .35s .12s ease-out both}
+@keyframes draw{from{stroke-dashoffset:22}to{stroke-dashoffset:0}}
 .btn[data-s=added],.btn[data-s=inplex],.btn[data-s=following]{background:transparent;border-color:var(--line);color:var(--teal-ink)}
 .btn.ghost{background:transparent;border-color:var(--line);color:var(--ink)}
 .btn.ghost:hover{border-color:var(--teal)}
@@ -78,6 +78,7 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 .journey{list-style:none;padding:0;position:relative;height:36px;margin-top:8px}
 .journey::before,.journey .fill{content:"";position:absolute;left:5px;right:5px;top:4px;height:3px;border-radius:2px;background:var(--line)}
 .journey .fill.live::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.6),transparent);animation:sheen 1.4s linear infinite}
+@media (prefers-reduced-motion:reduce){.journey .fill.live::after{display:none}}
 @keyframes sheen{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
 .journey .fill{overflow:hidden;background:var(--teal);transform-origin:left;transform:scaleX(var(--f,0));transition:transform .9s cubic-bezier(.16,1,.3,1)}
 .journey.paused .fill{background:var(--muted)}
