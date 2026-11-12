@@ -961,3 +961,56 @@ async fn restore_revives_the_rows_its_own_delete_retired() {
         "the first file's own row is the present one"
     );
 }
+
+#[tokio::test]
+async fn a_whole_show_is_refused_up_front_while_a_shared_download_must_stay() {
+    let e = start_exec(ExecOptions::default()).await;
+    // A movie's finished grab and the show's going grab are one torrent in the client.
+    let (movie_grab, _) = imported_matrix(&e).await;
+    let t = "Slow.Horses.S01E02.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(t, t, vec![(format!("{t}.mkv"), mkv(1))], 1.5, false);
+    e.search_results("Slow Horses S01E02", vec![r]);
+    let (_, v, _) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "episode:tvdb:372264:1:2", "execute": true })),
+        )
+        .await;
+    let single = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    let h = hash.clone();
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute(
+                "UPDATE grabs SET info_hash = ?2 WHERE id = ?1",
+                [&movie_grab, &h],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (s, p) = preview(&e, SHOW).await;
+    assert_eq!(s, 200, "{p}");
+    assert!(p["blocked"].is_string(), "{p}");
+    let token = p["token"].as_str().unwrap();
+    let (s, v) = delete(&e, SHOW, token, false).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("delete_refused")),
+        "{v}"
+    );
+    // Nothing moved and the show is still managed.
+    assert!(
+        e.tv.join("Slow Horses/Season 1/Slow.Horses.S01E01.1080p.WEB-DL.x264-OLD.mkv")
+            .is_file()
+    );
+    let (_, lib) = call(&e, e.get("/api/v1/library/series?q=slow")).await;
+    assert_eq!(lib["total"], 1, "{lib}");
+    assert!(e.grab_row(&single).active);
+    // Wanting a new copy leaves the show in Arr, so that goes ahead.
+    let (s, v) = delete(&e, SHOW, token, true).await;
+    assert_eq!(s, 200, "{v}");
+}

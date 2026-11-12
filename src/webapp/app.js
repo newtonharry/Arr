@@ -1099,10 +1099,11 @@ function ConfirmDelete() {
     parts.push(h('p', { key: 'f' }, `${plural(files, 'file', 'files')}${fmtSize(pv.library_bytes) ? ` (${fmtSize(pv.library_bytes)})` : ''} of `, h('em', null, dl.noun), " will move to Arr's bin. They stay there for 7 days, and the space comes back then or when you empty the bin in Settings."));
     if (pv.downloads.some((x) => x.removed)) parts.push(h('p', { key: 'd', class: 'hint' }, 'Arr also removes the finished download, so the space is really freed.'));
     if (shared.length) parts.push(h('p', { key: 's', class: 'hint' }, 'A download also holds episodes you are keeping. It stays, so some space stays used.'));
+    if (pv.blocked && !dl.keep) parts.push(h('p', { key: 'b', class: 'msg', role: 'alert', 'data-err': '' }, pv.blocked));
     if (pv.unknown) parts.push(h('p', { key: 'u', class: 'hint' }, `Arr couldn't find the file for ${plural(pv.unknown, 'item', 'items')}, so ${pv.unknown === 1 ? 'it stays' : 'they stay'}.`));
     parts.push(h('label', { key: 'k', class: 'chk' }, h('input', { type: 'checkbox', checked: dl.keep, disabled: busy, onChange: (e) => { dl.keep = e.target.checked; bump(); } }), h('span', null, 'Get a new copy afterwards')));
   }
-  const ready = dl.st === 'ready' && files > 0;
+  const ready = dl.st === 'ready' && files > 0 && !(pv.blocked && !dl.keep);
   return h('div', { class: 'confirm-back', onClick: (e) => { if (e.target === e.currentTarget && !dl.busy) closeDelete(); } },
     h('div', { id: 'confirm', class: 'confirm', role: 'alertdialog', 'aria-modal': 'true', 'aria-labelledby': 'confirm-t', 'aria-busy': dl.st === 'loading' ? 'true' : 'false' },
       h('h2', { id: 'confirm-t' }, `Delete the files of ${dl.noun}?`),

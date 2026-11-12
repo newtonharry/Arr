@@ -35,6 +35,8 @@ struct Scope {
     videos: Vec<String>,
     /// Owned items whose file Arr does not know the place of.
     unknown: usize,
+    /// The `files` rows behind each video, read with the scope (before anything moves).
+    rows: std::collections::HashMap<String, Vec<i64>>,
 }
 
 impl Scope {
@@ -117,24 +119,29 @@ async fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
     }
     // Every present file row of the title, whichever copy the catalog shows.
     let owner = plan_media(id).to_string();
-    let rows: Vec<(String, String)> = st
+    let rows: Vec<(i64, String, String)> = st
         .store
         .with(move |c| {
             let mut stmt = c.prepare(
-                "SELECT f.path, t.target FROM files f JOIN file_targets t ON t.file_id = f.id
+                "SELECT f.id, f.path, t.target FROM files f JOIN file_targets t ON t.file_id = f.id
                  WHERE f.present = 1 AND f.media_id = ?1 AND f.path IS NOT NULL ORDER BY f.id",
             )?;
-            let rows = stmt.query_map([owner], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let rows = stmt.query_map([owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await
         .map_err(internal("delete"))?;
     let (mut videos, mut kept) = (vec![], vec![]);
-    for (path, target) in rows {
+    let mut ids: std::collections::HashMap<String, Vec<i64>> = Default::default();
+    for (row, path, target) in rows {
         let Ok(t) = target.parse::<MediaId>() else {
             continue;
         };
         if inside_of(id, t) {
+            let list = ids.entry(path.clone()).or_default();
+            if !list.contains(&row) {
+                list.push(row);
+            }
             if !videos.contains(&path) {
                 videos.push(path);
             }
@@ -155,6 +162,7 @@ async fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
         root,
         videos,
         unknown,
+        rows: ids,
     })
 }
 
@@ -251,13 +259,25 @@ async fn plan_downloads(st: &AppState, sc: &Scope) -> Result<Vec<DownloadPlan>, 
     Ok(out)
 }
 
+/// A whole show cannot leave Arr while one of its downloads is going: when that download
+/// must stay because another title shares its torrent, deleting the show (unless a new copy
+/// is wanted) is refused up front, before any file moves.
+fn whole_show_blocked(sc: &Scope, plans: &[DownloadPlan]) -> Option<&'static str> {
+    (matches!(sc.id, MediaId::Series(_)) && plans.iter().any(|p| !p.removed && p.grab.active))
+        .then_some(
+            "A download of this show is shared with another title and has not finished, so the show cannot be removed from Arr yet. Try again when it is done, or choose to get a new copy.",
+        )
+}
+
 /// `POST /delete/preview`: what a delete of this movie, show, season or episode would take.
 pub(super) async fn preview(State(st): St, ApiJson(body): ApiJson<PreviewBody>) -> ApiResult {
     st.loaded()?;
     let sc = scope(&st, &body.media_id).await?;
     let files = files_of(&sc).await?;
     let mut shown = vec![];
-    for p in plan_downloads(&st, &sc).await? {
+    let plans = plan_downloads(&st, &sc).await?;
+    let blocked = whole_show_blocked(&sc, &plans);
+    for p in plans {
         let g = p.grab;
         let mut row =
             json!({ "grab_id": g.id, "title": g.title, "bytes": g.size, "removed": p.removed });
@@ -269,7 +289,7 @@ pub(super) async fn preview(State(st): St, ApiJson(body): ApiJson<PreviewBody>) 
     ok(json!({
         "media_id": sc.id, "title": sc.title, "files": files,
         "library_bytes": files.iter().map(|f| f.bytes).sum::<u64>(),
-        "downloads": shown, "unknown": sc.unknown,
+        "downloads": shown, "unknown": sc.unknown, "blocked": blocked,
         "token": trash::token(&sc.id.to_string(), &files),
     }))
 }
@@ -280,7 +300,7 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     let _guard = trash::LOCK.lock().await;
     let now = OffsetDateTime::now_utc();
     let sc = scope(&st, &body.media_id).await?;
-    let files = files_of(&sc).await?;
+    let mut files = files_of(&sc).await?;
     let id_s = sc.id.to_string();
     if files.is_empty() {
         return Err(refused("There are no files Arr knows of to delete."));
@@ -290,6 +310,9 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
             ErrorCode::Changed,
             "The files changed since you looked. Look again before deleting.",
         ));
+    }
+    for f in files.iter_mut().filter(|f| f.kind == "video") {
+        f.rows = sc.rows.get(&f.path).cloned().unwrap_or_default();
     }
     // Downloads whose torrent is wanted by nothing outside this delete end, with their data,
     // before the files move (removing one checks that the library copy it came from is still
@@ -304,6 +327,11 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
                 ErrorCode::ActiveDownloads,
                 "A download is nearly done and is being added to Plex. Try again in a minute.",
             ));
+        }
+        if !body.keep_wanted
+            && let Some(why) = whole_show_blocked(&sc, &plans)
+        {
+            return Err(refused(why));
         }
         let going = plans.iter().filter(|p| p.removed && p.grab.active);
         let done = plans.iter().filter(|p| p.removed && !p.grab.active);
@@ -374,16 +402,9 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
             let at = &entry2.deleted_at;
             // The files are gone from the library: no longer owned, and the item counts as
             // scanned so an older snapshot's flag cannot bring the ownership back.
-            // The exact rows retired and the exact imports marked deleted are kept with the
+            // The rows retired (read before the files moved) and the exact imports marked deleted are kept with the
             // entry, so a restore brings back those and no others.
             for f in entry2.files.iter_mut().filter(|f| f.kind == "video") {
-                let mut stmt = tx.prepare(
-                    "SELECT id FROM files WHERE media_id = ?1 AND present = 1 AND path = ?2",
-                )?;
-                f.rows = stmt
-                    .query_map(params![owner2, f.path], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
-                drop(stmt);
                 for id in &f.rows {
                     tx.execute("UPDATE files SET present = 0 WHERE id = ?1", [id])?;
                 }
