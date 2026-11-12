@@ -207,10 +207,11 @@ async fn pages_and_assets_carry_the_security_headers() {
         "rel=\"manifest\" href=\"/app/manifest.webmanifest\"",
         "rel=\"apple-touch-icon\" href=\"/app/icons/apple-touch-icon.png\"",
         "name=\"theme-color\"",
-        "src=\"/app/qrcodegen.js\"",
     ] {
         assert!(html.contains(want), "index.html lacks {want}");
     }
+    // The QR code script is only fetched when Settings shows it.
+    assert!(!html.contains("qrcodegen.js") && js.contains("el.src = '/app/qrcodegen.js'"));
     let manifest: Value = site
         .plain(Method::GET, "/app/manifest.webmanifest")
         .send()

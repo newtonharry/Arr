@@ -17,7 +17,29 @@ let V = { t: 'hint', text: '' }; // what the main area shows
 const R = { path: null }; // the screen under the sheet, for the active tab
 const A = new Map(); // add / retry state by id, kept for the session
 const fills = new Map();
-let token = 0, pollT = 0, retryT = 0, feedBusy = false, searchSeq = 0, searchAbort = null, debounceT = 0;
+// Answers kept in memory so a screen can show the last one at once while a fresh one is fetched.
+// Anything the person changes makes them wrong, so bust() forgets them all.
+const SC = new Map(), LC = new Map(), TC = new Map(); // search, library and title answers
+let driveC = null; // the drives line of the library: { drives, at }
+const SEARCH_TTL = 3 * 60e3;
+function remember(m, k, v, max) { m.delete(k); m.set(k, v); if (m.size > max) m.delete(m.keys().next().value); }
+function bust() { SC.clear(); LC.clear(); TC.clear(); driveC = null; }
+// The last feed, kept in this browser for the person who saw it, so opening Arr paints at once.
+const FEED_KEY = 'arr.feed';
+function saveFeed() {
+  if (!S.me || !S.feed) return;
+  try { localStorage.setItem(FEED_KEY, JSON.stringify({ u: S.me.email || '', feed: S.feed })); } catch { /* storage blocked: next open starts empty */ }
+}
+function dropFeed() { try { localStorage.removeItem(FEED_KEY); } catch { /* nothing kept */ } }
+function savedFeed() {
+  try {
+    const c = JSON.parse(localStorage.getItem(FEED_KEY) || 'null');
+    if (c && c.u === ((S.me && S.me.email) || '') && c.feed && typeof c.feed === 'object') return c.feed;
+    if (c) dropFeed(); // someone else's, or unreadable
+  } catch { dropFeed(); }
+  return null;
+}
+let token = 0, pollT = 0, retryT = 0, feedP = null, ideasP = null, searchSeq = 0, searchAbort = null, debounceT = 0;
 
 // ---------- drawing ----------
 let rerender = () => {}, pendingFk = null;
@@ -208,7 +230,7 @@ function Toast() {
 async function removeTitle(mediaId) {
   const r = await api('/v1/remove', { method: 'POST', body: { media_id: mediaId } });
   if (r.ok) {
-    forget(mediaId); S.stale = true; loadFeed();
+    forget(mediaId); bust(); S.stale = true; loadFeed();
     const n = r.data && r.data.cancelled;
     return { ok: true, text: n > 0 ? 'Arr cancelled the download and stopped tracking it.' : 'Arr stopped tracking it.' };
   }
@@ -232,14 +254,8 @@ async function addOne(it) {
   const st0 = A.get(it.id) || {};
   if ((st0.busy ? 'busy' : st0.state || it.base) !== 'add') return;
   A.set(it.id, { busy: true }); bump();
-  let next, got = null, fresh = false;
+  let next, got = null;
   try {
-    // Undo is only for a title Arr did not track at all. The movie page says so (a title the catalog
-    // knows but no longer tracks still counts as untracked); if that can't be read, no Undo.
-    try {
-      const pre = await api('/v1/movie/' + encodeURIComponent(it.id));
-      fresh = it.fresh && pre.ok && pre.data.removable === false && pre.data.state === 'none';
-    } catch { /* no Undo */ }
     const r = await api('/v1/quick-add', { method: 'POST', body: { media_id: it.id } });
     if (r.ok && r.data) {
       const o = r.data.outcome;
@@ -248,10 +264,11 @@ async function addOne(it) {
     } else next = { msg: "Couldn't add this one. Try again in a moment.", err: true };
   } catch { next = { msg: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   A.set(it.id, next); bump(); say(next.msg);
+  bust();
   if (next.err) return;
-  // Undo only for a title that was not in the catalog at all before this tap.
+  // Undo only for a title Arr did not track at all before this tap (the search result says so).
   const o = got.outcome;
-  toastAdded(it.title, o, got.detail, fresh ? () => undoAdd(it, got) : null);
+  toastAdded(it.title, o, got.detail, it.fresh ? () => undoAdd(it, got) : null);
   loadFeed();
 }
 async function undoAdd(it, got) {
@@ -273,6 +290,7 @@ async function retryOne(it) {
     next = r.ok ? { state: 'again', msg: 'Trying again. Check back in a minute.' } : { msg: "Couldn't try again just now. Give it a moment.", err: true };
   } catch { next = { msg: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   A.set(id, next); bump(); say(next.msg);
+  bust();
   if (!next.err) loadFeed();
 }
 
@@ -471,27 +489,32 @@ function Home() {
       h('h2', { id: 'h-empty' }, 'Find something to watch'), h('p', null, ideas.length ? 'Search above for a movie or show, or start with one of these.' : 'Search above for a movie or show.')));
   }
   if (ideas.length) secs.push(h(Section, { key: 'ideas', id: 'ideas', title: 'Ideas for you', extra: h('a', { href: '#/ideas' }, 'See all') }, h('ul', { class: 'ideas-row' }, keyed(ideas, (x) => x.media_id, (x, key) => h(IdeaCard, { key, x })))));
-  return h('div', { class: 'stack' }, secs);
+  return h('div', { class: 'stack' }, S.cached && h('p', { class: 'hint upd', role: 'status' }, 'Updating…'), secs);
 }
 function paintHome() { if (S.feed) setView({ t: 'home' }); }
 const onHome = () => parseHash().path === '/';
-async function loadFeed() {
-  if (S.out || feedBusy) return;
-  feedBusy = true;
-  try {
-    const r = await api('/v1/feed');
-    if (r.ok) { S.feed = r.data; S.tmdb = !!r.data.tmdb_backup; setSetup(false); if (onHome()) paintHome(); bump(); }
-    return r.ok;
-  } catch { return false; } finally {
-    feedBusy = false;
-    clearTimeout(pollT);
-    if (!document.hidden && onHome() && !S.out) pollT = setTimeout(loadFeed, 5000);
-  }
+// One feed read at a time: asking while one is on its way waits for that answer.
+function loadFeed() {
+  if (S.out) return Promise.resolve(false);
+  return (feedP ||= (async () => {
+    try {
+      const r = await api('/v1/feed');
+      if (r.ok) { S.feed = r.data; S.cached = false; S.tmdb = !!r.data.tmdb_backup; saveFeed(); setSetup(false); if (onHome()) paintHome(); bump(); }
+      return r.ok;
+    } catch { return false; } finally {
+      feedP = null;
+      if (S.cached) { S.cached = false; bump(); }
+      clearTimeout(pollT);
+      if (!document.hidden && onHome() && !S.out) pollT = setTimeout(loadFeed, 5000);
+    }
+  })());
 }
-async function loadIdeas() {
-  if (S.ideas && Date.now() - S.ideasAt < 6e5) return S.ideas;
-  try { const r = await api('/v1/ideas'); if (r.ok) { S.ideas = r.data; S.ideasAt = Date.now(); } } catch { /* optional */ }
-  return S.ideas;
+function loadIdeas() {
+  if (S.ideas && Date.now() - S.ideasAt < 6e5) return Promise.resolve(S.ideas);
+  return (ideasP ||= (async () => {
+    try { const r = await api('/v1/ideas'); if (r.ok) { S.ideas = r.data; S.ideasAt = Date.now(); } } catch { /* optional */ } finally { ideasP = null; }
+    return S.ideas;
+  })());
 }
 function failed(t) {
   setView(hint('Your list will show up here as soon as Arr is back.'));
@@ -500,11 +523,11 @@ function failed(t) {
 }
 async function renderHome(t) {
   if (S.feed) paintHome(); else setView(hint('Loading…'));
-  const ok = await loadFeed();
+  const had = S.ideas, feed = loadFeed(), ideas = loadIdeas(); // asked together
+  const ok = await feed;
   if (t !== token) return;
   if (!ok && !S.feed) return failed(t);
-  const had = S.ideas;
-  await loadIdeas();
+  await ideas;
   if (t === token && S.ideas !== had) paintHome();
 }
 
@@ -552,27 +575,44 @@ async function renderSearch(q, t) {
   searchAbort?.abort();
   const ac = (searchAbort = new AbortController());
   if (V.t === 'search') { V.busy = true; bump(); } else setView(hint('Searching…', 'status'));
-  const get = (kind) => api(`/v1/discover?kind=${kind}&q=${encodeURIComponent(q)}`, { signal: ac.signal });
-  const found = findPeople(q, seq, ac.signal); // never waited for: titles show as soon as they arrive
-  const [m, s] = await Promise.allSettled([get('movie'), get('series')]);
-  if (seq !== searchSeq || t !== token) return;
-  const ok = (r) => r.status === 'fulfilled' && r.value.ok;
-  if (!ok(m) && !ok(s)) { setView(hint('Search will work again as soon as Arr is back.', 'status')); return; }
-  const movies = ok(m) ? m.value.data.results || [] : [];
-  const shows = ok(s) ? s.value.data.results || [] : [];
-  const moviesOff = (S.feed && S.feed.movies_enabled === false) || (ok(m) && (m.value.data.providers || []).some((p) => p.name === 'plex' && p.status === 'not_configured'));
-  const rows = [];
-  for (let i = 0; i < Math.max(movies.length, shows.length); i++) {
-    if (movies[i]) rows.push({ x: movies[i], label: 'Movie' });
-    if (shows[i]) rows.push({ x: shows[i], label: 'Show' });
+  const key = q.toLowerCase(), hit = SC.get(key);
+  let view = null, pend = null;
+  const attach = () => { if (pend && view && V === view && seq === searchSeq) { view.people = pend; bump(); } };
+  // Searched a moment ago: shown at once, with the people it found.
+  if (hit && Date.now() - hit.at < SEARCH_TTL) {
+    view = { t: 'search', q, rows: hit.rows, notes: hit.notes, busy: false, loading: false, people: hit.people || null };
+    setView(view);
+    if (!hit.people) findPeople(q, seq, ac.signal).then((p) => { if (p) hit.people = p; pend = p; attach(); });
+    return;
   }
-  const notes = [];
-  if (moviesOff) notes.push("Movie search isn't set up yet.");
-  else if (!ok(m)) notes.push("Movie results aren't available right now.");
-  if (!ok(s)) notes.push("Show results aren't available right now.");
-  const view = { t: 'search', q, rows, notes, busy: false, people: null };
-  setView(view);
-  found.then((people) => { if (people && V === view && seq === searchSeq) { view.people = people; bump(); } });
+  findPeople(q, seq, ac.signal).then((p) => { pend = p; attach(); }); // never waited for
+  const ok = (r) => r && r.ok;
+  const part = (kind) => api(`/v1/discover?kind=${kind}&q=${encodeURIComponent(q)}`, { signal: ac.signal }).then((r) => ({ ok: r.ok, data: r.data }), () => ({ ok: false }));
+  const done = {}, shown = {};
+  const pm = part('movie').then((r) => (done.m = r)), ps = part('series').then((r) => (done.s = r));
+  const both = () => !!(done.m && done.s);
+  const rowsOf = (r, label) => (r.data.results || []).map((x) => ({ x, label }));
+  let rows = null;
+  // Each half is drawn as it arrives and the rows already there stay put: a later half goes below.
+  const paint = () => {
+    if (seq !== searchSeq || t !== token) return;
+    if (!ok(done.m) && !ok(done.s)) { if (both()) setView(hint('Search will work again as soon as Arr is back.', 'status')); return; }
+    const m = done.m && !shown.m && ok(done.m) ? rowsOf(done.m, 'Movie') : [], sh = done.s && !shown.s && ok(done.s) ? rowsOf(done.s, 'Show') : [];
+    shown.m = !!done.m; shown.s = !!done.s;
+    if (!rows) { rows = []; for (let i = 0; i < Math.max(m.length, sh.length); i++) { if (m[i]) rows.push(m[i]); if (sh[i]) rows.push(sh[i]); } } else rows = rows.concat(m, sh);
+    const moviesOff = (S.feed && S.feed.movies_enabled === false) || (ok(done.m) && (done.m.data.providers || []).some((p) => p.name === 'plex' && p.status === 'not_configured'));
+    const notes = [];
+    if (done.m && moviesOff) notes.push("Movie search isn't set up yet.");
+    else if (done.m && !ok(done.m)) notes.push("Movie results aren't available right now.");
+    if (done.s && !ok(done.s)) notes.push("Show results aren't available right now.");
+    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: null }; setView(view); }
+    attach();
+    if (both() && ok(done.m) && ok(done.s)) remember(SC, key, { at: Date.now(), rows, notes, people: pend }, 20);
+  };
+  await Promise.race([pm, ps]);
+  if (!both()) await Promise.race([Promise.all([pm, ps]), new Promise((r) => setTimeout(r, 120))]); // near-simultaneous halves are mixed together
+  paint();
+  if (!both()) { await Promise.all([pm, ps]); paint(); }
 }
 // People matching the search: the person (with their work) when it is clearly who was meant,
 // else a few names. Anything going wrong is no people block, never a failed search.
@@ -653,19 +693,20 @@ function SearchRow({ x, label }) {
       h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label)),
       chooseLink({ media_id: x.media_id, title: x.title, in_library: (x.in_catalog && x.monitored) || !!x.library_state }));
   }
-  // fresh: not in Plex; addOne also asks the movie page whether Arr tracked it, before offering Undo.
+  // fresh: Arr does not have it at all, so the add can be undone.
   const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add', fresh: !x.has_file && !x.library_state };
   return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
 function SearchResults() {
-  const { q, rows, notes, busy, people } = V;
+  const { q, rows, notes, busy, loading, people } = V;
   // Opening or adding a result counts the search as one worth keeping.
-  return h('div', { 'data-results': '', class: busy ? 'busy' : null, onClick: (e) => { if (e.target.closest('a,button')) noteSearch(q); } },
+  return h('div', { 'data-results': '', class: busy ? 'busy' : null, 'aria-busy': loading ? 'true' : null, onClick: (e) => { if (e.target.closest('a,button')) noteSearch(q); } },
     people && people.person ? h(PersonBlock, { person: people.person }) : null,
     h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label })))
       : h(Hint, { text: `Nothing found for “${q}”. Check the spelling or try fewer words.` })),
     people && people.names ? h(PeopleRow, { names: people.names }) : null,
+    loading ? h(Hint, { key: 'more', text: 'Still looking…', role: 'status' }) : null,
     notes.map((t) => h(Hint, { key: t, text: t })));
 }
 
@@ -678,10 +719,16 @@ function fmtDisk(bytes) {
 }
 // How full the drives holding the library are. Quiet if Arr can't tell.
 function Storage() {
-  const [drives, setDrives] = useState([]);
+  const [drives, setDrives] = useState(driveC ? driveC.drives : []);
   useEffect(() => {
     let live = true;
-    api('/v1/storage').then((r) => { if (live && r.ok) setDrives((r.data.drives || []).filter((d) => d.total_bytes > 0)); }).catch(() => {});
+    if (driveC && Date.now() - driveC.at < 60e3) return; // read a moment ago
+    api('/v1/storage').then((r) => {
+      if (!r.ok) return;
+      const ds = (r.data.drives || []).filter((d) => d.total_bytes > 0);
+      driveC = { drives: ds, at: Date.now() };
+      if (live) setDrives(ds);
+    }).catch(() => {});
     return () => { live = false; };
   }, []);
   if (!drives.length) return null;
@@ -706,14 +753,20 @@ function Library({ t }) {
   const [st, setSt] = useState({ items: [], total: 0, status: 'Loading…' });
   const m = useRef({ seq: 0, items: [], ft: 0 }).current;
   async function load(reset) {
-    const my = ++m.seq;
-    if (reset) { m.items = []; setSt({ items: [], total: 0, status: 'Loading…' }); }
+    const my = ++m.seq, key = `${S.kind}|${S.sort}|${S.filter.trim()}`;
+    if (reset) {
+      // The last answer for this list shows while the new one is fetched.
+      const hit = LC.get(key);
+      m.items = [];
+      setSt(hit ? { items: hit.items, total: hit.total, status: 'Updating…' } : { items: [], total: 0, status: 'Loading…' });
+    }
     const qs = `limit=50&offset=${m.items.length}&sort=${S.sort}` + (S.filter.trim() ? '&q=' + encodeURIComponent(S.filter.trim()) : '');
     try {
       const r = await api(`/v1/library/${S.kind}?${qs}`);
       if (my !== m.seq || t !== token) return;
       if (!r.ok) { setSt((s) => ({ ...s, status: "Couldn't load the library just now." })); return; }
       m.items = m.items.concat(r.data.items || []);
+      remember(LC, key, { items: m.items, total: r.data.total || 0 }, 12);
       setSt({ items: m.items, total: r.data.total || 0, status: m.items.length ? '' : S.filter.trim() ? `No matches for “${S.filter.trim()}”.` : 'Nothing here yet. Add something from the search above.' });
     } catch { if (my === m.seq && t === token && !S.out) { setSt((s) => ({ ...s, status: '' })); if (!m.items.length) failed(t); } }
   }
@@ -733,14 +786,14 @@ function Library({ t }) {
         h('select', { value: sort, onChange: (e) => { S.sort = e.target.value; saveSort(S.sort); setSort(S.sort); load(true); } },
           SORTS.map(([k, l]) => h('option', { key: k, value: k }, l))))),
     h('p', { class: 'hint', role: 'status' }, st.status || null),
-    h('ul', { class: 'list' }, keyed(st.items.map((x) => libraryRow(x, mv)), (r) => r.key, (r, key) => r.el(key))),
+    h('ul', { class: 'list', 'aria-busy': st.status === 'Updating…' ? 'true' : null }, keyed(st.items.map((x) => libraryRow(x, mv)), (r) => r.key, (r, key) => r.el(key))),
     h('div', { class: 'more' }, st.items.length < st.total ? [
       h('button', { key: 'b', type: 'button', class: 'btn ghost', onClick: () => load(false) }, 'Show more'),
       h('span', { key: 's' }, `Showing ${st.items.length} of ${st.total}`)] : null)));
 }
 
 // ---------- title pages (a show or a movie, as a sheet over the current screen) ----------
-const P = { del: null, confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null };
+const P = { del: null, confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null, peek: null, upd: false };
 let bgHash = '';
 const enc = encodeURIComponent;
 const pct = (p) => Math.round(p * 100);
@@ -774,7 +827,12 @@ function openTitle(t) {
     P.shown = true; // the page behind goes inert with the same redraw
   }
   clearTimeout(P.pollT); clearTimeout(P.askT);
-  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, del: null, removing: false, opt: freshOpt() });
+  // Until fresh data arrives: what was read last time, else the title, year and poster of the row that was tapped.
+  const hit = TC.get(t.id), o = P.opener, tr = o && o.getAttribute && titleRoute(parseHash(o.getAttribute('href') || '').path);
+  const row = tr && tr.id === t.id && o.isConnected ? o.closest('li') : null;
+  const peek = row && o.textContent ? { title: o.textContent, year: ((row.querySelector('.meta') || {}).textContent || '').match(/\b(?:19|20)\d\d\b/)?.[0] || '' } : null;
+  if (hit) document.title = `${hit.title} · Arr`;
+  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: hit || null, peek, upd: !!hit, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, del: null, removing: false, opt: freshOpt() });
   if (W.id === t.id) Object.assign(P.opt, { open: true, copiesOpen: true, season: W.season, fetch: true }); // from Needs you
   W.id = '';
   after(() => {
@@ -836,12 +894,15 @@ async function loadTitle(quiet) {
   try {
     const r = await api(`/v1/${P.kind}/${enc(P.id)}`);
     if (stale()) return;
-    if (!r.ok) { if (!P.data) P.err = errText(r); await seasons; if (!stale()) bump(); return; }
+    P.upd = false;
+    if (!r.ok) { TC.delete(P.id); if (!P.data || r.status === 404) { P.data = null; P.err = errText(r); } await seasons; if (!stale()) bump(); return; }
     P.data = r.data; P.err = '';
+    remember(TC, P.id, r.data, 30);
     document.title = `${r.data.title} · Arr`;
     if (P.opt.fetch) { P.opt.fetch = false; loadCopies(); }
   } catch {
     if (stale()) return;
+    P.upd = false;
     if (!P.data) P.err = "Couldn't reach Arr just now.";
   }
   await seasons;
@@ -875,17 +936,19 @@ function Sheet() {
   const open = P.shown;
   const body = !open ? null : P.data ? (P.kind === 'show' ? showBody() : movieBody()) : P.err ? errorBody() : skeleton();
   return h('div', { id: 'sheet', class: 'sheet', hidden: !open, onClick: (e) => { if (e.target === e.currentTarget) dismiss(); } },
-    h('div', { class: 'panel', id: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title', tabindex: '-1', inert: open && (P.confirm || !!P.del) },
+    h('div', { class: 'panel', id: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sheet-title', 'aria-busy': open && (P.upd || !(P.data || P.err)) ? 'true' : null, tabindex: '-1', inert: open && (P.confirm || !!P.del) },
       open ? [
-        h('div', { key: 'bar', class: 'sheet-bar' }, h('button', { type: 'button', class: 'btn ghost close', 'aria-label': 'Close', 'data-fk': 'close', onClick: dismiss }, ic('close'))),
+        h('div', { key: 'bar', class: 'sheet-bar' }, P.upd ? h('span', { class: 'upd', role: 'status' }, 'Updating…') : null, h('button', { type: 'button', class: 'btn ghost close', 'aria-label': 'Close', 'data-fk': 'close', onClick: dismiss }, ic('close'))),
         h('div', { key: 'body', class: 'sheet-body' }, body)] : null),
     open && P.confirm && P.data ? h(ConfirmRemove) : open && P.del && P.data ? h(ConfirmDelete) : null);
 }
 function skeleton() {
-  const bar = (w, extra) => h('div', { class: 'sk', style: { width: w, ...extra } });
+  const bar = (w, extra) => h('div', { class: 'sk', style: { width: w, ...extra } }), pk = P.peek;
   return h('div', { key: 'sk', class: 'stack', 'aria-busy': 'true' },
-    h('span', { id: 'sheet-title', class: 'sr' }, 'Loading'),
-    h('div', { class: 'hero' }, h('div', { class: 'tile big sk-tile' }), h('div', { class: 'hero-t' }, bar('80%'), bar('50%'))),
+    pk ? h('header', { class: 'hero' }, h(Tile, { title: pk.title, mediaId: P.id, big: true }),
+      h('div', { class: 'hero-t' }, h('h1', { id: 'sheet-title' }, pk.title), pk.year && h('p', { class: 'meta' }, pk.year)))
+      : [h('span', { key: 't', id: 'sheet-title', class: 'sr' }, 'Loading'),
+        h('div', { key: 'h', class: 'hero' }, h('div', { class: 'tile big sk-tile' }), h('div', { class: 'hero-t' }, bar('80%'), bar('50%')))],
     bar('100%'), bar('70%'),
     h('ul', { class: 'list' }, [1, 2, 3].map((i) => h('li', { key: i, class: 'item' }, h('div', { class: 'what' }, bar('40%'), bar('65%', { marginTop: '8px' }))))));
 }
@@ -968,6 +1031,7 @@ function undoGet(tk, id) {
 async function act(key, kind, scope) {
   const tk = P.token, id = P.data ? P.data.media_id : '', title = P.data ? P.data.title : '', was = kind === 'get' && P.data && P.data.removable === false ? stateOf(scope) : null;
   P.seq++; // an older read must not overwrite what this changes
+  bust();
   P.busy.add(key); P.ask = ''; P.msg.delete(key); bump();
   let res, got = null;
   try {
@@ -980,6 +1044,7 @@ async function act(key, kind, scope) {
     else if (r.data.finishing > 0) res = { text: 'Stopped looking. A download that is nearly done will still finish.' };
     else res = { text: 'Stopped. Arr will not look for it.' };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  bust();
   if (got && !res.err) toastAdded(got.title || title, got.outcome, got.detail, was === 'none' && id ? undoGet(tk, id) : null);
   if (tk !== P.token) return;
   P.busy.delete(key); P.msg.set(key, res); say(res.text);
@@ -990,13 +1055,14 @@ async function act(key, kind, scope) {
 async function toggleFollow() {
   if (P.followBusy) return;
   const want = !P.data.following, tk = P.token, fresh = P.data.removable === false;
-  P.seq++;
+  P.seq++; bust();
   P.followBusy = true; P.data.following = want; P.msg.delete('follow'); bump();
   let bad = false;
   try {
     const r = await api('/v1/follow', { method: 'POST', body: { media_id: P.data.media_id, on: want, ...(want && pickedLevel() ? { level: pickedLevel() } : {}) } });
     bad = !r.ok;
   } catch { bad = true; }
+  bust();
   if (tk !== P.token) return;
   P.followBusy = false;
   if (bad) {
@@ -1053,7 +1119,7 @@ function closeDelete() {
 async function restoreEntry(id) {
   const r = await api('/v1/bin/' + enc(id) + '/restore', { method: 'POST' });
   if (!r.ok) return { ok: false, text: "Couldn't put the files back just now. Try again in a moment." };
-  S.stale = true; loadFeed();
+  bust(); S.stale = true; loadFeed();
   const n = r.data.restored, left = (r.data.skipped || []).length;
   return { ok: true, text: left ? `${plural(n, 'file is', 'files are')} back. ${plural(left, 'file', 'files')} could not go back because something is already there.` : `${plural(n, 'file is', 'files are')} back.` };
 }
@@ -1076,7 +1142,7 @@ async function doDelete() {
   if (tk !== P.token) return;
   P.del = null;
   if (!res.ok) { P.msg.set('delete', res); say(res.text); bump(); after(() => $(`#panel [data-fk="${dl.fk}"]`)?.focus({ preventScroll: true })); return; }
-  forget(d.media_id);
+  forget(d.media_id); bust();
   S.stale = true; loadFeed();
   say(`${dl.noun} deleted. It stays in the bin for 7 days.`);
   const undo = async () => {
@@ -1138,7 +1204,7 @@ async function doRemove() {
   P.removing = false;
   if (!res.ok) { P.msg.set('remove', res); say(res.text); closeConfirm(); return; }
   P.confirm = false;
-  forget(d.media_id);
+  forget(d.media_id); bust();
   S.stale = true; // the screen under the sheet is drawn again, without this title
   dismiss();
   say(`${d.title} removed. Anything already in Plex stays there.`);
@@ -1177,7 +1243,7 @@ async function setLevel(level) {
     if (o.copiesOpen) loadCopies();
     return;
   }
-  o.saving = true; bump();
+  o.saving = true; bust(); bump();
   const tk = P.token;
   let res;
   try {
@@ -1424,7 +1490,7 @@ function movieBody() {
 
 // ---------- sign in ----------
 function showSignin(data) {
-  S.out = true; token++;
+  S.out = true; token++; dropFeed();
   clearTimeout(pollT); clearTimeout(retryT);
   setBanner(''); S.setup = false;
   document.title = 'Sign in · Arr';
@@ -1498,6 +1564,17 @@ function View() {
 const REMOTE_DOCS = 'https://github.com/newtonharry/Arr/blob/main/docs/REMOTE.md';
 
 // The code is always dark on white, whatever the theme: phones scan it that way.
+let qrP = null;
+function loadQr() {
+  return (qrP ||= new Promise((ok, no) => {
+    if (self.qrcodegen) return ok();
+    const el = document.createElement('script');
+    el.src = '/app/qrcodegen.js';
+    el.onload = () => ok();
+    el.onerror = () => { qrP = null; el.remove(); no(new Error('qr')); };
+    document.head.append(el);
+  }));
+}
 function QrCode({ text }) {
   const q = qrcodegen.QrCode.encodeText(text, qrcodegen.QrCode.Ecc.MEDIUM), pad = 3;
   let d = '';
@@ -1514,6 +1591,9 @@ async function copyText(node, text) {
 function Phone({ url }) {
   const [msg, setMsg] = useState('');
   const code = useRef(null);
+  const [qr, setQr] = useState(!!self.qrcodegen);
+  // The code's script is only fetched when this section opens; the address shows without it.
+  useEffect(() => { if (url && !qr) loadQr().then(() => setQr(true), () => {}); }, [url]);
   if (!url) {
     return h('div', { class: 'stack' },
       h('p', null, 'Arr works on this computer for now. To use it on your phone, turn on remote access: run the installer again with ',
@@ -1525,7 +1605,7 @@ function Phone({ url }) {
     h('div', { class: 'addr' }, h('code', { ref: code }, url),
       h('button', { type: 'button', class: 'btn ghost', onClick: async () => setMsg((await copyText(code.current, url)) ? 'Copied' : 'Press Ctrl+C to copy') }, 'Copy'),
       h('span', { class: 'msg', role: 'status' }, msg || null)),
-    h(QrCode, { text: url }),
+    qr ? h(QrCode, { text: url }) : null,
     h('div', { class: 'how' },
       h('p', null, h('b', null, 'iPhone: '), 'open the address in Safari, tap Share, then Add to Home Screen.'),
       h('p', null, h('b', null, 'Android: '), 'open the address in Chrome, tap the menu (three dots), then Add to Home screen or Install app.')));
@@ -1892,6 +1972,7 @@ function Footer() {
       ', show details and posters from ', h('a', { href: 'https://www.tvmaze.com', target: '_blank', rel: 'noopener noreferrer' }, 'TVmaze'), '.'));
 }
 async function signOut() {
+  dropFeed();
   try { await api('/signout', { method: 'POST' }); } catch { /* signed out anyway */ }
   location.hash = ''; location.reload();
 }
@@ -1963,6 +2044,10 @@ async function boot() {
     if (!document.hidden && S.me && U.phase === 'idle' && Date.now() - U.checkedAt > 30 * 60 * 1000) loadUpdate();
   });
   window.addEventListener('hashchange', route);
+  // Who is signed in, the feed and the ideas are asked together; none waits for another.
+  const path = parseHash().path;
+  if (path === '/' || path === '/ideas' || path === '/search') loadIdeas();
+  if (path === '/') loadFeed();
   try {
     const r = await api('/me');
     if (r.ok) { S.me = r.data; bump(); }
@@ -1972,6 +2057,12 @@ async function boot() {
     setTimeout(boot2, 5000);
     return;
   }
+  start();
+}
+// Signed in: show what was seen last time (only ever the same person's) while the feed is fetched.
+function start() {
+  if (S.feed) saveFeed();
+  else if (onHome()) { const f = savedFeed(); if (f) { S.feed = f; S.cached = true; } }
   route();
   // The feed also says whether TMDB is used, which the footer credit needs on every screen.
   if (!onHome()) loadFeed();
@@ -1980,7 +2071,7 @@ async function boot() {
 async function boot2() {
   try {
     const r = await api('/me');
-    if (r.ok) { S.me = r.data; bump(); route(); if (!onHome()) loadFeed(); if (!U.checkedAt) loadUpdate(); }
+    if (r.ok) { S.me = r.data; bump(); start(); }
   } catch { if (!S.out) setTimeout(boot2, 5000); }
 }
 document.body.replaceChildren();

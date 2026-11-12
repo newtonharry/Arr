@@ -156,7 +156,7 @@ body.sheet-open{overflow:hidden}
 .sheet{position:fixed;inset:0;z-index:30}
 .panel{position:absolute;inset:0;overflow-y:auto;overscroll-behavior:contain;background:var(--bg);outline:0;padding:0 20px calc(28px + env(safe-area-inset-bottom));animation:rise .3s cubic-bezier(.16,1,.3,1)}
 @keyframes rise{from{transform:translateY(40px);opacity:0}to{transform:none;opacity:1}}
-.sheet-bar{position:sticky;top:0;z-index:2;display:flex;justify-content:flex-end;padding:calc(10px + env(safe-area-inset-top)) 0 10px;background:var(--bg)}
+.sheet-bar{position:sticky;top:0;z-index:2;display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:calc(10px + env(safe-area-inset-top)) 0 10px;background:var(--bg)}
 .sheet-body{padding-top:2px}
 .hero{display:flex;gap:16px;align-items:flex-start}
 .tile.big{width:96px;height:144px;border-radius:12px;font-size:28px}
@@ -204,6 +204,8 @@ body.sheet-open{overflow:hidden}
 .item.state .act:has(.ask){flex-basis:100%}
 .sk{height:14px;border-radius:8px;background:var(--line);animation:pulse 1.4s ease-in-out infinite}
 .sk-tile{background:var(--line)}
+/* Shown while the last answer is on screen and a fresh one is on its way. */
+.upd{color:var(--muted);font-size:13px;animation:pulse 1.4s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.45}}
 .stretch{color:inherit;text-decoration:none}
 .stretch::after{content:"";position:absolute;inset:0;border-radius:18px}
