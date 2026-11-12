@@ -359,8 +359,8 @@ routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry a
   "Championship", "Decker" or "Winston" are fine). Otherwise the event is kept under the name
   `<League> event on <YYYY-MM-DD>` (UTC). Every other text from the feed follows the same
   idea: team names, short names and venues are plain names (letters, digits, spaces and
-  `. ' & - / ( )`, bounded) that pass the reject list, and a team whose name does not is called
-  `Team <id>`; an abbreviation is up to six letters, digits or `&`; a `season` is `2026`,
+  `. ' & - / ( )`, bounded, each word capitalised or a small particle) that pass the reject list,
+  and a team whose name does not is called `Team <id>`; an abbreviation is up to six letters, digits or `&`; a `season` is `2026`,
   `2026-27` or `2026-2027`, else `null`. See "No results" in `ARCHITECTURE.md`.
 - **Ids.** A league is `league:<slug>` (`league:nba`; routes also accept the bare slug), a game,
   fight card or tournament is `event:<slug>:<number>` (`event:nba:401909999`). Slugs are
@@ -445,6 +445,12 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
   at most 92 days), whatever their state (never `unlisted`), soonest first, at most 500. `league`
   limits it to one league. A `from` so late that its default end does not exist, or a time past
   the year 9999 once its offset is applied, is `400 invalid_query`.
+
+A team's label in follows, the league page and search is the one in the stored team list, which
+a successful read of the list corrects; `since` never changes. An event's own `home`, `away`,
+`name` and `short_name` are as of its last refresh. A request that waits for the schedule source
+(a league page, a follow) has one deadline, four fifths of `timeout_secs` and at most eight
+seconds, shared by everything it waits for; the work carries on in the background after it.
 
 How the schedule is kept (worker task `sports`, listed in `/system/tasks`; in shadow mode there is no worker, so a followed league is read when its page is opened or it is followed): a followed league is
 read once it is six hours old, or every twenty minutes within two hours before a followed game

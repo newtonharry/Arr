@@ -314,6 +314,15 @@ pub struct FollowRow {
     pub since: String,
 }
 
+/// A follow with its team's label taken from `sport_teams` now (the one place a team's name
+/// lives and is corrected), falling back to the label stored when it was made, then to
+/// `Team <id>`. `since` is always the stored one.
+const FOLLOW_SELECT: &str = "SELECT f.league, f.team_id,
+    CASE WHEN f.team_id IS NULL THEN NULL ELSE COALESCE(
+        (SELECT t.name FROM sport_teams t WHERE t.league = f.league AND t.team_id = f.team_id),
+        f.team_name, 'Team ' || f.team_id) END,
+    f.since_utc FROM sport_follows f";
+
 fn follow_row(r: &Row) -> rusqlite::Result<FollowRow> {
     Ok(FollowRow {
         league: r.get(0)?,
@@ -335,7 +344,7 @@ pub fn follow(
     let team_id = team.map(|t| t.0);
     let existing = tx
         .query_row(
-            "SELECT league, team_id, team_name, since_utc FROM sport_follows WHERE league = ?1 AND IFNULL(team_id, '') = ?2",
+            &format!("{FOLLOW_SELECT} WHERE f.league = ?1 AND IFNULL(f.team_id, '') = ?2"),
             params![league, team_id.unwrap_or("")],
             follow_row,
         )
@@ -365,9 +374,7 @@ pub fn unfollow(c: &Connection, league: &str, team_id: Option<&str>) -> Result<b
 }
 
 pub fn follows(c: &Connection) -> Result<Vec<FollowRow>> {
-    let mut stmt = c.prepare(
-        "SELECT league, team_id, team_name, since_utc FROM sport_follows ORDER BY since_utc, id",
-    )?;
+    let mut stmt = c.prepare(&format!("{FOLLOW_SELECT} ORDER BY f.since_utc, f.id"))?;
     Ok(stmt
         .query_map([], follow_row)?
         .collect::<rusqlite::Result<_>>()?)

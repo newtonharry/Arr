@@ -247,13 +247,56 @@ fn outcome_like(t: &str) -> bool {
 /// (Parentheses are allowed too: a real venue is "Toyota Center (Houston)".)
 const NAME_PUNCT: &str = " .'\u{2019}&-/()";
 
-/// A name (a team, a venue, a short name): letters of any script, digits, spaces and `. ' & - /`
-/// only, bounded, reading like neither a score nor an outcome.
+/// Small lowercase words that may sit inside a name ("Atl\u{e9}tico de Madrid", "Stade de France").
+const NAME_PARTICLES: [&str; 23] = [
+    "de", "da", "do", "dos", "das", "del", "della", "di", "du", "van", "von", "der", "den", "la",
+    "le", "el", "al", "of", "the", "and", "y", "e", "&",
+];
+/// More of them for venues ("Parc des Princes", "Stadio delle Alpi", "Stadion im Sportpark").
+const NAME_PARTICLES_MORE: [&str; 7] = ["des", "dei", "delle", "degli", "zu", "am", "im"];
+
+/// One word of a name. It must not start with a lowercase letter: a capital, a digit ("76ers",
+/// "1."), a letter of a script without case, or a bare symbol all fit, as do the particles above
+/// and the apostrophe form "d'Ivoire" (a letter or two, an apostrophe, a capital). Mixed case
+/// inside the word is fine ("McLaren"). Parentheses around a word are ignored.
+fn name_word(raw: &str) -> bool {
+    let t = raw.trim_matches(|c| c == '(' || c == ')');
+    if !t.chars().any(char::is_alphanumeric) {
+        return true;
+    }
+    if NAME_PARTICLES.contains(&t) || NAME_PARTICLES_MORE.contains(&t) {
+        return true;
+    }
+    let mut chars = t.chars();
+    let first = chars.next().unwrap_or(' ');
+    if !first.is_lowercase() {
+        return true;
+    }
+    // A sponsor's web address ("crypto.com Arena").
+    if let Some((host, tld)) = t.rsplit_once('.')
+        && ["com", "net", "org", "io", "tv", "co"].contains(&tld)
+        && !host.is_empty()
+        && host.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return true;
+    }
+    // d'Ivoire, l'Equipe
+    let lead = t.chars().take_while(|c| c.is_lowercase()).count();
+    let rest: Vec<char> = t.chars().skip(lead).collect();
+    (1..=2).contains(&lead)
+        && matches!(rest.first(), Some('\'' | '\u{2019}'))
+        && rest.get(1).is_some_and(|c| c.is_uppercase())
+}
+
+/// A name (a team, a venue, a short name): letters of any script, digits, spaces and
+/// `. ' & - / ( )` only, bounded, every word of the kind `name_word` accepts (so lowercase
+/// prose is not a name), reading like neither a score nor an outcome.
 pub fn plain_name(text: Option<&str>, max: usize) -> Option<String> {
     let t = clean(text, max + 1)?;
     let ok = t.chars().count() <= max
         && t.chars()
             .all(|c| c.is_alphanumeric() || NAME_PUNCT.contains(c))
+        && t.split(' ').all(name_word)
         && !outcome_like(&t);
     ok.then_some(t)
 }
@@ -1028,6 +1071,37 @@ mod title_tests {
             "Proch\u{e1}zka Arena",
             "Estadio Jos\u{e9} Zorrilla / Valladolid",
             "Toyota Center (Houston)",
+            "Brighton & Hove Albion",
+            "1. FC K\u{f6}ln",
+            "Paris Saint-Germain",
+            "Philadelphia 76ers",
+            "Atl\u{e9}tico de Madrid",
+            "Borussia M\u{f6}nchengladbach",
+            "AS Roma",
+            "Stade Toulousain",
+            "Union Bordeaux-B\u{e8}gles",
+            "ACT Brumbies",
+            "Moana Pasifika",
+            "Fijian Drua",
+            "South Sydney Rabbitohs",
+            "Manly Warringah Sea Eagles",
+            "St. George Illawarra Dragons",
+            "Sydney FC",
+            "Western Sydney Wanderers FC",
+            "LA Clippers",
+            "Estadio Santiago Bernab\u{e9}u",
+            "Allianz Arena",
+            "St. James' Park",
+            "Parc des Princes",
+            "Stadio delle Alpi",
+            "Stadion im Sportpark",
+            "Cote d'Ivoire",
+            "Stade de l'Aube",
+            "Costa d'Avorio",
+            "\u{9e7f}\u{5cf6}\u{30a2}\u{30f3}\u{30c8}\u{30e9}\u{30fc}\u{30ba}",
+            "\u{421}\u{43f}\u{430}\u{440}\u{442}\u{430}\u{43a} \u{41c}\u{43e}\u{441}\u{43a}\u{432}\u{430}",
+            "McLaren Park",
+            "crypto.com Arena",
         ] {
             assert_eq!(plain_name(Some(ok), 120).as_deref(), Some(ok), "{ok}");
         }
@@ -1038,6 +1112,13 @@ mod title_tests {
             "Arena <3",
             "Smith lost to Jones",
             "Team (wins)",
+            "smith outclasses jones",
+            "Smith outclasses jones",
+            "home side cruises",
+            "venue where smith won",
+            "the winner takes it all",
+            "lowercase Name",
+            "Stadium of smith",
             "Team A (3-1)",
             "Team; DROP",
             "Stadium, the winner",

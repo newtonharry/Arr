@@ -2027,3 +2027,128 @@ async fn a_team_is_missing_only_by_a_current_list_and_unavailable_by_a_stale_one
         "{v}"
     );
 }
+
+// ------------------------------------------------------------------ review round 4
+
+#[tokio::test]
+async fn a_cold_team_follow_shares_one_budget_between_the_team_list_and_the_schedule() {
+    let e = start_exec(ExecOptions::default()).await;
+    // Each request takes 1.2 s; the request timeout is 2 s, so the budget is 1.6 s.
+    e.mock.lock().unwrap().espn_delay = Some(Duration::from_millis(1200));
+    let started = Instant::now();
+    let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    let took = started.elapsed();
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["follow"]["team"]["name"], "Manchester City");
+    assert_eq!(
+        v["schedule_read"], false,
+        "the schedule is still being read"
+    );
+    // One deadline: the team list took most of it and the schedule got what was left, not a
+    // second budget of its own (that would be about 2.8 s).
+    assert!(took < Duration::from_millis(2300), "{took:?}");
+    let (_, f) = get(&e, "/api/v1/sport/following").await;
+    assert_eq!(f["following"].as_array().unwrap().len(), 1);
+    // The read the follow started carries on and completes.
+    let mut done = false;
+    for _ in 0..60 {
+        if count(&e, "sport_events").await > 0 {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(done, "the schedule never arrived");
+}
+
+#[tokio::test]
+async fn a_followed_teams_label_comes_from_the_team_list_and_since_never_moves() {
+    let e = start_exec(ExecOptions::default()).await;
+    let poison = |on: bool| {
+        let mut m = e.mock.lock().unwrap();
+        let name = if on {
+            "Jones wins by KO"
+        } else {
+            "Manchester City"
+        };
+        for ev in m.espn_events.get_mut(EPL).unwrap().iter_mut() {
+            for comp in ev["competitions"].as_array_mut().unwrap() {
+                for c in comp["competitors"].as_array_mut().unwrap() {
+                    if c["team"]["id"] == "382" {
+                        c["team"]["displayName"] = json!(name);
+                    }
+                }
+            }
+        }
+        let list = m.espn_teams.get_mut(EPL).unwrap();
+        for t in list["sports"][0]["leagues"][0]["teams"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if t["team"]["id"] == "382" {
+                t["team"]["displayName"] = json!(name);
+            }
+        }
+    };
+    poison(true);
+    let (s, v) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["follow"]["team"]["name"], "Team 382");
+    let since = v["follow"]["since"].clone();
+
+    // The feed's name is good now, and the team list is read again.
+    poison(false);
+    e.state
+        .store
+        .with(|c| {
+            c.execute(
+                "UPDATE sport_refresh SET teams_utc = '2026-01-01T00:00:00Z', teams_next_try_utc = NULL",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let r = refresh_run(&e, OffsetDateTime::now_utc() + time::Duration::hours(7)).await;
+    assert_eq!(r["leagues"][0]["status"], "ok", "{r}");
+
+    let (_, f) = get(&e, "/api/v1/sport/following").await;
+    assert_eq!(f["following"][0]["team"]["name"], "Manchester City", "{f}");
+    assert_eq!(f["following"][0]["since"], since);
+    let (_, page) = get(&e, "/api/v1/sport/league/premier-league").await;
+    assert_eq!(
+        page["following_teams"][0]["name"], "Manchester City",
+        "{page}"
+    );
+    let listed = page["teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "382")
+        .unwrap();
+    assert_eq!(
+        (listed["name"].as_str(), &listed["followed"]),
+        (Some("Manchester City"), &json!(true))
+    );
+    let (_, found) = get(&e, "/api/v1/sport/search?q=man%20city").await;
+    assert_eq!(
+        found["teams"][0]["team"]["name"], "Manchester City",
+        "{found}"
+    );
+    // Following again changes nothing but shows the current label.
+    let (s, again) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!((s, &again["created"]), (200, &json!(false)), "{again}");
+    assert_eq!(again["follow"]["team"]["name"], "Manchester City");
+    assert_eq!(again["follow"]["since"], since);
+    // A follow whose team is gone from the table keeps the label it was made with.
+    e.state
+        .store
+        .with(|c| {
+            c.execute("DELETE FROM sport_teams WHERE team_id = '382'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (_, f) = get(&e, "/api/v1/sport/following").await;
+    assert_eq!(f["following"][0]["team"]["name"], "Team 382", "{f}");
+}

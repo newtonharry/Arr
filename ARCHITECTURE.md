@@ -491,13 +491,20 @@ follows:
   a season is `YYYY`, `YYYY-YY` or `YYYY-YYYY`; a round is exactly one of a list of labels
   ("Round 12", "Group B", "Semi-final", ...) rebuilt by Arr; an abbreviation is up to six
   letters, digits or `&`; a team, short or venue name is letters, digits, spaces and
-  `. ' & - / ( )` within a length bound; a game between two teams is named by Arr from the two
+  `. ' & - / ( )` within a length bound, and every word of it starts with a capital, a digit or
+  a letter of a script without case (or is a small particle such as "de", "of", "des", or an
+  apostrophe form like "d'Ivoire"), so lowercase prose is not a name; a game between two teams is named by Arr from the two
   team names (`<Away> at <Home>`), its short name from the abbreviations; a fight card's title
   begins with one of the league's own names and has a small tail and optionally
   `: <Name> vs. <Name>`; a tournament title is capitalised words, numbers and a few small
   connectors. A string that does not fit becomes a neutral value made from Arr's own data
   (`Team <id>`, `<League> event on <date>`) or null. The event or team itself is never hidden
   because of it.
+- **One label per team.** A team's name lives in `sport_teams` and a successful team-list read
+  corrects it. Follows, the league page and search take the label from there at read time (a
+  follow keeps the label it was made with only as a fallback, then `Team <id>`; `since` never
+  changes). An event row keeps the home and away names, name and short name of its last
+  refresh, as one consistent snapshot; they are not re-resolved at read time.
 - **Reject list.** On top of each positive rule, text that reads like a score (`3-1`) or contains
   an outcome word as a whole word (def, beat, wins, winner, won, lost to, draw, ko, tko,
   submits, taps, stops, decision, forfeit, champion, upset, ...; "Championship" and

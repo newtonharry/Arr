@@ -8,8 +8,21 @@
 use super::*;
 use crate::sport::{self, catalog, data, refresh};
 
-/// How long a request waits for the schedule source before answering from what is stored.
+/// The most a request waits for the schedule source before answering from what is stored.
 const BUDGET: Duration = Duration::from_secs(8);
+
+/// This request's budget: four fifths of the source's own timeout, at most `BUDGET` (the
+/// default timeout of ten seconds gives eight). One deadline serves every stage of a request.
+fn budget(st: &AppState) -> Duration {
+    st.cfg.sports.as_ref().map_or(BUDGET, |c| {
+        (c.timeout * 4 / 5).clamp(Duration::from_secs(1), BUDGET)
+    })
+}
+
+/// What is left of a request's deadline.
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
 /// A league followed or opened within this long of its last read is not read again.
 const RECENT: Duration = Duration::from_secs(20 * 60);
 const SEARCH_LEAGUES: usize = 12;
@@ -180,9 +193,14 @@ pub(super) async fn league(State(st): St, p: Result<Path<String>, PathRejection>
         p.map_err(|e| ApiError::bad_request(ErrorCode::InvalidRequest, e.body_text()))?;
     let league = league_of(&raw)?;
     // Brings the schedule up to date if it is old, for a few seconds at most.
-    let fresh =
-        refresh::ensure_fresh_within(st.store.clone(), sports, league, refresh::STALE, BUDGET)
-            .await;
+    let fresh = refresh::ensure_fresh_within(
+        st.store.clone(),
+        sports,
+        league,
+        refresh::STALE,
+        budget(&st),
+    )
+    .await;
     let now = OffsetDateTime::now_utc();
     let slug = league.slug;
     let (follows, teams, upcoming, recent, state) = st
@@ -239,6 +257,8 @@ pub(super) struct FollowBody {
 /// Follows a league, or one team in it. Following starts now: nothing earlier is wanted.
 pub(super) async fn follow(State(st): St, ApiJson(b): ApiJson<FollowBody>) -> ApiResult {
     let sports = sports(&st)?.clone();
+    // One deadline for the whole request: the team list and the schedule share it.
+    let deadline = Instant::now() + budget(&st);
     let league = league_of(&b.league)?;
     let team_id = b.team_id.as_deref().map(team_id_of).transpose()?;
     if team_id.is_some() && !league.teams {
@@ -262,9 +282,13 @@ pub(super) async fn follow(State(st): St, ApiJson(b): ApiJson<FollowBody>) -> Ap
                 .map_err(internal("sport follow"))?;
             if found.is_none() {
                 // The league's team list has not been read yet.
-                let read =
-                    refresh::ensure_teams_within(st.store.clone(), sports.clone(), league, BUDGET)
-                        .await;
+                let read = refresh::ensure_teams_within(
+                    st.store.clone(),
+                    sports.clone(),
+                    league,
+                    remaining(deadline),
+                )
+                .await;
                 found = find(st.clone(), id.to_string())
                     .await
                     .map_err(internal("sport follow"))?;
@@ -319,8 +343,14 @@ pub(super) async fn follow(State(st): St, ApiJson(b): ApiJson<FollowBody>) -> Ap
     };
     // The first thing a person wants after following is to see what is coming up: read the
     // schedule now (a few seconds at most) unless it was read a moment ago.
-    let fresh =
-        refresh::ensure_fresh_within(st.store.clone(), sports, league, RECENT, BUDGET).await;
+    let fresh = refresh::ensure_fresh_within(
+        st.store.clone(),
+        sports,
+        league,
+        RECENT,
+        remaining(deadline),
+    )
+    .await;
     let now = OffsetDateTime::now_utc();
     let mine = row.clone();
     let next = st
