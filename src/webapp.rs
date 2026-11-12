@@ -827,6 +827,8 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | ["people"]
                 | ["people", _]
                 | ["library", "movies" | "series"]
+                | ["sport", "search" | "leagues" | "following" | "events"]
+                | ["sport", "league", _]
                 | ["show", _]
                 | ["show", _, "season", _]
                 | ["movie", _]
@@ -835,6 +837,7 @@ fn allowed(method: &Method, path: &str) -> bool {
         ),
         Method::POST => match parts.as_slice() {
             ["quick-add" | "follow" | "stop" | "quality" | "remove"] => true,
+            ["sport", "follow" | "unfollow"] => true,
             ["delete"] | ["delete", "preview"] => true,
             ["bin", id, "restore"] => !id.is_empty(),
             // Update now, and a changed setting: signed-in household members only, like the rest.
@@ -1121,5 +1124,25 @@ mod tests {
         );
         assert!(!out.is_empty());
         assert_eq!(s.requester("movie:tmdb:9"), None);
+    }
+
+    #[test]
+    fn the_app_may_read_sport_and_follow_but_not_reach_anything_else_new() {
+        let get = |p: &str| allowed(&Method::GET, p);
+        let post = |p: &str| allowed(&Method::POST, p);
+        for p in [
+            "/api/v1/sport/search",
+            "/api/v1/sport/leagues",
+            "/api/v1/sport/following",
+            "/api/v1/sport/events",
+            "/api/v1/sport/league/nba",
+        ] {
+            assert!(get(p), "{p}");
+            assert!(!post(p) || p.ends_with("follow"), "{p}");
+        }
+        assert!(post("/api/v1/sport/follow") && post("/api/v1/sport/unfollow"));
+        assert!(!get("/api/v1/sport/follow") && !get("/api/v1/sport"));
+        assert!(!get("/api/v1/sport/league/nba/extra"));
+        assert!(!allowed(&Method::DELETE, "/api/v1/sport/league/nba"));
     }
 }

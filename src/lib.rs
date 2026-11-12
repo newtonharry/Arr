@@ -50,6 +50,7 @@ pub mod selfupdate;
 pub mod set;
 pub mod settings;
 pub mod setup;
+pub mod sport;
 pub mod store;
 pub mod target;
 pub mod title;

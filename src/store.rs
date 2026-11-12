@@ -535,6 +535,8 @@ impl Store {
             "supersedes",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
+        // Sport schedules and follows (additive, `src/sport/data.rs`).
+        crate::sport::data::create_tables(&conn)?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
         })

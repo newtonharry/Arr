@@ -46,6 +46,10 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
     goes in `X-Api-Key`, and also in the Torznab query of a URL that is never logged.
   - **qBittorrent WebUI API v2:** WebAPI 2.8.2 (4.3.9) to 2.11+ (5.x).
   - **TVmaze/TMDB:** when enabled.
+  - **Sport schedules:** ESPN's public scoreboard feed (`GET {base}/{sport}/{league}/scoreboard?dates=YYYYMM&limit=400`
+    and `.../teams`), unauthenticated, with a plain `Arr` user agent, one request at a time.
+    On by default (nothing is asked until a league is opened or followed); `[sports] enabled = false`
+    turns it off.
   - **Plex:** a section or folder refresh (`?path=` from `movies_path`/`tv_path`); read-only
     `GET /library/sections`, paginated `/library/sections/{id}/all?includeGuids=1` and
     `/library/metadata/{key}/allLeaves` for discovery and the library bootstrap.
@@ -78,6 +82,7 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
 | `ingest`, `probe` | completed-download import with a journal and crash recovery; the bounded ffprobe media probe |
 | `scan` | per-root library reconciliation |
 | `rss` | Torznab parsing, matching and RSS sync |
+| `sport` | sport schedules and follows, a module of its own beside movies and series (`catalog`: the built-in leagues; `espn`: the schedule client and the fixtures-only parser; `data`: the `sport_*` tables; `refresh`: keeping followed leagues current, and the worker's `sports` task). The HTTP handlers are `api/sport.rs` |
 | `worker` | background loop: commands (leased), downloads pass, scheduled tasks, request retries, metadata refresh, startup recovery |
 | `api`, `openapi`, `error` | axum router, auth, limits, typed errors, OpenAPI document |
 | `mcp` | the MCP adapter: six tools over the REST API (stdio over HTTP, or remote over the in-process router), closed input schemas, typed errors with their outcome, no fallback; the remote `/mcp` mount |
@@ -414,7 +419,9 @@ pass:
    later passes, so user requests never starve;
 2. runs the downloads pass: submit, poll, import, cleanup, plan states;
 3. runs due tasks: `rss_sync`, `requests`, `refresh_metadata` (fresh TVmaze episode
-   lists and TMDB movie release evidence, 25 items per run each), `rescan`, `prune`.
+   lists and TMDB movie release evidence, 25 items per run each), `rescan`, `prune`, `bin`,
+   and last `sports` (every 15 minutes it looks at which followed sport leagues are due; it
+   never fails the pass and stops early when the schedule source is failing).
 
 Task status is in `tasks`. At startup the worker rolls back the import journal, returns
 `importing` grabs to `completed`, reconciles `unconfirmed` adds first, and requeues commands
@@ -446,6 +453,72 @@ observation is:
   `empty_unconfirmed`, an unusable mapping is `indexer_unavailable` — else `incomplete`.
 
 RSS reports retrieval status separately and never promises gap-free coverage.
+
+## Sport
+
+Sport is a module (`src/sport/`) and a set of tables (`sport_follows`, `sport_events`,
+`sport_teams`, `sport_refresh`, added with `CREATE TABLE IF NOT EXISTS` inside schema 3, so an
+older release ignores them) that sits beside movies and series. It is **not** a third media kind:
+no `MediaId` variant, no search, no download, no import and no Plex call exists for sport yet.
+
+What exists (phase one: schedules and follows):
+
+- a built-in catalogue of leagues (soccer, basketball, rugby union and league, golf, MMA), each
+  with its schedule-source path checked live, whether it has teams, and the names release titles
+  use for it (recorded now, unused until release matching exists);
+- following a league, or a team of a league that has teams, from now on; follows and events
+  survive restarts and are available in shadow mode (the immediate read on follow works
+  without the worker);
+- events with a fixed state vocabulary (`scheduled`, `postponed`, `cancelled`, `played`; plus
+  an internal `unlisted` for an event that dropped out of a complete answer, never served:
+  absence never cancels, only the source can). The
+  schedule parser has no field for scores, winners or result text, so none can be stored or
+  served; a test keeps real recordings that carry them and proves none gets through;
+- a worker task and on-demand reads that keep followed leagues current within a strict request
+  budget (see the Sport section of [`docs/API.md`](docs/API.md)), and the `/api/v1/sport/*`
+  routes, plus a `sport` field on `/feed` and `/calendar`.
+
+### No results
+
+Sport never keeps or shows how a contest went. The contract, which `src/sport/espn.rs`
+follows:
+
+- **Structural.** Score, winner, status-text and record fields are never parsed: no struct has a
+  place for them (the status is read only as the name and state that become `scheduled`,
+  `postponed`, `cancelled` or `played`). Athletes' names are not parsed at all.
+- **Positive rules.** Every string taken from the schedule source is accepted by a positive rule
+  for its kind, never by "anything except a denylist": ids are digits; times are parsed;
+  a season is `YYYY`, `YYYY-YY` or `YYYY-YYYY`; a round is exactly one of a list of labels
+  ("Round 12", "Group B", "Semi-final", ...) rebuilt by Arr; an abbreviation is up to six
+  letters, digits or `&`; a team, short or venue name is letters, digits, spaces and
+  `. ' & - / ( )` within a length bound, and every segment of it (a run of letters and digits; spaces, `. - / ( ) & '` are separators,
+  so "Smith.outclasses" is two segments) begins with a capital, a digit or a letter of a script
+  without case, or is a small particle ("de", "of", "des", "upon", "sur", ...), an apostrophe form
+  ("d'Ivoire") or a possessive `s` ("Children's"), or the whole word is a sponsor web address
+  such as "crypto.com"; so lowercase prose is not a name, whatever it is prefixed or joined with.
+  Tournament titles and fighters' names are judged by the same segment rule; a game between two teams is named by Arr from the two
+  team names (`<Away> at <Home>`), its short name from the abbreviations; a fight card's title
+  begins with one of the league's own names and has a small tail and optionally
+  `: <Name> vs. <Name>`; a tournament title is capitalised words, numbers and a few small
+  connectors. A string that does not fit becomes a neutral value made from Arr's own data
+  (`Team <id>`, `<League> event on <date>`) or null. The event or team itself is never hidden
+  because of it.
+- **One label per team.** A team's name lives in `sport_teams` and a successful team-list read
+  corrects it. Follows, the league page and search take the label from there at read time (a
+  follow keeps the label it was made with only as a fallback, then `Team <id>`; `since` never
+  changes). An event row keeps the home and away names, name and short name of its last
+  refresh, as one consistent snapshot; they are not re-resolved at read time.
+- **Reject list.** On top of each positive rule, text that reads like a score (`3-1`) or contains
+  an outcome word as a whole word (def, beat, wins, winner, won, lost to, draw, ko, tko,
+  submits, taps, stops, decision, forfeit, champion, upset, ...; "Championship" and
+  "Decker" are not outcome words) is refused.
+- **Known limit.** A positive rule for names cannot prove that a proper noun is not a result
+  written in title case ("Smith Overcomes Jones" is made of capitalised words); the reject list is
+  what stands behind that case, and a result phrased without any listed word would pass it.
+
+What does not exist yet: release matching for events, downloading, filing and Plex refresh for
+sport, automatic pickup, any web app page for sport (the app's proxy already allows the routes),
+and a stored history older than yesterday.
 
 ## Not implemented
 

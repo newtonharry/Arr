@@ -46,6 +46,7 @@ pub const TASKS: &[&str] = &[
     "rescan",
     "prune",
     "bin",
+    "sports",
 ];
 const COMMAND_LEASE: Duration = Duration::from_secs(15 * 60);
 const MAX_COMMAND_ATTEMPTS: i64 = 3;
@@ -362,6 +363,7 @@ pub async fn tick(st: &AppState, now: OffsetDateTime) -> Result<TickReport> {
         "rescan",
         "prune",
         "bin",
+        "sports",
     ] {
         if due(st, name, now).await? {
             run_task(st, name, now).await?;
@@ -382,6 +384,8 @@ fn interval(st: &AppState, name: &str) -> Option<Duration> {
         "rescan" => Some(a.rescan),
         "prune" => Some(Duration::from_secs(86_400)),
         "bin" => Some(Duration::from_secs(3_600)),
+        // Cheap when nothing is due: it looks at the follows and which leagues were read when.
+        "sports" => st.sports.as_ref().map(|_| Duration::from_secs(15 * 60)),
         _ => None,
     }
 }
@@ -428,6 +432,10 @@ pub async fn run_task(st: &AppState, name: &str, now: OffsetDateTime) -> Result<
         "rescan" => crate::scan::scan(st, now, false).await.map(|r| json!(r)),
         "prune" => prune(st, now).await,
         "bin" => crate::trash::purge_due(st, now).await,
+        "sports" => match &st.sports {
+            Some(s) => Ok(crate::sport::refresh::run(st.store.clone(), s.clone(), now).await),
+            None => Ok(json!({ "note": "sport is turned off" })),
+        },
         other => Err(anyhow::anyhow!("unknown task {other}")),
     };
     let (status, value) = match &result {

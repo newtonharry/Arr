@@ -41,6 +41,8 @@ struct FileConfig {
     #[serde(default)]
     tmdb: TmdbSection,
     #[serde(default)]
+    sports: SportsSection,
+    #[serde(default)]
     execution: ExecutionSection,
     qbittorrent: Option<QbitSection>,
     embedded: Option<EmbeddedSection>,
@@ -363,6 +365,59 @@ fn d_tmdb_url() -> String {
 }
 fn d_tmdb_image_url() -> String {
     "https://image.tmdb.org".into()
+}
+
+/// Sport schedules (ESPN's public scoreboard feed). On by default: nothing is contacted until
+/// someone opens a league or follows one, so there is nothing to opt in to; `enabled = false`
+/// turns the whole feature off.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SportsSection {
+    #[serde(default = "d_true")]
+    enabled: bool,
+    #[serde(default = "d_espn_url")]
+    base_url: String,
+    #[serde(default = "d_sports_timeout")]
+    timeout_secs: u64,
+    /// The least time between two requests to the schedule source.
+    #[serde(default = "d_sports_spacing")]
+    min_interval_ms: u64,
+    /// How long requests are refused after a failure (doubling with each failure in a row,
+    /// up to 15 minutes), so a source that is down is not asked again at once.
+    #[serde(default = "d_sports_backoff")]
+    backoff_secs: u64,
+    /// How long an answer is reused (0: never).
+    #[serde(default = "d_sports_cache")]
+    cache_secs: u64,
+}
+
+impl Default for SportsSection {
+    fn default() -> Self {
+        SportsSection {
+            enabled: true,
+            base_url: d_espn_url(),
+            timeout_secs: d_sports_timeout(),
+            min_interval_ms: d_sports_spacing(),
+            backoff_secs: d_sports_backoff(),
+            cache_secs: d_sports_cache(),
+        }
+    }
+}
+
+fn d_espn_url() -> String {
+    "https://site.api.espn.com/apis/site/v2/sports/".into()
+}
+fn d_sports_timeout() -> u64 {
+    10
+}
+fn d_sports_spacing() -> u64 {
+    500
+}
+fn d_sports_backoff() -> u64 {
+    60
+}
+fn d_sports_cache() -> u64 {
+    300
 }
 
 #[derive(Deserialize)]
@@ -978,6 +1033,16 @@ pub struct MetadataConfig {
     pub credential: Option<Secret>,
 }
 
+/// The sport schedule source (`[sports]`).
+#[derive(Debug, Clone)]
+pub struct SportsConfig {
+    pub base_url: Url,
+    pub timeout: Duration,
+    pub min_interval: Duration,
+    pub backoff: Duration,
+    pub cache: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub listen: SocketAddr,
@@ -989,6 +1054,8 @@ pub struct RuntimeConfig {
     pub prowlarr: Option<ProwlarrConfig>,
     pub tvmaze: Option<MetadataConfig>,
     pub tmdb: Option<MetadataConfig>,
+    /// Sport schedules; none when `[sports] enabled = false`.
+    pub sports: Option<SportsConfig>,
     /// Master switch for writes outside this server's state: torrent submission, file import,
     /// Plex refresh and scheduled acquisition searches.
     pub execution_enabled: bool,
@@ -1238,6 +1305,32 @@ pub fn parse_config(
                 120,
             )?),
             credential: Some(Secret(read_secret(file, "tmdb.credential_file")?)),
+        })
+    } else {
+        None
+    };
+    let sports = if fc.sports.enabled {
+        Some(SportsConfig {
+            base_url: parse_base_url(&fc.sports.base_url, "sports.base_url")?,
+            timeout: Duration::from_secs(within(
+                "sports.timeout_secs",
+                fc.sports.timeout_secs,
+                1,
+                60,
+            )?),
+            min_interval: Duration::from_millis(within(
+                "sports.min_interval_ms",
+                fc.sports.min_interval_ms,
+                0,
+                60_000,
+            )?),
+            backoff: Duration::from_secs(within(
+                "sports.backoff_secs",
+                fc.sports.backoff_secs,
+                0,
+                3600,
+            )?),
+            cache: Duration::from_secs(within("sports.cache_secs", fc.sports.cache_secs, 0, 3600)?),
         })
     } else {
         None
@@ -1655,6 +1748,7 @@ pub fn parse_config(
             prowlarr,
             tvmaze,
             tmdb,
+            sports,
             execution_enabled,
             download_cleanup: fc.execution.download_cleanup,
             migration,
