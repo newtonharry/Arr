@@ -14,9 +14,15 @@ const BUDGET: Duration = Duration::from_secs(8);
 /// This request's budget: four fifths of the source's own timeout, at most `BUDGET` (the
 /// default timeout of ten seconds gives eight). One deadline serves every stage of a request.
 fn budget(st: &AppState) -> Duration {
-    st.cfg.sports.as_ref().map_or(BUDGET, |c| {
-        (c.timeout * 4 / 5).clamp(Duration::from_secs(1), BUDGET)
-    })
+    st.cfg
+        .sports
+        .as_ref()
+        .map_or(BUDGET, |c| budget_for(c.timeout))
+}
+
+/// Four fifths of the source's timeout, at most `BUDGET`.
+fn budget_for(timeout: Duration) -> Duration {
+    (timeout * 4 / 5).min(BUDGET)
 }
 
 /// What is left of a request's deadline.
@@ -351,6 +357,20 @@ pub(super) async fn follow(State(st): St, ApiJson(b): ApiJson<FollowBody>) -> Ap
         remaining(deadline),
     )
     .await;
+    // The refresh may have corrected the team's label: answer with the label every other route
+    // shows now (the stored `since` is unchanged).
+    let row = {
+        let (l, t) = (row.league.clone(), row.team_id.clone());
+        st.store
+            .with(move |c| {
+                Ok(data::follows(c)?
+                    .into_iter()
+                    .find(|f| f.league == l && f.team_id == t))
+            })
+            .await
+            .map_err(internal("sport follow"))?
+            .unwrap_or(row)
+    };
     let now = OffsetDateTime::now_utc();
     let mine = row.clone();
     let next = st
@@ -532,4 +552,23 @@ pub(super) async fn in_window(
         .await
         .map_err(internal("calendar"))?;
     Ok(list.iter().map(sport::event_json).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_budget_is_four_fifths_of_the_timeout_at_most_eight_seconds() {
+        let ms = |t: u64| budget_for(Duration::from_millis(t)).as_millis();
+        assert_eq!(
+            ms(1000),
+            800,
+            "a one second timeout gives 800 ms, not a second"
+        );
+        assert_eq!(ms(500), 400);
+        assert_eq!(ms(2000), 1600);
+        assert_eq!(ms(10_000), 8000);
+        assert_eq!(ms(60_000), 8000);
+    }
 }

@@ -252,7 +252,9 @@ pub fn upsert_teams(c: &mut Connection, league: &str, teams: &[TeamInfo]) -> Res
     for t in teams {
         tx.execute(
             "INSERT INTO sport_teams (league, team_id, name, short_name, abbreviation) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (league, team_id) DO UPDATE SET name = ?3, short_name = ?4, abbreviation = ?5",
+             ON CONFLICT (league, team_id) DO UPDATE SET
+                 name = CASE WHEN ?3 = 'Team ' || ?2 THEN name ELSE ?3 END,
+                 short_name = ?4, abbreviation = ?5",
             params![league, t.id, t.name, t.short_name, t.abbreviation],
         )?;
     }

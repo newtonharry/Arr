@@ -491,9 +491,12 @@ follows:
   a season is `YYYY`, `YYYY-YY` or `YYYY-YYYY`; a round is exactly one of a list of labels
   ("Round 12", "Group B", "Semi-final", ...) rebuilt by Arr; an abbreviation is up to six
   letters, digits or `&`; a team, short or venue name is letters, digits, spaces and
-  `. ' & - / ( )` within a length bound, and every word of it starts with a capital, a digit or
-  a letter of a script without case (or is a small particle such as "de", "of", "des", or an
-  apostrophe form like "d'Ivoire"), so lowercase prose is not a name; a game between two teams is named by Arr from the two
+  `. ' & - / ( )` within a length bound, and every segment of it (a run of letters and digits; spaces, `. - / ( ) & '` are separators,
+  so "Smith.outclasses" is two segments) begins with a capital, a digit or a letter of a script
+  without case, or is a small particle ("de", "of", "des", "upon", "sur", ...), an apostrophe form
+  ("d'Ivoire") or a possessive `s` ("Children's"), or the whole word is a sponsor web address
+  such as "crypto.com"; so lowercase prose is not a name, whatever it is prefixed or joined with.
+  Tournament titles and fighters' names are judged by the same segment rule; a game between two teams is named by Arr from the two
   team names (`<Away> at <Home>`), its short name from the abbreviations; a fight card's title
   begins with one of the league's own names and has a small tail and optionally
   `: <Name> vs. <Name>`; a tournament title is capitalised words, numbers and a few small

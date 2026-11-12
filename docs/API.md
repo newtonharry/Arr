@@ -359,7 +359,7 @@ routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry a
   "Championship", "Decker" or "Winston" are fine). Otherwise the event is kept under the name
   `<League> event on <YYYY-MM-DD>` (UTC). Every other text from the feed follows the same
   idea: team names, short names and venues are plain names (letters, digits, spaces and
-  `. ' & - / ( )`, bounded, each word capitalised or a small particle) that pass the reject list,
+  `. ' & - / ( )`, bounded, each segment capitalised or a small particle) that pass the reject list,
   and a team whose name does not is called `Team <id>`; an abbreviation is up to six letters, digits or `&`; a `season` is `2026`,
   `2026-27` or `2026-2027`, else `null`. See "No results" in `ARCHITECTURE.md`.
 - **Ids.** A league is `league:<slug>` (`league:nba`; routes also accept the bare slug), a game,

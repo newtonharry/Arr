@@ -247,45 +247,73 @@ fn outcome_like(t: &str) -> bool {
 /// (Parentheses are allowed too: a real venue is "Toyota Center (Houston)".)
 const NAME_PUNCT: &str = " .'\u{2019}&-/()";
 
-/// Small lowercase words that may sit inside a name ("Atl\u{e9}tico de Madrid", "Stade de France").
-const NAME_PARTICLES: [&str; 23] = [
+/// Lowercase words that may stand as a whole segment of a name ("Atl\u{e9}tico de Madrid",
+/// "Stade de France", "Parc des Princes", "Newcastle upon Tyne", "Stoke-on-Trent",
+/// "Boulogne-sur-Mer", "Aix-en-Provence").
+const NAME_PARTICLES: &[&str] = &[
     "de", "da", "do", "dos", "das", "del", "della", "di", "du", "van", "von", "der", "den", "la",
-    "le", "el", "al", "of", "the", "and", "y", "e", "&",
+    "le", "el", "al", "of", "the", "and", "y", "e", "des", "dei", "delle", "degli", "zu", "am",
+    "im", "on", "upon", "sur", "en", "les", "sous", "aux",
 ];
-/// More of them for venues ("Parc des Princes", "Stadio delle Alpi", "Stadion im Sportpark").
-const NAME_PARTICLES_MORE: [&str; 7] = ["des", "dei", "delle", "degli", "zu", "am", "im"];
 
-/// One word of a name. It must not start with a lowercase letter: a capital, a digit ("76ers",
-/// "1."), a letter of a script without case, or a bare symbol all fit, as do the particles above
-/// and the apostrophe form "d'Ivoire" (a letter or two, an apostrophe, a capital). Mixed case
-/// inside the word is fine ("McLaren"). Parentheses around a word are ignored.
-fn name_word(raw: &str) -> bool {
-    let t = raw.trim_matches(|c| c == '(' || c == ')');
-    if !t.chars().any(char::is_alphanumeric) {
-        return true;
+/// What a segment of a name may begin with: a capital letter, a digit, or a letter of a script
+/// without case. (Spelled out; "anything that is not lowercase" would let punctuation through.)
+fn start_allowed(c: char) -> bool {
+    c.is_uppercase() || c.is_numeric() || (c.is_alphabetic() && !c.is_lowercase())
+}
+
+/// Whether every segment of a word is acceptable. A segment is a run of letters and digits; the
+/// separators between segments (`. - / ( ) & '`, anything else that is not a letter or digit)
+/// are never part of one, so "Smith.outclasses", "Smith-outclasses" and ".smith" are judged
+/// segment by segment. A segment that contains a letter must begin with `start_allowed`, or be
+/// one of `particles`, or be the one or two lowercase letters before an apostrophe and a capital
+/// ("d'Ivoire", "l'Aube"), or the `s` of a possessive ("Children's"). Segments with no letter or
+/// digit (a bare `&`) are not segments at all.
+fn segments_ok(word: &str, particles: &[&str]) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    let apostrophe = |c: Option<&char>| matches!(c, Some('\'' | '\u{2019}'));
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_alphanumeric() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        let seg: String = chars[start..i].iter().collect();
+        if start_allowed(chars[start]) || particles.contains(&seg.as_str()) {
+            continue;
+        }
+        let elision = (1..=2).contains(&seg.chars().count())
+            && apostrophe(chars.get(i))
+            && chars.get(i + 1).is_some_and(|c| c.is_uppercase());
+        let possessive = seg == "s"
+            && start >= 2
+            && apostrophe(chars.get(start - 1))
+            && chars[start - 2].is_alphanumeric();
+        if !(elision || possessive) {
+            return false;
+        }
     }
-    if NAME_PARTICLES.contains(&t) || NAME_PARTICLES_MORE.contains(&t) {
-        return true;
-    }
-    let mut chars = t.chars();
-    let first = chars.next().unwrap_or(' ');
-    if !first.is_lowercase() {
-        return true;
-    }
-    // A sponsor's web address ("crypto.com Arena").
-    if let Some((host, tld)) = t.rsplit_once('.')
-        && ["com", "net", "org", "io", "tv", "co"].contains(&tld)
-        && !host.is_empty()
-        && host.chars().all(|c| c.is_ascii_alphanumeric())
-    {
-        return true;
-    }
-    // d'Ivoire, l'Equipe
-    let lead = t.chars().take_while(|c| c.is_lowercase()).count();
-    let rest: Vec<char> = t.chars().skip(lead).collect();
-    (1..=2).contains(&lead)
-        && matches!(rest.first(), Some('\'' | '\u{2019}'))
-        && rest.get(1).is_some_and(|c| c.is_uppercase())
+    true
+}
+
+/// A sponsor's web address as a whole word of a name ("crypto.com Arena"): ASCII letters and
+/// digits, one dot, and one of a short list of endings, nothing else. The reject list and the
+/// other words of the name still apply, so "smith.com wins" and "smith.com outclasses jones" fail.
+fn web_address_word(w: &str) -> bool {
+    w.rsplit_once('.').is_some_and(|(host, tld)| {
+        ["com", "net", "org", "io", "tv", "co"].contains(&tld)
+            && !host.is_empty()
+            && host.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+/// One space-separated word of a name.
+fn name_word(w: &str) -> bool {
+    web_address_word(w) || segments_ok(w, NAME_PARTICLES)
 }
 
 /// A name (a team, a venue, a short name): letters of any script, digits, spaces and
@@ -323,15 +351,17 @@ fn season_label(v: Option<&Value>) -> Option<String> {
     season.is_match(&t).then_some(t)
 }
 
-/// A word of a name or title: starts with a capital letter or a digit, then letters, digits
-/// and `' . - &` (so "McIlroy", "AT&T", "3M", "Pro-Am", "U.S." fit; "wins" does not).
+/// A word of a title or a fighter's name: starts with a capital letter or a digit, then letters,
+/// digits and `' . - &`, and every segment of it (see `segments_ok`) is capitalised, so "McIlroy",
+/// "AT&T", "3M", "Pro-Am", "U.S." and "Children's" fit while "Smith.outclasses" does not.
 fn title_token(t: &str) -> bool {
-    let mut c = t.chars();
-    c.next()
+    t.chars()
+        .next()
         .is_some_and(|f| f.is_uppercase() || f.is_ascii_digit())
         && t.chars().count() <= 24
         && t.chars()
             .all(|c| c.is_alphanumeric() || "'\u{2019}.-&".contains(c))
+        && segments_ok(t, &[])
 }
 
 /// Small words that may sit in a tournament title without a capital.

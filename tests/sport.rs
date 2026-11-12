@@ -1654,15 +1654,12 @@ async fn titles_that_read_like_results_never_reach_an_answer() {
     for bad in ["def.", "lost to", "wins by", "3-1"] {
         assert!(!text.contains(bad), "{bad} in {text}");
     }
-    // A good title is untouched.
+    // A good title is untouched: follow the golf league and read the events again.
+    follow(&e, json!({ "league": "dp-world-tour" })).await;
+    let (_, v) = get(&e, &wide_events()).await;
     assert!(
-        events
-            .iter()
-            .any(|x| x["name"] == "DP World Tour Championship")
-            || {
-                follow(&e, json!({ "league": "dp-world-tour" })).await;
-                true
-            }
+        names(&v["events"]).contains(&"DP World Tour Championship".to_string()),
+        "{v}"
     );
 }
 
@@ -1943,6 +1940,11 @@ async fn every_text_field_that_carries_a_result_is_neutral_in_the_store_and_ever
         assert_eq!(s, 200, "{path}");
         seen.push(text);
     }
+    // Every answer really carried the neutral label, so the checks below are not about nothing.
+    assert!(
+        seen.iter().filter(|t| t.contains("Team 382")).count() >= 4,
+        "{seen:?}"
+    );
     for text in &seen {
         for bad in ["def.", "3-1", "wins by", "Smith", "Jones", "KO"] {
             assert!(!text.contains(bad), "{bad} in {text}");
@@ -2151,4 +2153,243 @@ async fn a_followed_teams_label_comes_from_the_team_list_and_since_never_moves()
         .unwrap();
     let (_, f) = get(&e, "/api/v1/sport/following").await;
     assert_eq!(f["following"][0]["team"]["name"], "Team 382", "{f}");
+}
+
+// ------------------------------------------------------------------ review round 5
+
+/// Every team name, short name and venue in the trimmed recordings, and every fight card and
+/// tournament title, through the real rules (not a copy of them).
+#[test]
+fn every_name_and_title_in_the_recordings_passes_the_rules() {
+    use arr::sport::{catalog, espn};
+    let boards = [
+        (
+            include_str!("fixtures/espn/soccer_eng1.json"),
+            "premier-league",
+        ),
+        (include_str!("fixtures/espn/basketball_nba.json"), "nba"),
+        (include_str!("fixtures/espn/rugby_top14.json"), "top-14"),
+        (include_str!("fixtures/espn/mma_ufc.json"), "ufc"),
+        (include_str!("fixtures/espn/golf_eur.json"), "dp-world-tour"),
+    ];
+    let lists = [
+        include_str!("fixtures/espn/soccer_eng1_teams.json"),
+        include_str!("fixtures/espn/basketball_nba_teams.json"),
+        include_str!("fixtures/espn/rugby_top14_teams.json"),
+    ];
+    let (mut passed, mut failed) = (0, vec![]);
+    let mut check = |what: &str, text: Option<&str>, ok: Option<String>| {
+        if text.is_some() {
+            if ok.is_some() {
+                passed += 1;
+            } else {
+                failed.push(format!("{what}: {text:?}"));
+            }
+        }
+    };
+    for (board, slug) in boards {
+        let v: Value = serde_json::from_str(board).unwrap();
+        let league = catalog::find(slug).unwrap();
+        for ev in v["events"].as_array().unwrap() {
+            check(
+                "title",
+                ev["name"].as_str().filter(|_| !league.teams),
+                espn::event_title(ev["name"].as_str(), league),
+            );
+            for comp in ev["competitions"].as_array().unwrap() {
+                let venue = comp["venue"]["fullName"].as_str();
+                check("venue", venue, espn::plain_name(venue, 120));
+                for c in comp["competitors"].as_array().into_iter().flatten() {
+                    let name = c["team"]["displayName"].as_str();
+                    check("team", name, espn::plain_name(name, 120));
+                }
+            }
+        }
+    }
+    for list in lists {
+        let v: Value = serde_json::from_str(list).unwrap();
+        for t in v["sports"][0]["leagues"][0]["teams"].as_array().unwrap() {
+            let name = t["team"]["displayName"].as_str();
+            check("team", name, espn::plain_name(name, 120));
+            let short = t["team"]["shortDisplayName"].as_str();
+            check("short", short, espn::plain_name(short, 60));
+        }
+    }
+    println!("recordings: {passed} passed, {} failed", failed.len());
+    assert!(failed.is_empty(), "{failed:?}");
+    assert!(passed > 200, "{passed}");
+}
+
+#[test]
+fn prose_cannot_get_into_a_name_or_title_by_a_separator_or_a_prefix() {
+    use arr::sport::{
+        catalog,
+        espn::{event_title, plain_name},
+    };
+    let tlds = ["com", "net", "org", "io", "tv", "co"];
+    let particles = [
+        "de", "da", "do", "dos", "das", "del", "della", "di", "du", "van", "von", "der", "den",
+        "la", "le", "el", "al", "of", "the", "and", "y", "e", "des", "dei", "delle", "degli", "zu",
+        "am", "im", "on", "upon", "sur", "en", "les", "sous", "aux",
+    ];
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut word = || loop {
+        let mut w = String::new();
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let len = 3 + (seed >> 60) as usize % 7;
+        for _ in 0..len {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            w.push((b'a' + ((seed >> 33) % 26) as u8) as char);
+        }
+        if !particles.contains(&w.as_str()) && !tlds.contains(&w.as_str()) {
+            return w;
+        }
+    };
+    let seps = [
+        " ", ".", "-", "/", "(", ")", "'", "\u{2019}", "&", ". ", " - ", " (", ") ",
+    ];
+    let prefixes = ["", ".", "-", "/", "(", ")", "'", "\u{2019}", "&"];
+    let (ufc, pga) = (
+        catalog::find("ufc").unwrap(),
+        catalog::find("pga-tour").unwrap(),
+    );
+    let mut tried = 0;
+    for _ in 0..60 {
+        let (a, b, c) = (word(), word(), word());
+        let cap = |w: &str| format!("{}{}", w[..1].to_uppercase(), &w[1..]);
+        for sep in seps {
+            for prefix in prefixes {
+                let lower = format!("{prefix}{a}{sep}{b}{sep}{c}");
+                let capped = format!("{prefix}{}{sep}{b}", cap(&a));
+                for name in [&lower, &capped] {
+                    tried += 1;
+                    assert_eq!(plain_name(Some(name), 120), None, "name {name:?}");
+                    assert_eq!(event_title(Some(name), pga), None, "tournament {name:?}");
+                    let card = format!("UFC 334: {name} vs. Jones");
+                    assert_eq!(event_title(Some(&card), ufc), None, "card {card:?}");
+                }
+            }
+        }
+    }
+    assert!(tried > 10_000);
+    // The cases from the review, by hand.
+    for bad in [
+        ".smith .outclasses .jones",
+        "Smith.outclasses.jones",
+        "Smith-outclasses-jones",
+        "Smith/outclasses/jones",
+        "Smith&outclasses&jones",
+        "(smith outclasses jones)",
+        "'smith 'outclasses",
+        "smith.com wins",
+        "smith.com outclasses jones",
+        "smith.com.au Arena",
+        "smith..com Arena",
+        "Smith's outclasses",
+    ] {
+        assert_eq!(plain_name(Some(bad), 120), None, "{bad}");
+    }
+    for good in [
+        "crypto.com Arena",
+        "Newcastle upon Tyne FC",
+        "Stoke-on-Trent",
+        "Boulogne-sur-Mer",
+        "Villeneuve-d'Ascq",
+        "Texas Children's Hospital",
+        "Smith.Jones",
+    ] {
+        assert_eq!(plain_name(Some(good), 120).as_deref(), Some(good), "{good}");
+    }
+    // Tournament and card titles judge segments too.
+    assert_eq!(event_title(Some("Smith.outclasses Open"), pga), None);
+    assert_eq!(event_title(Some("Open-of-smith Classic"), pga), None);
+    assert_eq!(
+        event_title(Some("UFC 334: Gane.hokit vs. Jones"), ufc),
+        None
+    );
+    assert_eq!(
+        event_title(Some("U.S. Open"), pga).as_deref(),
+        Some("U.S. Open")
+    );
+    assert_eq!(
+        event_title(Some("Texas Children's Houston Open"), pga).as_deref(),
+        Some("Texas Children's Houston Open")
+    );
+}
+
+#[tokio::test]
+async fn a_follow_that_corrects_the_label_answers_with_the_corrected_label() {
+    let e = start_exec(ExecOptions::default()).await;
+    follow(&e, json!({ "league": "premier-league" })).await;
+    // The stored label is stale, the team list is old and the league is due: the follow
+    // request itself does the refresh that corrects the name.
+    let stale = || async {
+        e.state
+            .store
+            .with(|c| {
+                c.execute("UPDATE sport_teams SET name = 'Team 382' WHERE team_id = '382'", [])?;
+                c.execute("UPDATE sport_refresh SET teams_utc = '2026-01-01T00:00:00Z', teams_next_try_utc = NULL, refreshed_utc = '2026-01-01T00:00:00Z'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    };
+    stale().await;
+    let (s, first) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!(s, 201, "{first}");
+    assert_eq!(
+        first["follow"]["team"]["name"], "Manchester City",
+        "{first}"
+    );
+    let since = first["follow"]["since"].clone();
+    let (_, f) = get(&e, "/api/v1/sport/following").await;
+    let mine = f["following"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["team"]["id"] == "382")
+        .unwrap();
+    assert_eq!(mine["team"]["name"], "Manchester City");
+    // A repeat follow does the same.
+    stale().await;
+    let (s, again) = follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    assert_eq!((s, &again["created"]), (200, &json!(false)), "{again}");
+    assert_eq!(
+        again["follow"]["team"]["name"], "Manchester City",
+        "{again}"
+    );
+    assert_eq!(again["follow"]["since"], since);
+}
+
+#[tokio::test]
+async fn a_bad_name_in_a_later_list_does_not_replace_a_good_label() {
+    let e = start_exec(ExecOptions::default()).await;
+    follow(&e, json!({ "league": "premier-league", "team_id": "382" })).await;
+    {
+        let mut m = e.mock.lock().unwrap();
+        let list = m.espn_teams.get_mut(EPL).unwrap();
+        for t in list["sports"][0]["leagues"][0]["teams"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if t["team"]["id"] == "382" {
+                t["team"]["displayName"] = json!("smith outclasses jones");
+            }
+        }
+    }
+    e.state
+        .store
+        .with(|c| {
+            c.execute("UPDATE sport_refresh SET teams_utc = '2026-01-01T00:00:00Z', teams_next_try_utc = NULL", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    refresh_run(&e, OffsetDateTime::now_utc() + time::Duration::hours(7)).await;
+    let (_, f) = get(&e, "/api/v1/sport/following").await;
+    assert_eq!(f["following"][0]["team"]["name"], "Manchester City", "{f}");
 }
