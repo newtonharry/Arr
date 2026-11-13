@@ -39,6 +39,7 @@ impl Sport {
     }
 }
 
+#[derive(Debug)]
 pub struct League {
     /// `[a-z0-9-]{2,24}`; the `league:<slug>` id and the prefix of every event id.
     pub slug: &'static str,
@@ -49,8 +50,10 @@ pub struct League {
     /// Whether it is played between teams (so a team can be followed). Golf and MMA have
     /// players and fighters, not teams.
     pub teams: bool,
-    /// The names release titles use for it. Nothing reads them yet: they are here so the
-    /// release matcher of a later phase starts from a reviewed list.
+    /// The names release titles use for it; the release matcher (`release`, `matcher`) reads
+    /// them. A name must identify this competition and no other: it is matched as whole words
+    /// at the start of a title, and anything that narrows it (a division number, "Women's",
+    /// another sport's name before it) makes the release a different competition.
     pub aliases: &'static [&'static str],
 }
 
@@ -118,7 +121,15 @@ pub const LEAGUES: &[League] = &[
         Soccer,
         "soccer/esp.1",
         true,
-        &["La Liga", "LaLiga", "Spanish La Liga"],
+        &[
+            "La Liga",
+            "LaLiga",
+            "LaLiga EA Sports",
+            "La Liga EA Sports",
+            "Spanish La Liga",
+            "Primera Division",
+            "Spanish Primera Division",
+        ],
     ),
     league(
         "bundesliga",
@@ -126,7 +137,8 @@ pub const LEAGUES: &[League] = &[
         Soccer,
         "soccer/ger.1",
         true,
-        &["Bundesliga", "German Bundesliga"],
+        // ("1. Bundesliga" is the top division itself; "2. Bundesliga" is another competition)
+        &["Bundesliga", "1 Bundesliga", "German Bundesliga"],
     ),
     league(
         "serie-a",
@@ -345,6 +357,14 @@ pub const LEAGUES: &[League] = &[
         &["PFL", "Professional Fighters League"],
     ),
 ];
+
+impl League {
+    /// Whether this is a women's competition. Every other league of the catalogue is men's (or
+    /// open), so a release that says "Women's" is never one of theirs.
+    pub fn women(&self) -> bool {
+        matches!(self.slug, "wnba" | "lpga-tour")
+    }
+}
 
 pub fn find(slug: &str) -> Option<&'static League> {
     LEAGUES.iter().find(|l| l.slug == slug)

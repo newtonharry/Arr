@@ -328,9 +328,9 @@ have none. The plain API does not return it. The movie and show pages also carry
 
 ### Sport: schedules and follows
 
-Follow a league or a team and Arr keeps its schedule. This is the first part of sport support:
-schedules and follows only. Nothing is searched for, downloaded or filed for sport yet, and
-Plex is not touched. The schedules come from ESPN's public scoreboard feed, which needs no key
+Follow a league or a team and Arr keeps its schedule. Sport support so far is schedules and
+follows, and a read-only list of the copies of a finished event (`GET /sport/event/{id}/copies`,
+below). Nothing is downloaded or filed for sport yet, and Plex is not touched. The schedules come from ESPN's public scoreboard feed, which needs no key
 and is not an official API; it is the one outside service sport adds (see
 [`PRIVACY.md`](PRIVACY.md)). `[sports] enabled = false` in `config.toml` turns sport off: its
 routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry an empty `sport`.
@@ -407,13 +407,18 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
   "away": { "id": "370", "name": "Fulham" },
   "round": null,
   "venue": "Etihad Stadium",
-  "season": "2026"
+  "season": "2026",
+  "expected_end": "2026-11-21T15:30:00Z"
 }
 ```
 
 `home` and `away` are `null` for golf and MMA; `ends_at` is set for events that run for days
 (a golf tournament); `round` and `venue` are `null` when the feed does not say (or, for
-`round`, says something that is not a round label).
+`round`, says something that is not a round label). `expected_end` is when Arr reckons the event
+is over: the source's end when it gives one (plus a day for a tournament, whose end date is the
+midnight before its last evening), else the start plus a length typical for the sport (soccer and
+rugby 3 hours, basketball 3.5, MMA 8, golf 4 days). The start of an MMA card is the start of the
+whole event (its first early prelim). Copies are looked for only after it.
 
 - **`GET /api/v1/sport/leagues`** lists every league, each with `followed` (the whole league)
   and `followed_teams` (how many of its teams). Answers from the store.
@@ -450,6 +455,93 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
   at most 92 days), whatever their state (never `unlisted`), soonest first, at most 500. `league`
   limits it to one league. A `from` so late that its default end does not exist, or a time past
   the year 9999 once its offset is applied, is `400 invalid_query`.
+
+- **`GET /api/v1/sport/event/{id}/copies?part=&fresh=`** finds the releases that look like this event, for a person to look over and choose from.
+  `{id}` is `event:ufc:600061400` (or `ufc:600061400`, with an optional `:main`, `:prelims`,
+  `:early-prelims` or `:r1`..`:r4` after it); `part` limits the list to one part (a file that holds
+  the whole event also answers), `fresh=true` asks the indexers again instead of using a recent
+  answer. It searches the indexers the shows use, at most three texts (the league's name with the
+  date, or the card's number, the fighters' surnames, a tournament's name), and judges every
+  answer against the stored event. **It only reads**: it records no link, grab or file, starts
+  nothing, and answers `405` to a write. An event that is not over by Arr's reckoning, or is
+  cancelled or postponed, answers `available: false` with `note` (`not_over_yet`, `cancelled`,
+  `postponed`) and asks no indexer. Otherwise the indexers are asked **at most once per event per
+  two minutes**, whatever `fresh` says (and not again within two minutes of a search that did not
+  finish); in between the answer is the last one, with `searched.cached: true` and
+  `searched.age_secs`. Requests for the same event at the same time share one search. Across all
+  events at most six searches start in a minute: past that, an event with no answer yet gets
+  `note: "busy"` with `searched.retry_after_secs` and no copies, and one that has an answer gets
+  it. Worst case, this route sends at most 18 queries a minute to any one indexer (six searches of
+  at most three queries). The part filter is applied to the answer, not to the search. Otherwise:
+
+  ```json
+  { "event": { ... }, "parts": [ { "part": "main", "label": "Main card" } ],
+    "available": true, "note": null,
+    "copies": [ { "id": "rel_<24 hex>", "part": "main", "part_label": "Main card",
+                  "caution": null,
+                  "resolution": "1080p", "source": "Web", "fps": 60, "language": "English",
+                  "size_bytes": 4800000000, "speed": "fast", "seeders": 31,
+                  "published_at": "2026-11-15T03:10:00Z", "indexer": "The Pirate Bay",
+                  "label": "Main card \u00b7 1080p \u00b7 Web" },
+                { "id": "rel_<24 hex>", "part": "main", "part_label": "Main card",
+                  "caution": { "reason": "no_uploader_tag",
+                               "note": "The title has no uploader's name to go by." },
+                  "...": "..." } ],
+    "skipped": [ { "reason": "not the event itself (a show about it)", "count": 3 } ],
+    "searched": { "queries": 3, "indexers": 2, "complete": true, "problem": null } }
+  ```
+
+  `parts` lists the parts the event can have (fight cards: `main`, `prelims`, `early-prelims`;
+  golf: `r1`..`r4`; a game has none). A copy's `part` is one of those or `whole` (a file of the
+  whole event).
+
+  **A caution, not a verdict.** Arr recommends nothing, and nothing in this answer says a copy is
+  right. Each copy has `caution`: `null`, or `{ "reason", "note" }` with the reason Arr could not
+  fully check the copy and a plain sentence for a person. **No caution does not mean Arr
+  verified the copy: a person chooses**, and a copy with a caution is the same kind of choice with
+  something to look at first. The copies are listed by part, then those with no caution before those
+  with one, then by swarm health, language, resolution, seeders and size. The order is only an
+  order: nothing is marked as the one to take. The reasons: `unlabelled_main` (a UFC file with no part
+  word, taken as the main card), `unlabelled_full` (one beside an explicit main card from the same
+  uploader), `unlabelled_whole` (a card of another league with no part word: the whole event, the
+  main card or one fight, nothing says; it answers no `part` request), `rematch_unverified` (a
+  rematch numeral the stored title does not carry equal), `date_only`, `place_only`,
+  `another_fixture_fits` (the same two teams or fighters have another fixture the title fits as
+  well), `schedule_unknown` (the league's schedule is not recorded as read in full for those days,
+  so "no other fixture fits" is not known), `unverified_text` (the title has words no closed list
+  or the event checks; an uploader's tag that is not on Arr's list of known ones), `no_uploader_tag`
+  (the title has no uploader's tag: a forum-style title has none by nature), `late_upload` (put
+  up long after the event, more than 14 days after its start), `undated` (the indexer gave no
+  publish time), `number_unverified` (a card number), `serial_unverified` (a Fight Night serial,
+  which the schedule source does not carry), `series_unverified`, `names_unverified` (the stored
+  card has no headliners), `head_unverified`, `sides_unverified`, `season_unverified` (a
+  season or year that is not the stored one exactly) and `round_unverified` (a stage or round the
+  stored event does not equal: "Final", "Game 7", "RS", "Matchweek 9" when the schedule has no such
+  round). What the store contradicts is not listed at all: it is counted in `skipped`. Arr never
+  picks a copy on its own.
+
+  `indexer` is the name the person configured for a native indexer, found by the source's
+  identity (its id); it is `null` for a Prowlarr copy and whenever the source cannot be resolved,
+  and it is never the text the release itself carries.
+
+  **What a copy shows.** The parsed part, resolution, source, frame rate, language, size,
+  seeders, publish time (re-written as a time) and indexer, and `label`, a neutral description
+  built from those. **Nothing the release wrote is returned**: not its title (the field was
+  removed: a title can carry a result, a link or a hash), not its uploader's tag, channel or any
+  word of it; every text field is a word from a closed list. A release whose words are not the
+  event's (a name that carries a result, a countdown, an embedded series, a video game, an
+  episode of a show, a summary in any of several languages, one fight of a card such as "Main
+  Event" or "Co-Main", a title over 400 bytes) is left out and counted in `skipped` by reason.
+  Every word of a title, including the text of its `[..]`, `(..)` and `{..}` groups, has to be
+  accounted for; a title with a word nothing checks carries a caution.
+
+  **A partial answer, not an error.** If an indexer fails or is slow, the others' copies are
+  listed, `searched.complete` is `false` and `searched.problem` says why; if every query fails the
+  list is empty with the same. The search stops at a deadline (twice the schedule source's
+  timeout, between two and twenty seconds) with what has answered. Only sport being off
+  (`503 provider_not_configured`), no search backend or no usable indexer (`503`, as for
+  `/media/{id}/releases`), an unknown event (`404`) and a malformed id or part (`400`) are errors.
+  What the matcher accepts is in `ARCHITECTURE.md`.
 
 A team's label in follows, the league page and search is the one in the stored team list, which
 a successful read of the list corrects; `since` never changes. An event's own `home`, `away`,

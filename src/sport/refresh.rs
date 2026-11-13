@@ -225,6 +225,10 @@ async fn read_league(
         .with(move |c| {
             let refs: Vec<&Fixture> = fetched.iter().collect();
             let Upserted { added, changed } = data::upsert_events(c, slug, &refs, from, now)?;
+            // The stretches this read judged in full are recorded: that is what later says
+            // "no other fixture fits" is known for them (a month cut at the page limit, empty,
+            // or with a record that could not be read is not one).
+            data::record_ranges(c, slug, &complete, now)?;
             let unlisted = if complete.is_empty() {
                 0
             } else {
@@ -317,7 +321,7 @@ pub async fn ensure_teams(
             store
                 .with(move |c| {
                     data::upsert_teams(c, slug, &teams)?;
-                    data::note_teams(c, slug, now)
+                    data::note_teams(c, slug, now, teams.complete)
                 })
                 .await?;
             Ok(())

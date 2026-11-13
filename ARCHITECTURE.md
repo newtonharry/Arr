@@ -84,7 +84,7 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
 | `ingest`, `probe` | completed-download import with a journal and crash recovery; the bounded ffprobe media probe |
 | `scan` | per-root library reconciliation |
 | `rss` | Torznab parsing, matching and RSS sync |
-| `sport` | sport schedules and follows, a module of its own beside movies and series (`catalog`: the built-in leagues; `espn`: the schedule client and the fixtures-only parser; `data`: the `sport_*` tables; `refresh`: keeping followed leagues current, and the worker's `sports` task). The HTTP handlers are `api/sport.rs` |
+| `sport` | sport schedules, follows and release matching, a module of its own beside movies and series (`catalog`: the built-in leagues and their names; `espn`: the schedule client and the fixtures-only parser; `data`: the `sport_*` tables; `refresh`: keeping followed leagues current, and the worker's `sports` task; `release`: the release-name parser; `names`: team and fighter name rules; `matcher`: whether a release is a stored event; `find`: the search texts and the judging of an answer). The HTTP handlers are `api/sport.rs` |
 | `worker` | background loop: commands (leased), downloads pass, scheduled tasks, request retries, metadata refresh, startup recovery |
 | `api`, `openapi`, `error` | axum router, auth, limits, typed errors, OpenAPI document |
 | `mcp` | the MCP adapter: six tools over the REST API (stdio over HTTP, or remote over the in-process router), closed input schemas, typed errors with their outcome, no fallback; the remote `/mcp` mount |
@@ -461,13 +461,13 @@ RSS reports retrieval status separately and never promises gap-free coverage.
 Sport is a module (`src/sport/`) and a set of tables (`sport_follows`, `sport_events`,
 `sport_teams`, `sport_refresh`, added with `CREATE TABLE IF NOT EXISTS` inside schema 3, so an
 older release ignores them) that sits beside movies and series. It is **not** a third media kind:
-no `MediaId` variant, no search, no download, no import and no Plex call exists for sport yet.
+no `MediaId` variant, no download, no import and no Plex call exists for sport yet. A search for the releases of one event exists, and only reads.
 
 What exists (phase one: schedules and follows):
 
 - a built-in catalogue of leagues (soccer, basketball, rugby union and league, golf, MMA), each
   with its schedule-source path checked live, whether it has teams, and the names release titles
-  use for it (recorded now, unused until release matching exists);
+  use for it (read by the release matcher);
 - following a league, or a team of a league that has teams, from now on; follows and events
   survive restarts and are available in shadow mode (the immediate read on follow works
   without the worker);
@@ -525,9 +525,190 @@ follows:
   written in title case ("Smith Overcomes Jones" is made of capitalised words); the reject list is
   what stands behind that case, and a result phrased without any listed word would pass it.
 
-What does not exist yet: release matching for events, downloading, filing and Plex refresh for
-sport, automatic pickup, any web app page for sport (the app's proxy already allows the routes),
-and a stored history older than yesterday.
+### Release matching
+
+`GET /api/v1/sport/event/{id}/copies` looks for the releases of one stored event and lists the
+copies Arr found, for a person to look over and choose from. It reads: no link, grab or file is recorded, and nothing is sent to a
+download client. A search for a movie or an episode and this one share `search::fetch` (the fan-out
+over the indexers, behaviour-preserving: `search::run` calls it and keeps its own decision tail);
+sport asks the indexers of the shows (`MediaKind::Series`), because the releases are filed under
+TV. An event is only searched once it is over by Arr's reckoning (`find::expected_end`: the
+source's end, or the start plus a length typical for the sport; an MMA start is the start of the
+whole event), and a cancelled or postponed one never.
+
+The matcher (`sport::matcher::judge`) is pure and strict: a release matches only on evidence its
+own title carries, and a wrong file under an event is the failure it exists to avoid.
+
+- **The competition** is named by the catalogue's names, as whole words at the start of the title
+  (after at most a broadcaster or a year). Anything else before it (a division number, "Women's",
+  another sport's name) makes it a different competition; two competitions named make it
+  ambiguous; none named refuses it. Women's and youth ("U21", "Reserves") releases are refused
+  for every league but the women's one.
+- **A game** needs the date in the title within one day of the event's UTC day (day first, never
+  month first: `01.19.2019` is not a date), and both teams. Each side must name exactly one team
+  of the league (generic words like "FC" aside; a word two clubs share, "Manchester", names
+  neither), and the two must be the event's home and away in either order. A round or season in
+  the title that contradicts the event's refuses it.
+- **A fight card** needs the card's number (a numbered card and a Fight Night are different
+  events) or both headline surnames, and a date in the title near the event or a publish time
+  between a day before the start and 14 days after. The part (main card, prelims, early prelims,
+  full event) is read from the title. A UFC file with no part word is taken as the main card but
+  only `likely` (one uploader and two cards are all the evidence): beside a prelims file of the
+  same uploader it is sure, beside an explicit "Main Card" file it is the whole event. A rematch
+  numeral ("Walker 2") that the schedule does not state is `likely`, unless the store holds an
+  earlier meeting of the pair. With neither number nor names, only a date in the title and no
+  other card within a day, or the card's place ("PFL Tampa"), give a `likely`.
+- **A golf tournament** needs its name (all of the title's name words are the event's) and a day
+  inside it (the source's end date is early by an evening, so the last day is allowed), and `Day N`
+  must agree with the date.
+- **The contract of phases C and D: no recommendation, no assurance.** Six rounds did not make
+  a `sure` that automation can trust, and nothing automatic exists yet. The matcher keeps its
+  internal `sure` / `likely` and every reason, exactly as below (the automatic phase will need
+  them and gets its own review), but the API and the app do not say "sure" or "recommended":
+  each copy has `caution: null` or `caution: {reason, note}`, the list is only ordered, and
+  nothing may act on confidence except to order the list and to decide whether a caution is
+  shown and a confirmation asked. No caution is not a verification; a person chooses.
+- **`sure` is earned from closed evidence only.** Every word of a title (and of its `[..]`,
+  `(..)` and `{..}` groups, after HTML entities and invisible characters are resolved) has a
+  role (`SportRelease::roles`). A word is *verified* when a closed vocabulary or the event itself
+  checks it: the competition's name; a broadcaster or a year right after it; a round, stage or
+  filler word, and a number only after the word that says what it is ("Round 3") or as a card's
+  number; a part word; a team or fighter (resolved against the league or the card); a place or
+  tournament word (checked against the event); a format word (a resolution, source, codec,
+  container, frame rate, and a number only after a codec or audio word); in a `[..]` group a sport
+  label, a language, and a channel from a closed list (after "DAZN", a region from a closed list;
+  a short code is a team's feed and is verified only if it is the code of one of the event's
+  own two teams); and one uploader's tag: the last word of the title (after the last hyphen, or
+  the last chunk), spelled exactly as one of a compiled list of known sport uploaders
+  (`KNOWN_UPLOADERS`, case-sensitive, taken from real titles), once the technical words have come,
+  once across the main text and the brackets together. **A tag that is not on the list is free
+  text**, however plain it looks. Shoulder markers are looked for across token boundaries too (up
+  to three neighbouring words joined: "Round-UP", "Wrap.Up", "Post Fight"). A word that
+  is none of these is either refused (a word in the body that nothing accounts for) or *free*
+  (text in the tail or a group that no list covers). **A match with any free word, any
+  given name before a surname, or a feed code that is not a code of the event's teams, is at
+  most `likely` (`unverified_text`), and is never
+  recommended.** The shoulder words (countdowns, embedded series, weigh-ins, previews,
+  highlights and their names in Spanish, Portuguese, French, German, Italian and Dutch, press
+  conferences, post-fight shows, studio shows) are refused outright, as a whole word and as a
+  substring of a longer word ("ExtendedHighlights", "Highlights2026"). Video games ("2K27",
+  updates, DLC), episode numbering ("S02E03") and anime are refused. Every date a title carries
+  must be near the event, not just one. An insertion test puts a hostile word (a summary, a
+  result, a score, a hash, a single fight, a random word) at every boundary of every `sure` title
+  of the table, glued and spaced, in every bracket form, after a bar and in or beside the tag,
+  and none stays `sure`.
+- **A bout is not the card.** "Main Event", "Co-Main", "Full Fight", "Fight 3", a bare "Main" and
+  "Round 2" name one fight or part of one; only "Main Card", "Prelims", "Early Prelims" and "Full
+  Event" (or "Main Card And Prelims") name a part of the card. A title naming two fighters who
+  are not the headliners is refused.
+- **One release's evidence is never lent to another.** A UFC file with no part word is the main
+  card at `likely`; a sibling (same uploader, same card) settles that and only that, and only if
+  the sibling is itself `sure`. A file that is also unsure which event it is (a date only, a rematch
+  numeral, another fixture that fits, a schedule not known) stays as it was. Any other card with
+  no part word (PFL, today) is `likely` as "unlabelled whole": nothing says whether it is the
+  whole event, the main card or one fight, so it answers no part request and is never
+  recommended.
+- **Every identity claim is checked against the stored event** (`matcher/claims.rs`, one
+  function, `check`, for all three shapes). A title claims a card number, a series serial
+  ("Fight Night 999"), each side's names, head and place words, dates, a season, a rematch
+  numeral, a round, a part. Each claim is `Verified` (the store says the same), `Unclaimed`
+  (the title does not make it), `Unverifiable` (the store cannot check it) or `Contradicted`
+  (the store says otherwise). A contradicted claim refuses the release; an unverifiable one
+  caps the match at `likely` with its own reason: `number_unverified`, `serial_unverified`,
+  `names_unverified` (the stored card has no headliners), `head_unverified`, `sides_unverified`
+  (a stored game with no teams), `season_unverified`, `round_unverified`, `rematch_unverified`,
+  and the part (`unlabelled_main`, `unlabelled_whole`). `sure` needs every claim verified or
+  unclaimed. The schedule source gives no serial for a Fight Night, so a release that carries one
+  is never `sure`; a numbered card ("UFC 334") and a title with no serial can be. A card or
+  tournament of the same days whose name or headliners are unknown could be the one the title
+  names, so a names-only match is `likely` (`schedule_unknown`) while one is in the window.
+- **There is no filler in a `sure` title.** A `sure` title is the league's alias; the event's
+  identity in the forms its shape allows, each verified; the connectives between the sides; the
+  part; technical words from closed lists (resolution, source, codec, audio, container, frame
+  rate, language, a channel); and one known uploader's tag. Every other word is an *assertion*,
+  an unverified word, or a refusal. Stage and phase words (final, semi-final, play-offs,
+  preseason, regular season, RS, group stage, leg, game N, match N, matchweek N, matchday N,
+  round N, day N, week N), years and seasons (`Season 2024`, a lone year, a span) become
+  `Assertion`s (`SportRelease::assertions`), and each word of one has `Role::Claim(i)`. A number
+  no claim consumes is unverified. What is left of the old `FILLERS` list is `CONNECTIVES`
+  (and, of, the, vs, v), which join words and assert nothing; "men" and "mens" set a flag the
+  matcher checks against the league, and the old lead words only decide where the names begin.
+  Every assertion is kept, not the first: equal ones are one, different ones of a kind refuse
+  (two rounds, two seasons, two dates, two numbers, two rematch numerals, two parts).
+  Verification means equality with the stored value (a round of another kind than the stored
+  one, a lone year inside a stored span, a numeral when the stored title has no ordinal are
+  incomparable and stay unverified); "an earlier meeting exists" never verifies a numeral. A
+  claim on a shape that does not support it (a season on a card, a part on a game, a numeral
+  after a team) is checked, capped or refused, never dropped. `matcher/claims.rs` reads every
+  assertion (`claim_of` is exhaustive), and a test asserts every word of every table row is in
+  exactly one bucket or attached to one assertion.
+- **Round 6 additions to the claims.** A sport label in a `[..]` ("Soccer", "Football", "Rugby",
+  "Basketball", "Golf", "MMA") is a claim compared with the event's sport (football is the soccer
+  label; rugby is union or league; a conflicting label refuses). A series or card number on a
+  game or a tournament refuses. Explicit name suffixes are compared before they are dropped
+  ("Jr" is not "Sr"; one side only is unverified). A major championship is an identity, equal to
+  the stored one ("The Open" is not "U.S. Open"), not a word contained in it. A title with no
+  uploader's tag carries the `no_uploader_tag` caution (forum-style titles have none by nature).
+  A qualifier word ("Junior", "Reserves") refuses only if it is not part of a participant's
+  stored name; a number after the competition's name is a division unless a stored participant's
+  name starts with it ("1. FC Union Berlin"); a numeral after the first name belongs to that
+  participant, not to the card number. A league's gender is recorded (LPGA and WNBA are women's)
+  and both "Men" and "Women" are applied against it.
+- **Phrases are read over the title's words in their visible order,** across brackets,
+  parentheses, braces, bars and separators, before any word has a role: "Main [Event]",
+  "Round | Up". Part words that name different parts anywhere in the title conflict.
+- **A fixture is not judged alone.** If the same two teams (or fighters, or a tournament of the
+  same name) have another fixture that the title would fit as well, such as the next night of a
+  series, the match is `likely` (`another_fixture_fits`) for each of them.
+- **What each judgement does when what it depends on is not known.** Completeness is a
+  recorded fact, not a guess from how long ago something was read:
+
+  | depends on | recorded as | if not |
+  |---|---|---|
+  | the league's teams (resolving "Wanderers" or "Manchester") | `sport_teams_read`: the last read of the list dropped no entry (one without an id), renamed none (a name that failed the name rule), and was not cut at the limit; and it is under 21 days old | only the exact names of known teams are taken; no partial name |
+  | the other fixtures around the title's dates ("no other fixture fits", "no other card within a day", rival tournaments) | `sport_ranges`: the stretches a schedule read judged in full (a month cut at the page limit, empty, or with a record that could not be read is not one), current while read within 3 days or after its own days were over; and the neighbours loaded were not cut at their limit | a game, or a card or tournament matched on names, is `likely` (`schedule_unknown`); a card with only a date is refused; a card with its number is unaffected |
+  | an earlier meeting of the fighters (a rematch numeral) | stored events since a day before the follow | the numeral is `likely` (`rematch_unverified`) |
+  | the part of a card | a part word, or a sure sibling | `likely`; and a whole-event match whose part the title does not say answers no request for a part |
+  | when | the publish time, whatever the title says (a date or a card's number says which event, not when it was put up) | a release is put up from a day before the event to 14 days after its start (a tournament: after its last day); a later one is `likely` (`late_upload`), and no publish time is `likely` (`undated`), for every sport. Without a date or a number to say which event, either refuses it |
+
+  The neighbours are loaded over the window the evidence allows: for a game the fixtures of the
+  same two teams within three days; for a card or a tournament every event of the league within
+  three weeks, and a list cut at 500 is incomplete. A fixture the league listed but Arr did not
+  keep (it was over before the league was followed: no backlog) is kept as *evidence only*
+  (`sport_evidence`): it is never served, and the loaders return it beside the kept ones, so a
+  recorded stretch means what it says. An event whose two sides are unknown (the feed put one
+  team on both sides) is returned by the pair loader too, and a title that fits its days is
+  `likely` (`schedule_unknown`), since nothing rules it out.
+  Evidence is kept for as long as any recorded span covers it (it is pruned only after the
+  span itself has expired), and no clean-up deletes a stored event or team: the only deletes are
+  an unfollow (the follow row), expired spans, and evidence no span covers. Judging
+  of a search runs off the async workers (`spawn_blocking`), four requests at a time, with the
+  wait for a slot, the setup and the judging inside one two-second budget; a request that
+  finds no slot answers busy.
+- **Bounds.** A title over 400 bytes, over 120 words or with more than 8 groups or 32 competition
+  names is refused unread (`title_too_long`). A search judges at most 300 results, within the
+  request's budget (a fifth of it, at most a second, is kept for judging), and says
+  `complete: false` if there were more. The event's side of every comparison (team keys, its name
+  as a title, its neighbours' names) is worked out once per search, not per result. The indexers'
+  own answers are capped separately (a megabyte).
+- **How often the indexers are asked** (`sport::gate`). What is kept is the *search* (the
+  releases found), never a judgement of it: every answer judges it again against the event,
+  its neighbours, the team data and the recorded completeness as they are then. One search per
+  event at a time (requests for it queue and share its answer); never again within two minutes
+  whatever `fresh` says, nor within two minutes of a search that did not finish or was dropped
+  half way (its start is recorded before it is awaited; the answer is then the last search with
+  its age, or "busy" if there is none); a complete answer is reused for fifteen minutes by a plain request; and at most six
+  searches start in a minute for all events together, after which an event with no answer yet is
+  told to come back (`busy`) and one with an answer gets it. A search is at most three queries per
+  indexer (`find::MAX_QUERIES`), so this route sends at most 18 queries a minute to any indexer,
+  each at the indexer's own paging and through its own gate (spacing, backoff, per-indexer limits).
+  At most 256 events are remembered; an unknown event is a 404 before any of this.
+- **No text a release wrote reaches a client.** A copy is numbers, times and words from closed
+  lists (the part, the resolution and source, the language, the reason); not the title, not
+  the uploader's tag, not the channel. The neutral `label` is built from the closed words.
+
+What does not exist yet: downloading, filing and Plex refresh for sport, automatic pickup, and a
+stored history older than yesterday.
 
 ## Not implemented
 

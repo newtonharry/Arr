@@ -684,10 +684,10 @@ const leagueHref = (slug) => '#/league/' + slug;
 // never answers (the server itself gives up on its source within eight seconds). A request that
 // runs out of time answers { ok: false, timedOut: true }, which callers treat as a failure.
 const SPORT_MS = { GET: 15e3, POST: 20e3 };
-async function sportReq(path, { method = 'GET', body, signal } = {}) {
+async function sportReq(path, { method = 'GET', body, signal, ms } = {}) {
   const ac = new AbortController();
   let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, SPORT_MS[method] || SPORT_MS.GET);
+  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, ms || SPORT_MS[method] || SPORT_MS.GET);
   const outer = () => ac.abort();
   if (signal) signal.addEventListener('abort', outer);
   try {
@@ -846,8 +846,68 @@ function EventRow({ e, home }) {
 }
 // What happened lately is only a name and a day.
 function EarlierRow({ e }) {
-  const s = new Date(e.starts_at);
-  return h('li', { class: 'item sport' }, h('div', { class: 'what' }, h('h3', { title: e.name }, e.name), h('p', { class: 'meta' }, isNaN(s) ? '' : dayWord(s))));
+  const s = new Date(e.starts_at), c = P.cp.get(e.id), open = !!(c && c.open);
+  return h('li', { class: 'item sport' }, h('div', { class: 'what' }, h('h3', { title: e.name }, e.name), h('p', { class: 'meta' }, isNaN(s) ? '' : dayWord(s)),
+    finished(e) ? h('button', { type: 'button', class: 'link quiet ecp-open', 'aria-expanded': String(open), 'aria-controls': 'ecp-' + e.id, 'data-fk': 'ecp:' + e.id, onClick: () => toggleEventCopies(e) }, 'Find a copy', ic('right')) : null),
+    eventCopiesNode(e));
+}
+
+// ----- a finished game or fight: the copies Arr can find, as a list to look at (reading only)
+// Finished by Arr's own reckoning (the server's expected_end), not by what the schedule source says.
+const finished = (e) => e.state !== 'cancelled' && e.state !== 'postponed' && Date.parse(e.expected_end) <= Date.now();
+async function loadEventCopies(e) {
+  const c = P.cp.get(e.id);
+  if (!c || c.st === 'loading') return;
+  const tk = P.token;
+  c.st = 'loading'; bump();
+  const r = await sportReq(`/event/${enc(e.id)}/copies`, { ms: 25e3 });
+  if (tk !== P.token || P.cp.get(e.id) !== c) return;
+  if (r && r.ok && r.data && Array.isArray(r.data.copies)) { c.st = 'ready'; c.data = r.data; } else c.st = 'error';
+  bump();
+  if (c.st === 'ready' && c.open) say(c.data.copies.length ? plural(c.data.copies.length, 'copy', 'copies') + ' found.' : "Arr couldn't find a copy right now.");
+}
+function toggleEventCopies(e) {
+  let c = P.cp.get(e.id);
+  if (!c) { c = { open: false, st: 'idle', data: null }; P.cp.set(e.id, c); }
+  c.open = !c.open;
+  if (c.open && c.st !== 'ready' && c.st !== 'loading') loadEventCopies(e); else bump();
+}
+// A copy Arr could not fully check carries a caution with its own plain note. No caution is not a
+// verification: a person chooses.
+function eventCopyRow(c) {
+  const line = [c.resolution, c.source].filter(Boolean).join(' · ') || 'Unknown quality';
+  const speed = { fast: 'Fast', ok: 'Medium speed', slow: 'Slow' }[c.speed];
+  const lang = c.language && c.language !== 'English' ? c.language : '';
+  const note = c.caution && c.caution.note ? c.caution.note : '';
+  return h('li', { key: c.id, class: 'item copy' },
+    h('div', { class: 'what' },
+      h('h3', null, line),
+      h('p', { class: 'meta' }, joinDot(fmtSize(c.size_bytes), c.fps > 30 ? `${c.fps} fps` : '', speed, lang)),
+      note && h('span', { class: 'tag check' }, ic('alert'), note)));
+}
+function eventCopiesNode(e) {
+  const c = P.cp.get(e.id);
+  if (!c || !c.open) return null;
+  const id = 'ecp-' + e.id;
+  const retry = h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'ecp-retry:' + e.id, onClick: () => loadEventCopies(e) }, ic('retry'), 'Try again');
+  if (c.st === 'loading' || c.st === 'idle') {
+    return h('div', { id, class: 'copies ecp', 'aria-busy': 'true' }, h('span', { class: 'sr', role: 'status' }, 'Looking for copies'),
+      h('ul', { class: 'list' }, [1, 2].map((i) => h('li', { key: i, class: 'item' }, h('div', { class: 'what' }, h('div', { class: 'sk', style: { width: '45%' } }), h('div', { class: 'sk', style: { width: '30%', marginTop: '8px' } }))))));
+  }
+  if (c.st === 'error') return h('div', { id, class: 'copies ecp' }, h(Hint, { text: "Couldn't look for copies just now.", role: 'status' }), retry);
+  const d = c.data, n = (d.skipped || []).reduce((a, x) => a + x.count, 0);
+  if (d.note === 'busy') return h('div', { id, class: 'copies ecp' }, h(Hint, { text: 'Arr is looking up other events right now. Try again in a minute.', role: 'status' }), retry);
+  if (!d.available) return h('div', { id, class: 'copies ecp' }, h(Hint, { text: "There's nothing to look for yet.", role: 'status' }));
+  const partial = d.searched && d.searched.complete === false ? h('p', { class: 'hint', role: 'status' }, 'Some places didn’t answer, so there may be more.') : null;
+  const skipped = n ? h('p', { class: 'hint skipped' }, `Left out ${plural(n, 'copy', 'copies')}: ` + d.skipped.map((x) => `${x.count} ${x.reason}`).join(', ') + '.') : null;
+  if (!d.copies.length) return h('div', { id, class: 'copies ecp' }, h(Hint, { text: "Arr couldn't find a copy yet. Replays usually show up a few hours after the game.", role: 'status' }), partial, skipped, retry);
+  const order = (d.parts || []).map((p) => p.part).concat('whole'), byPart = new Map();
+  for (const x of d.copies) byPart.set(x.part, [...(byPart.get(x.part) || []), x]);
+  const groups = [...byPart.keys()].sort((a, b) => order.indexOf(a) - order.indexOf(b));
+  const many = groups.length > 1;
+  return h('div', { id, class: 'copies ecp' },
+    ...groups.map((g) => h('div', { key: g, class: 'ecp-part' }, many ? h('h4', { class: 'part' }, byPart.get(g)[0].part_label) : null, h('ul', { class: 'list' }, byPart.get(g).map((x) => eventCopyRow(x))))),
+    partial, skipped);
 }
 
 // ----- search: leagues and teams that match, each a row you can follow in place
@@ -1396,7 +1456,7 @@ function Library({ t }) {
 }
 
 // ---------- title pages (a show or a movie, as a sheet over the current screen) ----------
-const P = { del: null, confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null, peek: null, upd: false, tf: '', tall: false, upAll: false, touched: new Set(), polls: 0 };
+const P = { del: null, confirm: false, removing: false, shown: false, id: '', kind: '', token: 0, seq: 0, data: null, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, pollT: 0, askT: 0, opener: null, scrollY: 0, canBack: false, opt: null, peek: null, upd: false, tf: '', tall: false, upAll: false, touched: new Set(), polls: 0, cp: new Map() };
 let bgHash = '';
 const enc = encodeURIComponent;
 const pct = (p) => Math.round(p * 100);
@@ -1438,7 +1498,7 @@ function openTitle(t) {
   if (hit) document.title = `${nameOf(hit)} · Arr`;
   // A league has no year to show; its name is on the link that was tapped, when there is one.
   const lead = t.kind === 'league' ? (o && o.dataset && o.dataset.lg ? { title: o.dataset.lg, year: '' } : null) : peek;
-  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: hit || null, peek: lead, upd: !!hit, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, del: null, removing: false, opt: freshOpt(), tf: '', tall: false, upAll: false, touched: new Set(), polls: 0 });
+  Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: hit || null, peek: lead, upd: !!hit, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, del: null, removing: false, opt: freshOpt(), tf: '', tall: false, upAll: false, touched: new Set(), polls: 0, cp: new Map() });
   if (W.id === t.id) Object.assign(P.opt, { open: true, copiesOpen: true, season: W.season, fetch: true }); // from Needs you
   W.id = '';
   after(() => {

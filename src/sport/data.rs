@@ -52,6 +52,45 @@ pub fn create_tables(c: &Connection) -> Result<()> {
             abbreviation TEXT,
             PRIMARY KEY (league, team_id)
         );
+        -- Fixtures a schedule read listed but did not store because they were over before the
+        -- league was followed. They are never served: they are only evidence, so that no other
+        -- fixture fits is judged over everything the recorded stretch listed, and not only
+        -- over what was kept.
+        CREATE TABLE IF NOT EXISTS sport_evidence (
+            id TEXT PRIMARY KEY,
+            league TEXT NOT NULL,
+            season TEXT,
+            starts_at_utc TEXT NOT NULL,
+            ends_at_utc TEXT,
+            name TEXT NOT NULL,
+            short_name TEXT,
+            home_id TEXT,
+            home_name TEXT,
+            away_id TEXT,
+            away_name TEXT,
+            round TEXT,
+            venue TEXT,
+            state TEXT NOT NULL,
+            noted_utc TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS sport_evidence_by_league ON sport_evidence(league, starts_at_utc);
+        -- What the last read of a league's team list was: whole (nothing dropped, renamed or cut)
+        -- or not. Only a whole list may say that a short name names one team.
+        CREATE TABLE IF NOT EXISTS sport_teams_read (
+            league TEXT PRIMARY KEY,
+            read_utc TEXT NOT NULL,
+            complete INTEGER NOT NULL
+        );
+        -- The stretches of time a schedule read judged in full (see `refresh::read_league`):
+        -- every event of the league that starts in [from, to) was in the answer, as of
+        -- `read_utc`. No other fixture fits is only known inside such a stretch.
+        CREATE TABLE IF NOT EXISTS sport_ranges (
+            league TEXT NOT NULL,
+            from_utc TEXT NOT NULL,
+            to_utc TEXT NOT NULL,
+            read_utc TEXT NOT NULL,
+            PRIMARY KEY (league, from_utc)
+        );
         CREATE TABLE IF NOT EXISTS sport_refresh (
             league TEXT PRIMARY KEY,
             refreshed_utc TEXT,
@@ -109,11 +148,84 @@ fn event_row(r: &Row) -> rusqlite::Result<EventRow> {
     })
 }
 
+/// One event by id. An `unlisted` event is never served, so it is not found either.
+pub fn event(c: &Connection, id: &str) -> Result<Option<EventRow>> {
+    Ok(c.query_row(
+        &format!(
+            "SELECT {EVENT_COLUMNS} FROM sport_events e WHERE e.id = ?1 AND e.state != 'unlisted'"
+        ),
+        [id],
+        event_row,
+    )
+    .optional()?)
+}
+
+/// Events of one league between the same two teams (either way round) that start in
+/// `[from, to)`. A pair has a handful of fixtures in any window, so nothing is cut.
+pub fn pair_events_between(
+    c: &Connection,
+    league: &str,
+    a: &str,
+    b: &str,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+) -> Result<Vec<EventRow>> {
+    // An event whose sides are not known could be a fixture of this pair: it is loaded too, and
+    // the judgement treats it as a fixture it cannot rule out.
+    let mut stmt = c.prepare(&format!(
+        "SELECT {EVENT_COLUMNS} FROM sport_events e
+         WHERE e.league = ?1 AND e.state != 'unlisted' AND e.starts_at_utc >= ?2 AND e.starts_at_utc < ?3
+           AND ((e.home_id = ?4 AND e.away_id = ?5) OR (e.home_id = ?5 AND e.away_id = ?4)
+                OR e.home_id IS NULL OR e.away_id IS NULL)
+         UNION
+         SELECT {EVENT_COLUMNS} FROM sport_evidence e
+         WHERE e.league = ?1 AND e.starts_at_utc >= ?2 AND e.starts_at_utc < ?3
+           AND ((e.home_id = ?4 AND e.away_id = ?5) OR (e.home_id = ?5 AND e.away_id = ?4)
+                OR e.home_id IS NULL OR e.away_id IS NULL)
+           AND e.id NOT IN (SELECT id FROM sport_events)
+         ORDER BY 4, 1 LIMIT 200"
+    ))?;
+    Ok(stmt
+        .query_map(params![league, ts(from), ts(to), a, b], event_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Events of one league that start in `[from, to)`, any state but `unlisted`, soonest first.
+pub fn league_events_between(
+    c: &Connection,
+    league: &str,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    limit: usize,
+) -> Result<Vec<EventRow>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {EVENT_COLUMNS} FROM sport_events e
+         WHERE e.league = ?1 AND e.state != 'unlisted' AND e.starts_at_utc >= ?2 AND e.starts_at_utc < ?3
+         UNION
+         SELECT {EVENT_COLUMNS} FROM sport_evidence e
+         WHERE e.league = ?1 AND e.starts_at_utc >= ?2 AND e.starts_at_utc < ?3
+           AND e.id NOT IN (SELECT id FROM sport_events)
+         ORDER BY 4, 1 LIMIT ?4"
+    ))?;
+    Ok(stmt
+        .query_map(params![league, ts(from), ts(to), limit as i64], event_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn event_id(league: &str, espn_id: &str) -> String {
     format!("event:{league}:{espn_id}")
 }
 
 /// The name of an event whose own title did not pass the checks: the league and the date.
+/// Whether a stored name is the neutral one (`neutral_name`): the feed's own title for the
+/// event did not pass the checks, so nothing about who is in it is known.
+pub fn is_neutral_name(league: &str, name: &str) -> bool {
+    let l = super::catalog::find(league).map_or(league, |l| l.name);
+    name.strip_prefix(l)
+        .and_then(|rest| rest.strip_prefix(" event on "))
+        .is_some()
+}
+
 fn neutral_name(league: &str, starts_at: OffsetDateTime) -> String {
     let l = super::catalog::find(league).map_or(league, |l| l.name);
     format!("{l} event on {}", starts_at.date())
@@ -171,7 +283,20 @@ pub fn upsert_events(
             )
             .optional()?;
         match old {
-            None if f.ends_at.unwrap_or(f.starts_at) < keep_from => continue,
+            None if f.ends_at.unwrap_or(f.starts_at) < keep_from => {
+                // Not kept (no backlog), but not forgotten as evidence either: a recorded
+                // stretch says everything in it was listed, and this was listed.
+                tx.execute(
+                    "INSERT OR REPLACE INTO sport_evidence (id, league, season, starts_at_utc, ends_at_utc, name, short_name, home_id, home_name, away_id, away_name, round, venue, state, noted_utc)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    params![
+                        new.id, new.league, new.season, new.starts_at, new.ends_at, new.name,
+                        new.short_name, new.home_id, new.home_name, new.away_id, new.away_name,
+                        new.round, new.venue, new.state, now_s
+                    ],
+                )?;
+                continue;
+            }
             None => {
                 tx.execute(
                     "INSERT INTO sport_events (id, league, season, starts_at_utc, ends_at_utc, name, short_name, home_id, home_name, away_id, away_name, round, venue, state, first_seen_utc, updated_utc)
@@ -540,13 +665,99 @@ pub fn note_failed(
     Ok(())
 }
 
-pub fn note_teams(c: &Connection, league: &str, now: OffsetDateTime) -> Result<()> {
+pub fn note_teams(c: &Connection, league: &str, now: OffsetDateTime, complete: bool) -> Result<()> {
+    c.execute(
+        "INSERT INTO sport_teams_read (league, read_utc, complete) VALUES (?1, ?2, ?3)
+         ON CONFLICT (league) DO UPDATE SET read_utc = ?2, complete = ?3",
+        params![league, ts(now), complete],
+    )?;
     c.execute(
         "INSERT INTO sport_refresh (league, teams_utc) VALUES (?1, ?2)
          ON CONFLICT (league) DO UPDATE SET teams_utc = ?2, teams_failures = 0, teams_next_try_utc = NULL",
         params![league, ts(now)],
     )?;
     Ok(())
+}
+
+/// When the league's team list was last read and whether that read was whole.
+pub fn teams_read(c: &Connection, league: &str) -> Result<Option<(OffsetDateTime, bool)>> {
+    let row: Option<(String, bool)> = c
+        .query_row(
+            "SELECT read_utc, complete FROM sport_teams_read WHERE league = ?1",
+            [league],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(t, ok)| parse(Some(t)).map(|t| (t, ok))))
+}
+
+/// Records the stretches a schedule read judged in full.
+pub fn record_ranges(
+    c: &Connection,
+    league: &str,
+    spans: &[(OffsetDateTime, OffsetDateTime)],
+    now: OffsetDateTime,
+) -> Result<()> {
+    for (from, to) in spans {
+        c.execute(
+            "INSERT INTO sport_ranges (league, from_utc, to_utc, read_utc) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (league, from_utc) DO UPDATE SET to_utc = ?3, read_utc = ?4",
+            params![league, ts(*from), ts(*to), ts(now)],
+        )?;
+    }
+    // What is long past and long since read is no use to a judgement: keep the table small.
+    // The spans go first, and evidence is kept for as long as any span still covers it: a
+    // span says "everything in these days was listed", and what it relied on must outlive it.
+    c.execute(
+        "DELETE FROM sport_ranges WHERE league = ?1 AND to_utc < ?2",
+        params![league, ts(now - time::Duration::days(120))],
+    )?;
+    c.execute(
+        "DELETE FROM sport_evidence WHERE league = ?1 AND starts_at_utc < ?2
+           AND NOT EXISTS (SELECT 1 FROM sport_ranges r
+                           WHERE r.league = sport_evidence.league
+                             AND r.from_utc <= sport_evidence.starts_at_utc
+                             AND sport_evidence.starts_at_utc < r.to_utc)",
+        params![league, ts(now - time::Duration::days(120))],
+    )?;
+    Ok(())
+}
+
+/// A recorded range is good for a judgement now if it was read within `FRESH_DAYS`, or after
+/// its own days were over (so nothing in it can have changed since).
+pub const RANGE_FRESH_DAYS: i64 = 3;
+
+/// The stretches the schedule is known in full for, merged. A stretch counts only while it is
+/// current: read within [`RANGE_FRESH_DAYS`], or after (a day short of) its own end.
+pub fn complete_spans(
+    c: &Connection,
+    league: &str,
+    now: OffsetDateTime,
+) -> Result<Vec<(OffsetDateTime, OffsetDateTime)>> {
+    let mut stmt = c.prepare(
+        "SELECT from_utc, to_utc, read_utc FROM sport_ranges WHERE league = ?1 ORDER BY from_utc",
+    )?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([league], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut spans: Vec<(OffsetDateTime, OffsetDateTime)> = vec![];
+    for (from, to, read) in rows {
+        let (Some(from), Some(to), Some(read)) =
+            (parse(Some(from)), parse(Some(to)), parse(Some(read)))
+        else {
+            continue;
+        };
+        let current = now - read <= time::Duration::days(RANGE_FRESH_DAYS)
+            || read >= to - time::Duration::days(1);
+        if !current {
+            continue;
+        }
+        match spans.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => spans.push((from, to)),
+        }
+    }
+    Ok(spans)
 }
 
 /// The team list could not be read: not asked for again before `next_try`.

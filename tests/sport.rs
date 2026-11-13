@@ -2682,3 +2682,92 @@ async fn the_worker_re_reads_a_list_with_a_fallback_name_once_a_day_without_anyo
     assert_eq!(r["catalogue_teams"], json!([]), "{r}");
     assert_eq!(team_requests(&e).len(), before);
 }
+
+// ------------------------------------------------------------------ what the reads record
+
+#[tokio::test]
+async fn a_schedule_read_records_the_stretches_it_judged_in_full() {
+    let (e, _now) = two_months().await;
+    let spans = stored(
+        &e,
+        "SELECT from_utc || ' ' || to_utc FROM sport_ranges WHERE league = 'premier-league' ORDER BY from_utc",
+    )
+    .await;
+    assert!(!spans.is_empty(), "{spans:?}");
+    // March and April answered in full: one stretch runs from early March into late April.
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.starts_with("2027-03-") || s.starts_with("2027-02-")),
+        "{spans:?}"
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.contains(" 2027-04-30") || s.contains(" 2027-05-")),
+        "{spans:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_month_with_a_record_that_could_not_be_read_is_not_recorded_as_judged() {
+    let e = start_exec(ExecOptions::default()).await;
+    let now = time::macros::datetime!(2027-03-20 12:00 UTC);
+    pin_events(&e, &MARCH);
+    // One of March's records has an id that cannot be used (it is served in March, and cannot
+    // be read): March cannot be taken to list everything.
+    espn_set_field(&e.mock, EPL, "9001", "id", json!("0123"));
+    follow_quietly(&e, "premier-league", now).await;
+    refresh_run(&e, now).await;
+    let spans = stored(
+        &e,
+        "SELECT from_utc || ' ' || to_utc FROM sport_ranges WHERE league = 'premier-league' ORDER BY from_utc",
+    )
+    .await;
+    assert!(
+        spans.iter().all(|s| !s.starts_with("2027-03-")),
+        "March was recorded in spite of its broken record: {spans:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_team_list_that_dropped_an_entry_is_recorded_as_not_whole() {
+    let e = start_exec(ExecOptions::default()).await;
+    let league = arr::sport::catalog::find("premier-league").unwrap();
+    let list = |with_id: bool| {
+        json!({ "sports": [{ "leagues": [{ "teams": [
+            { "team": { "id": "363", "displayName": "Chelsea" } },
+            { "team": { "id": "360", "displayName": "Manchester United" } },
+            if with_id { json!({ "team": { "id": "382", "displayName": "Manchester City" } }) }
+            else { json!({ "team": { "displayName": "Manchester City" } }) },
+        ] }] }] })
+    };
+    let read = |e: &Exec, now: OffsetDateTime| {
+        let (store, sports) = (e.state.store.clone(), e.state.sports.clone().unwrap());
+        async move {
+            arr::sport::refresh::ensure_teams(&store, &sports, league, now)
+                .await
+                .unwrap();
+            store
+                .with(|c| data::teams_read(c, "premier-league"))
+                .await
+                .unwrap()
+        }
+    };
+    let now = time::macros::datetime!(2027-03-20 12:00 UTC);
+    e.mock
+        .lock()
+        .unwrap()
+        .espn_teams
+        .insert(EPL.to_string(), list(false));
+    let (_, whole) = read(&e, now).await.expect("read");
+    assert!(!whole, "an entry without an id was dropped");
+    // A later read that lists everyone is recorded as whole.
+    e.mock
+        .lock()
+        .unwrap()
+        .espn_teams
+        .insert(EPL.to_string(), list(true));
+    let (_, whole) = read(&e, now + time::Duration::days(8)).await.expect("read");
+    assert!(whole);
+}

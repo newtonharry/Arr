@@ -1238,3 +1238,115 @@ fn a_pack_is_judged_by_size_over_the_whole_season_not_by_what_it_gets() {
         tiny.rejections
     );
 }
+
+// ---- sport releases stay out of movies and shows
+
+/// Real titles of sport releases (the same ones the sport matcher is tested on): games, fight
+/// cards and the shows about them.
+const SPORT_TITLES: &[&str] = &[
+    "UFC.Fight.Night.293.Cortes-Acosta.vs.Walker.Prelims.1080p.WEB-DL.H264.Fight-BB",
+    "UFC.Fight.Night.234.Ankalaev.vs.Walker.2.1080p.WEB-DL.H264.Fight-BB",
+    "UFC.333.Volkanovski.vs.Evloev.1080p.WEB-DL.H264-nVa",
+    "UFC.333.Prelims.1080p.WEB-DL.H264.Fight-BB",
+    "UFC 333 Volkanovski Vs Evloev 1080P 60FPS Full Event WEB-DL AAC2.0. X265 POOTLED",
+    "PFL Tampa Cyborg vs Vieira 2026 08 22 720p WEB-DL H264-FBB",
+    "PFL MENA 9 2026 720p WEB H 264-JFF",
+    "One Championship ONE Fight Night 49 60fps 1080p WEBRip h264-TJ [TJET]",
+    "UFC 334 Embedded-Vlog Series-Episode 2 1080p WEBRip h264-TJ [TJET]",
+    "UFC 334 Countdown 1080p WEBRip h264-TJ [TJET]",
+    "A-League 2026 11 07 Melbourne City Vs Western Sydney Wanderers 1080p HDTV H264-DARKSPORT",
+    "Frauen-Bundesliga 2026 11 09 Koln vs Leipzig 720p WEB h264-ViCEROYS",
+    "EPL.2019.01.19.Liverpool.vs.Crystal.Palace.XviD-AFG",
+    "EPL - Liverpool vs Crystal Palace 19.01.2019 720p HD",
+    "Match Of The Day 2026 11 08 1080p HEVC x265-MeGusta",
+    "Rugby League Super League Wigan vs Wakefield 26 Sep 2026 BBC 720p H.264-teaspoon",
+    "BBC.Women's.Six.Nations.2026.05.17.Ireland.v.Scotland.1080i.HDTV.h264-NX",
+    "NBA 2K27 Update v2 1-RUNE",
+    "PGA TOUR 2K25 (v2026.03.27 & All DLCs) (Hypervisor|DenuvOwO)",
+];
+
+#[test]
+fn sport_releases_are_still_refused_for_movies_and_shows() {
+    use arr::rss::{Match, match_item};
+    // A catalog that holds titles named like the sport: a show called UFC, a series of
+    // league shows and a film with a card's name. A sport release must not be taken for any.
+    let env = Env::with_catalog(catalog_of(
+        vec![
+            catalog_movie(990101, "UFC 333", 2026, &[]),
+            catalog_movie(990102, "UFC Fight Night", 2026, &[]),
+        ],
+        vec![
+            catalog_series(990201, "UFC", 2026, &[]),
+            catalog_series(990202, "A-League", 2026, &[]),
+            catalog_series(990203, "EPL", 2019, &[]),
+            catalog_series(990204, "Match of the Day", 1964, &[]),
+        ],
+    ));
+    let shows = [
+        season(
+            series("UFC", 990201, Some(2026), vec![]),
+            1,
+            Some(eps(&[], &[], 10)),
+        ),
+        season(
+            series("A-League", 990202, Some(2026), vec![]),
+            1,
+            Some(eps(&[], &[], 10)),
+        ),
+        season(
+            series("EPL", 990203, Some(2019), vec![]),
+            1,
+            Some(eps(&[], &[], 10)),
+        ),
+        season(
+            series("Match of the Day", 990204, Some(1964), vec![]),
+            1,
+            Some(eps(&[], &[], 10)),
+        ),
+    ];
+    let films = [
+        Target::Movie(movie("UFC 333", 990101, 2026, Ownership::Missing)),
+        Target::Movie(movie("UFC Fight Night", 990102, 2026, Ownership::Missing)),
+    ];
+    // The harness is not vacuous: a proper release of the same show or film is approved.
+    assert!(
+        env.eval(&shows[0], S1, "UFC.S01.1080p.WEB-DL.x264", 2.0, 30)
+            .approved
+    );
+    assert!(
+        env.eval(
+            &films[0],
+            Scope::Movie,
+            "UFC.333.2026.1080p.WEB-DL.x264",
+            4.0,
+            30
+        )
+        .approved
+    );
+    for title in SPORT_TITLES {
+        for show in &shows {
+            let d = env.eval(show, S1, title, 2.0, 30);
+            assert!(!d.approved, "{title} approved for a show: {d:?}");
+        }
+        for film in &films {
+            let d = env.eval(film, Scope::Movie, title, 4.0, 30);
+            assert!(!d.approved, "{title} approved for a film: {d:?}");
+        }
+        // RSS matching, in a TV category and in a movie category.
+        for category in [
+            json!([{ "id": 5040, "name": "TV/HD" }]),
+            json!([{ "id": 2040, "name": "Movies/HD" }]),
+        ] {
+            let mut r = release(title, 2.0, 30);
+            r["categories"] = category;
+            let r: ProwlarrRelease = serde_json::from_value(r).unwrap();
+            assert!(
+                matches!(
+                    match_item(&env.catalog, &r, &release::parse(title)),
+                    Match::Ignored(_)
+                ),
+                "{title} matched a title in the catalog"
+            );
+        }
+    }
+}
