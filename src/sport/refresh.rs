@@ -36,6 +36,9 @@ const FAIL_MAX: Duration = Duration::from_secs(6 * 3600);
 const LEAGUES_PER_RUN: usize = 6;
 const RUN_BUDGET: Duration = Duration::from_secs(45);
 const MAX_FAILURES_IN_A_ROW: usize = 2;
+/// Team lists of leagues nobody follows or has opened, read in the background so that search
+/// finds teams out of the box: at most this many per run, after the followed schedules.
+const CATALOGUE_TEAMS_PER_RUN: usize = 2;
 
 #[derive(Debug)]
 pub enum RefreshError {
@@ -473,6 +476,32 @@ pub async fn run_with_budget(
     budget: Duration,
 ) -> Value {
     let started = Instant::now();
+    let (mut report, clean) = run_schedules(store.clone(), sports.clone(), now, budget).await;
+    // Only once the followed leagues are done, and only if the source has been answering.
+    let teams = if clean {
+        read_catalogue_teams(
+            &store,
+            &sports,
+            now,
+            budget.saturating_sub(started.elapsed()),
+        )
+        .await
+    } else {
+        vec![]
+    };
+    report["catalogue_teams"] = json!(teams);
+    report
+}
+
+/// The followed leagues that are due, nothing else. The second value says the run was clean:
+/// it finished its list without a failure or running out of time.
+pub async fn run_schedules(
+    store: Store,
+    sports: std::sync::Arc<Sports>,
+    now: OffsetDateTime,
+    budget: Duration,
+) -> (Value, bool) {
+    let started = Instant::now();
     let plan = {
         let store = store.clone();
         store
@@ -495,11 +524,15 @@ pub async fn run_with_budget(
     };
     let plan = match plan {
         Ok(p) => p,
-        Err(e) => return json!({ "error": format!("{e:#}"), "leagues": [] }),
+        Err(e) => return (json!({ "error": format!("{e:#}"), "leagues": [] }), false),
     };
     let due_count = plan.len();
     let mut results = vec![];
     let mut in_a_row = 0;
+    let mut failures = 0;
+    // Due leagues that were dealt with (read, or found read already): a run that did fewer than
+    // were due (the six-league cap, a league someone else is reading, one still running) is not clean.
+    let mut done = 0;
     let mut stopped = None;
     for (_, league) in plan.into_iter().take(LEAGUES_PER_RUN) {
         let remaining = budget.saturating_sub(started.elapsed());
@@ -535,6 +568,7 @@ pub async fn run_with_budget(
         match outcome {
             Freshness::Refreshed(s) => {
                 in_a_row = 0;
+                done += 1;
                 results.push(json!({
                     "league": league.slug, "status": "ok", "fixtures": s.fixtures,
                     "added": s.added, "changed": s.changed, "unlisted": s.unlisted,
@@ -542,14 +576,82 @@ pub async fn run_with_budget(
             }
             Freshness::Failed(why) => {
                 in_a_row += 1;
+                failures += 1;
                 results.push(json!({ "league": league.slug, "status": "failed", "error": why }));
             }
-            Freshness::Fresh | Freshness::Backoff(_) | Freshness::Pending => {
+            Freshness::Fresh | Freshness::Backoff(_) => {
+                done += 1;
+                results.push(json!({ "league": league.slug, "status": "skipped" }));
+            }
+            Freshness::Pending => {
                 results.push(json!({ "league": league.slug, "status": "skipped" }));
             }
         }
     }
-    json!({ "due": due_count, "leagues": results, "stopped": stopped })
+    let clean = stopped.is_none() && failures == 0 && done == due_count;
+    (
+        json!({ "due": due_count, "leagues": results, "stopped": stopped }),
+        clean,
+    )
+}
+
+/// Reads the team list of up to `CATALOGUE_TEAMS_PER_RUN` catalogue leagues whose list is not
+/// current (never read first), so a team in any league can be found by search. It is the same
+/// read a league page makes (`ensure_teams`: one request, the client's gap and backoff, a
+/// failed league waited out on its own timing), and it stops at the first failure. A league that
+/// is being read already is skipped.
+async fn read_catalogue_teams(
+    store: &Store,
+    sports: &std::sync::Arc<Sports>,
+    now: OffsetDateTime,
+    budget: Duration,
+) -> Vec<Value> {
+    let started = Instant::now();
+    let plan = store
+        .with(move |c| {
+            let mut want: Vec<(Option<OffsetDateTime>, &'static League)> = vec![];
+            for league in catalog::LEAGUES.iter().filter(|l| l.teams) {
+                let state = data::refresh_state(c, league.slug)?;
+                let known = data::teams_of(c, league.slug)?.len();
+                if teams_current(&state, now) && known > 0 {
+                    continue;
+                }
+                if state.teams_next_try.is_some_and(|t| t > now) {
+                    continue;
+                }
+                want.push((state.teams, league));
+            }
+            want.sort_by_key(|(at, l)| (*at, l.slug));
+            Ok(want)
+        })
+        .await
+        .unwrap_or_default();
+    let mut out = vec![];
+    for (_, league) in plan.into_iter().take(CATALOGUE_TEAMS_PER_RUN) {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(turn) = sports.league_lock(league.slug).try_lock_owned() else {
+            continue;
+        };
+        let (store2, sports2) = (store.clone(), sports.clone());
+        let work = tokio::spawn(async move {
+            let _turn = turn;
+            ensure_teams(&store2, &sports2, league, now).await
+        });
+        match tokio::time::timeout(remaining, work).await {
+            Ok(Ok(Ok(()))) => out.push(json!({ "league": league.slug, "status": "ok" })),
+            Ok(Ok(Err(e))) => {
+                out.push(
+                    json!({ "league": league.slug, "status": "failed", "error": e.describe() }),
+                );
+                break;
+            }
+            _ => break,
+        }
+    }
+    out
 }
 
 #[cfg(test)]

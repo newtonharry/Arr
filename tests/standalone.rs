@@ -566,6 +566,8 @@ base_url = "http://{mock}/tvmaze"
 enabled = true
 base_url = "http://{mock}/tmdb"
 credential_file = "secrets/tmdb"
+[sports]
+enabled = false
 [execution]
 enabled = {execution}
 download_cleanup = true
@@ -639,7 +641,7 @@ struct Running {
 }
 
 async fn serve(dir: &Path) -> Running {
-    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let cfg = common::load_local(&dir.join("config.toml"));
     let state = Arc::new(api::AppState::new(cfg).unwrap());
     arr::worker::recover(&state, time::OffsetDateTime::now_utc()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1848,7 +1850,7 @@ async fn managed_setup_api_hot_activation_guards_and_restart() {
     let mut text = std::fs::read_to_string(&settings).unwrap();
     text = text.replacen("\"seed_ratio\": 1.0", "\"seed_ratio\": 0.0", 1);
     std::fs::write(&settings, text).unwrap();
-    let cfg = config::load(&p.state.join("config.toml")).unwrap();
+    let cfg = common::load_local(&p.state.join("config.toml"));
     let err = api::AppState::new(cfg)
         .err()
         .expect("tampering is detected");
@@ -2111,7 +2113,7 @@ async fn bootstrap_refuses_unavailable_roots_and_unmapped_paths_and_snapshot_sta
     // A state made by the removed Sonarr/Radarr snapshot importer (an import without the
     // managed setup's source file) is refused at startup with a pointer to a fresh setup, and
     // `arr setup` never replaces it. Nothing in it is changed.
-    let cfg = config::load(&p.state.join("config.toml")).unwrap();
+    let cfg = common::load_local(&p.state.join("config.toml"));
     let doc: arr::setup::SetupDoc = toml::from_str(SETUP_DOC).unwrap();
     let prepared = arr::setup::prepare(&doc, &cfg, time::OffsetDateTime::now_utc()).unwrap();
     // Source name of the old importer; a different import id keeps the managed one on disk.

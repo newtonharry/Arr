@@ -4755,6 +4755,7 @@ async fn feed(State(st): St) -> ApiResult {
     ok(json!({
         "generated_at": rfc3339(now),
         "movies_enabled": st.movies.is_some(),
+        "sport_enabled": st.sports.is_some(),
         "tmdb_backup": st.movies.as_ref().is_some_and(Movies::has_tmdb),
         "needs_you": needs_you,
         "on_its_way": on_its_way,

@@ -239,7 +239,9 @@ have none. The plain API does not return it. The movie and show pages also carry
 - **`GET /api/v1/feed`** is what the web app's home shows, in plain words: `needs_you`,
   `on_its_way`, `arrived` (imports of the last 24 hours, newest first, at most 20), `looking`
   and `coming_up`, and `sport` (followed sport events coming in the next 14 days, separate from
-  `coming_up`; see [Sport](#sport-schedules-and-follows)). Catalog and state only, no network
+  `coming_up`; see [Sport](#sport-schedules-and-follows)), and `sport_enabled` (whether sport is
+  turned on, as `movies_enabled` says for movies; the web app uses it to show or hide sport).
+  Catalog and state only, no network
   calls. Two things in it help a client explain itself:
   - each `needs_you` item has `problem` (a short sentence), plus `kind` (`download_failed`,
     `import_blocked` or `request_expired`) and `failure` (why a download failed, for example
@@ -334,7 +336,7 @@ and is not an official API; it is the one outside service sport adds (see
 routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry an empty `sport`.
 
 - **No spoilers.** Arr never reads, stores or shows scores, winners or result text. An event's
-  name is the fixture ("Fulham at Manchester City", "UFC 334: Gane vs. Hokit"), and its state is
+  name is the fixture ("Manchester City v Fulham", "UFC 334: Gane vs. Hokit"), and its state is
   one of `scheduled`, `postponed`, `cancelled` or `played`, with nothing about how it went.
   `cancelled` is only ever what the schedule source says. An event that merely drops out of the
   source's answers is kept internally as `unlisted` and appears in no answer (it comes back, in
@@ -342,11 +344,13 @@ routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry a
   round label ("Round 12", "Matchweek 9", "Group B", "Semi-final", ...); any other note is free
   text that could name a winner, so it is dropped.
 - **Names are built, not copied, wherever there are two sides.** A game, match or fixture
-  between two teams is named `<Away> at <Home>` from the structured team names ("Fulham at
-  Manchester City", "Charlotte Hornets at Los Angeles Lakers", "Stade Toulousain at Lyon"),
-  for every sport; `home` and `away` say which side is which, and `at` does not claim the game
-  is at the home team's ground in a neutral-venue competition. `short_name` is built from the
-  teams' abbreviations the same way ("FUL @ MNC"), or `null`. The feed's own `name` and
+  between two teams is named from the structured team names in the order its sport reads them:
+  basketball puts the away side first, `<Away> at <Home>` ("Charlotte Hornets at Los Angeles
+  Lakers", short "CHA @ LAL"); soccer, rugby union and rugby league put the home side first,
+  `<Home> v <Away>` ("Manchester City v Fulham", "Lyon v Stade Toulousain", short "MNC v FUL").
+  `home` and `away` say which side is which whatever the order of the name, and neither form
+  claims the game is at the home team's ground in a neutral-venue competition. `short_name` is
+  built from the teams' abbreviations the same way, or `null`. The feed's own `name` and
   `shortName` are never copied for these. Events with no two sides (a fight card, a
   tournament) keep the feed's title only if it fits the grammar of its kind. A fight card must
   begin with one of its league's own names ("UFC", "PFL", ...), then a small tail (a number,
@@ -394,8 +398,8 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
   "id": "event:premier-league:401879233",
   "league": { "id": "league:premier-league", "slug": "premier-league", "name": "Premier League",
               "sport": "soccer", "sport_label": "Soccer", "has_teams": true },
-  "name": "Fulham at Manchester City",
-  "short_name": "FUL @ MNC",
+  "name": "Manchester City v Fulham",
+  "short_name": "MNC v FUL",
   "starts_at": "2026-11-21T12:30:00Z",
   "ends_at": null,
   "state": "scheduled",
@@ -414,8 +418,9 @@ A league looks like `{"id": "league:nba", "slug": "nba", "name": "NBA", "sport":
 - **`GET /api/v1/sport/leagues`** lists every league, each with `followed` (the whole league)
   and `followed_teams` (how many of its teams). Answers from the store.
 - **`GET /api/v1/sport/search?q=`** finds leagues by name, alias ("EPL"), sport or the start of a
-  word, and teams (name, short name or abbreviation) of the leagues Arr has read so far. Teams
-  are learnt when a league is opened or followed, so search does not ask the feed for anything:
+  word, and teams (name, short name or abbreviation) of the leagues whose team list Arr has read.
+  Team lists are read when a league is opened or followed, and in the background by the worker
+  for every league that has teams (below), so search does not ask the feed for anything:
   `{"q", "leagues": [league + followed], "teams": [{"league", "team": {"id", "name",
   "short_name", "abbreviation", "followed"}}]}`.
 - **`GET /api/v1/sport/league/{slug}`** is a league's page: `league` (with `followed`),
@@ -451,6 +456,8 @@ a successful read of the list corrects; `since` never changes. An event's own `h
 `name` and `short_name` are as of its last refresh. A request that waits for the schedule source
 (a league page, a follow) has one deadline, four fifths of `timeout_secs` and at most eight
 seconds, shared by everything it waits for; the work carries on in the background after it.
+
+Team lists in the background: after the followed leagues, and only when they all answered, each run of the worker task reads the team list of up to two leagues that have teams and no current list (never read first; a list younger than seven days, or one whose last read failed and is being waited out, is skipped, as is a league being read already). It uses the same client, gap and pause after a failure, and stops at the first failure, so a few runs fill the catalogue and a week later each list is read again. This is the one thing Arr asks ESPN for without anyone having opened or followed a league (see [`PRIVACY.md`](PRIVACY.md)).
 
 How the schedule is kept (worker task `sports`, listed in `/system/tasks`; in shadow mode there is no worker, so a followed league is read when its page is opened or it is followed): a followed league is
 read once it is six hours old, or every twenty minutes within two hours before a followed game

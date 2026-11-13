@@ -6,7 +6,7 @@
 
 mod common;
 
-use arr::{api, config, fsutil};
+use arr::{api, fsutil};
 use axum::extract::{Form, State};
 use axum::routing::post;
 use base64::Engine;
@@ -600,6 +600,204 @@ async fn the_app_has_the_delete_controls_and_reaches_the_bin_routes() {
             "{method} {path}"
         );
     }
+}
+
+// ------------------------------------------------------------------ sport
+
+#[tokio::test]
+async fn the_app_has_its_sport_screens_and_promises_nothing_it_does_not_do() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let js = site
+        .plain(Method::GET, "/app/app.js")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // The league page opens like a title's, search, Home and the Library list sport, and a follow
+    // changes at once and goes back when it fails.
+    for want in [
+        "|league)\\/(.+)$/",
+        "function leagueBody()",
+        "function SportHits(",
+        "function SportFollowing()",
+        "function EventRow(",
+        "sportReq('/search?q='",
+        "'/follow' : '/unfollow'",
+        "n('sport')",
+        "['sport', 'Sport']",
+        "'Unfollow'",
+        "Updating the schedule…",
+        "Showing what Arr had.",
+        "Nothing is scheduled right now. It may be the off season.",
+        "Sport isn't switched on for this Arr.",
+        "Search for a league above",
+        "S.feed.sport_enabled",
+        // A fresh read brings the retained snapshots to its answer before it drops a tap's override,
+        // and a Library read that a follow or unfollow overtook is not used.
+        "function patchSnapshots(",
+        "patchSnapshots(k, v);",
+        "if (gen !== SF.gen)",
+        "FOL.get(folKey(f)) !== false",
+        // Every sport request has a deadline, a change that runs out of time is a failure that is
+        // read back, and the list keeps the server's rows (a pending unfollow is hidden at render).
+        // The Library's answer is the whole followed set: what it leaves out is reconciled to "not followed".
+        "function settleAbsent(followed)",
+        "settleAbsent(new Set(SF.rows.map(folKey)))",
+        "const SPORT_MS = {",
+        "if (r && r.timedOut) loadFollowing();",
+        "SF.rows = r.data.following || []; SF.state = 'ok';",
+        "canHover()",
+    ] {
+        assert!(js.contains(want), "app.js lacks {want}");
+    }
+    // What a person reads about sport says nothing of downloading, results or Plex: sport is a
+    // schedule, and there are no scores. (Comments are left out; they say why, in the open.)
+    let start = js.find("// ---------- sport:").unwrap();
+    let end = js.find("// ---------- home ----------").unwrap();
+    let comments = regex::Regex::new(r"//[^\n]*").unwrap();
+    let copy = comments.replace_all(&js[start..end], "").to_lowercase();
+    for word in [
+        "download", "score", "result", "winner", "won ", "plex", "watch", "record",
+    ] {
+        assert!(!copy.contains(word), "sport copy mentions {word}");
+    }
+    // Sport is not in the search box's words, so nothing about it shows when it is off.
+    assert!(js.contains("placeholder: 'Find a movie or show'"));
+}
+
+#[tokio::test]
+async fn the_app_follows_a_league_and_reads_its_schedule_through_the_proxy() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    let get = |path: &'static str| site.json(site.app(Method::GET, path, c));
+    let post =
+        |path: &'static str, body: Value| site.json(site.app(Method::POST, path, c).json(&body));
+    let (s, v) = get("/app/api/v1/sport/search?q=premier").await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["leagues"][0]["slug"], "premier-league");
+    assert_eq!(v["leagues"][0]["followed"], false);
+    // Following answers at once with what the app needs for its note; soccer reads home v away.
+    let (s, v) = post(
+        "/app/api/v1/sport/follow",
+        json!({ "league": "premier-league" }),
+    )
+    .await;
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["follow"]["league"]["slug"], "premier-league");
+    assert_eq!(v["schedule_read"], true, "{v}");
+    assert!(v["upcoming"].as_u64().unwrap() > 0, "{v}");
+    assert_eq!(v["next_event"]["name"], "Manchester City v Fulham", "{v}");
+    let (s, v) = get("/app/api/v1/sport/league/premier-league").await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["league"]["followed"], true);
+    assert_eq!(v["schedule"]["updating"], false);
+    assert!(
+        v["upcoming"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["name"] == "Manchester City v Fulham" && x["state"] == "scheduled"),
+        "{v}"
+    );
+    assert!(
+        v["teams"].as_array().unwrap().len() > 8,
+        "a long list to filter"
+    );
+    // Home's Coming up and the Library list.
+    let (_, v) = get("/app/api/v1/feed").await;
+    assert_eq!(v["sport_enabled"], true, "{v}");
+    assert!(!v["sport"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!(v["sport"][0]["league"]["slug"], "premier-league");
+    let (_, v) = get("/app/api/v1/sport/following").await;
+    assert_eq!(v["following"][0]["league"]["name"], "Premier League");
+    assert_eq!(
+        v["following"][0]["next_event"]["name"],
+        "Manchester City v Fulham"
+    );
+    // A team can be followed too, then both stop.
+    let (s, v) = post(
+        "/app/api/v1/sport/follow",
+        json!({ "league": "premier-league", "team_id": "382" }),
+    )
+    .await;
+    assert_eq!(s, 201, "{v}");
+    let (_, v) = post(
+        "/app/api/v1/sport/unfollow",
+        json!({ "league": "premier-league", "team_id": "382" }),
+    )
+    .await;
+    assert_eq!(v["removed"], true);
+    let (_, v) = post(
+        "/app/api/v1/sport/unfollow",
+        json!({ "league": "premier-league" }),
+    )
+    .await;
+    assert_eq!(v["removed"], true);
+    let (_, v) = get("/app/api/v1/sport/following").await;
+    assert_eq!(v["following"], json!([]));
+    // An unknown league is a plain 404, which the page words as "doesn't know that league".
+    let (s, v) = get("/app/api/v1/sport/league/no-such-league").await;
+    assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
+}
+
+#[test]
+fn the_harness_refuses_a_config_that_would_reach_the_real_sport_source() {
+    let mock: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let load = |extra: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        write_managed_config(&state, mock, false, extra);
+        std::panic::catch_unwind(|| load_local(&state.join("config.toml"))).is_ok()
+    };
+    // The writers say `[sports] enabled = false` unless asked; a config that turns sport on
+    // without a loopback base_url (so it means the real source) fails the harness at once.
+    assert!(load(""), "off by default");
+    assert!(
+        load("[sports]\nbase_url = \"http://127.0.0.1:1/espn\"\n"),
+        "the fake is fine"
+    );
+    assert!(
+        !load("[sports]\nenabled = true\n"),
+        "the real source is refused"
+    );
+}
+
+#[tokio::test]
+async fn with_sport_off_the_app_gets_the_answer_it_hides_sport_on() {
+    let e = start_exec(ExecOptions {
+        tmdb: true,
+        sports: false,
+        ..Default::default()
+    })
+    .await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let c = Some(cookie.as_str());
+    for path in [
+        "/app/api/v1/sport/search?q=premier",
+        "/app/api/v1/sport/following",
+        "/app/api/v1/sport/league/nba",
+    ] {
+        let (s, v) = site.json(site.app(Method::GET, path, c)).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (503, Some("provider_not_configured")),
+            "{path}"
+        );
+    }
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/v1/feed", c))
+        .await;
+    assert_eq!((s, v["sport"].clone()), (200, json!([])), "{v}");
+    assert_eq!(
+        v["sport_enabled"], false,
+        "the app hides sport from the first draw: {v}"
+    );
 }
 
 // ------------------------------------------------------------------ feed
@@ -1482,7 +1680,7 @@ impl GoogleEnv {
         let g = self.google;
         let text = format!(
             "[server]\napi_token_file = \"secrets/api_token\"\n\
-             [tvmaze]\nenabled = false\n\
+             [tvmaze]\nenabled = false\n[sports]\nenabled = false\n\
              [mcp]\nenabled = true\ntoken_file = \"secrets/mcp_token\"\nallowed_hosts = [\"127.0.0.1\"]\n\
              [mcp.oauth]\npublic_url = '{}'\ngoogle_client_id = '{GOOGLE_ID}'\n\
              google_client_secret_file = \"secrets/google_secret\"\nallowed_emails = {}\n\
@@ -1494,7 +1692,7 @@ impl GoogleEnv {
         );
         fsutil::atomic_replace_private(&self.dir.path().join("config.toml"), text.as_bytes())
             .unwrap();
-        let cfg = config::load(&self.dir.path().join("config.toml")).unwrap();
+        let cfg = load_local(&self.dir.path().join("config.toml"));
         let state = Arc::new(api::AppState::new(cfg).unwrap());
         let (app, _stop) = api::app(state).unwrap();
         self.server = Some(tokio::spawn(async move {

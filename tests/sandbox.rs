@@ -158,7 +158,7 @@ impl Sandbox {
 }
 
 async fn serve(dir: &Path) -> (Arc<api::AppState>, String) {
-    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let cfg = load_local(&dir.join("config.toml"));
     let state = Arc::new(api::AppState::new(cfg).unwrap());
     arr::worker::recover(&state, time::OffsetDateTime::now_utc()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

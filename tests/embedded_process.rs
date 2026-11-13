@@ -168,6 +168,7 @@ async fn sigkill_recovers_partial_download_then_real_upload_accounting() {
         movies.display()
     );
     common::write_managed_config(&state, mock_addr, false, &extra);
+    common::load_local(&state.join("config.toml")); // the child process must not reach the real sport source
     // The ratio-two seed goal (the setup default is ratio one).
     let settings = root.join("setup.toml");
     std::fs::write(

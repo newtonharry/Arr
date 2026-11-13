@@ -25,6 +25,8 @@
 //! When a fixture has to change because a release really changed what it writes, add the new
 //! layout next to the old ones; never edit an old one to make a test pass.
 
+mod common;
+
 use arr::{api, config, fsutil};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -142,7 +144,10 @@ async fn state_written_by_v0_9_0_opens_and_serves() {
     write_secrets(&dir, &text);
     let cfg_path = dir.join("config.toml");
     fsutil::atomic_replace_private(&cfg_path, text.as_bytes()).unwrap();
-    let cfg = config::load(&cfg_path).unwrap();
+    let mut cfg = config::load(&cfg_path).unwrap();
+    // The released config says nothing about sport, which would mean the real source: not for a test.
+    cfg.sports = None;
+    common::assert_sport_is_local(&cfg);
 
     let state = Arc::new(api::AppState::new(cfg).expect("the old state opens"));
     let (app, _stop) = api::app(state.clone()).unwrap();
