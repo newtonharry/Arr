@@ -508,7 +508,10 @@ follows:
   `: <Name> vs. <Name>`; a tournament title is capitalised words, numbers and a few small
   connectors. A string that does not fit becomes a neutral value made from Arr's own data
   (`Team <id>`, `<League> event on <date>`) or null. The event or team itself is never hidden
-  because of it.
+  because of it. The one excuse in the reject list is for a team object's name (`team_name`: team
+  lists and fixture sides, never free text): it may end in a word from a short compiled list of club
+  words (`CLUB_WORDS`, now "Victory", for "Melbourne Victory"), with everything before it passing the
+  whole rule. A team list that holds a `Team <id>` name is read again after a day instead of a week.
 - **One label per team.** A team's name lives in `sport_teams` and a successful team-list read
   corrects it. Follows, the league page and search take the label from there at read time (a
   follow keeps the label it was made with only as a fallback, then `Team <id>`; `since` never

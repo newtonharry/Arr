@@ -30,6 +30,8 @@ const NEAR_STALE: Duration = Duration::from_secs(20 * 60);
 const NEAR_BEFORE: time::Duration = time::Duration::hours(4);
 const NEAR_AFTER: time::Duration = time::Duration::hours(2);
 const TEAMS_STALE: Duration = Duration::from_secs(7 * 86_400);
+/// A team list that holds a `Team <id>` fallback name is read again after this long.
+const TEAMS_FALLBACK_STALE: Duration = Duration::from_secs(86_400);
 const FAIL_FIRST: Duration = Duration::from_secs(15 * 60);
 const FAIL_MAX: Duration = Duration::from_secs(6 * 3600);
 /// Leagues read per worker run, and how long a run may keep starting new ones.
@@ -262,17 +264,23 @@ pub async fn ensure_teams(
         return Ok(());
     }
     let slug = league.slug;
-    let (state, known) = store
+    let (state, known, fallbacks) = store
         .with(move |c| {
-            Ok((
-                data::refresh_state(c, slug)?,
-                data::teams_of(c, slug)?.len(),
-            ))
+            let teams = data::teams_of(c, slug)?;
+            // Teams stored as `Team <id>` (their real name was refused once): read the list again
+            // after a day, not a week, so a corrected rule or a corrected feed shows up soon.
+            let fallbacks = teams.iter().any(|t| t.name == format!("Team {}", t.id));
+            Ok((data::refresh_state(c, slug)?, teams.len(), fallbacks))
         })
         .await?;
+    let stale = if fallbacks {
+        TEAMS_FALLBACK_STALE
+    } else {
+        TEAMS_STALE
+    };
     let fresh = state
         .teams
-        .is_some_and(|t| now - t < time::Duration::try_from(TEAMS_STALE).unwrap_or_default());
+        .is_some_and(|t| now - t < time::Duration::try_from(stale).unwrap_or_default());
     if fresh && known > 0 {
         return Ok(());
     }

@@ -329,6 +329,26 @@ pub fn plain_name(text: Option<&str>, max: usize) -> Option<String> {
     ok.then_some(t)
 }
 
+/// Words that end a real club's name and are also on the reject list ("Melbourne Victory").
+/// Short and explicit on purpose: the reject list stays whole for everything else.
+const CLUB_WORDS: &[&str] = &["Victory"];
+
+/// A team's name, from a team object (a team list or a fixture's competitor, never free text):
+/// `plain_name`, except that a club word as the last word of a longer name is not held against
+/// it. Everything before that word must pass the full rule by itself, so "Melbourne wins
+/// Victory" and "Smith def. Victory" are still refused, and so is a bare "Victory".
+pub fn team_name(text: Option<&str>, max: usize) -> Option<String> {
+    if let Some(n) = plain_name(text, max) {
+        return Some(n);
+    }
+    let t = clean(text, max + 1)?;
+    let (rest, last) = t.rsplit_once(' ')?;
+    (CLUB_WORDS.contains(&last)
+        && t.chars().count() <= max
+        && plain_name(Some(rest), max).is_some())
+    .then_some(t)
+}
+
 /// A team abbreviation: up to six letters, digits or `&`.
 fn abbreviation(text: Option<&str>) -> Option<String> {
     let t = clean(text, 7)?;
@@ -532,7 +552,7 @@ fn state_of(status: Option<&RawStatus>) -> EventState {
 /// becomes `Team <id>`: the team stays, whatever the feed wrote.
 fn side(t: &RawTeam) -> Option<Side> {
     let id = plain_id(t.id.as_ref())?;
-    let name = plain_name(t.display_name.as_deref().or(t.name.as_deref()), 120)
+    let name = team_name(t.display_name.as_deref().or(t.name.as_deref()), 120)
         .unwrap_or_else(|| format!("Team {id}"));
     Some(Side {
         id,
@@ -1227,6 +1247,45 @@ mod title_tests {
         assert_eq!(f.venue.as_deref(), Some("Stade Gerland"));
         assert_eq!(f.home.as_ref().unwrap().name, "Lyon");
         assert_eq!(f.away.as_ref().unwrap().name, "Stade Toulousain");
+    }
+
+    #[test]
+    fn a_club_word_ends_a_real_team_name_but_nothing_else_gets_the_reject_list_off() {
+        // A-League Men's "Melbourne Victory" is a real name; "victory" is on the reject list.
+        let list = br#"{"sports":[{"leagues":[{"teams":[
+            {"team":{"id":"5328","displayName":"Melbourne Victory","shortDisplayName":"Victory","abbreviation":"MBV"}}]}]}]}"#;
+        let teams = parse_teams(list).unwrap();
+        assert_eq!(teams[0].name, "Melbourne Victory");
+        assert_eq!(teams[0].abbreviation.as_deref(), Some("MBV"));
+        // A fixture names its sides the same way, so the event reads right.
+        let body = br#"{"events":[{"id":"7","date":"2026-11-21T12:30Z","competitions":[{"competitors":[
+            {"homeAway":"home","team":{"id":"1","displayName":"Auckland FC","abbreviation":"AUC"}},
+            {"homeAway":"away","team":{"id":"5328","displayName":"Melbourne Victory","abbreviation":"MBV"}}]}]}]}"#;
+        let f = &parse_month(body, league("a-league-men")).unwrap().fixtures[0];
+        assert_eq!(f.name.as_deref(), Some("Auckland FC v Melbourne Victory"));
+        assert_eq!(f.away.as_ref().unwrap().name, "Melbourne Victory");
+        // The word is excused only as the last word of a team's name, with the rest clean.
+        for refused in [
+            "Melbourne wins Victory",
+            "Smith def. Victory",
+            "Victory",
+            "Victory Melbourne",
+            "Melbourne Victory wins",
+            "Melbourne 3-1 Victory",
+        ] {
+            assert_eq!(team_name(Some(refused), 120), None, "{refused}");
+        }
+        // Anywhere else the full list applies: a venue, a free-text name, a tournament or a card.
+        assert_eq!(plain_name(Some("Melbourne Victory"), 120), None);
+        assert_eq!(plain_name(Some("Victory Park"), 120), None);
+        assert_eq!(
+            event_title(Some("The Victory Open"), league("pga-tour")),
+            None
+        );
+        assert_eq!(
+            event_title(Some("UFC 334: Gane Victory"), league("ufc")),
+            None
+        );
     }
 
     #[test]

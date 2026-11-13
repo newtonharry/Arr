@@ -2569,3 +2569,52 @@ async fn team_lists_wait_until_every_due_followed_league_has_been_read() {
     assert!(!r["catalogue_teams"].as_array().unwrap().is_empty(), "{r}");
     assert!(team_requests(&e).len() > before);
 }
+
+#[tokio::test]
+async fn a_team_stored_under_its_fallback_name_gets_its_real_name_from_the_next_list() {
+    let e = start_exec(ExecOptions::default()).await;
+    // The feed's list names a team "Melbourne Victory" (a name the first version refused).
+    {
+        let mut m = e.mock.lock().unwrap();
+        let doc = m.espn_teams.get_mut(EPL).unwrap();
+        doc["sports"][0]["leagues"][0]["teams"][0]["team"]["displayName"] =
+            json!("Melbourne Victory");
+        doc["sports"][0]["leagues"][0]["teams"][0]["team"]["id"] = json!("5328");
+    }
+    // An install that stored it as `Team 5328` two days ago.
+    e.state
+        .store
+        .with(|c| {
+            c.execute(
+                "INSERT INTO sport_teams (league, team_id, name) VALUES ('premier-league', '5328', 'Team 5328')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO sport_refresh (league, teams_utc) VALUES ('premier-league', ?1)
+                 ON CONFLICT (league) DO UPDATE SET teams_utc = ?1",
+                [(OffsetDateTime::now_utc() - time::Duration::days(2))
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (s, v) = get(&e, "/api/v1/sport/league/premier-league").await;
+    assert_eq!(s, 200, "{v}");
+    let names: Vec<&str> = v["teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"Melbourne Victory"), "{names:?}");
+    assert!(!names.contains(&"Team 5328"), "{names:?}");
+    // With no fallback name left, the list is left alone for a week again.
+    sports_task(&e).await;
+    let reads = team_requests(&e)
+        .iter()
+        .filter(|l| l.contains("eng.1"))
+        .count();
+    assert_eq!(reads, 1);
+}
