@@ -399,3 +399,4 @@ a.link{display:inline-flex;align-items:center;padding:0 6px}
   .item.sport:has(>.btn)>.btn{margin-left:58px}
 }
 .what .meta.wrap{white-space:normal}
+.people-sec{margin-bottom:22px}

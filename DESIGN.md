@@ -296,6 +296,7 @@ The drive meter is a text line ("Movies drive: 1.2 TB free of 4 TB") over a 10px
 - **Toast:** one small pill above the tab bar, ink fill with page-coloured text and a link-button action ("Hidden · Undo"), gone after seven seconds. No shadow.
 - **Search before typing:** tapping the search field opens Search with "Recent" (the last eight searches on this device, each removable, plus "Clear") and "Popular now" (the same ideas row as Home).
 - **Owned badge:** the "In Plex" tag style (teal ink, check glyph) under a search result's meta line: "In Plex", "On its way" or "Tracking". A movie already in Plex shows the Done button instead of a second badge.
+- **People in search:** a person who matches the search (their block with their work) or a row of names (chips, "People") has one place, the top of the results, above Results. Rows that arrive later go below it and never push it out of sight. The first draw waits up to 150 ms for the people (not at all once they have answered, or failed, or found nothing); people that arrive after that glide in and the rows below glide down. While typing on, the names or the person already shown that still fit the new query stay until the new answer replaces them; drawing the same query again keeps them.
 - **Title pages:** under the summary (four lines, then "More"), genres as small pills (999px, 2px warm border, 13px/800 muted); at the end of the page a "Cast" section of up to six names with the character in muted text, two columns on a phone. Names only, no photos.
 
 ### Sport

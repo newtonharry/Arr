@@ -364,7 +364,7 @@ routes answer `503 provider_not_configured`, and `/feed` and `/calendar` carry a
   `<League> event on <YYYY-MM-DD>` (UTC). Every other text from the feed follows the same
   idea: team names, short names and venues are plain names (letters, digits, spaces and
   `. ' & - / ( )`, bounded, each segment capitalised or a small particle) that pass the reject list,
-  and a team whose name does not is called `Team <id>`; an abbreviation is up to six letters, digits or `&`; a `season` is `2026`,
+  and a team whose name does not is called `Team <id>` (a team's name, from a team object only, may end in a club word that is on the reject list, now only "Victory" as in "Melbourne Victory", with the rest of the name clean; a team stored under `Team <id>` gets its real name when its league's team list is read again, within a day); an abbreviation is up to six letters, digits or `&`; a `season` is `2026`,
   `2026-27` or `2026-2027`, else `null`. See "No results" in `ARCHITECTURE.md`.
 - **Ids.** A league is `league:<slug>` (`league:nba`; routes also accept the bare slug), a game,
   fight card or tournament is `event:<slug>:<number>` (`event:nba:401909999`). Slugs are

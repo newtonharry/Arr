@@ -768,6 +768,37 @@ fn the_harness_refuses_a_config_that_would_reach_the_real_sport_source() {
 }
 
 #[tokio::test]
+async fn search_keeps_the_people_in_one_place_at_the_top() {
+    // Source assertions only: the sequences themselves (staggered answers, typing on, the same
+    // query again) are driven by the browser rig, not here.
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let js = site
+        .plain(Method::GET, "/app/app.js")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for want in [
+        "function carryPeople(p, q)",
+        "people && people.person ? h('div', { class: 'people-sec' }",
+        "if (pdone && pend && entry) entry.people = pend;",
+        "const terminal = () => both() && !rowsReady();",
+        "if (!terminal() && (!both() || !pdone)) await Promise.race([settled,",
+        "'data-flip': fl",
+    ] {
+        assert!(js.contains(want), "app.js lacks {want}");
+    }
+    // The names row is drawn once, at the top, and no longer after the sport section.
+    assert_eq!(
+        js.matches("h(PeopleRow, { names: people.names })").count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn with_sport_off_the_app_gets_the_answer_it_hides_sport_on() {
     let e = start_exec(ExecOptions {
         tmdb: true,
