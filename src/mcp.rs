@@ -1038,6 +1038,7 @@ fn canonical(raw: &str, scope: Scope) -> Result<String, CallToolResult> {
         Ok(MediaId::Series(_)) if scope == Scope::Acquirable => Err(invalid(
             "whole series are not added through this tool: ask the user which season or episode they want",
         )),
+        Ok(MediaId::Event(_)) => Err(invalid("sport events are not available through this tool")),
         Ok(id) => Ok(id.to_string()),
         Err(_) => Err(invalid(
             "media_id must be a canonical id such as movie:tmdb:603, season:tvdb:372264:1 or episode:tvdb:372264:1:2",

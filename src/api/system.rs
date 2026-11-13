@@ -279,6 +279,7 @@ fn folders_item(st: &AppState) -> Value {
     };
     let mut missing = vec![];
     let mut any = false;
+    // (the sport folder is made at the first import, so its absence is not a problem)
     for (name, p) in [("Movies", &l.movies), ("TV", &l.tv)] {
         if let Some(p) = p {
             any = true;
@@ -373,10 +374,8 @@ fn search_item(st: &AppState) -> Value {
 
 async fn disk_item(st: &AppState) -> Option<Value> {
     let l = st.cfg.library.as_ref()?;
-    let roots: Vec<PathBuf> = [l.movies.clone(), l.tv.clone()]
-        .into_iter()
-        .flatten()
-        .collect();
+    // (the sport root is not made until the first import, so a missing one is left out)
+    let roots: Vec<PathBuf> = l.roots().into_iter().filter(|p| p.exists()).collect();
     let free = tokio::task::spawn_blocking(move || {
         roots
             .iter()

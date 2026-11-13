@@ -515,6 +515,10 @@ impl Resolver<'_> {
                 ErrorCode::InvalidMediaId,
                 "searches and plans target a movie, a season or an episode (whole-series requests are not supported)",
             )),
+            MediaId::Event(_) => Err(ApiError::bad_request(
+                ErrorCode::InvalidMediaId,
+                "a sport event is not a title: sport has its own routes",
+            )),
         }
     }
 }

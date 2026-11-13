@@ -14,7 +14,7 @@ const MAX_COPIES: usize = 12;
 /// The profile id for a level of a title's media kind, when this setup has the levels.
 pub(super) fn level_profile(st: &AppState, id: MediaId, level: &str) -> Result<String, ApiError> {
     let l = st.loaded()?;
-    let media = downloads::media_kind(id);
+    let media = downloads::policy_kind(id);
     let profile = Level::parse(level)
         .map(|lv| lv.profile_id(media))
         .filter(|p| l.settings.profile(p).is_some_and(|x| x.media == media))
@@ -47,10 +47,10 @@ pub(super) async fn set_profile(
     let index = st.index();
     let stored = match id {
         MediaId::Movie { tmdb } => index.movie(tmdb).map(|m| m.id),
-        other => other
-            .series_key()
-            .and_then(|k| index.series(k))
-            .map(|s| s.id),
+        MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
+            index.series(k).map(|s| s.id)
+        }
+        MediaId::Event(_) => None,
     };
     let Some(stored) = stored else {
         return Ok(false);
@@ -252,10 +252,10 @@ pub(super) async fn copies(
         MediaId::Movie { tmdb } => index
             .movie(tmdb)
             .is_some_and(|m| m.quality_profile.is_some()),
-        other => other
-            .series_key()
-            .and_then(|k| index.series(k))
-            .is_some_and(|s| s.quality_profile.is_some()),
+        MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
+            index.series(k).is_some_and(|s| s.quality_profile.is_some())
+        }
+        MediaId::Event(_) => false,
     };
     let (target, run, _) = release_run(&st, id, false, want.as_deref().filter(|_| !known)).await?;
     let mut copies = vec![];
@@ -322,7 +322,8 @@ pub(super) struct GetBody {
 fn monitored_unit(index: &CatalogIndex, id: MediaId) -> Option<bool> {
     match id {
         MediaId::Movie { tmdb } => index.movie(tmdb).map(|m| m.monitored),
-        other => {
+        MediaId::Event(_) => None,
+        other @ (MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..)) => {
             let s: &Series = other.series_key().and_then(|k| index.series(k))?;
             if !s.monitored {
                 return Some(false);
@@ -330,7 +331,9 @@ fn monitored_unit(index: &CatalogIndex, id: MediaId) -> Option<bool> {
             let (season, episode) = match other {
                 MediaId::Season(_, n) => (n, None),
                 MediaId::Episode(_, n, e) => (n, Some(e)),
-                _ => return Some(true),
+                MediaId::Series(_) | MediaId::Movie { .. } | MediaId::Event(_) => {
+                    return Some(true);
+                }
             };
             Some(match &s.episodes {
                 Some(eps) => eps

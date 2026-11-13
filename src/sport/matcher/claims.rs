@@ -121,7 +121,7 @@ pub fn claim_of(a: &Assertion) -> Claim {
 /// The identity of a major championship from the words that name it, so that "The Open" (the
 /// Open Championship) and "U.S. Open" are two tournaments and not one containing the other.
 /// `None` for any other tournament, which is compared by its words.
-fn major_of(words: &[String]) -> Option<&'static str> {
+pub fn major_of(words: &[String]) -> Option<&'static str> {
     let mut w: Vec<&str> = vec![];
     let mut i = 0;
     while i < words.len() {

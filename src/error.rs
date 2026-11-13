@@ -69,6 +69,12 @@ pub enum ErrorCode {
     DeleteRefused,
     /// A file could not be moved; what already moved was put back.
     MoveFailed,
+    /// A sport copy that is only `likely` was picked without the confirmation flag.
+    ConfirmationNeeded,
+    /// Sport: the event already has a file for that part.
+    AlreadyHave,
+    /// Sport: the event is not over by Arr's reckoning (or was cancelled or postponed).
+    NotPlayedYet,
     Internal,
 }
 
@@ -123,6 +129,9 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::Changed,
     ErrorCode::DeleteRefused,
     ErrorCode::MoveFailed,
+    ErrorCode::ConfirmationNeeded,
+    ErrorCode::AlreadyHave,
+    ErrorCode::NotPlayedYet,
     ErrorCode::Internal,
 ];
 

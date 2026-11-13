@@ -321,6 +321,7 @@ pub async fn batch(
     run.updated_at = now_s.clone();
     run.section = section;
     // Configuration problems fail the run and change nothing.
+    // (movies and TV only: the Plex refresh of a sport import is `worker::plex_refresh`'s)
     let (what, plex_root, root) = match media {
         MediaKind::Movie => (
             "movies",

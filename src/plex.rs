@@ -22,6 +22,9 @@ pub struct Section {
     pub title: String,
     /// `movie`, `show`, `artist`, `photo`.
     pub kind: String,
+    /// The metadata agent (`com.plexapp.agents.none` for a plain "Other Videos" library); empty
+    /// when the server does not say.
+    pub agent: String,
     pub locations: Vec<String>,
 }
 
@@ -45,6 +48,8 @@ struct Directory {
     title: Option<String>,
     #[serde(rename = "type", default)]
     kind: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
     #[serde(rename = "Location", default)]
     locations: Vec<Location>,
 }
@@ -294,6 +299,7 @@ pub fn parse_sections(body: &[u8]) -> Result<Vec<Section>, UpstreamError> {
                 key,
                 title: clip(d.title.as_deref().unwrap_or("")),
                 kind: clip(d.kind.as_deref().unwrap_or("")),
+                agent: clip(d.agent.as_deref().unwrap_or("")),
                 locations: d
                     .locations
                     .iter()
@@ -341,6 +347,115 @@ impl Plex {
             root.trim_end_matches('/'),
             folder.to_string_lossy()
         ))
+    }
+
+    /// Creates a library section. The request is a `POST` to `library/sections` with the token
+    /// header and the query parameters `name`, `type`, `agent`, `scanner`, `language` and
+    /// `location` (a folder as Plex sees it), as the wizard sends it for Movies and TV Shows.
+    pub async fn create_section(
+        &self,
+        name: &str,
+        kind: &str,
+        agent: &str,
+        scanner: &str,
+        language: &str,
+        location: &str,
+    ) -> Result<(), UpstreamError> {
+        let mut url =
+            self.cfg
+                .base_url
+                .join("library/sections")
+                .map_err(|_| UpstreamError::BadResponse {
+                    reason: "invalid base URL".into(),
+                })?;
+        url.query_pairs_mut()
+            .append_pair("name", name)
+            .append_pair("type", kind)
+            .append_pair("agent", agent)
+            .append_pair("scanner", scanner)
+            .append_pair("language", language)
+            .append_pair("location", location);
+        let resp = upstream::send(
+            self.http
+                .post(url)
+                .header("X-Plex-Token", self.cfg.token.expose())
+                .header("Accept", "application/json"),
+        )
+        .await?;
+        match upstream::classify_status(resp.status()) {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
+    }
+
+    /// The server's machine identifier (`GET identity`, a read), which tells one Plex server from
+    /// another. `None` when the server does not say.
+    pub async fn machine_id(&self) -> Result<Option<String>, UpstreamError> {
+        let url = self
+            .cfg
+            .base_url
+            .join("identity")
+            .map_err(|_| UpstreamError::BadResponse {
+                reason: "invalid base URL".into(),
+            })?;
+        let resp = upstream::send(
+            self.http
+                .get(url)
+                .header("X-Plex-Token", self.cfg.token.expose())
+                .header("Accept", "application/json"),
+        )
+        .await?;
+        let body = upstream::read_bytes(resp, MAX_SECTIONS_BYTES).await?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| UpstreamError::BadResponse {
+                reason: "invalid identity JSON".into(),
+            })?;
+        Ok(v["MediaContainer"]["machineIdentifier"]
+            .as_str()
+            .map(|s| s.chars().filter(|c| !c.is_control()).take(100).collect()))
+    }
+
+    /// What Plex itself sees in a folder, as its own folder picker asks: `GET
+    /// services/browse/<base64 of the path>?includeFiles=1` (standard base64 with padding). Plex
+    /// answers `MediaContainer` with `Path` entries `{key, path, title}` for folders and `File`
+    /// entries `{key, path, title}` for files, `path` being the full Plex-side path and `title`
+    /// the bare name. Returns the full paths of the FILE entries only, as written by Plex.
+    pub async fn browse_files(&self, path: &str) -> Result<Vec<String>, UpstreamError> {
+        use base64::Engine;
+        let mut url =
+            self.cfg
+                .base_url
+                .join("services/browse/")
+                .map_err(|_| UpstreamError::BadResponse {
+                    reason: "invalid base URL".into(),
+                })?;
+        let enc = base64::engine::general_purpose::STANDARD.encode(path.as_bytes());
+        url.path_segments_mut()
+            .map_err(|_| UpstreamError::BadResponse {
+                reason: "invalid base URL".into(),
+            })?
+            .pop_if_empty()
+            .push(&enc);
+        url.query_pairs_mut().append_pair("includeFiles", "1");
+        let resp = upstream::send(
+            self.http
+                .get(url)
+                .header("X-Plex-Token", self.cfg.token.expose())
+                .header("Accept", "application/json"),
+        )
+        .await?;
+        let body = upstream::read_bytes(resp, MAX_SECTIONS_BYTES).await?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| UpstreamError::BadResponse {
+                reason: "invalid browse JSON".into(),
+            })?;
+        Ok(v["MediaContainer"]["File"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(5000)
+            .filter_map(|e| e["path"].as_str().map(str::to_string))
+            .collect())
     }
 
     /// The server's library sections (read-only).
@@ -570,8 +685,10 @@ mod tests {
             token: crate::config::Secret::new("t".into()),
             movie_section: Some(1),
             tv_section: Some(2),
+            sport_section: Some(3),
             movies_path: Some("/m".into()),
             tv_path: Some("/t".into()),
+            sport_path: Some("/s".into()),
             timeout: std::time::Duration::from_secs(5),
             discover_url: base.clone(),
             metadata_url: base.clone(),
@@ -672,6 +789,7 @@ mod tests {
                 key: 1,
                 title: "Movies".into(),
                 kind: "movie".into(),
+                agent: String::new(),
                 locations: vec!["/data/movies".into()]
             }
         );

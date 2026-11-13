@@ -839,6 +839,7 @@ fn allowed(method: &Method, path: &str) -> bool {
         Method::POST => match parts.as_slice() {
             ["quick-add" | "follow" | "stop" | "quality" | "remove"] => true,
             ["sport", "follow" | "unfollow"] => true,
+            ["sport", "event", id, "get"] => !id.is_empty(),
             ["delete"] | ["delete", "preview"] => true,
             ["bin", id, "restore"] => !id.is_empty(),
             // Update now, and a changed setting: signed-in household members only, like the rest.
@@ -884,6 +885,8 @@ fn title_key(id: &str) -> Option<String> {
         MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
             MediaId::Series(k).to_string()
         }
+        // (a sport event has no requester)
+        MediaId::Event(_) => return None,
     })
 }
 
@@ -1148,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn the_app_may_read_the_copies_of_an_event_and_nothing_more() {
+    fn the_app_may_read_the_copies_of_an_event_and_pick_one() {
         let get = |p: &str| allowed(&Method::GET, p);
         assert!(get("/api/v1/sport/event/event:ufc:600061400/copies"));
         assert!(get("/api/v1/sport/event/event:ufc:600061400:main/copies"));
@@ -1161,9 +1164,18 @@ mod tests {
         }
         assert!(!get("/api/v1/sport/event/event:ufc:600061400"));
         assert!(!get("/api/v1/sport/event/event:ufc:600061400/copies/get"));
-        assert!(!allowed(
+        // ...and may pick one (a POST of its own), nothing else about an event.
+        assert!(allowed(
             &Method::POST,
             "/api/v1/sport/event/event:ufc:600061400/get"
+        ));
+        assert!(!allowed(
+            &Method::POST,
+            "/api/v1/sport/event/event:ufc:600061400/copies"
+        ));
+        assert!(!allowed(
+            &Method::POST,
+            "/api/v1/sport/event/event:ufc:600061400/get/now"
         ));
     }
 }

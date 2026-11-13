@@ -515,6 +515,8 @@ struct LibrarySection {
     /// imported root folder of that kind).
     movies_native_root: Option<String>,
     tv_native_root: Option<String>,
+    /// Where sport lands. Default: a `Sport` folder beside the movies root.
+    sport: Option<String>,
     #[serde(default = "d_ffprobe")]
     ffprobe: String,
     #[serde(default = "d_probe_timeout")]
@@ -625,6 +627,10 @@ struct PlexSection {
     movies_path: Option<String>,
     /// The `[library] tv` root as Plex sees it.
     tv_path: Option<String>,
+    /// The Plex library section that holds sport (default: found by its folder, or created).
+    sport_section: Option<u32>,
+    /// The sport root as Plex sees it (default: a `Sport` folder beside `movies_path`).
+    sport_path: Option<String>,
     #[serde(default = "d_meta_timeout")]
     timeout_secs: u64,
     /// Where Plex's movie search lives (tests only; installers never write this).
@@ -700,12 +706,49 @@ pub struct LibraryConfig {
     pub movies: Option<PathBuf>,
     /// Local path of the imported TV root.
     pub tv: Option<PathBuf>,
+    /// Where sport lands (`[library] sport`), if set; otherwise `sport_root` derives it.
+    pub sport: Option<PathBuf>,
     pub movies_native_root: Option<String>,
     pub tv_native_root: Option<String>,
     pub ffprobe: PathBuf,
     pub probe_timeout: Duration,
     pub sample_detection: bool,
     pub probes_per_scan: u32,
+}
+
+/// The default name of the sport folder beside the movies folder: it follows the case of the
+/// movies folder's own name (`sport` beside `movies`, `Sport` beside `Movies`).
+pub fn sport_folder_name(movies_folder: &str) -> &'static str {
+    if movies_folder.chars().next().is_some_and(char::is_lowercase) {
+        "sport"
+    } else {
+        "Sport"
+    }
+}
+
+impl LibraryConfig {
+    /// Where sport lands: `[library] sport`, else a folder beside the movies root (so it is on
+    /// the same drive as the library and a hard link works), named `Sport` or, when the movies
+    /// folder's own name is lower case, `sport`.
+    pub fn sport_root(&self) -> Option<PathBuf> {
+        self.sport.clone().or_else(|| {
+            let movies = self.movies.as_deref()?;
+            let name = movies.file_name().and_then(|n| n.to_str())?;
+            movies.parent().map(|p| p.join(sport_folder_name(name)))
+        })
+    }
+
+    /// Every library root: movies, TV and the effective sport root (its default included). Every
+    /// place that must keep downloads and the library apart, or protect library files, uses this;
+    /// a place that lists only movies and TV says in a comment why.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.movies
+            .iter()
+            .chain(&self.tv)
+            .cloned()
+            .chain(self.sport_root())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -727,9 +770,12 @@ pub struct PlexConfig {
     pub token: Secret,
     pub movie_section: Option<u32>,
     pub tv_section: Option<u32>,
+    /// The section sport lives in, if the person set one.
+    pub sport_section: Option<u32>,
     /// Plex-side paths of the library roots (absolute, no trailing `/`).
     pub movies_path: Option<String>,
     pub tv_path: Option<String>,
+    pub sport_path: Option<String>,
     pub timeout: Duration,
     /// Plex's own movie metadata service, read with the same token.
     pub discover_url: Url,
@@ -1484,6 +1530,11 @@ pub fn parse_config(
                 .as_deref()
                 .map(|p| absolute_path(p, "library.tv"))
                 .transpose()?,
+            sport: l
+                .sport
+                .as_deref()
+                .map(|p| absolute_path(p, "library.sport"))
+                .transpose()?,
             movies_native_root: l
                 .movies_native_root
                 .as_deref()
@@ -1516,9 +1567,33 @@ pub fn parse_config(
             )? as u32,
         }),
     };
-    if let (Some(q), Some(l)) = (&qbittorrent, &library) {
+    if let Some(l) = &library
+        && let Some(sport) = l.sport_root()
+    {
+        // Sport is filed in its own folder: inside or around a movie or TV root it would be
+        // scanned and listed as one of theirs.
         for root in l.movies.iter().chain(&l.tv) {
-            if root.starts_with(&q.local_path) || q.local_path.starts_with(root) {
+            if crate::paths::overlap(root, &sport)
+                .map_err(|e| anyhow::anyhow!("library.sport: {e}"))?
+            {
+                bail!(
+                    "library.sport and the movies and tv roots must not contain each other ({} vs {})",
+                    sport.display(),
+                    root.display()
+                );
+            }
+        }
+    }
+    if let (Some(q), Some(l)) = (&qbittorrent, &library) {
+        for root in l.roots() {
+            let root = &root;
+            // (movies and TV are compared as written, as before; sport, which is new, is also
+            // compared by where it really is)
+            let is_sport = l.sport_root().as_ref() == Some(root);
+            let real = is_sport
+                && crate::paths::overlap(root, &q.local_path)
+                    .map_err(|e| anyhow::anyhow!("library.sport: {e}"))?;
+            if root.starts_with(&q.local_path) || q.local_path.starts_with(root) || real {
                 bail!(
                     "qbittorrent.local_path and the library roots must not contain each other ({} vs {})",
                     q.local_path.display(),
@@ -1528,8 +1603,13 @@ pub fn parse_config(
         }
     }
     if let (Some(e), Some(l)) = (&embedded, &library) {
-        for root in l.movies.iter().chain(&l.tv) {
-            if paths_overlap(root, &e.download_dir) {
+        for root in l.roots() {
+            let root = &root;
+            let is_sport = l.sport_root().as_ref() == Some(root);
+            let real = is_sport
+                && crate::paths::overlap(root, &e.download_dir)
+                    .map_err(|e| anyhow::anyhow!("library.sport: {e}"))?;
+            if paths_overlap(root, &e.download_dir) || real {
                 bail!(
                     "embedded.download_dir and the library roots must not contain each other ({} vs {})",
                     e.download_dir.display(),
@@ -1608,18 +1688,28 @@ pub fn parse_config(
             for (section, what) in [
                 (p.movie_section, "plex.movie_section"),
                 (p.tv_section, "plex.tv_section"),
+                (p.sport_section, "plex.sport_section"),
             ] {
                 if section == Some(0) {
                     bail!("{what} must be a Plex library section id (a positive number)");
                 }
+            }
+            if let Some(k) = p.sport_section
+                && (Some(k) == p.movie_section || Some(k) == p.tv_section)
+            {
+                bail!(
+                    "plex.sport_section ({k}) is the movie or TV library; sport has a library of its own (a plain Other Videos one)"
+                );
             }
             Some(PlexConfig {
                 base_url: parse_base_url(&p.base_url, "plex.base_url")?,
                 token: Secret(read_secret(&p.token_file, "plex.token_file")?),
                 movie_section: p.movie_section,
                 tv_section: p.tv_section,
+                sport_section: p.sport_section,
                 movies_path: plex_path(&p.movies_path, "plex.movies_path")?,
                 tv_path: plex_path(&p.tv_path, "plex.tv_path")?,
+                sport_path: plex_path(&p.sport_path, "plex.sport_path")?,
                 timeout: Duration::from_secs(within("plex.timeout_secs", p.timeout_secs, 1, 120)?),
                 discover_url: parse_base_url(&p.discover_url, "plex.discover_url")?,
                 metadata_url: parse_base_url(&p.metadata_url, "plex.metadata_url")?,
@@ -2113,6 +2203,7 @@ mode = "coexistence"
 # [library]
 # movies = "/srv/media/movies"
 # tv = "/srv/media/tv"
+# sport = "/srv/media/sport"          # optional; default: a Sport folder beside movies
 # ffprobe = "/usr/bin/ffprobe"        # external dependency (Debian/Ubuntu: apt install ffmpeg)
 
 # [plex]
@@ -2120,8 +2211,10 @@ mode = "coexistence"
 # token_file = "secrets/plex_token"
 # movie_section = 1
 # tv_section = 2
+# sport_section = 3                   # optional: the library that holds sport
 # movies_path = "/data/movies"        # [library] movies as Plex sees it
 # tv_path = "/data/tv"                # [library] tv as Plex sees it
+# sport_path = "/data/sport"          # [library] sport as Plex sees it. Without it Arr infers a folder beside movies_path and creates a library only after Plex shows the filed video there
 
 # Remote MCP at /mcp (Streamable HTTP, static bearer token; optional Google OAuth sign-in,
 # see config/standalone.example.toml and docs/MCP.md).
@@ -2193,6 +2286,60 @@ mod tests {
     #[test]
     fn templates_quote_what_they_are_given() {
         assert!(standalone_template("127.0.0.1:8787").contains("listen = \"127.0.0.1:8787\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sport_root_is_kept_apart_from_downloads_like_movies_and_tv() {
+        let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n[execution]\nenabled = true\n[migration]\nmode = \"coexistence\"\n";
+        let emb =
+            |dl: &str| format!("[embedded]\ndownload_dir = \"{dl}\"\nlisten = \"127.0.0.1:0\"\n");
+        // A stated sport root inside the downloads, and around them.
+        for (lib, dl) in [
+            (
+                "movies = \"/srv/lib/movies\"\nsport = \"/srv/dl/Sport\"\n",
+                "/srv/dl",
+            ),
+            (
+                "movies = \"/srv/lib/movies\"\nsport = \"/srv\"\n",
+                "/srv/dl",
+            ),
+            // the default one, beside the movies folder, is in the downloads here
+            ("movies = \"/srv/dl/movies\"\n", "/srv/dl"),
+        ] {
+            let (_t, cfg) = setup(&format!("{base}[library]\n{lib}{}", emb(dl)));
+            let err = format!("{:#}", load(&cfg).unwrap_err());
+            assert!(err.contains("must not contain each other"), "{lib}: {err}");
+        }
+        // qBittorrent's local path is checked the same way.
+        let q = "[qbittorrent]\nbase_url = \"http://127.0.0.1:8080\"\nusername_file = \"secrets/prowlarr_api_key\"\npassword_file = \"secrets/prowlarr_api_key\"\nsave_path = \"/dl\"\nlocal_path = \"/srv/dl\"\nmovie_category = \"m\"\ntv_category = \"t\"\n";
+        let (_t, cfg) = setup(&format!(
+            "{base}[library]\nmovies = \"/srv/lib/movies\"\nsport = \"/srv/dl/Sport\"\n{q}"
+        ));
+        let err = format!("{:#}", load(&cfg).unwrap_err());
+        assert!(err.contains("must not contain each other"), "{err}");
+        // The sport root and the movie or TV roots do not hold each other.
+        let (_t, cfg) = setup(&format!(
+            "{base}[library]\nmovies = \"/srv/lib/movies\"\nsport = \"/srv/lib/movies/Sport\"\n{}",
+            emb("/srv/um-dl")
+        ));
+        assert!(format!("{:#}", load(&cfg).unwrap_err()).contains("library.sport"));
+        // Apart: fine, and the default follows the movies folder's case.
+        let (_t, cfg) = setup(&format!(
+            "{base}[library]\nmovies = \"/srv/lib/movies\"\n{}",
+            emb("/srv/um-dl")
+        ));
+        let l = load(&cfg).unwrap().library.unwrap();
+        assert_eq!(l.sport_root().unwrap(), PathBuf::from("/srv/lib/sport"));
+        assert_eq!(l.roots().len(), 2);
+        let (_t, cfg) = setup(&format!(
+            "{base}[library]\nmovies = \"/srv/lib/Movies\"\n{}",
+            emb("/srv/um-dl")
+        ));
+        assert_eq!(
+            load(&cfg).unwrap().library.unwrap().sport_root().unwrap(),
+            PathBuf::from("/srv/lib/Sport")
+        );
     }
 
     #[cfg(unix)]
@@ -2624,6 +2771,30 @@ mod tests {
             c.plex.as_ref().unwrap().movies_path.as_deref(),
             Some("/data/movies")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sport_section_cannot_be_the_movie_or_tv_section() {
+        let head = "[server]\napi_token_file = \"secrets/api_token\"\n[plex]\nbase_url = \"http://127.0.0.1:32400\"\ntoken_file = \"secrets/plex_token\"\n";
+        for (extra, bad) in [
+            ("movie_section = 1\nsport_section = 1\n", true),
+            ("tv_section = 2\nsport_section = 2\n", true),
+            (
+                "movie_section = 1\ntv_section = 2\nsport_section = 3\n",
+                false,
+            ),
+        ] {
+            let text = format!("{head}{extra}");
+            let (_t, cfg) = setup(&text);
+            let base = cfg.parent().unwrap();
+            let r = parse_config(&text, base, "x", Secrets::Defer);
+            match (bad, r) {
+                (true, Err(e)) => assert!(format!("{e:#}").contains("plex.sport_section"), "{e:#}"),
+                (false, Ok(_)) => {}
+                (b, r) => panic!("{extra:?}: bad={b} {:?}", r.map(|_| ())),
+            }
+        }
     }
 
     #[test]

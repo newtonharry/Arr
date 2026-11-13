@@ -13,12 +13,16 @@
 pub mod catalog;
 pub mod data;
 pub mod espn;
+pub mod files;
 pub mod find;
 pub mod gate;
+pub mod get;
 #[cfg(test)]
 mod match_tests;
 pub mod matcher;
 pub mod names;
+pub mod payload;
+pub mod reason;
 pub mod refresh;
 pub mod release;
 #[cfg(test)]
@@ -137,6 +141,9 @@ pub struct Sports {
     /// How many requests may be judging a search at once (see `find::judge_search_bounded`):
     /// judging runs off the async workers, and only this many at a time.
     pub judging: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Until every catalogue league with teams has had its team list read once, the worker
+    /// reads one league a minute (the first pass after a fresh start); then two every 15 minutes.
+    pub catalogue_quick: std::sync::atomic::AtomicBool,
     /// One turn per league: a league is read by one caller at a time (a page, a follow or
     /// the worker), and the ones behind it find it freshly read.
     turns: std::sync::Mutex<
@@ -150,6 +157,7 @@ impl Sports {
             espn: espn::Espn::new(cfg),
             copies: gate::CopiesGate::default(),
             judging: std::sync::Arc::new(tokio::sync::Semaphore::new(find::JUDGE_SLOTS)),
+            catalogue_quick: std::sync::atomic::AtomicBool::new(true),
             turns: Default::default(),
         }
     }

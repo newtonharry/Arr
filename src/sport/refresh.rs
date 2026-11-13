@@ -656,7 +656,13 @@ async fn read_catalogue_teams(
         .await
         .unwrap_or_default();
     let mut out = vec![];
-    for (_, league) in plan.into_iter().take(CATALOGUE_TEAMS_PER_RUN) {
+    // The first pass over the catalogue is one league a run, run every minute (the worker asks
+    // `catalogue_quick`); once every league has been read once, the usual pace.
+    let quick = sports
+        .catalogue_quick
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let per_run = if quick { 1 } else { CATALOGUE_TEAMS_PER_RUN };
+    for (_, league) in plan.into_iter().take(per_run) {
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             break;
@@ -680,6 +686,23 @@ async fn read_catalogue_teams(
             _ => break,
         }
     }
+    // Is any league still waiting for its first read (and not waiting out a failure)?
+    let pending = store
+        .with(move |c| {
+            for league in catalog::LEAGUES.iter().filter(|l| l.teams) {
+                let state = data::refresh_state(c, league.slug)?;
+                let waiting = state.teams_next_try.is_some_and(|t| t > now);
+                if state.teams.is_none() && !waiting {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .unwrap_or(true);
+    sports
+        .catalogue_quick
+        .store(pending, std::sync::atomic::Ordering::Relaxed);
     out
 }
 

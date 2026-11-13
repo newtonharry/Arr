@@ -105,6 +105,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/sport/following"),
     ("get", "/api/v1/sport/events"),
     ("get", "/api/v1/sport/event/{id}/copies"),
+    ("post", "/api/v1/sport/event/{id}/get"),
     ("get", "/api/v1/ideas"),
     ("post", "/api/v1/ideas/hide"),
     ("delete", "/api/v1/ideas/hide/{media_id}"),
@@ -751,7 +752,7 @@ trait Kind {
 
 impl Kind for MediaId {
     fn kind(self) -> MediaKind {
-        downloads::media_kind(self)
+        downloads::policy_kind(self)
     }
 }
 
@@ -776,6 +777,8 @@ fn refusal_code(code: &str) -> ErrorCode {
         "indexer_limit_reached" => ErrorCode::IndexerLimitReached,
         "no_peer_discovery" => ErrorCode::NoPeerDiscovery,
         "quality_changed" => ErrorCode::QualityChanged,
+        "already_have" => ErrorCode::AlreadyHave,
+        "not_played_yet" => ErrorCode::NotPlayedYet,
         _ => ErrorCode::InvalidRequest,
     }
 }
@@ -850,6 +853,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sport/following", get(sport::following))
         .route("/api/v1/sport/events", get(sport::events))
         .route("/api/v1/sport/event/{id}/copies", get(sport::event_copies))
+        .route("/api/v1/sport/event/{id}/get", post(sport::event_get))
         .route("/api/v1/ideas", get(ideas))
         .route("/api/v1/ideas/hide", post(ideas_hide))
         .route("/api/v1/ideas/hide/{media_id}", delete(ideas_unhide))
@@ -1027,10 +1031,22 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for ApiQuery<T> {
     }
 }
 
+/// A movie, show, season or episode id. A sport event id is refused here, in one place: every
+/// route that takes a title id goes through this, so an event cannot reach the catalogue.
+/// (Sport routes parse their own ids with `parse_event_id`.)
 fn parse_media_id(raw: &str) -> Result<MediaId, ApiError> {
-    raw.parse().map_err(|e: crate::ids::MediaIdError| {
+    let id: MediaId = raw.parse().map_err(|e: crate::ids::MediaIdError| {
         ApiError::bad_request(ErrorCode::InvalidMediaId, e.0)
-    })
+    })?;
+    match id {
+        MediaId::Event(_) => Err(ApiError::bad_request(
+            ErrorCode::InvalidMediaId,
+            "that is a sport event, not a title; sport has its own routes under /api/v1/sport",
+        )),
+        MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+            Ok(id)
+        }
+    }
 }
 
 fn media_id(p: Result<Path<String>, PathRejection>) -> Result<MediaId, ApiError> {
@@ -2181,6 +2197,12 @@ async fn library_add(State(st): St, ApiJson(body): ApiJson<AddBody>) -> ApiResul
     let now = OffsetDateTime::now_utc();
     let index = st.index();
     let mut v = match id {
+        MediaId::Event(_) => {
+            return Err(ApiError::bad_request(
+                ErrorCode::InvalidMediaId,
+                "that is a sport event, not a title",
+            ));
+        }
         MediaId::Movie { tmdb } => {
             let monitored = body.monitored.unwrap_or(true);
             let movie = match index.movie(tmdb).cloned() {
@@ -2288,10 +2310,10 @@ async fn library_add(State(st): St, ApiJson(body): ApiJson<AddBody>) -> ApiResul
             .and_then(|s| s.parse::<MediaId>().ok())
             .and_then(|m| match m {
                 MediaId::Movie { tmdb } => index.movie(tmdb).and_then(|x| x.acquisition.clone()),
-                other => other
-                    .series_key()
-                    .and_then(|k| index.series(k))
-                    .and_then(|x| x.acquisition.clone()),
+                MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
+                    index.series(k).and_then(|x| x.acquisition.clone())
+                }
+                MediaId::Event(_) => None,
             });
         v["adoption"] = json!({
             "mode": st.cfg.migration.as_str(),
@@ -2413,6 +2435,8 @@ async fn library_remove(State(st): St, p: Result<Path<String>, PathRejection>) -
 /// `GET /storage`: free and total space of the drive(s) holding the movie and TV folders.
 /// Drives are named Movies, TV or Movies and TV; folder paths are never part of the reply.
 async fn storage(State(st): St) -> ApiResult {
+    // (movies and TV only, as the reply's labels say: the sport folder is beside the movies and
+    // on their drive by default, and its space is not a separate number a person acts on)
     let (movies, tv) = match &st.cfg.library {
         Some(l) => (l.movies.clone(), l.tv.clone()),
         None => (None, None),
@@ -3326,7 +3350,7 @@ async fn grab(State(st): St, ApiJson(body): ApiJson<GrabBody>) -> ApiResult {
     )
     .await
     .map_err(|e| enqueue_error(e, &provider))?;
-    created(json!({ "grab": downloads::view(&g) }))
+    created(json!({ "grab": grab_json(&st, &g).await }))
 }
 
 #[derive(Deserialize)]
@@ -3337,6 +3361,26 @@ struct QueueQuery {
     offset: Option<u32>,
 }
 
+/// A grab as a client reads it: `downloads::view`, with an event's title taken from the stored
+/// event (never from the grab's stored title).
+async fn grab_json(st: &AppState, g: &downloads::Grab) -> Value {
+    if matches!(g.media_id, MediaId::Event(_)) {
+        let m = g.media_id.to_string();
+        let title = st
+            .store
+            .with(move |c| Ok(crate::sport::get::grab_title(c, &m)))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "Sport event".into());
+        let mut v = downloads::view_named(g, Some(&title));
+        v["title"] = json!(title);
+        v
+    } else {
+        downloads::view(g)
+    }
+}
+
 async fn queue(State(st): St, ApiQuery(q): ApiQuery<QueueQuery>) -> ApiResult {
     let (limit, offset) = page_bounds(q.limit, q.offset)?;
     let all = q.all.unwrap_or(false);
@@ -3345,7 +3389,11 @@ async fn queue(State(st): St, ApiQuery(q): ApiQuery<QueueQuery>) -> ApiResult {
         .with(move |c| downloads::queue(c, all, limit as u32, offset as u32))
         .await
         .map_err(internal("queue"))?;
-    ok(json!({ "total": total, "items": items.iter().map(downloads::view).collect::<Vec<_>>() }))
+    let mut out = vec![];
+    for g in &items {
+        out.push(grab_json(&st, g).await);
+    }
+    ok(json!({ "total": total, "items": out }))
 }
 
 fn grab_id(p: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
@@ -3360,17 +3408,27 @@ async fn queue_item(State(st): St, p: Result<Path<String>, PathRejection>) -> Ap
         .with(move |c| {
             let g = downloads::get(c, &id2)?;
             let mut stmt = c.prepare("SELECT at, kind, message FROM events WHERE grab_id = ?1 ORDER BY id DESC LIMIT 50")?;
-            let events: Vec<Value> = stmt.query_map([&id2], |r| Ok(json!({ "at": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "message": r.get::<_, String>(2)? })))?.collect::<rusqlite::Result<_>>()?;
+            let sport = g.as_ref().is_some_and(|g| matches!(g.media_id, MediaId::Event(_)));
+            let media = g.as_ref().map(|g| g.media_id.to_string()).unwrap_or_default();
+            let events: Vec<Value> = stmt.query_map([&id2], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .map(|(at, kind, message)| {
+                    // (defence in depth: a sport row is read through the same rule it is written by)
+                    let message = if sport { crate::sport::get::history_message(c, &media, &message) } else { message };
+                    json!({ "at": at, "kind": kind, "message": message })
+                })
+                .collect();
             let mut stmt = c.prepare("SELECT dest, method, state, error, updated_at FROM import_journal WHERE grab_id = ?1 ORDER BY id")?;
             let journal: Vec<Value> = stmt
-                .query_map([&id2], |r| Ok(json!({ "dest": r.get::<_, String>(0)?, "method": r.get::<_, Option<String>>(1)?, "state": r.get::<_, String>(2)?, "error": r.get::<_, Option<String>>(3)?, "updated_at": r.get::<_, String>(4)? })))?
+                .query_map([&id2], |r| Ok(json!({ "dest": r.get::<_, String>(0)?, "method": r.get::<_, Option<String>>(1)?, "state": r.get::<_, String>(2)?, "error": r.get::<_, Option<String>>(3)?.map(|e| if sport { crate::sport::reason::render_stored(&crate::sport::reason::classify(&e)) } else { e }), "updated_at": r.get::<_, String>(4)? })))?
                 .collect::<rusqlite::Result<_>>()?;
             Ok((g, events, journal))
         })
         .await
         .map_err(internal("queue item"))?;
     let g = g.ok_or_else(|| ApiError::not_found("no such download"))?;
-    ok(json!({ "grab": downloads::view(&g), "imports": journal, "events": events }))
+    ok(json!({ "grab": grab_json(&st, &g).await, "imports": journal, "events": events }))
 }
 
 async fn queue_pause(State(st): St, p: Result<Path<String>, PathRejection>) -> ApiResult {
@@ -3378,7 +3436,7 @@ async fn queue_pause(State(st): St, p: Result<Path<String>, PathRejection>) -> A
     let g = downloads::pause(&st, &id, true)
         .await
         .map_err(|e| action_error(e, st.cfg.download_backend().unwrap_or("download_client")))?;
-    ok(json!({ "grab": downloads::view(&g) }))
+    ok(json!({ "grab": grab_json(&st, &g).await }))
 }
 
 async fn queue_resume(State(st): St, p: Result<Path<String>, PathRejection>) -> ApiResult {
@@ -3386,7 +3444,7 @@ async fn queue_resume(State(st): St, p: Result<Path<String>, PathRejection>) -> 
     let g = downloads::pause(&st, &id, false)
         .await
         .map_err(|e| action_error(e, st.cfg.download_backend().unwrap_or("download_client")))?;
-    ok(json!({ "grab": downloads::view(&g) }))
+    ok(json!({ "grab": grab_json(&st, &g).await }))
 }
 
 #[derive(Deserialize, Default)]
@@ -3422,7 +3480,7 @@ async fn queue_cancel(
     )
     .await
     .map_err(|e| action_error(e, st.cfg.download_backend().unwrap_or("download_client")))?;
-    ok(json!({ "grab": downloads::view(&g) }))
+    ok(json!({ "grab": grab_json(&st, &g).await }))
 }
 
 async fn queue_retry(State(st): St, p: Result<Path<String>, PathRejection>) -> ApiResult {
@@ -3430,7 +3488,7 @@ async fn queue_retry(State(st): St, p: Result<Path<String>, PathRejection>) -> A
     let (g, action) = downloads::retry(&st, &id)
         .await
         .map_err(|e| action_error(e, st.cfg.download_backend().unwrap_or("download_client")))?;
-    ok(json!({ "grab": downloads::view(&g), "action": action }))
+    ok(json!({ "grab": grab_json(&st, &g).await, "action": action }))
 }
 
 // ---------------------------------------------------------------- history, blocklist
@@ -3476,7 +3534,19 @@ async fn history(State(st): St, ApiQuery(q): ApiQuery<HistoryQuery>) -> ApiResul
                         "data": r.get::<_, Option<String>>(7)?.and_then(|d| serde_json::from_str::<Value>(&d).ok()),
                     }))
                 })?
-                .collect::<rusqlite::Result<_>>()?;
+                .collect::<rusqlite::Result<Vec<Value>>>()?
+                .into_iter()
+                .map(|mut v| {
+                    // A sport event's history is rendered from its typed record and the stored
+                    // event's own name; whatever else the row holds (text, data) is not returned.
+                    if let Some(m) = v["media_id"].as_str().filter(|m| m.starts_with("event:")).map(str::to_string) {
+                        let stored = v["message"].as_str().unwrap_or("").to_string();
+                        v["message"] = json!(crate::sport::get::history_message(c, &m, &stored));
+                        v["data"] = Value::Null;
+                    }
+                    v
+                })
+                .collect();
             Ok((rows, total))
         })
         .await
@@ -3512,7 +3582,22 @@ async fn blocklist(State(st): St, ApiQuery(q): ApiQuery<BlocklistQuery>) -> ApiR
                         "title": r.get::<_, String>(3)?, "reason": r.get::<_, String>(4)?, "grab_id": r.get::<_, Option<String>>(5)?, "created_at": r.get::<_, String>(6)?,
                     }))
                 })?
-                .collect::<rusqlite::Result<_>>()?;
+                .collect::<rusqlite::Result<Vec<Value>>>()?
+                .into_iter()
+                .map(|mut v| {
+                    // An event's entry is shown under the stored event's own name, with a reason
+                    // from the fixed list of codes (anything else is "other").
+                    if let Some(m) = v["media_id"].as_str().filter(|m| m.starts_with("event:")).map(str::to_string) {
+                        v["title"] = json!(crate::sport::get::grab_title(c, &m).unwrap_or_default());
+                        let reason = v["reason"].as_str().unwrap_or("").to_string();
+                        const CODES: &[&str] = &["wrong_payload", "unsafe_payload", "invalid_media", "wrong_quality", "invalid_torrent", "submission_failed", "foreign_torrent", "stalled", "no_metadata", "cancelled", "failed"];
+                        if !CODES.contains(&reason.as_str()) {
+                            v["reason"] = json!("other");
+                        }
+                    }
+                    v
+                })
+                .collect();
             Ok(rows)
         })
         .await
@@ -3592,7 +3677,7 @@ async fn command_create(State(st): St, ApiJson(body): ApiJson<CommandBody>) -> A
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(json!({ "command": cmd, "id": id, "note": if fresh { "queued" } else { "an identical command is already pending" } }))).into_response())
+    Ok((status, Json(json!({ "command": cmd.clone().public(), "id": id, "note": if fresh { "queued" } else { "an identical command is already pending" } }))).into_response())
 }
 
 async fn command_list(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult {
@@ -3602,6 +3687,7 @@ async fn command_list(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiRes
         .with(move |c| worker::list_commands(c, limit as u32, offset as u32))
         .await
         .map_err(internal("commands"))?;
+    let rows: Vec<worker::PublicCommand> = rows.into_iter().map(worker::Command::public).collect();
     ok(json!({ "total": total, "items": rows }))
 }
 
@@ -3613,7 +3699,7 @@ async fn command_get(State(st): St, p: Result<Path<String>, PathRejection>) -> A
         .await
         .map_err(internal("command"))?
     {
-        Some(c) => ok(json!({ "command": c })),
+        Some(c) => ok(json!({ "command": c.public() })),
         None => Err(ApiError::not_found("no such command")),
     }
 }
@@ -4163,7 +4249,7 @@ fn grab_brief(g: &downloads::Grab) -> Value {
     json!({
         "id": g.id, "target": g.target, "state": g.state, "status": downloads::status(g),
         "progress": g.progress, "client_state": g.client_state, "active": g.active,
-        "failure": g.failure, "last_error": g.last_error.as_deref().map(|e| e.chars().take(300).collect::<String>()),
+        "failure": g.failure, "last_error": downloads::sport_read(g.media_id, g.last_error.as_deref()).map(|e| e.chars().take(300).collect::<String>()),
         "retry": g.retry, "updated_at": g.updated_at,
     })
 }
@@ -4192,7 +4278,8 @@ fn owned_now(index: &CatalogIndex, t: MediaId) -> bool {
             let mut season = eps.iter().filter(|x| x.season == n).peekable();
             season.peek().is_some() && season.all(|x| x.has_file)
         }),
-        _ => false,
+        // (a whole series is not a unit; a sport event is owned by `sport_files`, not here)
+        MediaId::Series(_) | MediaId::Event(_) => false,
     }
 }
 
@@ -4211,9 +4298,9 @@ fn attention_items(grabs: &[downloads::Grab], requests: &[Value], holds: Vec<Val
     let mut out = holds;
     for g in grabs {
         if g.active && g.state == "import_blocked" {
-            out.push(json!({ "kind": "import_blocked", "target": g.target, "grab_id": g.id, "since": g.updated_at, "reason": g.last_error, "action": "fix the reason, then POST /api/v1/queue/{grab_id}/retry, or cancel it" }));
+            out.push(json!({ "kind": "import_blocked", "target": g.target, "grab_id": g.id, "since": g.updated_at, "reason": downloads::sport_read(g.media_id, g.last_error.as_deref()), "action": "fix the reason, then POST /api/v1/queue/{grab_id}/retry, or cancel it" }));
         } else if g.state == "failed" {
-            out.push(json!({ "kind": "download_failed", "target": g.target, "grab_id": g.id, "failure": g.failure, "reason": g.last_error, "retry": g.retry, "at": g.updated_at, "covers": covered_by(g) }));
+            out.push(json!({ "kind": "download_failed", "target": g.target, "grab_id": g.id, "failure": g.failure, "reason": downloads::sport_read(g.media_id, g.last_error.as_deref()), "retry": g.retry, "at": g.updated_at, "covers": covered_by(g) }));
         }
     }
     for r in requests {
@@ -4416,10 +4503,9 @@ async fn media_status(State(st): St, p: Result<Path<String>, PathRejection>) -> 
     body["downloads"] = json!(scoped.iter().map(grab_brief).collect::<Vec<_>>());
     body["requests"] = json!(scoped_requests.iter().map(request_view).collect::<Vec<_>>());
     let holds: Vec<Value> = match id {
-        MediaId::Movie { .. } => vec![],
-        other => other
-            .series_key()
-            .and_then(|k| index.series(k))
+        MediaId::Movie { .. } | MediaId::Event(_) => vec![],
+        MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => index
+            .series(k)
             .map(hold_item)
             .into_iter()
             .flatten()
@@ -4551,18 +4637,16 @@ fn feed_title(index: &CatalogIndex, id: MediaId) -> (String, Option<u16>) {
             .movie(tmdb)
             .map(|m| (m.title.clone(), m.year))
             .unwrap_or_else(|| (format!("Movie {tmdb}"), None)),
-        other => other
-            .series_key()
-            .and_then(|k| {
-                index
-                    .series(k)
-                    .map(|s| (s.title.clone(), s.year))
-                    .or_else(|| {
-                        let (SeriesKey::Tvdb(n) | SeriesKey::Tvmaze(n)) = k;
-                        Some((format!("Show {n}"), None))
-                    })
-            })
-            .unwrap_or_else(|| ("Unknown title".into(), None)),
+        MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => index
+            .series(k)
+            .map(|s| (s.title.clone(), s.year))
+            .unwrap_or_else(|| {
+                let (SeriesKey::Tvdb(n) | SeriesKey::Tvmaze(n)) = k;
+                (format!("Show {n}"), None)
+            }),
+        // The name of a sport event is in the sport store, not the index: callers that show
+        // one preload it (`sport::get::names`); this is only the placeholder.
+        MediaId::Event(_) => ("Sport event".into(), None),
     }
 }
 
@@ -4636,8 +4720,27 @@ async fn feed(State(st): St) -> ApiResult {
         let t: Vec<MediaId> = g.targets.iter().map(|t| t.target).collect();
         if t.is_empty() { vec![g.target] } else { t }
     };
+    // Sport downloads are named from the stored event, which the catalogue index does not know.
+    let facts = st
+        .store
+        .with(|c| crate::sport::get::feed_facts(c))
+        .await
+        .map_err(internal("feed sport"))?;
     let entry = |id: MediaId, targets: &[MediaId]| {
-        let (title, year) = feed_title(&index, id);
+        let (title, year) = match id {
+            MediaId::Event(_) => (
+                facts
+                    .names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "Sport event".into()),
+                None,
+            ),
+            MediaId::Movie { .. }
+            | MediaId::Series(_)
+            | MediaId::Season(..)
+            | MediaId::Episode(..) => feed_title(&index, id),
+        };
         (title, year, feed_detail(&index, targets))
     };
 
@@ -4692,7 +4795,11 @@ async fn feed(State(st): St) -> ApiResult {
             // A request is retried by adding the title again, which takes a movie or a series.
             let media_id = match (grab_id, target) {
                 (None, t @ MediaId::Movie { .. }) => t,
-                (None, t) => MediaId::Series(t.series_key()?),
+                (None, t @ (MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..))) => {
+                    MediaId::Series(t.series_key()?)
+                }
+                // (a sport request is never retried by adding a title)
+                (None, MediaId::Event(_)) => return None,
                 (Some(_), t) => t,
             };
             // A download made for a season plan names the episodes it really covered.
@@ -4706,6 +4813,12 @@ async fn feed(State(st): St) -> ApiResult {
                 "key": format!("{kind}:{}", grab_id.map_or_else(|| target.to_string(), str::to_string)),
                 "media_id": media_id, "target": target, "title": title, "year": year, "detail": detail,
                 "problem": problem, "grab_id": grab_id,
+                // A sport download: one plain sentence, and where "Find another copy" goes.
+                "why": grab_id.and_then(|g| facts.why.get(g)),
+                "find_another": match target {
+                    MediaId::Event(e) => Some(e.event_id()),
+                    MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => None,
+                },
                 "kind": kind, "failure": a.get("failure").cloned().unwrap_or(Value::Null),
                 "count": a.get("count").cloned().unwrap_or(json!(1)),
                 "at": a.get("at").or_else(|| a.get("since")).cloned().unwrap_or(Value::Null),
@@ -4879,10 +4992,12 @@ struct HideBody {
 fn idea_id(raw: &str) -> Result<String, ApiError> {
     match parse_media_id(raw)? {
         id @ MediaId::Series(_) => Ok(id.to_string()),
-        _ => Err(ApiError::bad_request(
-            ErrorCode::InvalidMediaId,
-            "expected a series id",
-        )),
+        MediaId::Movie { .. } | MediaId::Season(..) | MediaId::Episode(..) | MediaId::Event(_) => {
+            Err(ApiError::bad_request(
+                ErrorCode::InvalidMediaId,
+                "expected a series id",
+            ))
+        }
     }
 }
 
@@ -5025,6 +5140,10 @@ async fn quick_add(State(st): St, ApiJson(body): ApiJson<QuickAddBody>) -> ApiRe
         options::apply_profile(&st, id, p).await?;
     }
     match id {
+        MediaId::Event(_) => Err(ApiError::bad_request(
+            ErrorCode::InvalidMediaId,
+            "that is a sport event, not a title",
+        )),
         MediaId::Movie { tmdb } => {
             let v = match add_value(&st, id.to_string(), None, true, profile).await {
                 Ok(v) => v,

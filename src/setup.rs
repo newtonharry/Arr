@@ -1079,7 +1079,7 @@ pub fn active_grabs(c: &rusqlite::Connection) -> anyhow::Result<Vec<ActiveGrab>>
         .filter_map(|(m, i, category)| {
             let id: crate::ids::MediaId = m.parse().ok()?;
             Some(ActiveGrab {
-                media: crate::downloads::media_kind(id),
+                media: crate::downloads::policy_kind(id),
                 indexer_id: i.and_then(|i| u32::try_from(i).ok()),
                 category,
             })
