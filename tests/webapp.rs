@@ -785,7 +785,8 @@ async fn search_keeps_the_people_in_one_place_at_the_top() {
         "function carryPeople(p, q)",
         "people && people.person ? h('div', { class: 'people-sec' }",
         "if (pdone && pend && entry) entry.people = pend;",
-        "if (!both() || !pdone) await Promise.race([Promise.all([pm, ps, pp])",
+        "const terminal = () => both() && !rowsReady();",
+        "if (!terminal() && (!both() || !pdone)) await Promise.race([settled,",
         "'data-flip': fl",
     ] {
         assert!(js.contains(want), "app.js lacks {want}");

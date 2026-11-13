@@ -1172,7 +1172,11 @@ async function renderSearch(q, t) {
   await Promise.race([pm, ps]);
   // Near-simultaneous halves are mixed together, and the first draw waits a moment for the people
   // (never more than 150 ms, and not at all once they have answered, with something or nothing).
-  if (!both() || !pdone) await Promise.race([Promise.all([pm, ps, pp]), new Promise((r) => setTimeout(r, pdone ? 120 : 150))]);
+  // A finished failure or nothing-found screen has no rows to lay out: it is drawn at once, whatever the people do.
+  const rowsReady = () => [done.m, done.s].some((r) => ok(r) && (r.data.results || []).length);
+  const terminal = () => both() && !rowsReady();
+  const settled = Promise.all([pm, ps]).then(() => (terminal() ? null : pp));
+  if (!terminal() && (!both() || !pdone)) await Promise.race([settled, new Promise((r) => setTimeout(r, pdone ? 120 : 150))]);
   paint();
   if (!both()) { await Promise.all([pm, ps]); paint(); }
 }

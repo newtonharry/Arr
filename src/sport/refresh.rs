@@ -252,6 +252,30 @@ pub fn teams_current(state: &data::RefreshRow, now: OffsetDateTime) -> bool {
         .is_some_and(|t| now - t < time::Duration::try_from(TEAMS_STALE).unwrap_or_default())
 }
 
+/// Whether a stored team list needs no new read: it has teams, and it was read within the week,
+/// or within a day when it holds a `Team <id>` fallback name (a name that was refused, which a
+/// corrected rule or feed may now give). A read that succeeds restamps the list, so a league whose
+/// list always holds a refused name is asked for at most once a day; one that fails waits out
+/// `teams_next_try` (a list in that wait is skipped by every caller). This is the freshness every
+/// reader of the lists uses; `teams_current` (seven days, for "no such team" versus "try again")
+/// is separate.
+fn list_fresh(
+    state: &data::RefreshRow,
+    known: usize,
+    fallbacks: bool,
+    now: OffsetDateTime,
+) -> bool {
+    let age = if fallbacks {
+        TEAMS_FALLBACK_STALE
+    } else {
+        TEAMS_STALE
+    };
+    known > 0
+        && state
+            .teams
+            .is_some_and(|t| now - t < time::Duration::try_from(age).unwrap_or_default())
+}
+
 /// Reads the league's team list unless it was read within the week (or never produced a team).
 /// A failure is remembered, with a time before which it is not tried again.
 pub async fn ensure_teams(
@@ -273,15 +297,7 @@ pub async fn ensure_teams(
             Ok((data::refresh_state(c, slug)?, teams.len(), fallbacks))
         })
         .await?;
-    let stale = if fallbacks {
-        TEAMS_FALLBACK_STALE
-    } else {
-        TEAMS_STALE
-    };
-    let fresh = state
-        .teams
-        .is_some_and(|t| now - t < time::Duration::try_from(stale).unwrap_or_default());
-    if fresh && known > 0 {
+    if list_fresh(&state, known, fallbacks, now) {
         return Ok(());
     }
     if state.teams_next_try.is_some_and(|t| t > now) {
@@ -620,8 +636,9 @@ async fn read_catalogue_teams(
             let mut want: Vec<(Option<OffsetDateTime>, &'static League)> = vec![];
             for league in catalog::LEAGUES.iter().filter(|l| l.teams) {
                 let state = data::refresh_state(c, league.slug)?;
-                let known = data::teams_of(c, league.slug)?.len();
-                if teams_current(&state, now) && known > 0 {
+                let teams = data::teams_of(c, league.slug)?;
+                let fallbacks = teams.iter().any(|t| t.name == format!("Team {}", t.id));
+                if list_fresh(&state, teams.len(), fallbacks, now) {
                     continue;
                 }
                 if state.teams_next_try.is_some_and(|t| t > now) {

@@ -2618,3 +2618,67 @@ async fn a_team_stored_under_its_fallback_name_gets_its_real_name_from_the_next_
         .count();
     assert_eq!(reads, 1);
 }
+
+#[tokio::test]
+async fn the_worker_re_reads_a_list_with_a_fallback_name_once_a_day_without_anyone_opening_the_league()
+ {
+    let e = start_exec(ExecOptions::default()).await;
+    {
+        let mut m = e.mock.lock().unwrap();
+        let doc = m.espn_teams.get_mut(EPL).unwrap();
+        doc["sports"][0]["leagues"][0]["teams"][0]["team"]["displayName"] =
+            json!("Melbourne Victory");
+        doc["sports"][0]["leagues"][0]["teams"][0]["team"]["id"] = json!("5328");
+    }
+    // Stored as `Team 5328`, read two days ago; every other league's list was read a minute ago,
+    // so only this one is due.
+    e.state
+        .store
+        .with(|c| {
+            c.execute(
+                "INSERT INTO sport_teams (league, team_id, name) VALUES ('premier-league', '5328', 'Team 5328')",
+                [],
+            )?;
+            let at = |d: time::Duration| {
+                (OffsetDateTime::now_utc() - d)
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            };
+            for l in arr::sport::catalog::LEAGUES.iter().filter(|l| l.teams) {
+                let when = if l.slug == "premier-league" {
+                    at(time::Duration::days(2))
+                } else {
+                    at(time::Duration::minutes(1))
+                };
+                c.execute(
+                    "INSERT INTO sport_refresh (league, teams_utc) VALUES (?1, ?2)
+                     ON CONFLICT (league) DO UPDATE SET teams_utc = ?2",
+                    [l.slug.to_string(), when],
+                )?;
+                if l.slug != "premier-league" {
+                    c.execute(
+                        "INSERT OR IGNORE INTO sport_teams (league, team_id, name) VALUES (?1, '1', 'Some Team')",
+                        [l.slug],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let r = sports_task(&e).await;
+    let read: Vec<&str> = r["catalogue_teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["league"].as_str().unwrap())
+        .collect();
+    assert_eq!(read, ["premier-league"], "{r}");
+    let (_, v) = get(&e, "/api/v1/sport/search?q=melbourne").await;
+    assert_eq!(v["teams"][0]["team"]["name"], "Melbourne Victory", "{v}");
+    // The same day, nothing more is asked for that league.
+    let before = team_requests(&e).len();
+    let r = sports_task(&e).await;
+    assert_eq!(r["catalogue_teams"], json!([]), "{r}");
+    assert_eq!(team_requests(&e).len(), before);
+}

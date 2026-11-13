@@ -329,24 +329,20 @@ pub fn plain_name(text: Option<&str>, max: usize) -> Option<String> {
     ok.then_some(t)
 }
 
-/// Words that end a real club's name and are also on the reject list ("Melbourne Victory").
-/// Short and explicit on purpose: the reject list stays whole for everything else.
-const CLUB_WORDS: &[&str] = &["Victory"];
+/// Real club names the name rules refuse, in exactly the forms ESPN gives them: "Melbourne
+/// Victory" carries a word on the reject list, "Hapoel Be'er" and "Kid'minster" a lowercase
+/// segment after an apostrophe. Only these complete strings, compared as they are after `clean`
+/// (case and punctuation included): no word and no part of a name is excused, so "Sydney FC
+/// Victory" or "Melbourne Victory wins" are still refused.
+const KNOWN_CLUB_NAMES: &[&str] = &["Melbourne Victory", "Hapoel Be'er", "Kid'minster"];
 
 /// A team's name, from a team object (a team list or a fixture's competitor, never free text):
-/// `plain_name`, except that a club word as the last word of a longer name is not held against
-/// it. Everything before that word must pass the full rule by itself, so "Melbourne wins
-/// Victory" and "Smith def. Victory" are still refused, and so is a bare "Victory".
+/// `plain_name`, or one of `KNOWN_CLUB_NAMES` exactly.
 pub fn team_name(text: Option<&str>, max: usize) -> Option<String> {
-    if let Some(n) = plain_name(text, max) {
-        return Some(n);
-    }
-    let t = clean(text, max + 1)?;
-    let (rest, last) = t.rsplit_once(' ')?;
-    (CLUB_WORDS.contains(&last)
-        && t.chars().count() <= max
-        && plain_name(Some(rest), max).is_some())
-    .then_some(t)
+    plain_name(text, max).or_else(|| {
+        clean(text, max + 1)
+            .filter(|t| t.chars().count() <= max && KNOWN_CLUB_NAMES.contains(&t.as_str()))
+    })
 }
 
 /// A team abbreviation: up to six letters, digits or `&`.
@@ -750,7 +746,7 @@ pub fn parse_teams(body: &[u8]) -> Result<Vec<TeamInfo>, UpstreamError> {
             Some(TeamInfo {
                 id: s.id,
                 name: s.name,
-                short_name: plain_name(t.short_display_name.as_deref(), 60),
+                short_name: team_name(t.short_display_name.as_deref(), 60),
                 abbreviation: abbreviation(t.abbreviation.as_deref()),
             })
         })
@@ -1250,32 +1246,48 @@ mod title_tests {
     }
 
     #[test]
-    fn a_club_word_ends_a_real_team_name_but_nothing_else_gets_the_reject_list_off() {
-        // A-League Men's "Melbourne Victory" is a real name; "victory" is on the reject list.
+    fn known_club_names_are_accepted_whole_and_nothing_around_them_is() {
+        // The exact forms the feed gives (team list displayName, shortDisplayName, name).
         let list = br#"{"sports":[{"leagues":[{"teams":[
-            {"team":{"id":"5328","displayName":"Melbourne Victory","shortDisplayName":"Victory","abbreviation":"MBV"}}]}]}]}"#;
+            {"team":{"id":"5328","displayName":"Melbourne Victory","shortDisplayName":"Melbourne V","name":"Melbourne Victory","abbreviation":"MBV"}},
+            {"team":{"id":"13083","displayName":"Hapoel Be'er","shortDisplayName":"Hapoel Be'er","name":"Hapoel Be'er","abbreviation":"HBE"}},
+            {"team":{"id":"319","displayName":"Kidderminster Harriers","shortDisplayName":"Kid'minster","name":"Kidderminster Harriers","abbreviation":"KID"}}]}]}]}"#;
         let teams = parse_teams(list).unwrap();
         assert_eq!(teams[0].name, "Melbourne Victory");
         assert_eq!(teams[0].abbreviation.as_deref(), Some("MBV"));
+        assert_eq!(teams[1].name, "Hapoel Be'er");
+        assert_eq!(teams[1].short_name.as_deref(), Some("Hapoel Be'er"));
+        assert_eq!(teams[2].short_name.as_deref(), Some("Kid'minster"));
         // A fixture names its sides the same way, so the event reads right.
-        let body = br#"{"events":[{"id":"7","date":"2026-11-21T12:30Z","competitions":[{"competitors":[
-            {"homeAway":"home","team":{"id":"1","displayName":"Auckland FC","abbreviation":"AUC"}},
-            {"homeAway":"away","team":{"id":"5328","displayName":"Melbourne Victory","abbreviation":"MBV"}}]}]}]}"#;
-        let f = &parse_month(body, league("a-league-men")).unwrap().fixtures[0];
+        let f = &parse_month(&body_with_away("Melbourne Victory"), league("a-league-men"))
+            .unwrap()
+            .fixtures[0];
         assert_eq!(f.name.as_deref(), Some("Auckland FC v Melbourne Victory"));
         assert_eq!(f.away.as_ref().unwrap().name, "Melbourne Victory");
-        // The word is excused only as the last word of a team's name, with the rest clean.
+        // Not the club: something around the name, or another case or punctuation.
         for refused in [
-            "Melbourne wins Victory",
-            "Smith def. Victory",
-            "Victory",
-            "Victory Melbourne",
+            "Sydney FC Victory",
             "Melbourne Victory wins",
-            "Melbourne 3-1 Victory",
+            "Victory",
+            "Melbourne Victory 2-1",
+            "Melbourne Victory def. Sydney FC",
+            "melbourne victory",
+            "MELBOURNE VICTORY",
+            "Melbourne-Victory",
+            "Melbourne Victory.",
+            "Hapoel Be'er wins",
+            "hapoel be'er",
+            "Kid'minster beats Hull",
         ] {
             assert_eq!(team_name(Some(refused), 120), None, "{refused}");
         }
-        // Anywhere else the full list applies: a venue, a free-text name, a tournament or a card.
+        // A fixture competitor carrying outcome text is a neutral name, not that text.
+        let f = &parse_month(&body_with_away("Sydney FC Victory"), league("a-league-men"))
+            .unwrap()
+            .fixtures[0];
+        assert_eq!(f.away.as_ref().unwrap().name, "Team 5328");
+        assert_eq!(f.name.as_deref(), Some("Auckland FC v Team 5328"));
+        // Anywhere else the full list applies: a venue, a free-text name, a tournament, a card, a round.
         assert_eq!(plain_name(Some("Melbourne Victory"), 120), None);
         assert_eq!(plain_name(Some("Victory Park"), 120), None);
         assert_eq!(
@@ -1286,6 +1298,16 @@ mod title_tests {
             event_title(Some("UFC 334: Gane Victory"), league("ufc")),
             None
         );
+        assert_eq!(round_label("Victory Round 3"), None);
+    }
+
+    fn body_with_away(away: &str) -> Vec<u8> {
+        format!(
+            r#"{{"events":[{{"id":"7","date":"2026-11-21T12:30Z","competitions":[{{"competitors":[
+            {{"homeAway":"home","team":{{"id":"1","displayName":"Auckland FC","abbreviation":"AUC"}}}},
+            {{"homeAway":"away","team":{{"id":"5328","displayName":"{away}","abbreviation":"MBV"}}}}]}}]}}]}}"#
+        )
+        .into_bytes()
     }
 
     #[test]
