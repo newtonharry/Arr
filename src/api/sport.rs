@@ -504,6 +504,355 @@ pub(super) async fn events(State(st): St, ApiQuery(q): ApiQuery<EventsQuery>) ->
     }))
 }
 
+/// The most a search for the copies of an event may take, whatever the indexers do.
+/// The most stored events of a league that are looked at around a card or a tournament. More
+/// than this and the list is cut, and a cut list is not a complete one.
+const NEIGHBOURS_LIMIT: usize = 500;
+const COPIES_CEILING: Duration = Duration::from_secs(20);
+
+/// How long a search for the copies of an event may take: twice the schedule source's own
+/// timeout (the indexers answer concurrently, each within its own), at most [`COPIES_CEILING`]
+/// and at least two seconds. A slow indexer gives a partial answer rather than a wait.
+fn copies_budget(st: &AppState) -> Duration {
+    copies_budget_for(st.cfg.sports.as_ref().map_or(COPIES_CEILING, |c| c.timeout))
+}
+
+fn copies_budget_for(timeout: Duration) -> Duration {
+    (timeout * 2).clamp(Duration::from_secs(2), COPIES_CEILING)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CopiesQuery {
+    /// `main`, `prelims`, `early-prelims` or `r1`..`r4`.
+    part: Option<String>,
+    /// Ask the indexers again instead of using a recent answer.
+    fresh: Option<bool>,
+}
+
+/// `event:ufc:600061400`, `ufc:600061400` or either with `:main` after it: the event's id and
+/// the part the id names, if any.
+fn event_id_of(raw: &str) -> Result<(String, Option<sport::Part>), ApiError> {
+    let bad = || {
+        ApiError::bad_request(
+            ErrorCode::InvalidRequest,
+            "an event id looks like event:<league>:<number>, optionally followed by :<part>",
+        )
+    };
+    let rest = raw.trim().strip_prefix("event:").unwrap_or(raw.trim());
+    let mut it = rest.split(':');
+    let (slug, n, part) = (it.next(), it.next(), it.next());
+    if it.next().is_some() {
+        return Err(bad());
+    }
+    let (Some(slug), Some(n)) = (slug, n) else {
+        return Err(bad());
+    };
+    let league = catalog::find(slug).ok_or_else(|| ApiError::not_found("no such league"))?;
+    if n.is_empty() || n.starts_with('0') || !n.bytes().all(|b| b.is_ascii_digit()) || n.len() > 18
+    {
+        return Err(bad());
+    }
+    let part = part
+        .map(|p| sport::Part::from_slug(p).ok_or_else(bad))
+        .transpose()?;
+    Ok((data::event_id(league.slug, n), part))
+}
+
+fn parts_of(league: &catalog::League) -> Vec<sport::Part> {
+    match league.sport {
+        catalog::Sport::Mma => vec![
+            sport::Part::Main,
+            sport::Part::Prelims,
+            sport::Part::EarlyPrelims,
+        ],
+        catalog::Sport::Golf => (1..=4).map(sport::Part::Round).collect(),
+        _ => vec![],
+    }
+}
+
+fn part_slug(p: sport::Part) -> String {
+    p.slug().unwrap_or_else(|| "whole".into())
+}
+
+/// One copy as the list shows it. Every field is a number, a time or a word from a closed list
+/// (the part, the resolution and source, the language, the reason): **nothing is the release's
+/// own text**, not its title, its uploader's tag, its channel or its words, so nothing a release
+/// says (a result, a link, a hash) can reach a client. `label` is built from the closed words.
+fn copy_json(c: &sport::find::Candidate, indexer: Option<String>) -> Value {
+    let q = c.parsed.quality;
+    let (resolution, source) = (options::resolution_word(q), options::source_word(q));
+    let label = [
+        Some(c.m.part.label()),
+        resolution.map(str::to_string),
+        source.map(str::to_string),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" \u{b7} ");
+    // The publish time is the indexers' own field: it is returned only as a time, re-written.
+    let published = c
+        .release
+        .publish_date
+        .as_deref()
+        .and_then(|d| OffsetDateTime::parse(d, &time::format_description::well_known::Rfc3339).ok())
+        .map(rfc3339);
+    json!({
+        "id": c.release_ref,
+        "part": part_slug(c.m.part),
+        "part_label": c.m.part.label(),
+        // A caution, not a verdict: absent does not mean Arr verified the copy.
+        "caution": match c.m.confidence {
+            sport::matcher::Confidence::Sure => Value::Null,
+            sport::matcher::Confidence::Likely => {
+                let reason = c.m.reason.unwrap_or("unverified_text");
+                json!({ "reason": reason, "note": sport::caution_note(reason) })
+            }
+        },
+        "resolution": resolution,
+        "source": source,
+        "fps": c.parsed.fps,
+        "language": c.parsed.language,
+        "size_bytes": c.release.size.filter(|s| *s > 0),
+        "speed": options::speed_word(c.release.seeders),
+        "seeders": c.release.seeders,
+        "published_at": published,
+        // (the configured name by the source's identity; never the release's own text)
+        "indexer": indexer,
+        "label": label,
+    })
+}
+
+/// `GET /sport/event/{id}/copies`: the releases that are this event, found over the indexers
+/// the shows use and judged by the sport matcher. Read only: it records no link, no grab and no
+/// file, starts nothing and sends the person nothing to a download client. An indexer that
+/// fails gives a partial answer (`searched.complete` false with `problem`), and the whole
+/// request stops at a deadline with what it has.
+pub(super) async fn event_copies(
+    State(st): St,
+    p: Result<Path<String>, PathRejection>,
+    ApiQuery(q): ApiQuery<CopiesQuery>,
+) -> ApiResult {
+    let sports = sports(&st)?.clone();
+    let Path(raw) =
+        p.map_err(|e| ApiError::bad_request(ErrorCode::InvalidRequest, e.body_text()))?;
+    let (id, id_part) = event_id_of(&raw)?;
+    let query_part = q
+        .part
+        .as_deref()
+        .map(|s| {
+            sport::Part::from_slug(s).ok_or_else(|| {
+                ApiError::bad_request(ErrorCode::InvalidRequest, "part is not one this event has")
+            })
+        })
+        .transpose()?;
+    if let (Some(a), Some(b)) = (id_part, query_part)
+        && a != b
+    {
+        return Err(ApiError::bad_request(
+            ErrorCode::InvalidRequest,
+            "the id and part name different parts",
+        ));
+    }
+    let want = id_part.or(query_part);
+    let id2 = id.clone();
+    let ev = st
+        .store
+        .with(move |c| data::event(c, &id2))
+        .await
+        .map_err(internal("sport event"))?
+        .ok_or_else(|| ApiError::not_found("no such event; GET /api/v1/sport/events lists them"))?;
+    let league = catalog::find(&ev.league)
+        .ok_or_else(|| ApiError::not_found("the event's league is not one Arr knows"))?;
+    let parts = parts_of(league);
+    if let Some(w) = want
+        && !parts.contains(&w)
+    {
+        return Err(ApiError::bad_request(
+            ErrorCode::InvalidRequest,
+            "this event has no such part",
+        ));
+    }
+    let now = OffsetDateTime::now_utc();
+    let head = |available: bool, note: Option<&str>| {
+        json!({
+            "event": sport::event_json(&ev),
+            "parts": parts.iter().map(|p| json!({ "part": part_slug(*p), "label": p.label() })).collect::<Vec<_>>(),
+            "available": available,
+            "note": note,
+        })
+    };
+    // Nothing to look for yet, or ever: say so without asking an indexer anything.
+    if let Err(why) = sport::find::availability(&ev, league.sport, now) {
+        let mut v = head(false, Some(why));
+        v["copies"] = json!([]);
+        v["skipped"] = json!([]);
+        v["searched"] = json!({ "queries": 0, "indexers": 0, "complete": true, "problem": null });
+        return ok(v);
+    }
+    let loaded = st.loaded()?;
+    let slug = league.slug;
+    let ev2 = ev.clone();
+    let sport_kind = league.sport;
+    let around = st
+        .store
+        .with(move |c| {
+            let at = OffsetDateTime::parse(
+                &ev2.starts_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap_or(now);
+            let teams = data::teams_of(c, slug)?;
+            // Complete is a recorded fact: the last read of the list was whole, and recent.
+            let teams_complete = !teams.is_empty()
+                && data::teams_read(c, slug)?.is_some_and(|(t, whole)| {
+                    whole && now - t <= time::Duration::days(sport::find::TEAMS_FRESH_DAYS)
+                });
+            // The neighbours: for a game, the fixtures of the same two teams within three days
+            // (a pair has a handful, so nothing is cut); for a card or a tournament, every
+            // event of the league within three weeks, cut at a limit that is noticed.
+            let (neighbours, neighbours_whole) = match (sport_kind, &ev2.home_id, &ev2.away_id) {
+                (
+                    catalog::Sport::Soccer
+                    | catalog::Sport::Basketball
+                    | catalog::Sport::RugbyUnion
+                    | catalog::Sport::RugbyLeague,
+                    Some(h),
+                    Some(a),
+                ) => (
+                    data::pair_events_between(
+                        c,
+                        slug,
+                        h,
+                        a,
+                        at - time::Duration::days(3),
+                        at + time::Duration::days(3),
+                    )?,
+                    true,
+                ),
+                _ => {
+                    let mut list = data::league_events_between(
+                        c,
+                        slug,
+                        at - time::Duration::days(21),
+                        at + time::Duration::days(21),
+                        NEIGHBOURS_LIMIT + 1,
+                    )?;
+                    let whole = list.len() <= NEIGHBOURS_LIMIT;
+                    list.truncate(NEIGHBOURS_LIMIT);
+                    (list, whole)
+                }
+            };
+            Ok(sport::find::Surroundings {
+                teams_complete,
+                spans: data::complete_spans(c, slug, now)?,
+                neighbours_whole,
+                teams,
+                neighbours,
+                earlier: data::league_events(c, slug, false, now, 200)?,
+            })
+        })
+        .await
+        .map_err(internal("sport surroundings"))?;
+    // One search per event at a time, not again within a cooldown (whatever `fresh` says), and
+    // a bounded number across all events (see `sport::gate`). The indexers are asked together,
+    // and whatever has answered when the budget runs out is the answer. What is kept is the
+    // search; it is judged again, below, against the event as it is now.
+    let fresh = q.fresh.unwrap_or(false);
+    let budget = copies_budget(&st);
+    let served = sports
+        .copies
+        .serve(&ev.id, fresh, || {
+            sport::find::search_event(
+                st.search.as_ref(),
+                &loaded.settings,
+                &ev,
+                league,
+                fresh,
+                budget,
+            )
+        })
+        .await?;
+    let (found, cached_age) = match served {
+        sport::gate::Served::Searched(f) => (f, None),
+        sport::gate::Served::Cached { found, age } => (found, Some(age)),
+        sport::gate::Served::Busy { retry_after } => {
+            return ok(busy_answer(
+                head(true, Some("busy")),
+                retry_after.as_secs() + 1,
+                "Arr is looking up other events right now",
+            ));
+        }
+    };
+    // Judging is CPU work: off the async workers, a few requests at a time, and inside one
+    // budget that counts the wait for a slot.
+    let Some(found) = sport::find::judge_search_bounded(
+        sports.judging.clone(),
+        found,
+        ev.clone(),
+        league,
+        around,
+    )
+    .await
+    else {
+        return ok(busy_answer(
+            head(true, Some("busy")),
+            sport::find::JUDGE_BUDGET.as_secs(),
+            "Arr is judging other requests right now",
+        ));
+    };
+    let found = found.for_part(want);
+    let mut skipped: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for (code, n) in &found.skipped {
+        *skipped.entry(code.plain()).or_default() += n;
+    }
+    let mut skipped: Vec<(&str, usize)> = skipped.into_iter().collect();
+    skipped.sort_by_key(|(reason, n)| (std::cmp::Reverse(*n), *reason));
+    let mut v = head(true, None);
+    v["copies"] = json!(
+        found
+            .candidates
+            .iter()
+            .map(|c| {
+                copy_json(
+                    c,
+                    st.search
+                        .as_ref()
+                        .and_then(|b| b.configured_name(c.release.indexer_id)),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+    v["skipped"] = json!(
+        skipped
+            .into_iter()
+            .map(|(reason, count)| json!({ "reason": reason, "count": count }))
+            .collect::<Vec<_>>()
+    );
+    v["searched"] = json!({
+        "queries": found.queries,
+        "indexers": found.indexers,
+        "complete": found.complete,
+        "problem": found.problem,
+        "cached": cached_age.is_some(),
+        "age_secs": cached_age.map(|a| a.as_secs()),
+    });
+    ok(v)
+}
+
+/// The answer when Arr cannot take the request now: no copies, and when to ask again.
+fn busy_answer(mut v: Value, retry_after_secs: u64, problem: &str) -> Value {
+    v["copies"] = json!([]);
+    v["skipped"] = json!([]);
+    v["searched"] = json!({
+        "queries": 0, "indexers": 0, "complete": false, "cached": false, "age_secs": null,
+        "retry_after_secs": retry_after_secs,
+        "problem": problem,
+    });
+    v
+}
+
 /// What `/feed` shows under "sport": the next fortnight of followed events that are still to
 /// be played (postponed ones too, so the feed says so). Empty when sport is off.
 pub(super) async fn coming_up(st: &AppState, now: OffsetDateTime) -> Result<Vec<Value>, ApiError> {
@@ -557,6 +906,22 @@ pub(super) async fn in_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_copies_search_gets_twice_the_timeout_between_two_and_twenty_seconds() {
+        assert_eq!(
+            copies_budget_for(Duration::from_millis(100)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            copies_budget_for(Duration::from_secs(4)),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            copies_budget_for(Duration::from_secs(60)),
+            Duration::from_secs(20)
+        );
+    }
 
     #[test]
     fn the_budget_is_four_fifths_of_the_timeout_at_most_eight_seconds() {

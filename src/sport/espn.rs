@@ -80,6 +80,23 @@ pub struct TeamInfo {
     pub abbreviation: Option<String>,
 }
 
+/// A team list as the source gave it, and whether it can be taken to be the league's whole list:
+/// no entry was dropped (one without a usable id), none was given a neutral name because its own
+/// did not pass the name rule (it is in the league but a release cannot name it), and it was not
+/// cut at the limit. Only a whole list may say that a short name names one team.
+#[derive(Debug, Clone)]
+pub struct TeamList {
+    pub teams: Vec<TeamInfo>,
+    pub complete: bool,
+}
+
+impl std::ops::Deref for TeamList {
+    type Target = Vec<TeamInfo>;
+    fn deref(&self) -> &Vec<TeamInfo> {
+        &self.teams
+    }
+}
+
 /// A month's fixtures.
 #[derive(Debug, Clone)]
 pub struct Month {
@@ -228,7 +245,7 @@ fn clean(text: Option<&str>, max: usize) -> Option<String> {
 /// character that is not a letter or digit, so "def." and "Decker" are told apart); "champion"
 /// is here but "Championship" is not, because a tournament's name may say that and a result
 /// ("X, champion") may not.
-fn outcome_like(t: &str) -> bool {
+pub(crate) fn outcome_like(t: &str) -> bool {
     static RESULT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let result = RESULT.get_or_init(|| {
         regex::Regex::new(concat!(
@@ -600,6 +617,12 @@ fn fixture(e: RawEvent, league: &League) -> Option<Fixture> {
     } else {
         (None, None)
     };
+    // A record that puts one team on both sides is not a game between two teams. The event is
+    // kept (an event is never hidden), without sides and named by the neutral rule.
+    let (home, away) = match (&home, &away) {
+        (Some(h), Some(a)) if h.id == a.id => (None, None),
+        _ => (home, away),
+    };
     // The name never comes from the feed's own `name` or `shortName` when both teams are
     // known: it is built from the structured team names in the order the sport reads them:
     // away side first for basketball ("Charlotte Hornets at Los Angeles Lakers", short
@@ -724,6 +747,10 @@ pub fn parse_month(body: &[u8], league: &League) -> Result<Month, UpstreamError>
 }
 
 pub fn parse_teams(body: &[u8]) -> Result<Vec<TeamInfo>, UpstreamError> {
+    parse_team_list(body).map(|l| l.teams)
+}
+
+pub fn parse_team_list(body: &[u8]) -> Result<TeamList, UpstreamError> {
     let raw: RawTeams = serde_json::from_slice(body).map_err(|e| UpstreamError::BadResponse {
         reason: format!(
             "invalid JSON ({:?} error at line {} column {})",
@@ -736,24 +763,44 @@ pub fn parse_teams(body: &[u8]) -> Result<Vec<TeamInfo>, UpstreamError> {
     let sports = raw.sports.ok_or_else(|| UpstreamError::BadResponse {
         reason: "no list of sports in the answer".into(),
     })?;
-    let teams: Vec<TeamInfo> = sports
+    let entries: Vec<RawTeamEntry> = sports
         .into_iter()
         .flat_map(|s| s.leagues)
         .flat_map(|l| l.teams)
-        .filter_map(|t| t.team)
-        .filter_map(|t| {
-            let s = side(&t)?;
-            Some(TeamInfo {
-                id: s.id,
-                name: s.name,
-                short_name: team_name(t.short_display_name.as_deref(), 60),
-                abbreviation: abbreviation(t.abbreviation.as_deref()),
-            })
-        })
-        .filter(|t| seen.insert(t.id.clone()))
-        .take(MAX_TEAMS)
         .collect();
-    Ok(teams)
+    let listed = entries.len();
+    let mut dropped = 0usize;
+    let mut unique: Vec<TeamInfo> = vec![];
+    for t in entries {
+        let Some(t) = t.team else {
+            dropped += 1;
+            continue;
+        };
+        let Some(s) = side(&t) else {
+            dropped += 1;
+            continue;
+        };
+        if !seen.insert(s.id.clone()) {
+            continue;
+        }
+        unique.push(TeamInfo {
+            id: s.id,
+            name: s.name,
+            short_name: team_name(t.short_display_name.as_deref(), 60),
+            abbreviation: abbreviation(t.abbreviation.as_deref()),
+        });
+    }
+    // A team whose own name was refused is in the league under a neutral name.
+    let neutral = unique
+        .iter()
+        .filter(|t| t.name == format!("Team {}", t.id))
+        .count();
+    let truncated = unique.len() > MAX_TEAMS;
+    unique.truncate(MAX_TEAMS);
+    Ok(TeamList {
+        complete: listed > 0 && dropped == 0 && neutral == 0 && !truncated,
+        teams: unique,
+    })
 }
 
 struct Gate {
@@ -772,7 +819,7 @@ pub struct Espn {
     /// one ahead of it in the cache instead of asking again.
     gate: tokio::sync::Mutex<Gate>,
     months: TtlCache<String, Arc<Month>>,
-    teams: TtlCache<String, Arc<Vec<TeamInfo>>>,
+    teams: TtlCache<String, Arc<TeamList>>,
 }
 
 impl Espn {
@@ -902,7 +949,7 @@ impl Espn {
     }
 
     /// The teams of a league.
-    pub async fn teams(&self, path: &str) -> Result<Arc<Vec<TeamInfo>>, UpstreamError> {
+    pub async fn teams(&self, path: &str) -> Result<Arc<TeamList>, UpstreamError> {
         let key = path.to_string();
         if let Some(hit) = self.teams.get(&key) {
             return Ok(hit);
@@ -911,7 +958,7 @@ impl Espn {
         self.fetch(
             url,
             || self.teams.get(&key),
-            |b| parse_teams(b).map(Arc::new),
+            |b| parse_team_list(b).map(Arc::new),
             |t| self.teams.insert(key.clone(), t.clone()),
         )
         .await

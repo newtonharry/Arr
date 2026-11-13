@@ -829,6 +829,7 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | ["library", "movies" | "series"]
                 | ["sport", "search" | "leagues" | "following" | "events"]
                 | ["sport", "league", _]
+                | ["sport", "event", _, "copies"]
                 | ["show", _]
                 | ["show", _, "season", _]
                 | ["movie", _]
@@ -1144,5 +1145,25 @@ mod tests {
         assert!(!get("/api/v1/sport/follow") && !get("/api/v1/sport"));
         assert!(!get("/api/v1/sport/league/nba/extra"));
         assert!(!allowed(&Method::DELETE, "/api/v1/sport/league/nba"));
+    }
+
+    #[test]
+    fn the_app_may_read_the_copies_of_an_event_and_nothing_more() {
+        let get = |p: &str| allowed(&Method::GET, p);
+        assert!(get("/api/v1/sport/event/event:ufc:600061400/copies"));
+        assert!(get("/api/v1/sport/event/event:ufc:600061400:main/copies"));
+        // Only a read: no write verb, no deeper path, no event without its copies.
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(
+                !allowed(&method, "/api/v1/sport/event/event:ufc:600061400/copies"),
+                "{method}"
+            );
+        }
+        assert!(!get("/api/v1/sport/event/event:ufc:600061400"));
+        assert!(!get("/api/v1/sport/event/event:ufc:600061400/copies/get"));
+        assert!(!allowed(
+            &Method::POST,
+            "/api/v1/sport/event/event:ufc:600061400/get"
+        ));
     }
 }

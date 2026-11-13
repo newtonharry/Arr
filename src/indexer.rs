@@ -533,6 +533,20 @@ impl Backend {
         }
     }
 
+    /// The name the person configured for the indexer a release came from, if it can be told
+    /// from trusted configuration: a native indexer's own configured name, found by its id.
+    /// A release's own `indexer` text is upstream text and is never used for this; Prowlarr's
+    /// indexer names are not read by Arr, so a Prowlarr release has none.
+    pub fn configured_name(&self, indexer_id: Option<i64>) -> Option<String> {
+        match self {
+            Backend::Prowlarr(_) => None,
+            Backend::Native(r) => indexer_id
+                .and_then(|i| u32::try_from(i).ok())
+                .and_then(|i| r.get(i))
+                .map(|ix| ix.cfg.name.clone()),
+        }
+    }
+
     /// The provider label for errors about a release from `indexer_id`.
     pub fn label(&self, indexer_id: Option<i64>) -> String {
         match self {

@@ -185,7 +185,7 @@ fn skip_reason(code: &str) -> (u8, &'static str) {
     }
 }
 
-fn source_word(q: crate::quality::Quality) -> Option<&'static str> {
+pub(super) fn source_word(q: crate::quality::Quality) -> Option<&'static str> {
     let n = q.as_str();
     if n.starts_with("webdl") || n.starts_with("webrip") {
         Some("Web")
@@ -198,7 +198,7 @@ fn source_word(q: crate::quality::Quality) -> Option<&'static str> {
     }
 }
 
-fn resolution_word(q: crate::quality::Quality) -> Option<&'static str> {
+pub(super) fn resolution_word(q: crate::quality::Quality) -> Option<&'static str> {
     Some(match q.resolution()? {
         2160 => "4K",
         1080 => "1080p",
@@ -208,7 +208,7 @@ fn resolution_word(q: crate::quality::Quality) -> Option<&'static str> {
     })
 }
 
-fn speed_word(seeders: Option<i64>) -> &'static str {
+pub(super) fn speed_word(seeders: Option<i64>) -> &'static str {
     match seeders {
         None => "ok",
         Some(n) if n >= 10 => "fast",

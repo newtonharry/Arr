@@ -400,3 +400,14 @@ a.link{display:inline-flex;align-items:center;padding:0 6px}
 }
 .what .meta.wrap{white-space:normal}
 .people-sec{margin-bottom:22px}
+/* a finished game or fight: a list of the copies Arr can find, under its row */
+.item.sport:has(.ecp){flex-wrap:wrap}
+.item.sport .ecp{flex:1 1 100%;min-width:0}
+.ecp-open{display:inline-flex;align-items:center;gap:2px;padding-left:0}
+.ecp-open .ic{width:18px;height:18px}
+.ecp-open[aria-expanded=true] .ic{transform:rotate(90deg)}
+.ecp-part{width:100%;display:grid;gap:8px}
+.ecp .part{margin:4px 0 0;font-size:13px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+.ecp .item.copy{background:var(--bg)}
+.tag.check{color:var(--muted);font-weight:700;align-items:flex-start}
+.tag.check .ic{flex:none;margin-top:1px}

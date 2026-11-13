@@ -382,25 +382,37 @@ pub fn profile_for<'a>(
     Ok((settings.profile(&id), Some(id)))
 }
 
-/// Runs `scopes` (each producing its own queries) and evaluates every unique release
-/// against `eval_scope`. Fails only if every query failed.
-pub async fn run(
-    inputs: &SearchInputs<'_>,
-    target: &Target,
-    profile: (Option<&Profile>, Option<String>),
-    query_scopes: &[Scope],
-    eval_scope: Scope,
-) -> Result<SearchRun, ApiError> {
-    let media = target.media();
-    let backend = inputs.backend.ok_or_else(|| {
+/// What `fetch` returns: one `QueryView` per (query, indexer) and every unique release found,
+/// with the indexes of the queries that found it.
+pub struct Fetched {
+    pub queries: Vec<QueryView>,
+    pub found: Vec<(ProwlarrRelease, Vec<usize>)>,
+}
+
+/// Sends `texts` to every usable indexer of `media` (native: one request per query and
+/// indexer; Prowlarr: one per query) and merges the answers by release identity. Fails only if
+/// every query failed. This is the part of `run` that does not depend on what is being looked
+/// for, so a search that is not for a movie or an episode can use it. With a `budget`, requests
+/// still unanswered when it runs out are given up (recorded as timed out) and what has
+/// answered is kept; without one, every request is waited for as it always was.
+pub async fn fetch(
+    backend_in: Option<&Backend>,
+    settings: &Settings,
+    media: crate::settings::MediaKind,
+    automatic: bool,
+    refresh: bool,
+    texts: &[String],
+    budget: Option<std::time::Duration>,
+) -> Result<Fetched, ApiError> {
+    let backend = backend_in.ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::ProviderNotConfigured,
             "no release search backend is configured: add [[indexer]] entries (native indexers) or a [prowlarr] section to config.toml",
         )
     })?;
-    let indexers = inputs.settings.search_indexers(media, inputs.automatic);
-    let mode = if inputs.automatic {
+    let indexers = settings.search_indexers(media, automatic);
+    let mode = if automatic {
         "automatic"
     } else {
         "interactive"
@@ -415,15 +427,6 @@ pub async fn run(
             ),
         ));
     }
-    let mut texts: Vec<String> = vec![];
-    for scope in query_scopes {
-        for q in queries_for(target, *scope) {
-            if !texts.contains(&q) {
-                texts.push(q);
-            }
-        }
-    }
-
     // One request per (query, indexer) for native indexers, each with that indexer's own
     // categories; one request per query for Prowlarr, which fans out itself.
     struct Job {
@@ -443,7 +446,7 @@ pub async fn run(
                 .collect();
             categories.sort_unstable();
             categories.dedup();
-            for q in &texts {
+            for q in texts {
                 jobs.push(Job {
                     req: SearchRequest {
                         query: q.clone(),
@@ -486,7 +489,7 @@ pub async fn run(
                     ),
                 ));
             }
-            for q in &texts {
+            for q in texts {
                 for (id, cats) in &usable {
                     let mut cats = cats.clone();
                     cats.sort_unstable();
@@ -509,7 +512,7 @@ pub async fn run(
 
     let mut set = tokio::task::JoinSet::new();
     for (i, job) in jobs.iter().enumerate() {
-        let (req, refresh, backend) = (job.req.clone(), inputs.refresh, backend.clone());
+        let (req, refresh, backend) = (job.req.clone(), refresh, backend.clone());
         set.spawn(async move {
             let r: Result<SearchOutcome, UpstreamError> = match &backend {
                 Backend::Prowlarr(p) => p.search(&req, refresh).await,
@@ -524,7 +527,19 @@ pub async fn run(
         });
     }
     let mut outcomes = vec![None; jobs.len()];
-    while let Some(joined) = set.join_next().await {
+    let deadline = budget.map(|b| tokio::time::Instant::now() + b);
+    loop {
+        let next = match deadline {
+            Some(d) => match tokio::time::timeout_at(d, set.join_next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    set.abort_all();
+                    break;
+                }
+            },
+            None => set.join_next().await,
+        };
+        let Some(joined) = next else { break };
         let (i, r) = joined.map_err(|e| ApiError::internal("search task", e))?;
         outcomes[i] = Some(r);
     }
@@ -535,7 +550,8 @@ pub async fn run(
     let mut found: Vec<(ProwlarrRelease, Vec<usize>)> = vec![];
     for (i, (job, outcome)) in jobs.iter().zip(outcomes).enumerate() {
         let (req, label) = (&job.req, &job.label);
-        let outcome = outcome.expect("every task reports");
+        // (Only a request given up at the budget has no outcome.)
+        let outcome = outcome.unwrap_or(Err(UpstreamError::Timeout));
         let mut view = QueryView {
             query: req.query.clone(),
             categories: req.categories.clone(),
@@ -611,7 +627,7 @@ pub async fn run(
         }
         queries.push(view);
     }
-    for q in &texts {
+    for q in texts {
         for (id, name, why) in &unavailable {
             queries.push(QueryView {
                 query: q.clone(),
@@ -641,6 +657,42 @@ pub async fn run(
     {
         return Err(e.into_api(&label));
     }
+
+    Ok(Fetched { queries, found })
+}
+
+/// Runs `scopes` (each producing its own queries) and evaluates every unique release
+/// against `eval_scope`. Fails only if every query failed.
+pub async fn run(
+    inputs: &SearchInputs<'_>,
+    target: &Target,
+    profile: (Option<&Profile>, Option<String>),
+    query_scopes: &[Scope],
+    eval_scope: Scope,
+) -> Result<SearchRun, ApiError> {
+    let media = target.media();
+    let mut texts: Vec<String> = vec![];
+    for scope in query_scopes {
+        for q in queries_for(target, *scope) {
+            if !texts.contains(&q) {
+                texts.push(q);
+            }
+        }
+    }
+
+    let Fetched { queries, found } = fetch(
+        inputs.backend,
+        inputs.settings,
+        media,
+        inputs.automatic,
+        inputs.refresh,
+        &texts,
+        None,
+    )
+    .await?;
+    let backend = inputs
+        .backend
+        .expect("fetch succeeded, so a backend is configured");
 
     let native = matches!(backend, Backend::Native(_));
     let ctx = EvalContext {

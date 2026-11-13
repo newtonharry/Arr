@@ -3,8 +3,9 @@
 //! This is a module of its own, next to movies and series rather than inside them. Phase one
 //! (this one) only knows what is on and when: a built-in list of leagues (`catalog`), a gentle
 //! client for ESPN's public schedule feed (`espn`), tables for follows and events (`data`) and
-//! the refresh that keeps them current (`refresh`). Nothing here downloads, matches releases
-//! or touches Plex.
+//! the refresh that keeps them current (`refresh`). Release names are read (`release`), judged
+//! against a stored event (`matcher`, with the name rules in `names`) and searched for (`find`),
+//! read-only. Nothing here downloads, files a download or touches Plex.
 //!
 //! No spoilers: scores, winners and result text are not parsed, not stored and not served.
 //! Event names are the fixture ("Lakers at Bucks"), never the outcome.
@@ -12,16 +13,130 @@
 pub mod catalog;
 pub mod data;
 pub mod espn;
+pub mod find;
+pub mod gate;
+#[cfg(test)]
+mod match_tests;
+pub mod matcher;
+pub mod names;
 pub mod refresh;
+pub mod release;
+#[cfg(test)]
+mod review2_tests;
+#[cfg(test)]
+mod review3_tests;
+#[cfg(test)]
+mod review4_tests;
+#[cfg(test)]
+mod review5_tests;
+#[cfg(test)]
+mod review6_tests;
+#[cfg(test)]
+mod review_tests;
 
 use crate::config::SportsConfig;
 use catalog::League;
 use data::{EventRow, FollowRow};
 use serde_json::{Value, json};
 
+/// Which part of an event a file holds. A game or a golf tournament is `Whole`; a fight card
+/// comes in parts that releases carry separately; a golf round is `Round`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Part {
+    Whole,
+    Main,
+    Prelims,
+    EarlyPrelims,
+    Round(u8),
+}
+
+impl Part {
+    /// `main`, `prelims`, `early-prelims`, `r1`..`r4`; `None` for a whole event.
+    pub fn slug(self) -> Option<String> {
+        Some(match self {
+            Part::Whole => return None,
+            Part::Main => "main".into(),
+            Part::Prelims => "prelims".into(),
+            Part::EarlyPrelims => "early-prelims".into(),
+            Part::Round(n) => format!("r{n}"),
+        })
+    }
+
+    pub fn from_slug(s: &str) -> Option<Part> {
+        Some(match s {
+            "main" => Part::Main,
+            "prelims" => Part::Prelims,
+            "early-prelims" => Part::EarlyPrelims,
+            _ => {
+                let n: u8 = s.strip_prefix('r')?.parse().ok()?;
+                if !(1..=4).contains(&n) || s.len() != 2 {
+                    return None;
+                }
+                Part::Round(n)
+            }
+        })
+    }
+
+    /// What a person calls it.
+    pub fn label(self) -> String {
+        match self {
+            Part::Whole => "Full event".into(),
+            Part::Main => "Main card".into(),
+            Part::Prelims => "Prelims".into(),
+            Part::EarlyPrelims => "Early prelims".into(),
+            Part::Round(n) => format!("Round {n}"),
+        }
+    }
+}
+
+/// What a person is told about a copy Arr could not fully check, in plain words, by the reason
+/// the matcher gave. There is no note for a copy with nothing to say: absence of a caution is
+/// not a verification.
+pub fn caution_note(reason: &str) -> &'static str {
+    match reason {
+        "unlabelled_main" => {
+            "The title doesn't say which part this is. It's probably the main card."
+        }
+        "unlabelled_full" => {
+            "The title doesn't say which part this is. It's probably the whole event."
+        }
+        "unlabelled_whole" => "The title doesn't say which part this is.",
+        "rematch_unverified" => {
+            "Check it's the right fight: the rematch number couldn't be checked."
+        }
+        "date_only" => "Only the date matched, not the names.",
+        "place_only" => "Only the place matched, not the names.",
+        "another_fixture_fits" => {
+            "Another event fits this title as well. Check it's the right one."
+        }
+        "schedule_unknown" => {
+            "Arr can't rule out another event on those days. Check it's the right one."
+        }
+        "unverified_text" => "Some of the title couldn't be checked.",
+        "no_uploader_tag" => "The title has no uploader's name to go by.",
+        "late_upload" => "It was put up long after the event.",
+        "undated" => "Nothing says when it was put up.",
+        "serial_unverified" => "Its number isn't one Arr can check.",
+        "number_unverified" => "Its number isn't one Arr can check.",
+        "series_unverified" => "Arr can't check that this is the series the title says.",
+        "names_unverified" | "sides_unverified" => {
+            "Arr doesn't know who is on the card, so the names couldn't be checked."
+        }
+        "head_unverified" => "The place in the title couldn't be checked.",
+        "season_unverified" => "The season in the title couldn't be checked.",
+        "round_unverified" => "The round or stage in the title couldn't be checked.",
+        _ => "Some of the title couldn't be checked.",
+    }
+}
+
 /// The schedule source, shared by the API and the worker.
 pub struct Sports {
     pub espn: espn::Espn,
+    /// How often the indexers are asked for the copies of an event (see `gate`).
+    pub copies: gate::CopiesGate,
+    /// How many requests may be judging a search at once (see `find::judge_search_bounded`):
+    /// judging runs off the async workers, and only this many at a time.
+    pub judging: std::sync::Arc<tokio::sync::Semaphore>,
     /// One turn per league: a league is read by one caller at a time (a page, a follow or
     /// the worker), and the ones behind it find it freshly read.
     turns: std::sync::Mutex<
@@ -33,6 +148,8 @@ impl Sports {
     pub fn new(cfg: &SportsConfig) -> Self {
         Sports {
             espn: espn::Espn::new(cfg),
+            copies: gate::CopiesGate::default(),
+            judging: std::sync::Arc::new(tokio::sync::Semaphore::new(find::JUDGE_SLOTS)),
             turns: Default::default(),
         }
     }
@@ -79,6 +196,11 @@ pub fn event_json(e: &EventRow) -> Value {
         "round": e.round,
         "venue": e.venue,
         "season": e.season,
+        // When Arr reckons it is over (the source's end, or the start plus a length typical for
+        // the sport). Copies are looked for only after it.
+        "expected_end": catalog::find(&e.league)
+            .and_then(|l| find::expected_end(e, l.sport))
+            .map(crate::import::rfc3339),
     })
 }
 

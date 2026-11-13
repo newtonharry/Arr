@@ -58,13 +58,17 @@ Arr's interface exposes the wish and the outcome.
   is off). TV uses TVmaze (no key). TMDB's API terms apply: attribution with the TMDB logo,
   no caching TMDB data longer than 6 months, and an open question about §1.C (AI-connected
   apps) that TMDB has not answered.
-- Sport is only schedules so far: a person can follow a league or a team and see its coming
-  games, fights and tournaments (soccer, basketball, rugby, golf, MMA). Arr never shows scores
-  or results, and nothing is searched for or downloaded for sport yet. The schedule comes from
+- Sport is schedules, and a list of copies to look at: a person can follow a league or a team and
+  see its coming games, fights and tournaments (soccer, basketball, rugby, golf, MMA). Arr never
+  shows scores or results, and nothing is downloaded for sport yet. The schedule comes from
   ESPN's public feed, which is asked only once someone opens or follows a league. The web app has it
   in four places: search finds leagues and teams (each with a Follow button), a league has its own
   page, Home's "Coming up" lists the next events beside episodes, and Library has a Sport list of
-  what is followed. Nothing in the interface promises a download or shows how a game went.
+  what is followed. On a league's page, a game or fight that has finished has a "Find a copy"
+  link: it asks the same indexers the shows use and lists the copies Arr found, for a person to look over and choose from
+  (by quality, size and speed, never by name, so a title that gives the result away is never
+  shown), and that is all it does: it reads, and nothing in the interface promises a download or
+  shows how a game went.
 - One tap to add: Arr chooses release and quality. No release picking in the interface (a
   person who wants to can choose a copy under Download options, or from a Needs-you item).
 - Every add says what happened: a short "Added Title" note with Undo when Undo is safe. A
