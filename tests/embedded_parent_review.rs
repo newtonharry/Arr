@@ -1,4 +1,6 @@
 //! Independent recovery and confinement regressions. Scratch paths and loopback only.
+mod common;
+
 use arr::{
     config, embedded::Embedded, fixture, fsutil, prowlarr::Payload, qbit::AddRequest, store::Store,
 };
@@ -25,11 +27,11 @@ fn setup(root: &Path, api: SocketAddr, engine: SocketAddr) -> config::RuntimeCon
     .unwrap();
     std::fs::create_dir(root.join("downloads")).unwrap();
     let text = format!(
-        "[server]\nlisten=\"{api}\"\napi_token_file=\"secrets/api_token\"\n[state]\ndir=\".\"\n[execution]\nenabled=false\n[embedded]\ndownload_dir='{}'\nlisten=\"{engine}\"\ntrackers=false\ndht=false\nlocal_discovery=false\n",
+        "[server]\nlisten=\"{api}\"\napi_token_file=\"secrets/api_token\"\n[state]\ndir=\".\"\n[sports]\nenabled=false\n[execution]\nenabled=false\n[embedded]\ndownload_dir='{}'\nlisten=\"{engine}\"\ntrackers=false\ndht=false\nlocal_discovery=false\n",
         root.join("downloads").display()
     );
     fsutil::write_new_private_file(&state.join("config.toml"), text.as_bytes()).unwrap();
-    config::load(&state.join("config.toml")).unwrap()
+    common::load_local(&state.join("config.toml"))
 }
 
 struct OwnChild(Child);

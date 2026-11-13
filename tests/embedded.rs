@@ -199,7 +199,7 @@ struct Emb {
 }
 
 async fn serve(dir: &Path) -> (Arc<api::AppState>, String, tokio::task::JoinHandle<()>) {
-    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let cfg = load_local(&dir.join("config.toml"));
     let state = Arc::new(api::AppState::new(cfg).unwrap());
     arr::worker::recover(&state, time::OffsetDateTime::now_utc()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -883,7 +883,7 @@ async fn a_state_is_bound_to_its_first_download_backend() {
     );
     let (addr, _mock) = start_mock().await;
     write_managed_config(&dir, addr, false, &embedded);
-    let state = api::AppState::new(config::load(&dir.join("config.toml")).unwrap()).unwrap();
+    let state = api::AppState::new(load_local(&dir.join("config.toml"))).unwrap();
     assert!(
         !state.client.as_ref().unwrap().embedded().unwrap().started(),
         "no engine until used"
@@ -895,7 +895,7 @@ async fn a_state_is_bound_to_its_first_download_backend() {
         tmp.path().join("qb").display()
     );
     write_managed_config(&dir, addr, false, &qbit);
-    let err = api::AppState::new(config::load(&dir.join("config.toml")).unwrap())
+    let err = api::AppState::new(load_local(&dir.join("config.toml")))
         .err()
         .unwrap();
     assert!(

@@ -1,7 +1,9 @@
 //! OAuth sign-in for the remote MCP endpoint, end to end on loopback: a mock serves the
 //! connector's metadata documents and keys and plays Google's token endpoint.
 
-use arr::{api, config, fsutil};
+mod common;
+
+use arr::{api, fsutil};
 use axum::Router;
 use axum::extract::{Form, Path as AxPath, State};
 use axum::http::StatusCode;
@@ -186,7 +188,7 @@ impl Env {
         let emails = serde_json::to_string(emails).unwrap();
         let m = self.mock_addr;
         let text = format!(
-            "[server]\napi_token_file = \"secrets/api_token\"\n\
+            "[server]\napi_token_file = \"secrets/api_token\"\n[sports]\nenabled = false\n\
              [mcp]\nenabled = true\ntoken_file = \"secrets/mcp_token\"\nallowed_hosts = [\"127.0.0.1\"]\n\
              [mcp.oauth]\npublic_url = '{}'\ngoogle_client_id = '{GOOGLE_ID}'\n\
              google_client_secret_file = \"secrets/google_secret\"\nallowed_emails = {emails}\n\
@@ -200,7 +202,7 @@ impl Env {
     }
 
     fn start(&mut self, listener: tokio::net::TcpListener) {
-        let cfg = config::load(&self.dir.path().join("config.toml")).unwrap();
+        let cfg = common::load_local(&self.dir.path().join("config.toml"));
         let state = Arc::new(api::AppState::new(cfg).unwrap());
         let (app, _stop) = api::app(state).unwrap();
         self.server = Some(tokio::spawn(async move {

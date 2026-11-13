@@ -1548,15 +1548,21 @@ pub fn write_prowlarr_state(
             fsutil::write_new_private_file(&p, value.as_bytes()).unwrap();
         }
     }
+    // Sport is off unless a test asks for it: a config without `[sports]` means the real source.
+    let sports_off = if extra_config.contains("[sports]") {
+        ""
+    } else {
+        "[sports]\nenabled = false\n"
+    };
     let cfg = format!(
         "[server]\napi_token_file = \"secrets/api_token\"\nrequest_timeout_secs = 30\nmax_body_bytes = 4096\n\
          [prowlarr]\nbase_url = \"http://{mock}/prowlarr\"\napi_key_file = \"secrets/prowlarr_api_key\"\ntimeout_secs = 2\npage_size = 100\nmax_pages = 2\nmax_response_bytes = 1048576\n\
-         [migration]\nmode = \"coexistence\"\n{extra_config}"
+         [migration]\nmode = \"coexistence\"\n{sports_off}{extra_config}"
     );
     let cfg_path = dir.join("config.toml");
     let _ = std::fs::remove_file(&cfg_path);
     fsutil::write_new_private_file(&cfg_path, cfg.as_bytes()).unwrap();
-    let rt = config::load(&cfg_path).unwrap();
+    let rt = load_local(&cfg_path);
     let doc: arr::setup::SetupDoc = serde_json::from_value(setup_document(&ExecOptions {
         stack: Stack::Legacy,
         categories: Some(categories),
@@ -1574,9 +1580,31 @@ pub fn write_prowlarr_state(
     .unwrap();
 }
 
+/// Fails loudly if a test's config would let the worker or a sport route reach a real sport source:
+/// sport is either off or pointed at a loopback fake. Every harness that builds an `AppState` (or
+/// starts `arr serve`) from a config it wrote calls this, so a config without a `[sports]` section
+/// (which means ESPN's real address) can never run unnoticed.
+pub fn assert_sport_is_local(cfg: &config::RuntimeConfig) {
+    if let Some(s) = &cfg.sports {
+        let host = s.base_url.host_str().unwrap_or("");
+        assert!(
+            matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1"),
+            "this test's config would contact the real sport source ({}): add `[sports] enabled = false` or point base_url at the fake",
+            s.base_url
+        );
+    }
+}
+
+/// `config::load` for a test's own config, checked with `assert_sport_is_local`.
+pub fn load_local(path: &Path) -> config::RuntimeConfig {
+    let cfg = config::load(path).unwrap();
+    assert_sport_is_local(&cfg);
+    cfg
+}
+
 /// Starts the API in-process on a loopback port against `dir` (already populated).
 pub async fn serve_dir(dir: &Path) -> String {
-    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let cfg = load_local(&dir.join("config.toml"));
     let state = Arc::new(api::AppState::new(cfg).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1868,7 +1896,7 @@ impl Exec {
     /// Simulates a process restart: a new AppState (and server) over the same state dir,
     /// with startup recovery.
     pub async fn restart(&mut self) -> Value {
-        let cfg = config::load(&self.dir.join("config.toml")).unwrap();
+        let cfg = load_local(&self.dir.join("config.toml"));
         let state = Arc::new(api::AppState::new(cfg).unwrap());
         let recovery = arr::worker::recover(&state, time::OffsetDateTime::now_utc()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2146,7 +2174,7 @@ async fn start_managed(o: ExecOptions) -> Exec {
     }
     let cfg_text = managed_config(&o, mock_addr, qb_addr, &fake_id, &downloads, &movies, &tv);
     fsutil::write_new_private_file(&dir.join("config.toml"), cfg_text.as_bytes()).unwrap();
-    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let cfg = load_local(&dir.join("config.toml"));
     let state = Arc::new(api::AppState::new(cfg).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2403,7 +2431,7 @@ pub fn managed_settings(o: &ExecOptions) -> arr::settings::Settings {
             tv.display()
         ),
     );
-    let cfg = config::load(&dir.join("config.toml")).unwrap();
+    let cfg = load_local(&dir.join("config.toml"));
     let doc: arr::setup::SetupDoc = serde_json::from_value(setup_document(o)).unwrap();
     arr::setup::normalize(&doc, &cfg).unwrap().0
 }
@@ -2428,6 +2456,10 @@ pub fn write_managed_config(dir: &Path, mock: SocketAddr, tvmaze: bool, extra: &
         cfg.push_str(&format!(
             "[tvmaze]\nenabled = true\nbase_url = \"http://{mock}/tvmaze\"\nimage_base_url = \"http://{mock}\"\ntimeout_secs = 2\n"
         ));
+    }
+    // Sport is off unless a test asks for it: a config without `[sports]` means the real source.
+    if !extra.contains("[sports]") {
+        cfg.push_str("[sports]\nenabled = false\n");
     }
     cfg.push_str(extra);
     let cfg_path = dir.join("config.toml");

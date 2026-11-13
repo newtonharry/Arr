@@ -6,7 +6,7 @@
 
 mod common;
 
-use arr::{api, config, fsutil};
+use arr::{api, fsutil};
 use axum::extract::{Form, State};
 use axum::routing::post;
 use base64::Engine;
@@ -743,6 +743,28 @@ async fn the_app_follows_a_league_and_reads_its_schedule_through_the_proxy() {
     // An unknown league is a plain 404, which the page words as "doesn't know that league".
     let (s, v) = get("/app/api/v1/sport/league/no-such-league").await;
     assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
+}
+
+#[test]
+fn the_harness_refuses_a_config_that_would_reach_the_real_sport_source() {
+    let mock: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let load = |extra: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        write_managed_config(&state, mock, false, extra);
+        std::panic::catch_unwind(|| load_local(&state.join("config.toml"))).is_ok()
+    };
+    // The writers say `[sports] enabled = false` unless asked; a config that turns sport on
+    // without a loopback base_url (so it means the real source) fails the harness at once.
+    assert!(load(""), "off by default");
+    assert!(
+        load("[sports]\nbase_url = \"http://127.0.0.1:1/espn\"\n"),
+        "the fake is fine"
+    );
+    assert!(
+        !load("[sports]\nenabled = true\n"),
+        "the real source is refused"
+    );
 }
 
 #[tokio::test]
@@ -1658,7 +1680,7 @@ impl GoogleEnv {
         let g = self.google;
         let text = format!(
             "[server]\napi_token_file = \"secrets/api_token\"\n\
-             [tvmaze]\nenabled = false\n\
+             [tvmaze]\nenabled = false\n[sports]\nenabled = false\n\
              [mcp]\nenabled = true\ntoken_file = \"secrets/mcp_token\"\nallowed_hosts = [\"127.0.0.1\"]\n\
              [mcp.oauth]\npublic_url = '{}'\ngoogle_client_id = '{GOOGLE_ID}'\n\
              google_client_secret_file = \"secrets/google_secret\"\nallowed_emails = {}\n\
@@ -1670,7 +1692,7 @@ impl GoogleEnv {
         );
         fsutil::atomic_replace_private(&self.dir.path().join("config.toml"), text.as_bytes())
             .unwrap();
-        let cfg = config::load(&self.dir.path().join("config.toml")).unwrap();
+        let cfg = load_local(&self.dir.path().join("config.toml"));
         let state = Arc::new(api::AppState::new(cfg).unwrap());
         let (app, _stop) = api::app(state).unwrap();
         self.server = Some(tokio::spawn(async move {
