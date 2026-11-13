@@ -1116,29 +1116,36 @@ async function renderSearch(q, t) {
   const seq = ++searchSeq;
   searchAbort?.abort();
   const ac = (searchAbort = new AbortController());
+  // The people already on screen that still fit what is typed now stay until the new answer comes.
+  const carried = V.t === 'search' ? carryPeople(V.people, q) : null;
   if (V.t === 'search') { V.busy = true; bump(); } else setView(skel('Searching…'));
   const key = q.toLowerCase(), hit = SC.get(key), ag = authGen, cg = cacheGen;
-  let view = null, pend = null, pendS = null;
+  let view = null, pend = null, pendS = null, pdone = false, entry = null;
+  // A people or sport answer that comes after the view was drawn goes into it, and into the cache
+  // entry of this query, so drawing the same query again has it at once.
   const attach = () => {
-    if ((pend || pendS) && view && V === view && seq === searchSeq) {
-      const late = pendS && !view.sport && !M.fresh;
-      if (pend) view.people = pend;
-      if (pendS) view.sport = pendS;
-      bump();
-      // Sport that turns up after the rest rises in the same way.
-      if (late && (pendS.leagues.length || pendS.teams.length)) after(() => stagger([...document.querySelectorAll('#view .sport-sec .item')]));
-    }
+    if (!(view && V === view && seq === searchSeq)) return;
+    let changed = false, late = false;
+    if (pdone && view.people !== pend) { view.people = pend; changed = true; }
+    if (pdone && pend && entry) entry.people = pend;
+    if (pendS && view.sport !== pendS) { late = !view.sport && !M.fresh; view.sport = pendS; changed = true; }
+    if (pendS && entry) entry.sport = pendS;
+    if (!changed) return;
+    bump();
+    // Sport that turns up after the rest rises in the same way.
+    if (late && (pendS.leagues.length || pendS.teams.length)) after(() => stagger([...document.querySelectorAll('#view .sport-sec .item')]));
   };
   // Searched a moment ago: shown at once, with the people and the sport it found.
   if (hit && Date.now() - hit.at < SEARCH_TTL) {
-    view = { t: 'search', q, rows: hit.rows, notes: hit.notes, busy: false, loading: false, people: hit.people || null, sport: hit.sport || null };
+    entry = hit;
+    view = { t: 'search', q, rows: hit.rows, notes: hit.notes, busy: false, loading: false, people: hit.people || carried, sport: hit.sport || null };
     M.fresh = true; setView(view);
-    if (!hit.people) findPeople(q, seq, ac.signal).then((p) => { if (p) hit.people = p; pend = p; attach(); });
-    if (!hit.sport) findSport(q, ac.signal).then((s) => { if (s) hit.sport = s; pendS = s; attach(); });
+    if (!hit.people) findPeople(q, seq, ac.signal).then((p) => { pend = p; pdone = true; attach(); }); else { pend = hit.people; pdone = true; }
+    if (!hit.sport) findSport(q, ac.signal).then((s) => { pendS = s; attach(); });
     return;
   }
-  findPeople(q, seq, ac.signal).then((p) => { pend = p; attach(); }); // never waited for
-  findSport(q, ac.signal).then((s) => { pendS = s; attach(); }); // nor is sport: it only adds a section, or nothing
+  const pp = findPeople(q, seq, ac.signal).then((p) => { pend = p; pdone = true; attach(); });
+  findSport(q, ac.signal).then((s) => { pendS = s; attach(); }); // never waited for: it only adds a section, or nothing
   const ok = (r) => r && r.ok;
   const part = (kind) => api(`/v1/discover?kind=${kind}&q=${encodeURIComponent(q)}`, { signal: ac.signal }).then((r) => ({ ok: r.ok, data: r.data }), () => ({ ok: false }));
   const done = {}, shown = {};
@@ -1158,12 +1165,14 @@ async function renderSearch(q, t) {
     if (done.m && moviesOff) notes.push("Movie search isn't set up yet.");
     else if (done.m && !ok(done.m)) notes.push("Movie results aren't available right now.");
     if (done.s && !ok(done.s)) notes.push("Show results aren't available right now.");
-    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: null, sport: null }; M.fresh = true; setView(view); }
+    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: carried, sport: null }; M.fresh = true; setView(view); }
     attach();
-    if (both() && ok(done.m) && ok(done.s) && cg === cacheGen) remember(SC, key, { at: Date.now(), rows, notes, people: pend, sport: pendS }, 20);
+    if (both() && ok(done.m) && ok(done.s) && cg === cacheGen && !entry) { entry = { at: Date.now(), rows, notes, people: pend, sport: pendS }; remember(SC, key, entry, 20); }
   };
   await Promise.race([pm, ps]);
-  if (!both()) await Promise.race([Promise.all([pm, ps]), new Promise((r) => setTimeout(r, 120))]); // near-simultaneous halves are mixed together
+  // Near-simultaneous halves are mixed together, and the first draw waits a moment for the people
+  // (never more than 150 ms, and not at all once they have answered, with something or nothing).
+  if (!both() || !pdone) await Promise.race([Promise.all([pm, ps, pp]), new Promise((r) => setTimeout(r, pdone ? 120 : 150))]);
   paint();
   if (!both()) { await Promise.all([pm, ps]); paint(); }
 }
@@ -1183,6 +1192,16 @@ async function findPeople(q, seq, signal) {
     return { names: list.slice(0, 3) };
   } catch { return null; }
 }
+// The people on screen that still fit a longer or changed query: the same words, each the start of one
+// of the name's words. A chip that stays still leads to a real person's page.
+function carryPeople(p, q) {
+  if (!p) return null;
+  const toks = fold(q).split(' ').filter(Boolean);
+  const fits = (name) => toks.length > 0 && toks.every((t) => fold(name).split(' ').some((w) => w.startsWith(t)));
+  if (p.person) return fits(p.person.name) ? p : null;
+  const names = (p.names || []).filter((n) => fits(n.name));
+  return names.length ? { names } : null;
+}
 const creditRows = (groups) => keyed(groups.flatMap((g) => g.credits.map((c) => ({ c, job: g.job }))), (r) => r.c.media_id,
   (r, key) => h(SearchRow, { key, x: r.c, label: r.c.kind === 'movie' ? 'Movie' : 'Show' }));
 const PERSON_ROWS = 12;
@@ -1193,8 +1212,8 @@ function PersonBlock({ person }) {
     person.known_for && h('p', { class: 'meta' }, person.known_for), h(List, null, creditRows(shown)));
 }
 function PeopleRow({ names }) {
-  return h(Section, { id: 'people', title: 'People' },
-    h('div', { class: 'chips' }, names.map((n) => h('a', { key: n.person_id, class: 'chip', href: '#/person/' + encodeURIComponent(n.person_id) }, n.name))));
+  return h('div', { class: 'people-sec' }, h(Section, { id: 'people', title: 'People' },
+    h('div', { class: 'chips' }, names.map((n) => h('a', { key: n.person_id, class: 'chip', href: '#/person/' + encodeURIComponent(n.person_id) }, n.name)))));
 }
 async function renderPerson(id, t) {
   setView(skel());
@@ -1239,16 +1258,17 @@ function SearchStart() {
 // What Arr already has, as a small badge.
 const HAVE = { in_plex: ['check', 'In Plex'], on_its_way: ['check', 'On its way'], tracking: ['check', 'Tracking'] };
 const haveBadge = (x, label) => HAVE[x.library_state] && !(label === 'Movie' && x.library_state === 'in_plex') && h('span', { class: 'tag' }, ic(HAVE[x.library_state][0]), HAVE[x.library_state][1]);
-function SearchRow({ x, label }) {
+function SearchRow({ x, label, flip }) {
+  const fl = flip ? 'sr:' + label + ':' + x.media_id : null; // rows that move when people turn up above them glide
   // A movie is one tap; a show opens its page to pick what to get.
   if (label === 'Show') {
-    return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
+    return h('li', { class: 'item top-align', 'data-flip': fl }, h(Tile, { title: x.title, mediaId: x.media_id }),
       h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label)),
       chooseLink({ media_id: x.media_id, title: x.title, in_library: (x.in_catalog && x.monitored) || !!x.library_state }));
   }
   // fresh: the result says Arr did not have it at all, so the add can be undone.
   const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add', fresh: x.in_catalog === false && !x.has_file && !x.library_state };
-  return h('li', { class: 'item top-align' }, h(Tile, { title: x.title, mediaId: x.media_id }),
+  return h('li', { class: 'item top-align', 'data-flip': fl }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
 function SearchResults() {
@@ -1256,11 +1276,12 @@ function SearchResults() {
   const hits = !!(sport && (sport.leagues.length || sport.teams.length));
   // Opening or adding a result counts the search as one worth keeping.
   return h('div', { 'data-results': '', class: busy ? 'busy' : null, 'aria-busy': loading ? 'true' : null, onClick: (e) => { if (e.target.closest('a,button')) noteSearch(q); } },
-    people && people.person ? h(PersonBlock, { person: people.person }) : null,
-    rows.length || !hits ? h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label })))
+    // People matches have one place, the top, whether it is one person or a row of names: rows that
+    // arrive later go below and never push them out of sight.
+    people && people.person ? h('div', { class: 'people-sec' }, h(PersonBlock, { person: people.person })) : people && people.names ? h(PeopleRow, { names: people.names }) : null,
+    rows.length || !hits ? h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label, flip: true })))
       : h(Hint, { text: `Nothing found for “${q}”. Check the spelling or try fewer words.` })) : null,
     hits ? h(SportHits, { sport }) : null,
-    people && people.names ? h(PeopleRow, { names: people.names }) : null,
     loading ? h(Hint, { key: 'more', text: 'Still looking…', role: 'status' }) : null,
     notes.map((t) => h(Hint, { key: t, text: t })));
 }
