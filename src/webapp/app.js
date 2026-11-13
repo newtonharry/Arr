@@ -731,6 +731,20 @@ function patchSnapshots(key, on) {
     for (const t of d.teams || []) if (tkey(d.league.slug, t.id) === key) t.followed = on;
   }
 }
+// The Library's answer is the whole followed set: every key it does not name is not followed. That
+// covers a tap whose answer never came (the server did it, the page rolled it back), and the
+// league page and search results that still say otherwise. A key with a change in flight is left alone.
+function settleAbsent(followed) {
+  const known = new Set(FOL.keys());
+  for (const l of (V.sport && V.sport.leagues) || []) known.add(lkey(l.slug));
+  for (const x of (V.sport && V.sport.teams) || []) known.add(tkey(x.league.slug, x.team.id));
+  const d = P.data;
+  if (P.kind === 'league' && d && d.league) {
+    known.add(lkey(d.league.slug));
+    for (const t of d.teams || []) known.add(tkey(d.league.slug, t.id));
+  }
+  settle([...known].filter((k) => !followed.has(k)).map((k) => [k, false]));
+}
 function settleLeague(d) {
   const l = d.league;
   settle([[lkey(l.slug), !!l.followed], ...(d.teams || []).map((t) => [tkey(l.slug, t.id), !!t.followed])]);
@@ -914,7 +928,7 @@ async function loadFollowing() {
     // The rows are what the server says. A change still in flight (it began before this read did) is
     // shown by hiding its row when the list is drawn, so a change that then fails loses nothing.
     SF.rows = r.data.following || []; SF.state = 'ok';
-    if (cg === cacheGen) settle(SF.rows.map((f) => [folKey(f), true]));
+    if (cg === cacheGen) { settle(SF.rows.map((f) => [folKey(f), true])); settleAbsent(new Set(SF.rows.map(folKey))); }
   } else if (!SF.rows) SF.state = sportOff() ? 'off' : 'err';
   bump();
 }

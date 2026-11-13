@@ -643,6 +643,9 @@ async fn the_app_has_its_sport_screens_and_promises_nothing_it_does_not_do() {
         "FOL.get(folKey(f)) !== false",
         // Every sport request has a deadline, a change that runs out of time is a failure that is
         // read back, and the list keeps the server's rows (a pending unfollow is hidden at render).
+        // The Library's answer is the whole followed set: what it leaves out is reconciled to "not followed".
+        "function settleAbsent(followed)",
+        "settleAbsent(new Set(SF.rows.map(folKey)))",
         "const SPORT_MS = {",
         "if (r && r.timedOut) loadFollowing();",
         "SF.rows = r.data.following || []; SF.state = 'ok';",
