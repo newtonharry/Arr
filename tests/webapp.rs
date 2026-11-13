@@ -635,6 +635,12 @@ async fn the_app_has_its_sport_screens_and_promises_nothing_it_does_not_do() {
         "Sport isn't switched on for this Arr.",
         "Search for a league above",
         "S.feed.sport_enabled",
+        // A fresh read brings the retained snapshots to its answer before it drops a tap's override,
+        // and a Library read that a follow or unfollow overtook is not used.
+        "function patchSnapshots(",
+        "patchSnapshots(k, v);",
+        "if (gen !== SF.gen)",
+        "FOL.get(folKey(f)) !== false",
         "canHover()",
     ] {
         assert!(js.contains(want), "app.js lacks {want}");

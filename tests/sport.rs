@@ -2532,3 +2532,40 @@ async fn with_sport_off_the_worker_reads_nothing() {
     assert_eq!(r["note"], "sport is turned off");
     assert_eq!(espn_requests(&e.mock), 0);
 }
+
+#[tokio::test]
+async fn team_lists_wait_until_every_due_followed_league_has_been_read() {
+    let e = start_exec(ExecOptions::default()).await;
+    let now = OffsetDateTime::now_utc();
+    // Seven due leagues, one more than a run takes: six are read, the seventh waits.
+    for league in [
+        "dp-world-tour",
+        "liv-golf",
+        "lpga-tour",
+        "pfl",
+        "pga-tour",
+        "premier-league",
+        "ufc",
+    ] {
+        follow_quietly(&e, league, now).await;
+    }
+    let r = full_run(&e, now).await;
+    assert_eq!(r["due"], 7, "{r}");
+    assert_eq!(r["leagues"].as_array().unwrap().len(), 6, "{r}");
+    assert_eq!(r["catalogue_teams"], json!([]), "{r}");
+    // The only team list read is the followed league's own, as part of reading it.
+    assert!(
+        team_requests(&e).iter().all(|l| l.contains("eng.1")),
+        "{:?}",
+        team_requests(&e)
+    );
+    // The seventh is read next; once nothing is due the catalogue's lists are read.
+    let r = full_run(&e, now + time::Duration::minutes(1)).await;
+    assert_eq!(r["due"], 1, "{r}");
+    assert_eq!(r["leagues"][0]["status"], "ok", "{r}");
+    let before = team_requests(&e).len();
+    let r = full_run(&e, now + time::Duration::minutes(2)).await;
+    assert_eq!(r["due"], 0, "{r}");
+    assert!(!r["catalogue_teams"].as_array().unwrap().is_empty(), "{r}");
+    assert!(team_requests(&e).len() > before);
+}

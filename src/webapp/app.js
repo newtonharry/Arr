@@ -670,7 +670,7 @@ function IdeaRow({ x }) {
 // screens simply have no sport on them.
 const SPT = { off: 0 }; // off: until when sport counts as switched off (asked again after that)
 const FOL = new Map(), FBUSY = new Set(), FMSG = new Map(), POP = new Set(); // set by a tap until a fresh read says it; taps in flight; notes; just followed
-const SF = { rows: null, state: 'loading', seq: 0 }; // what is followed, as the Library lists it
+const SF = { rows: null, state: 'loading', seq: 0, gen: 0, again: false }; // what is followed, as the Library lists it
 const lkey = (slug) => 'l:' + slug, tkey = (slug, id) => `t:${slug}:${id}`;
 const folOn = (key, server) => (FOL.has(key) ? FOL.get(key) : !!server);
 const sportOff = () => Date.now() < SPT.off;
@@ -695,12 +695,32 @@ async function sportReq(path, { method = 'GET', body, signal } = {}) {
     return { ok: r.ok, status: r.status, data };
   } catch { return null; }
 }
-// A fresh read says what is followed: the taps it already includes are forgotten. A read that began
-// before the last change (cacheGen) may be older than a tap and says nothing.
-function settle(keys) { for (const k of keys) if (!FBUSY.has(k)) FOL.delete(k); }
+// A fresh read says what is followed, as [key, followed] pairs: the taps it already includes are
+// forgotten. A read that began before the last change (cacheGen) may be older than a tap and says
+// nothing. Before a tap is forgotten, every snapshot still on screen or kept for a screen under a
+// sheet (the search results, the league page) is brought to the same answer: they were read before
+// the tap and would otherwise show the old state the moment it stops being overridden.
+function settle(pairs) {
+  for (const [k, v] of pairs) {
+    if (FBUSY.has(k)) continue;
+    patchSnapshots(k, v);
+    FOL.delete(k);
+  }
+}
+function patchSnapshots(key, on) {
+  const sp = V.sport, d = P.data;
+  if (sp) {
+    for (const l of sp.leagues) if (lkey(l.slug) === key) l.followed = on;
+    for (const x of sp.teams) if (tkey(x.league.slug, x.team.id) === key) x.team.followed = on;
+  }
+  if (P.kind === 'league' && d && d.league) {
+    if (lkey(d.league.slug) === key) d.league.followed = on;
+    for (const t of d.teams || []) if (tkey(d.league.slug, t.id) === key) t.followed = on;
+  }
+}
 function settleLeague(d) {
   const l = d.league;
-  settle([lkey(l.slug), ...(d.teams || []).map((t) => tkey(l.slug, t.id))]);
+  settle([[lkey(l.slug), !!l.followed], ...(d.teams || []).map((t) => [tkey(l.slug, t.id), !!t.followed])]);
 }
 
 // ----- times: the server speaks UTC, the page speaks the viewer's own clock
@@ -742,11 +762,14 @@ function sportFx(key, kind) {
 async function sportSet(sp, want, { keep } = {}) {
   if (FBUSY.has(sp.key)) return null;
   const was = folOn(sp.key, !want);
+  SF.gen++; // a Library read that began before this is out of date, whatever it says
   FBUSY.add(sp.key); FOL.set(sp.key, want); FMSG.delete(sp.key);
   if (want) POP.add(sp.key); else POP.delete(sp.key);
   bump(); sportFx(sp.key, 'tap');
   const r = await sportReq(want ? '/follow' : '/unfollow', { method: 'POST', body: { league: sp.league, ...(sp.team_id ? { team_id: sp.team_id } : {}) } });
   FBUSY.delete(sp.key);
+  SF.gen++;
+  if (SF.again && !FBUSY.size) { SF.again = false; loadFollowing(); } // a read was turned away while this was under way
   bust();
   if (!r || !r.ok) {
     FOL.set(sp.key, was); POP.delete(sp.key);
@@ -805,7 +828,7 @@ async function findSport(q, signal) {
   const cg = cacheGen;
   const r = await sportReq('/search?q=' + encodeURIComponent(q), { signal });
   if (!r || !r.ok || !r.data) return null;
-  if (cg === cacheGen) settle([...(r.data.leagues || []).map((l) => lkey(l.slug)), ...(r.data.teams || []).map((x) => tkey(x.league.slug, x.team.id))]);
+  if (cg === cacheGen) settle([...(r.data.leagues || []).map((l) => [lkey(l.slug), !!l.followed]), ...(r.data.teams || []).map((x) => [tkey(x.league.slug, x.team.id), !!x.team.followed])]);
   return { leagues: r.data.leagues || [], teams: r.data.teams || [] };
 }
 function SportHit({ l, t }) {
@@ -866,11 +889,16 @@ async function loadFollowing() {
   const my = ++SF.seq, ag = authGen, cg = cacheGen;
   if (!sportOn()) { SF.state = 'off'; SF.rows = null; return bump(); }
   if (!SF.rows) { SF.state = 'loading'; bump(); }
+  const gen = SF.gen;
   const r = await sportReq('/following');
   if (my !== SF.seq || ag !== authGen) return;
   if (r && r.ok && r.data) {
-    SF.rows = r.data.following || []; SF.state = 'ok';
-    if (cg === cacheGen) settle(SF.rows.map(folKey));
+    // A follow or unfollow began or ended while this was on its way: the answer may not include it.
+    // It is not used; the list is read again once nothing is in flight.
+    if (gen !== SF.gen) { if (FBUSY.size) SF.again = true; else loadFollowing(); return; }
+    // A change still in flight (it began before this read did) keeps what it set.
+    SF.rows = (r.data.following || []).filter((f) => FOL.get(folKey(f)) !== false); SF.state = 'ok';
+    if (cg === cacheGen) settle(SF.rows.map((f) => [folKey(f), true]));
   } else if (!SF.rows) SF.state = sportOff() ? 'off' : 'err';
   bump();
 }
@@ -915,7 +943,7 @@ function SportFollowing() {
       : h(Hint, { text: SF.state === 'off' ? "Sport isn't switched on for this Arr." : "Couldn't load what you follow just now.", role: 'status' });
   }
   if (!SF.rows.length) return h(Hint, { text: 'You’re not following any sport yet. Search for a league above, like “NBA” or “Premier League”, then follow it or one of its teams.' });
-  return h('ul', { class: 'list' }, keyed(SF.rows, folKey, (f, key) => h(FollowRow, { key, f })));
+  return h('ul', { class: 'list' }, keyed(SF.rows.filter((f) => FOL.get(folKey(f)) !== false), folKey, (f, key) => h(FollowRow, { key, f })));
 }
 
 // ---------- home ----------

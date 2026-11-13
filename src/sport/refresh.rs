@@ -530,6 +530,9 @@ pub async fn run_schedules(
     let mut results = vec![];
     let mut in_a_row = 0;
     let mut failures = 0;
+    // Due leagues that were dealt with (read, or found read already): a run that did fewer than
+    // were due (the six-league cap, a league someone else is reading, one still running) is not clean.
+    let mut done = 0;
     let mut stopped = None;
     for (_, league) in plan.into_iter().take(LEAGUES_PER_RUN) {
         let remaining = budget.saturating_sub(started.elapsed());
@@ -565,6 +568,7 @@ pub async fn run_schedules(
         match outcome {
             Freshness::Refreshed(s) => {
                 in_a_row = 0;
+                done += 1;
                 results.push(json!({
                     "league": league.slug, "status": "ok", "fixtures": s.fixtures,
                     "added": s.added, "changed": s.changed, "unlisted": s.unlisted,
@@ -575,12 +579,16 @@ pub async fn run_schedules(
                 failures += 1;
                 results.push(json!({ "league": league.slug, "status": "failed", "error": why }));
             }
-            Freshness::Fresh | Freshness::Backoff(_) | Freshness::Pending => {
+            Freshness::Fresh | Freshness::Backoff(_) => {
+                done += 1;
+                results.push(json!({ "league": league.slug, "status": "skipped" }));
+            }
+            Freshness::Pending => {
                 results.push(json!({ "league": league.slug, "status": "skipped" }));
             }
         }
     }
-    let clean = stopped.is_none() && failures == 0;
+    let clean = stopped.is_none() && failures == 0 && done == due_count;
     (
         json!({ "due": due_count, "leagues": results, "stopped": stopped }),
         clean,
