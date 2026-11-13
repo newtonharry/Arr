@@ -641,6 +641,11 @@ async fn the_app_has_its_sport_screens_and_promises_nothing_it_does_not_do() {
         "patchSnapshots(k, v);",
         "if (gen !== SF.gen)",
         "FOL.get(folKey(f)) !== false",
+        // Every sport request has a deadline, a change that runs out of time is a failure that is
+        // read back, and the list keeps the server's rows (a pending unfollow is hidden at render).
+        "const SPORT_MS = {",
+        "if (r && r.timedOut) loadFollowing();",
+        "SF.rows = r.data.following || []; SF.state = 'ok';",
         "canHover()",
     ] {
         assert!(js.contains(want), "app.js lacks {want}");

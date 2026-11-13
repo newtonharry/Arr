@@ -680,20 +680,33 @@ const sportKnown = () => !!S.feed && typeof S.feed.sport_enabled === 'boolean';
 const sportOn = () => (sportKnown() ? S.feed.sport_enabled : !sportOff());
 const nameOf = (d) => (d.league && d.league.name) || d.title || '';
 const leagueHref = (slug) => '#/league/' + slug;
+// Every sport request has a deadline, so a busy flag or a loading state can never wait on one that
+// never answers (the server itself gives up on its source within eight seconds). A request that
+// runs out of time answers { ok: false, timedOut: true }, which callers treat as a failure.
+const SPORT_MS = { GET: 15e3, POST: 20e3 };
 async function sportReq(path, { method = 'GET', body, signal } = {}) {
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, SPORT_MS[method] || SPORT_MS.GET);
+  const outer = () => ac.abort();
+  if (signal) signal.addEventListener('abort', outer);
   try {
     const r = await fetch('/app/api/v1/sport' + path, {
-      method, signal, credentials: 'same-origin',
+      method, signal: ac.signal, credentials: 'same-origin',
       headers: { 'X-Arr-App': '1', ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
     let data = null;
-    try { data = await r.json(); } catch { /* empty body */ }
+    try { data = await r.json(); } catch { /* empty body, or the deadline came while it was read */ }
+    if (timedOut) return { ok: false, status: 0, timedOut: true, data: null };
     if (r.status === 401) { showSignin(data); return null; }
     if (r.status === 503 && data && data.error && data.error.code === 'provider_not_configured') SPT.off = Date.now() + 5 * 60e3;
     else if (r.ok) SPT.off = 0;
     return { ok: r.ok, status: r.status, data };
-  } catch { return null; }
+  } catch { return timedOut ? { ok: false, status: 0, timedOut: true, data: null } : null; } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', outer);
+  }
 }
 // A fresh read says what is followed, as [key, followed] pairs: the taps it already includes are
 // forgotten. A read that began before the last change (cacheGen) may be older than a tap and says
@@ -766,8 +779,8 @@ async function sportSet(sp, want, { keep } = {}) {
   FBUSY.add(sp.key); FOL.set(sp.key, want); FMSG.delete(sp.key);
   if (want) POP.add(sp.key); else POP.delete(sp.key);
   bump(); sportFx(sp.key, 'tap');
-  const r = await sportReq(want ? '/follow' : '/unfollow', { method: 'POST', body: { league: sp.league, ...(sp.team_id ? { team_id: sp.team_id } : {}) } });
-  FBUSY.delete(sp.key);
+  let r = null;
+  try { r = await sportReq(want ? '/follow' : '/unfollow', { method: 'POST', body: { league: sp.league, ...(sp.team_id ? { team_id: sp.team_id } : {}) } }); } finally { FBUSY.delete(sp.key); }
   SF.gen++;
   if (SF.again && !FBUSY.size) { SF.again = false; loadFollowing(); } // a read was turned away while this was under way
   bust();
@@ -775,11 +788,13 @@ async function sportSet(sp, want, { keep } = {}) {
     FOL.set(sp.key, was); POP.delete(sp.key);
     const text = sportOff() ? "Sport isn't switched on for this Arr." : `Couldn't ${want ? 'follow' : 'stop following'} ${sp.name}. Try again in a moment.`;
     FMSG.set(sp.key, { msg: text, err: true }); say(text); bump(); sportFx(sp.key, 'bad');
+    // Out of time is not "no": the server may have done it, so the Library list is read again.
+    if (r && r.timedOut) loadFollowing();
     return { ok: false, text };
   }
   // The Library list is out of date: a follow has no next event in it yet, an unfollow is just gone.
   if (!want && SF.rows) SF.rows = SF.rows.filter((f) => folKey(f) !== sp.key);
-  else if (want && !keep) SF.rows = null;
+  else if (want && !keep) { SF.rows = null; loadFollowing(); }
   if (P.shown && /^\/library/.test(parseHash(bgHash).path)) S.stale = true;
   bump(); sportFx(sp.key, 'ok'); say(want ? `Following ${sp.name}.` : `Stopped following ${sp.name}.`);
   loadFeed(); // Home's Coming up changes with what is followed
@@ -896,8 +911,9 @@ async function loadFollowing() {
     // A follow or unfollow began or ended while this was on its way: the answer may not include it.
     // It is not used; the list is read again once nothing is in flight.
     if (gen !== SF.gen) { if (FBUSY.size) SF.again = true; else loadFollowing(); return; }
-    // A change still in flight (it began before this read did) keeps what it set.
-    SF.rows = (r.data.following || []).filter((f) => FOL.get(folKey(f)) !== false); SF.state = 'ok';
+    // The rows are what the server says. A change still in flight (it began before this read did) is
+    // shown by hiding its row when the list is drawn, so a change that then fails loses nothing.
+    SF.rows = r.data.following || []; SF.state = 'ok';
     if (cg === cacheGen) settle(SF.rows.map((f) => [folKey(f), true]));
   } else if (!SF.rows) SF.state = sportOff() ? 'off' : 'err';
   bump();
@@ -917,19 +933,20 @@ async function stopFollowing(f) {
   const sp = folSpec(f), at = (SF.rows || []).indexOf(f);
   if (at < 0 || FBUSY.has(sp.key)) return;
   outgoing(document.querySelector(`[data-fk="unf:${CSS.escape(sp.key)}"]`)?.closest('li'), [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200 });
-  SF.rows = SF.rows.filter((x) => x !== f);
+  // The row is hidden when the list is drawn (the tap's override); it is removed once the server agrees.
   // The button that had the focus is gone: the first row's takes it, else the choice above the list.
   after(() => (document.querySelector('[data-fk^="unf:"]') || document.querySelector('.seg [aria-pressed="true"]'))?.focus({ preventScroll: true }));
-  const put = () => { SF.rows = SF.rows.includes(f) ? SF.rows : [...SF.rows.slice(0, at), f, ...SF.rows.slice(at)]; };
+  const put = () => { if (SF.rows) SF.rows = SF.rows.includes(f) ? SF.rows : [...SF.rows.slice(0, at), f, ...SF.rows.slice(at)]; };
   const r = await sportSet(sp, false);
   if (!r) return;
-  if (!r.ok) { FMSG.delete(sp.key); put(); bump(); return toast(r.text); }
+  if (!r.ok) { FMSG.delete(sp.key); bump(); return toast(r.text); }
   showToast({ before: 'Stopped following ', title: sp.name, after: '' }, async () => {
     put(); bump();
     after(() => { const li = document.querySelector(`[data-fk="unf:${CSS.escape(sp.key)}"]`)?.closest('li'); anim(li, [{ transform: 'scale(.6)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 480, easing: SPRING }); });
     const u = await sportSet(sp, true, { keep: true });
     if (u && u.ok) return { ok: true, text: `Following ${sp.name} again.` };
-    SF.rows = SF.rows.filter((x) => x !== f); bump();
+    if (SF.rows) SF.rows = SF.rows.filter((x) => x !== f);
+    bump();
     return null;
   });
 }
@@ -1445,7 +1462,10 @@ async function loadTitle(quiet) {
   // Expanded seasons reload on their own, so a failed title read can't leave one loading forever.
   const seasons = P.kind === 'show' ? Promise.all([...P.open].map((n) => loadSeason(n, tk, sq))) : null;
   try {
-    const r = await api(P.kind === 'league' ? `/v1/sport/league/${enc(P.id)}` : `/v1/${P.kind}/${enc(P.id)}`);
+    // A league page does not wait for ever: the server answers within about eight seconds even when its source is down.
+    const dl = P.kind === 'league' ? new AbortController() : null, dt = dl && setTimeout(() => dl.abort(), SPORT_MS.GET + 5e3);
+    let r;
+    try { r = await api(P.kind === 'league' ? `/v1/sport/league/${enc(P.id)}` : `/v1/${P.kind}/${enc(P.id)}`, dl ? { signal: dl.signal } : undefined); } finally { clearTimeout(dt); }
     if (stale()) return;
     P.upd = false;
     if (!r.ok) { TC.delete(P.id); if (!P.data || r.status === 404) { P.data = null; P.err = errText(r); } await seasons; if (!stale()) bump(); return; }
