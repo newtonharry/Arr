@@ -6,6 +6,7 @@ mod common;
 
 use common::*;
 use serde_json::{Value, json};
+#[cfg(unix)]
 use std::path::PathBuf;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -55,10 +56,13 @@ async fn setup_on(stack: Stack) -> (Exec, OffsetDateTime) {
     (e, start)
 }
 
+// The two helpers below serve only the symlink tests, which need a Unix file system.
+#[cfg(unix)]
 fn sport_root(e: &Exec) -> PathBuf {
     e.movies.parent().unwrap().join("sport")
 }
 
+#[cfg(unix)]
 fn files_under(root: &std::path::Path) -> Vec<PathBuf> {
     let mut out = vec![];
     let mut stack = vec![root.to_path_buf()];
