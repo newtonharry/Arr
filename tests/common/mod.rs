@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use arr::{api, config, fsutil};
+use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
@@ -82,6 +83,20 @@ pub struct MockState {
     pub feed_log: Vec<String>,
     /// Plex section refreshes received (section ids), with the token check result.
     pub plex: Vec<(String, bool)>,
+    /// The library sections the fake Plex lists (`Directory` entries), and the ones created
+    /// (the query string of each `POST library/sections`), and each refresh's query string.
+    pub plex_sections: Vec<Value>,
+    pub plex_created: Vec<String>,
+    pub plex_scans: Vec<String>,
+    pub plex_create_fail: bool,
+    /// The fake Plex's machine identifier (`GET identity`).
+    pub plex_machine: String,
+    /// Folders the fake Plex can see: the path as Plex names it and the local folder it is.
+    pub plex_visible: Vec<(String, PathBuf)>,
+    /// Every `services/browse` request (the decoded path and the raw query).
+    pub plex_browsed: Vec<(String, String)>,
+    /// When set, every `services/browse` request is answered with this JSON.
+    pub plex_browse_fixed: Option<Value>,
     /// Extra TVmaze episodes per show id (metadata that appears later).
     pub tvmaze_extra: HashMap<String, Vec<Value>>,
     /// TMDB movie details overriding the built-in ones, per id.
@@ -1400,12 +1415,109 @@ async fn tz_download(
     }
 }
 
+async fn plex_sections_list(State(m): State<Mock>, headers: HeaderMap) -> Response {
+    let ok = headers.get("x-plex-token").and_then(|v| v.to_str().ok()) == Some(PLEX_TOKEN);
+    if !ok {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let dirs = m.lock().unwrap().plex_sections.clone();
+    Json(json!({ "MediaContainer": { "Directory": dirs } })).into_response()
+}
+
+/// `POST library/sections?name=..&type=..&agent=..&scanner=..&language=..&location=..`: the
+/// query is logged and the section appears in the list with the location it was given.
+async fn plex_create(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> Response {
+    let ok = headers.get("x-plex-token").and_then(|v| v.to_str().ok()) == Some(PLEX_TOKEN);
+    if !ok {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let q = q.unwrap_or_default();
+    let mut g = m.lock().unwrap();
+    g.plex_created.push(q.clone());
+    if g.plex_create_fail {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let pairs: HashMap<String, String> = url::form_urlencoded::parse(q.as_bytes())
+        .into_owned()
+        .collect();
+    let key = 10 + g.plex_sections.len();
+    g.plex_sections.push(json!({
+        "key": key.to_string(), "title": pairs.get("name"), "type": pairs.get("type"),
+        "agent": pairs.get("agent"),
+        "Location": [{ "path": pairs.get("location") }]
+    }));
+    StatusCode::OK.into_response()
+}
+
+async fn plex_identity(State(m): State<Mock>) -> Response {
+    let id = m.lock().unwrap().plex_machine.clone();
+    Json(json!({ "MediaContainer": { "machineIdentifier": id } })).into_response()
+}
+
+/// `GET services/browse/<base64 path>?includeFiles=1`: lists the local folder the path stands
+/// for, folders under `Path` and files under `File`; a folder Plex cannot see is a 404.
+async fn plex_browse(
+    State(m): State<Mock>,
+    headers: HeaderMap,
+    axum::extract::Path(b64): axum::extract::Path<String>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> Response {
+    use base64::Engine;
+    if headers.get("x-plex-token").and_then(|v| v.to_str().ok()) != Some(PLEX_TOKEN) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let path = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    let mut g = m.lock().unwrap();
+    g.plex_browsed.push((path.clone(), q.unwrap_or_default()));
+    if let Some(v) = g.plex_browse_fixed.clone() {
+        return Json(v).into_response();
+    }
+    let Some((plex_dir, local)) = g
+        .plex_visible
+        .iter()
+        .find(|(p, _)| path == *p || path.starts_with(&format!("{p}/")))
+        .cloned()
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let local = local.join(
+        path.strip_prefix(&plex_dir)
+            .unwrap_or("")
+            .trim_start_matches('/'),
+    );
+    let (mut dirs, mut files) = (vec![], vec![]);
+    for e in std::fs::read_dir(&local).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let p = format!("{}/{name}", path.trim_end_matches('/'));
+        let entry = json!({ "path": p, "title": name });
+        if e.path().is_dir() {
+            dirs.push(entry);
+        } else {
+            files.push(entry);
+        }
+    }
+    Json(json!({ "MediaContainer": { "Path": dirs, "File": files } })).into_response()
+}
+
 async fn plex_refresh(
     State(m): State<Mock>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
 ) -> Response {
     let ok = headers.get("x-plex-token").and_then(|v| v.to_str().ok()) == Some(PLEX_TOKEN);
+    m.lock()
+        .unwrap()
+        .plex_scans
+        .push(format!("{id}?{}", q.unwrap_or_default()));
     m.lock().unwrap().plex.push((id, ok));
     if ok {
         StatusCode::OK.into_response()
@@ -1467,6 +1579,14 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         feed_status: None,
         feed_log: vec![],
         plex: vec![],
+        plex_sections: vec![],
+        plex_created: vec![],
+        plex_scans: vec![],
+        plex_create_fail: false,
+        plex_machine: "machine-A".into(),
+        plex_visible: vec![],
+        plex_browsed: vec![],
+        plex_browse_fixed: None,
         tvmaze_extra: HashMap::new(),
         tmdb_movies: HashMap::new(),
         schedule: vec![],
@@ -1524,6 +1644,12 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
             "/plex/library/sections/{id}/refresh",
             axum::routing::post(plex_refresh),
         )
+        .route(
+            "/plex/library/sections",
+            get(plex_sections_list).post(plex_create),
+        )
+        .route("/plex/identity", get(plex_identity))
+        .route("/plex/services/browse/{b64}", get(plex_browse))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1731,6 +1857,10 @@ pub enum Stack {
 pub struct ExecOptions {
     pub stack: Stack,
     pub sample_detection: bool,
+    /// Extra keys for the `[plex]` section (`sport_path = ..`).
+    pub plex_extra: String,
+    /// Extra keys for the `[library]` section (`ffprobe = ..`).
+    pub library_extra: String,
     pub cleanup: bool,
     pub tvmaze: bool,
     /// Configure `[sports]` against the fake ESPN (false: `enabled = false`).
@@ -1781,6 +1911,8 @@ impl Default for ExecOptions {
         ExecOptions {
             stack: Stack::Managed,
             sample_detection: false,
+            plex_extra: String::new(),
+            library_extra: String::new(),
             cleanup: true,
             tvmaze: true,
             sports: true,
@@ -2072,8 +2204,9 @@ fn managed_config(
     };
     let plex = if o.plex {
         format!(
-            "[plex]\nbase_url = \"http://{mock}/plex\"\ntoken_file = \"secrets/plex_token\"\nmovie_section = 1\ntv_section = 2\n\
-             discover_url = \"http://{mock}/plexmeta\"\nmetadata_url = \"http://{mock}/plexmeta\"\nimage_base_url = \"http://{mock}\"\n"
+            "[plex]\nbase_url = \"http://{mock}/plex\"\ntoken_file = \"secrets/plex_token\"\nmovie_section = 1\ntv_section = 2\n{}\
+             discover_url = \"http://{mock}/plexmeta\"\nmetadata_url = \"http://{mock}/plexmeta\"\nimage_base_url = \"http://{mock}\"\n",
+            o.plex_extra
         )
     } else {
         String::new()
@@ -2114,7 +2247,7 @@ fn managed_config(
         "[server]\napi_token_file = \"secrets/api_token\"\n{timeout}{server}\
          {indexer}{tvmaze}{tmdb}{sports}{execution}\
          [migration]\nmode = \"coexistence\"\n\
-         [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = {sample}\nprobe_timeout_secs = 30\n\
+         [library]\nmovies = '{movies}'\ntv = '{tv}'\nsample_detection = {sample}\nprobe_timeout_secs = 30\n{library_extra}\
          [automation]\npoll_seconds = 3600\n{stall}\
          {plex}{extra}",
         timeout = if o.server_extra.contains("request_timeout_secs") {
@@ -2126,6 +2259,7 @@ fn managed_config(
         movies = movies.display(),
         tv = tv.display(),
         sample = o.sample_detection,
+        library_extra = o.library_extra,
         extra = o.extra,
         stall = o
             .stall_timeout_minutes

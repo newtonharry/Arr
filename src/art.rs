@@ -87,7 +87,9 @@ impl Art {
                 st.movies.as_ref()?;
                 Source::Movie(*tmdb)
             }
-            _ => {
+            // (a sport event has no poster here)
+            MediaId::Event(_) => return None,
+            MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
                 let tv = st.tvmaze.as_ref()?;
                 Source::Show(match id.series_key()? {
                     SeriesKey::Tvmaze(id) => id,

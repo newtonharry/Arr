@@ -536,6 +536,13 @@ function wantCopies(it) {
   W.id = s ? 'series:' + s[1] : it.media_id; W.season = m ? Number(m[1]) : null;
 }
 function NeedRow({ it }) {
+  if (it.find_another) {
+    const slug = String(it.find_another).split(':')[1] || '';
+    return h('li', { class: 'item need', 'data-flip': it.media_id }, h(Tile, { title: it.title, mediaId: it.media_id }),
+      h('div', { class: 'what' }, h('h3', null, it.title),
+        h('p', { class: 'problem' }, ic('alert'), h('span', null, it.why || "The download didn't work.")),
+        h('a', { class: 'btn coral', href: leagueHref(slug), 'data-fk': 'fa:' + it.key, 'aria-label': `Find another copy, ${it.title}` }, ic('right'), 'Find another copy')));
+  }
   const id = retryId(it), st = A.get(id) || {}, off = st.busy || st.state, { text, act } = needInfo(it);
   const btn = act === 'copies'
     ? h('a', { class: 'btn coral', href: titleHref(it.media_id), 'data-fk': id, 'aria-label': `Choose a copy yourself, ${it.title}`, onClick: () => wantCopies(it) }, ic('right'), 'Choose a copy yourself')
@@ -873,17 +880,55 @@ function toggleEventCopies(e) {
   if (c.open && c.st !== 'ready' && c.st !== 'loading') loadEventCopies(e); else bump();
 }
 // A copy Arr could not fully check carries a caution with its own plain note. No caution is not a
-// verification: a person chooses.
-function eventCopyRow(c) {
+// verification: a person chooses. "Get this one" sends the pick; a copy with a caution asks for a
+// second tap that says so.
+const EG = new Map(); // copy id -> { st: 'confirm' | 'busy' | 'done' | 'error', text }
+const EGET_ERRORS = {
+  already_have: 'Arr already has this part of the event.',
+  release_not_found: 'That list is out of date. Look again and pick one.',
+  not_played_yet: "This event isn't over yet.",
+  blocklisted: "That copy failed before, so Arr won't try it again.",
+  already_queued: 'Arr is already getting that one.',
+  client_not_configured: 'Downloading for shows has to be set up first.',
+};
+async function getEventCopy(e, c, confirm) {
+  if ((EG.get(c.id) || {}).st === 'busy') return;
+  EG.set(c.id, { st: 'busy' }); bump();
+  let res;
+  try {
+    const r = await sportReq(`/event/${enc(e.id)}/get`, { method: 'POST', body: { id: c.id, confirm: !!confirm } });
+    if (r && r.ok) res = { st: 'done', text: (r.data && r.data.message) || 'Arr is getting that copy now.' };
+    else if (r && r.data && r.data.error && r.data.error.code === 'confirmation_needed') res = { st: 'confirm' };
+    else res = { st: 'error', text: EGET_ERRORS[r && r.data && r.data.error && r.data.error.code] || "Couldn't start that one just now. Try again in a moment." };
+  } catch { res = { st: 'error', text: "Couldn't reach Arr. Try again in a moment." }; }
+  EG.set(c.id, res); say(res.text || ''); bump();
+}
+function eventCopyRow(c, e) {
   const line = [c.resolution, c.source].filter(Boolean).join(' · ') || 'Unknown quality';
   const speed = { fast: 'Fast', ok: 'Medium speed', slow: 'Slow' }[c.speed];
   const lang = c.language && c.language !== 'English' ? c.language : '';
   const note = c.caution && c.caution.note ? c.caution.note : '';
+  const g = EG.get(c.id) || {}, busy = g.st === 'busy';
+  const label = `${line}${c.size_bytes ? ', ' + fmtSize(c.size_bytes) : ''}`;
+  const ask = g.st === 'confirm' || (c.caution && g.st === 'ask');
+  let action;
+  if (g.st === 'done') action = h('p', { class: 'hint', role: 'status' }, ic('check'), g.text);
+  else if (ask) {
+    action = h('div', { class: 'confirm', role: 'group', 'aria-label': 'Check before getting this copy' },
+      h('p', { class: 'problem' }, ic('alert'), h('span', null, `${note || 'Some of its name couldn’t be checked.'} Get it anyway?`)),
+      h('button', { type: 'button', class: 'btn coral', 'data-fk': 'eget-yes:' + c.id, 'aria-label': `Get it anyway: ${label}`, onClick: () => getEventCopy(e, c, true) }, 'Get it anyway'),
+      h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'eget-no:' + c.id, onClick: () => { EG.delete(c.id); bump(); } }, 'Not this one'));
+  } else {
+    action = h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'eget:' + c.id, 'data-s': busy ? 'busy' : null, 'aria-disabled': busy ? 'true' : 'false', 'aria-label': `Get this copy: ${label}`,
+      onClick: () => { if (c.caution) { EG.set(c.id, { st: 'ask' }); bump(); } else getEventCopy(e, c, false); } }, busy ? 'Getting…' : 'Get this one');
+  }
   return h('li', { key: c.id, class: 'item copy' },
     h('div', { class: 'what' },
       h('h3', null, line),
       h('p', { class: 'meta' }, joinDot(fmtSize(c.size_bytes), c.fps > 30 ? `${c.fps} fps` : '', speed, lang)),
-      note && h('span', { class: 'tag check' }, ic('alert'), note)));
+      note && h('span', { class: 'tag check' }, ic('alert'), note),
+      g.st === 'error' && h('p', { class: 'problem', role: 'status' }, ic('alert'), h('span', null, g.text)),
+      action));
 }
 function eventCopiesNode(e) {
   const c = P.cp.get(e.id);
@@ -906,7 +951,7 @@ function eventCopiesNode(e) {
   const groups = [...byPart.keys()].sort((a, b) => order.indexOf(a) - order.indexOf(b));
   const many = groups.length > 1;
   return h('div', { id, class: 'copies ecp' },
-    ...groups.map((g) => h('div', { key: g, class: 'ecp-part' }, many ? h('h4', { class: 'part' }, byPart.get(g)[0].part_label) : null, h('ul', { class: 'list' }, byPart.get(g).map((x) => eventCopyRow(x))))),
+    ...groups.map((g) => h('div', { key: g, class: 'ecp-part' }, many ? h('h4', { class: 'part' }, byPart.get(g)[0].part_label) : null, h('ul', { class: 'list' }, byPart.get(g).map((x) => eventCopyRow(x, e))))),
     partial, skipped);
 }
 

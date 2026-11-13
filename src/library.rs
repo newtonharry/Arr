@@ -601,6 +601,8 @@ pub fn set_monitored(
             }
             n
         }
+        // A sport event is not a title: it has no monitored flag and no `media` row.
+        MediaId::Event(_) => 0,
     };
     if changed > 0 {
         event(
@@ -735,6 +737,11 @@ pub fn not_adopted_now(
     title: MediaId,
     covers: &[MediaId],
 ) -> Result<Option<String>> {
+    // A sport event is not in the catalogue: `sport::get::gate_now` judges it, in the same
+    // transaction.
+    if let MediaId::Event(_) = title {
+        return Ok(None);
+    }
     let key = title.to_string();
     let row: Option<(bool, bool, String, bool)> = c
         .query_row(
@@ -1195,9 +1202,24 @@ pub fn event(
     message: &str,
     data: Option<&serde_json::Value>,
 ) -> Result<()> {
+    // The one sink of the history: for a sport event only sentences the code built from the
+    // stored event are kept (see `sport::get::safe_message`); other titles are untouched.
+    // A sport event's history is a typed record (`sport::reason::HistoryEvent`), decided by the
+    // kind alone; its text and data are not kept.
+    let sport = media_id.is_some_and(|m| m.starts_with("event:"));
+    let message = if sport {
+        crate::sport::reason::HistoryEvent::from_kind(kind, message).encode()
+    } else {
+        message.to_string()
+    };
+    let data = if sport {
+        None
+    } else {
+        data.map(|d| d.to_string())
+    };
     c.execute(
         "INSERT INTO events (at, kind, media_id, target, grab_id, message, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![at, kind, media_id, target, grab_id, message, data.map(|d| d.to_string())],
+        params![at, kind, media_id, target, grab_id, message, data],
     )?;
     Ok(())
 }
@@ -1332,7 +1354,9 @@ pub fn record_search(
                     params![MediaId::Series(k).to_string(), s, e, now, next, failed],
                 )?;
             }
-            other => {
+            // (a sport event is not searched on a schedule: there is nothing to record)
+            MediaId::Event(_) => {}
+            other @ (MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..)) => {
                 c.execute(
                     "UPDATE media SET last_search_at = ?2, next_search_at = ?3, search_failures = CASE WHEN ?4 THEN search_failures + 1 ELSE 0 END WHERE id = ?1",
                     params![other.to_string(), now, next, failed],
@@ -1352,7 +1376,8 @@ pub fn hold_search(c: &Connection, targets: &[MediaId], until: OffsetDateTime) -
                 "UPDATE episodes SET next_search_at = ?4 WHERE series_id = ?1 AND season = ?2 AND number = ?3",
                 params![MediaId::Series(k).to_string(), s, e, until],
             )?,
-            other => c.execute("UPDATE media SET next_search_at = ?2 WHERE id = ?1", params![other.to_string(), until])?,
+            MediaId::Event(_) => 0,
+            other @ (MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..)) => c.execute("UPDATE media SET next_search_at = ?2 WHERE id = ?1", params![other.to_string(), until])?,
         };
     }
     Ok(())

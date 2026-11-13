@@ -51,6 +51,15 @@ your IP address, as any website does, and the User-Agent `Arr`. Arr makes one re
 with half a second between them and pauses after a failure. Arr never reads scores or results
 from it. To turn it off, add `[sports]` with `enabled = false` to `config.toml` and restart Arr.
 
+## What a sport download sends
+
+Picking a copy of a sport event sends nothing new to any service: the download goes through the
+download client and the indexers that shows already use, and the file is named from the schedule's
+own event name, never from the torrent. If Plex is set up, the first sport import may ask Plex
+(your own server, with your token) to create a plain "Sport" library for the Sport folder, and
+every import asks it to scan that folder; both are the calls Arr already makes for movies and
+shows.
+
 ## What a report contains
 
 A report is sent only when something stops working:

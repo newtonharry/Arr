@@ -139,6 +139,60 @@ pub fn ensure_dirs(root: &Path, rel: &Path) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// `path` with every symbolic link in it resolved, for comparing where two folders really are
+/// (available on every platform). The folder may not exist yet: the longest existing ancestor is
+/// resolved and the components that do not exist are appended as written. Only a component that
+/// is genuinely missing is tolerated; any other failure (no permission, a dangling link, a loop,
+/// a file where a folder should be) is an error with a plain message, and the caller refuses.
+pub fn resolved(path: &Path) -> Result<PathBuf, String> {
+    let mut rest: Vec<std::ffi::OsString> = vec![];
+    let mut cur = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&cur) {
+            Ok(real) => {
+                let mut out = real;
+                out.extend(rest.iter().rev());
+                return Ok(out);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Missing for real, not a link that points nowhere (that one exists as a link).
+                if std::fs::symlink_metadata(&cur).is_ok() {
+                    return Err(format!(
+                        "{} is a link that points nowhere, so where it leads cannot be checked",
+                        cur.display()
+                    ));
+                }
+                match (cur.file_name().map(|n| n.to_os_string()), cur.parent()) {
+                    (Some(name), Some(parent)) if !parent.as_os_str().is_empty() => {
+                        rest.push(name);
+                        cur = parent.to_path_buf();
+                    }
+                    _ => {
+                        return Err(format!(
+                            "no part of {} can be looked at, so where it is cannot be checked",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot look at {} to see where it is ({}); not going on",
+                    cur.display(),
+                    e.kind()
+                ));
+            }
+        }
+    }
+}
+
+/// Whether two folders are the same place or one holds the other, by where they really are.
+/// An error when either cannot be resolved (see `resolved`).
+pub fn overlap(a: &Path, b: &Path) -> Result<bool, String> {
+    let (a, b) = (resolved(a)?, resolved(b)?);
+    Ok(a.starts_with(&b) || b.starts_with(&a))
+}
+
 /// `(free, total)` bytes of the filesystem holding `path`; free is what this process may use.
 #[cfg(unix)]
 pub fn disk_space(path: &Path) -> Option<(u64, u64)> {

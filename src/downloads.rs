@@ -61,7 +61,7 @@ pub const ACTIVE_STATES: &[&str] = &[
     "import_blocked",
 ];
 
-fn ts(t: OffsetDateTime) -> String {
+pub fn ts(t: OffsetDateTime) -> String {
     rfc3339(t)
 }
 
@@ -235,7 +235,9 @@ pub fn save_links(c: &Connection, links: &[ReleaseLink], now: OffsetDateTime) ->
     Ok(())
 }
 
-/// Link material for `release_ref`, preferring the row recorded for `target`.
+/// Link material for `release_ref`, preferring the row recorded for `target`. A sport event's
+/// links and every other title's never answer for each other: a request for an event's link
+/// finds only event links, and a request for any other target finds none of them.
 pub fn load_link(
     c: &Connection,
     release_ref: &str,
@@ -243,7 +245,8 @@ pub fn load_link(
 ) -> Result<Option<ReleaseLink>> {
     let mut stmt = c.prepare(
         "SELECT release_ref, target, media_id, info_hash, magnet, download_url, title, size, indexer_id, quality, revision_version, revision_real, full_season, covers, replaces, interactive, supersedes
-         FROM release_links WHERE release_ref = ?1 ORDER BY CASE WHEN target = ?2 THEN 0 ELSE 1 END, seen_at DESC LIMIT 1",
+         FROM release_links WHERE release_ref = ?1 AND ((target LIKE 'event:%') = (COALESCE(?2, '') LIKE 'event:%'))
+         ORDER BY CASE WHEN target = ?2 THEN 0 ELSE 1 END, seen_at DESC LIMIT 1",
     )?;
     let row = stmt
         .query_row(params![release_ref, target.map(|t| t.to_string())], |r| {
@@ -309,7 +312,7 @@ pub struct GrabTarget {
     pub replaces: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Grab {
     pub id: String,
     pub media_id: MediaId,
@@ -317,7 +320,6 @@ pub struct Grab {
     pub plan_id: Option<String>,
     pub release_ref: String,
     /// Raw info-hash: internal identity only, never in API views or history.
-    #[serde(skip)]
     pub info_hash: String,
     pub title: String,
     pub indexer_id: Option<i64>,
@@ -351,7 +353,6 @@ pub struct Grab {
     pub cleanup_detail: Option<String>,
     pub cleanup_at: Option<String>,
     /// Journaled local paths of a removal in progress (private).
-    #[serde(skip)]
     pub cleanup_files: Option<String>,
     pub imported_files: i64,
     pub created_at: String,
@@ -362,7 +363,6 @@ pub struct Grab {
     pub targets: Vec<GrabTarget>,
     /// Ids of grabs this one took over when it was enqueued (a season pack replacing idle or
     /// unsent single-episode downloads). Set by `enqueue` only.
-    #[serde(skip)]
     pub replaced: Vec<String>,
 }
 
@@ -513,7 +513,48 @@ pub fn status(g: &Grab) -> &'static str {
     }
 }
 
+/// A row's text as a client may read it: unchanged for a movie or a series, and for a sport
+/// event only if it is a sentence the code built.
+pub fn sport_read(media: MediaId, text: Option<&str>) -> Option<String> {
+    sport_read_for(media, text, crate::sport::reason::THIS_EVENT)
+}
+
+/// As `sport_read`, with the stored event's own name where a sentence names the event.
+pub fn sport_read_for(media: MediaId, text: Option<&str>, display: &str) -> Option<String> {
+    let t = text?;
+    match media {
+        // (a stored reason is rendered where it is shown; anything else is the generic sentence)
+        MediaId::Event(_) => Some(crate::sport::reason::render_stored_for(
+            &crate::sport::reason::classify(t),
+            display,
+        )),
+        MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+            Some(t.to_string())
+        }
+    }
+}
+
+/// What is stored for an error from the download client or the engine: for a sport grab the typed
+/// reason (its text never kept), for any other the label and the error as before.
+fn client_text(g: &Grab, label: &str, e: &crate::upstream::UpstreamError) -> String {
+    match g.media_id {
+        MediaId::Event(_) => {
+            tracing::warn!(grab = %g.id, "client error: {} {}", label, e.describe());
+            crate::sport::reason::Reason::from_upstream(e).encode()
+        }
+        MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+            format!("{label} {}", e.describe())
+        }
+    }
+}
+
 pub fn view(g: &Grab) -> serde_json::Value {
+    view_named(g, None)
+}
+
+/// `view`, with the stored event's own name (an event grab's reasons name the event with it).
+pub fn view_named(g: &Grab, display: Option<&str>) -> serde_json::Value {
+    let display = display.unwrap_or(crate::sport::reason::THIS_EVENT);
     json!({
         "id": g.id,
         "media_id": g.media_id,
@@ -521,7 +562,13 @@ pub fn view(g: &Grab) -> serde_json::Value {
         "plan_id": g.plan_id,
         "release_ref": g.release_ref,
         "title": g.title,
-        "client_name": g.client_name,
+        // (a sport download shows the event's name only: the torrent's own name is release text)
+        "client_name": match g.media_id {
+            MediaId::Event(_) => None,
+            MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+                g.client_name.clone()
+            }
+        },
         "size_bytes": g.size,
         "quality": g.quality,
         "revision": g.revision,
@@ -536,13 +583,14 @@ pub fn view(g: &Grab) -> serde_json::Value {
         "category": g.category,
         "attempts": g.attempts,
         "next_attempt_at": g.active.then_some(&g.next_attempt_at),
-        "last_error": g.last_error,
+        // (for a sport grab only a sentence the code built is returned, whatever the row holds)
+        "last_error": sport_read_for(g.media_id, g.last_error.as_deref(), display),
         "failure": g.failure,
         "retry": g.retry,
         "seed_goal": { "ratio": g.seed_ratio, "seeding_time_minutes": g.seed_time_minutes },
         "cleanup": {
             "state": g.cleanup,
-            "detail": g.cleanup_detail,
+            "detail": sport_read_for(g.media_id, g.cleanup_detail.as_deref(), display),
             "at": g.cleanup_at,
             "policy": { "remove_completed": g.remove_completed, "remove_failed": g.remove_failed },
         },
@@ -576,10 +624,15 @@ fn refused(code: &'static str, msg: impl Into<String>) -> EnqueueError {
     EnqueueError::Refused(code, msg.into())
 }
 
-pub fn media_kind(id: MediaId) -> MediaKind {
+/// The settings a grab runs under. Sport has none of its own: it uses the shows' download
+/// client, category, indexers, seed goals and import settings.
+#[deny(clippy::wildcard_enum_match_arm)]
+pub fn policy_kind(id: MediaId) -> MediaKind {
     match id {
         MediaId::Movie { .. } => MediaKind::Movie,
-        _ => MediaKind::Series,
+        MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) | MediaId::Event(_) => {
+            MediaKind::Series
+        }
     }
 }
 
@@ -704,6 +757,9 @@ fn not_adopted_one(index: &crate::catalog::CatalogIndex, target: MediaId) -> Opt
                 "{target} is not in the managed catalog; add it with POST /api/v1/library"
             )),
         },
+        // A sport event is not in the catalogue. Whether it exists and has started is checked
+        // against the stored event, in the grab's transaction (`sport::pick`).
+        MediaId::Event(_) => None,
         MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
             let Some(s) = series(k) else {
                 return Some(format!(
@@ -724,7 +780,7 @@ fn not_adopted_one(index: &crate::catalog::CatalogIndex, target: MediaId) -> Opt
                 .filter(|e| match target {
                     MediaId::Season(_, n) => e.season == n,
                     MediaId::Episode(_, n, x) => e.season == n && e.number == x,
-                    _ => true,
+                    MediaId::Series(_) | MediaId::Movie { .. } | MediaId::Event(_) => true,
                 })
                 .map(|e| format!("S{:02}E{:02}", e.season, e.number))
                 .collect();
@@ -732,7 +788,11 @@ fn not_adopted_one(index: &crate::catalog::CatalogIndex, target: MediaId) -> Opt
                 MediaId::Season(_, n) if s.episodes.is_none() => {
                     s.seasons.iter().any(|x| x.number == n && x.monitored)
                 }
-                _ => true,
+                MediaId::Season(..)
+                | MediaId::Series(_)
+                | MediaId::Episode(..)
+                | MediaId::Movie { .. }
+                | MediaId::Event(_) => true,
             };
             if unmonitored.is_empty() && season_flag {
                 None
@@ -756,6 +816,36 @@ fn not_adopted_one(index: &crate::catalog::CatalogIndex, target: MediaId) -> Opt
 
 /// Whether execution is possible for a media kind; the reason when not.
 pub fn execution_blocker(st: &AppState, media: MediaKind) -> Option<(&'static str, String)> {
+    execution_blocker_with(
+        st,
+        media,
+        |lib| crate::ingest::root_for(lib, media).is_some(),
+        media.label(),
+    )
+}
+
+/// As `execution_blocker`, for a media id: an event needs the sport root, not a TV root.
+#[deny(clippy::wildcard_enum_match_arm)]
+pub fn execution_blocker_for(st: &AppState, id: MediaId) -> Option<(&'static str, String)> {
+    match id {
+        MediaId::Event(_) => execution_blocker_with(
+            st,
+            policy_kind(id),
+            |lib| crate::ingest::sport_root(lib).is_some(),
+            "sport",
+        ),
+        MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+            execution_blocker(st, policy_kind(id))
+        }
+    }
+}
+
+fn execution_blocker_with(
+    st: &AppState,
+    media: MediaKind,
+    root_ok: impl Fn(&crate::config::LibraryConfig) -> bool,
+    what: &str,
+) -> Option<(&'static str, String)> {
     if !st.cfg.execution_enabled {
         return Some((
             "execution_disabled",
@@ -774,16 +864,10 @@ pub fn execution_blocker(st: &AppState, media: MediaKind) -> Option<(&'static st
             "no download client ([qbittorrent] or [embedded]) is configured".into(),
         ));
     }
-    if st
-        .cfg
-        .library
-        .as_ref()
-        .and_then(|lib| crate::ingest::root_for(lib, media))
-        .is_none()
-    {
+    if !st.cfg.library.as_ref().is_some_and(root_ok) {
         return Some((
             "client_not_configured",
-            format!("no [library] root is configured for {}", media.label()),
+            format!("no [library] root is configured for {what}"),
         ));
     }
     if l.settings.media_management(media).is_none() {
@@ -964,8 +1048,8 @@ pub struct EnqueueRequest {
 /// Validates, fetches the payload (through the release's own backend), computes identity and
 /// inserts the grab atomically with coverage, blocklist and duplicate checks.
 pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, EnqueueError> {
-    let media = media_kind(req.link.media_id);
-    if let Some((code, msg)) = execution_blocker(st, media) {
+    let media = policy_kind(req.link.media_id);
+    if let Some((code, msg)) = execution_blocker_for(st, req.link.media_id) {
         return Err(refused(code, msg));
     }
     let loaded = st.current().expect("checked");
@@ -1005,7 +1089,16 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
         ));
     }
     // The payload's own names must not contradict the item, whatever the search title said.
-    if let Some(why) = payload_contradiction(st, link.media_id, &payload) {
+    // (what is said, and what is stored: an event's reason is a typed value)
+    let contradiction: Option<(String, String)> = match link.media_id {
+        MediaId::Event(e) => event_contradiction(st, e, &payload)
+            .await
+            .map(|r| (r.render(), r.encode())),
+        MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+            payload_contradiction(st, link.media_id, &payload).map(|w| (w.clone(), w))
+        }
+    };
+    if let Some((why, stored)) = contradiction {
         let (media_s, release_ref, title, h) = (
             link.media_id.to_string(),
             link.release_ref.clone(),
@@ -1013,14 +1106,18 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
             hash.clone(),
         );
         let now_s = ts(OffsetDateTime::now_utc());
-        let why2 = why.clone();
+        let why2 = if matches!(link.media_id, MediaId::Event(_)) {
+            stored
+        } else {
+            format!("{title}: {why}")
+        };
         st.store
             .with(move |c| {
                 c.execute(
                     "INSERT OR IGNORE INTO blocklist (media_id, release_ref, info_hash, title, reason, grab_id, created_at) VALUES (?1, ?2, ?3, ?4, 'wrong_payload', NULL, ?5)",
                     params![media_s, release_ref, h, title, now_s],
                 )?;
-                library::event(c, &now_s, "release_rejected", Some(&media_s), None, None, &format!("{title}: {why2}"), Some(&json!({ "reason": "wrong_payload" })))?;
+                library::event(c, &now_s, "release_rejected", Some(&media_s), None, None, &why2, Some(&json!({ "reason": "wrong_payload" })))?;
                 Ok(())
             })
             .await?;
@@ -1073,6 +1170,23 @@ pub async fn enqueue(st: &AppState, req: EnqueueRequest) -> Result<Grab, Enqueue
             // and the release is refused as an active download.
             if let Some(why) = library::not_adopted_now(&tx, link.media_id, &link.covers)? {
                 return Ok(Err(("not_adopted", why)));
+            }
+            // Sport: a part that is already filed is not fetched again, and the event is
+            // checked on the stored row (a cancel racing the fetch wins).
+            if let MediaId::Event(e) = link.media_id {
+                if let Some(why) = crate::sport::get::gate_now(&tx, e, now)? {
+                    return Ok(Err(("not_played_yet", why)));
+                }
+                if crate::sport::files::present(
+                    &tx,
+                    &e.event_id(),
+                    &e.part.slug().unwrap_or_default(),
+                )? {
+                    return Ok(Err((
+                        "already_have",
+                        "Arr already has a file for this part of the event; nothing is overwritten".to_string(),
+                    )));
+                }
             }
             // The copy's quality must be one the title's profile allows now. A list of
             // copies can be older than a change of quality level; profile changes are
@@ -1251,7 +1365,9 @@ fn pack_selection(st: &AppState, g: &Grab) -> Option<crate::qbit::FileSelection>
                     .collect()
             })
             .unwrap_or_default(),
-        _ => vec![],
+        MediaId::Movie { .. } | MediaId::Season(..) | MediaId::Episode(..) | MediaId::Event(_) => {
+            vec![]
+        }
     };
     targets
         .iter()
@@ -1291,7 +1407,7 @@ async fn settle_pack(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) 
         }
         Err(e) => {
             let next = ts(now + backoff(g.attempts));
-            update(st, &g.id, "UPDATE grabs SET last_error = ?2, next_attempt_at = ?3, updated_at = ?4 WHERE id = ?1", vec![text(format!("{} {}", qb.label(), e.describe())), text(next), text(ts(now))]).await?;
+            update(st, &g.id, "UPDATE grabs SET last_error = ?2, next_attempt_at = ?3, updated_at = ?4 WHERE id = ?1", vec![text(client_text(g, qb.label(), &e)), text(next), text(ts(now))]).await?;
             return Ok(false);
         }
     };
@@ -1319,7 +1435,7 @@ fn redownload(st: &AppState, g: &Grab) -> bool {
     let loaded = st.current();
     let policy = loaded
         .as_deref()
-        .and_then(|l| l.settings.policy(media_kind(g.media_id)));
+        .and_then(|l| l.settings.policy(policy_kind(g.media_id)));
     match g.origin.as_str() {
         "interactive" => policy.is_some_and(|p| p.redownload_failed_interactive),
         _ => policy.is_some_and(|p| p.redownload_failed),
@@ -1431,14 +1547,66 @@ async fn remove_superseded(st: &AppState, id: &str) {
 }
 
 /// Identity of a managed item (movie or series) from the current index.
+#[deny(clippy::wildcard_enum_match_arm)]
 pub fn identity_of(st: &AppState, media: MediaId) -> Option<crate::identity::Identity> {
     let index = st.index();
     match media {
         MediaId::Movie { tmdb } => index.movie(tmdb).map(crate::identity::Identity::movie),
-        other => other
-            .series_key()
-            .and_then(|k| index.series(k))
-            .map(crate::identity::Identity::series),
+        MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
+            index.series(k).map(crate::identity::Identity::series)
+        }
+        // A sport event has no catalogue identity; its payload is judged by the sport
+        // matcher (`sport::pick::payload_contradiction`).
+        MediaId::Event(_) => None,
+    }
+}
+
+/// The sport counterpart of `payload_contradiction`: the payload's own names judged by the sport
+/// matcher against the stored event. Only a positive contradiction counts.
+async fn event_contradiction(
+    st: &AppState,
+    e: crate::ids::EventRef,
+    payload: &Payload,
+) -> Option<crate::sport::reason::Reason> {
+    // (the torrent's own name and every file; the sport check counts the videos too)
+    let (torrent_name, all_files): (Option<String>, Vec<String>) = match payload {
+        Payload::Torrent(t) => {
+            let (name, files) = crate::torrent::names(t).ok()?;
+            (Some(name), files)
+        }
+        Payload::Magnet(m) => {
+            let url = reqwest::Url::parse(m).ok()?;
+            (
+                url.query_pairs()
+                    .find(|(k, _)| k == "dn")
+                    .map(|(_, v)| v.into_owned()),
+                vec![],
+            )
+        }
+    };
+    let id = e.event_id();
+    let league = e.league;
+    let _ = league;
+    let (ev, known) = st
+        .store
+        .with(move |c| {
+            let ev = crate::sport::data::event(c, &id)?;
+            let known = match &ev {
+                Some(ev) => crate::sport::get::known_for(c, ev)?,
+                None => Default::default(),
+            };
+            Ok((ev, known))
+        })
+        .await
+        .ok()?;
+    let ev = ev?;
+    match crate::sport::get::judge_payload(&ev, &known, torrent_name.as_deref(), &all_files, e.part)
+    {
+        crate::sport::get::PayloadCheck::Fine => None,
+        crate::sport::get::PayloadCheck::Contradicts(why) => Some(why),
+        crate::sport::get::PayloadCheck::SeveralVideos => {
+            Some(crate::sport::reason::Reason::SeveralVideos)
+        }
     }
 }
 
@@ -1495,9 +1663,37 @@ async fn update(
     let id = id.to_string();
     st.store
         .with(move |c| {
-            let mut all: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(id)];
+            let mut all: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(id.clone())];
             all.extend(args);
             c.execute(sql, rusqlite::params_from_iter(all))?;
+            // Every write of a grab's `last_error` or clean-up detail goes through here: for a
+            // sport grab whatever was written is swapped for event-safe text (the real text is
+            // logged), because it can carry what a client or the engine said about the
+            // torrent's own names.
+            if sql.contains("last_error = ?") || sql.contains("cleanup_detail = ?") {
+                let seen: Option<(Option<String>, Option<String>)> = c
+                    .query_row(
+                        "SELECT last_error, cleanup_detail FROM grabs WHERE id = ?1 AND media_id LIKE 'event:%'",
+                        [&id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((err, detail)) = seen {
+                    tracing::debug!(grab = %id, ?err, ?detail, "sport grab text written");
+                    if let Some(e) = err.filter(|_| sql.contains("last_error = ?")) {
+                        c.execute(
+                            "UPDATE grabs SET last_error = ?2 WHERE id = ?1",
+                            params![id, crate::sport::reason::classify(&e)],
+                        )?;
+                    }
+                    if let Some(d) = detail.filter(|_| sql.contains("cleanup_detail = ?")) {
+                        c.execute(
+                            "UPDATE grabs SET cleanup_detail = ?2 WHERE id = ?1",
+                            params![id, crate::sport::reason::classify(&d)],
+                        )?;
+                    }
+                }
+            }
             Ok(())
         })
         .await
@@ -1709,7 +1905,7 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
         Some(l) => &l.settings,
         None => return Ok(false),
     };
-    let media = media_kind(g.media_id);
+    let media = policy_kind(g.media_id);
     let post = client_policy(st, settings, media)
         .ok()
         .and_then(|p| p.post_import_category);
@@ -1720,7 +1916,7 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
             .find(|t| t.hash.eq_ignore_ascii_case(&g.info_hash)),
         Err(e) => {
             let next = ts(now + backoff(g.attempts));
-            update(st, &g.id, "UPDATE grabs SET last_error = ?2, next_attempt_at = ?3, updated_at = ?4 WHERE id = ?1", vec![text(format!("{} {}", qb.label(), e.describe())), text(next), text(ts(now))]).await?;
+            update(st, &g.id, "UPDATE grabs SET last_error = ?2, next_attempt_at = ?3, updated_at = ?4 WHERE id = ?1", vec![text(client_text(g, qb.label(), &e)), text(next), text(ts(now))]).await?;
             return Ok(false);
         }
     };
@@ -1856,7 +2052,7 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
                     st,
                     g,
                     "invalid_torrent",
-                    &format!("{} {}", qb.label(), e.describe()),
+                    &client_text(g, qb.label(), &e),
                     true,
                     now,
                 )
@@ -1910,16 +2106,19 @@ pub async fn fail(
     blocklist: bool,
     now: OffsetDateTime,
 ) -> Result<()> {
-    let media = media_kind(g.media_id);
+    let media = policy_kind(g.media_id);
     let loaded = st.current();
     let policy = loaded.as_deref().and_then(|l| l.settings.policy(media));
-    let research = match g.origin.as_str() {
+    let research = (match g.origin.as_str() {
         "interactive" => policy.is_some_and(|p| p.redownload_failed_interactive),
         _ => policy.is_some_and(|p| p.redownload_failed),
     } && code != "foreign_torrent"
         // A payload that was not what it claimed (wrong item or quality) is replaced
         // automatically: the request still stands.
-        || matches!(code, "wrong_payload" | "wrong_quality" | "wrong_language");
+        || matches!(code, "wrong_payload" | "wrong_quality" | "wrong_language"))
+        // Nothing is searched for a sport event automatically in this phase: the person is
+        // offered "Find another copy".
+        && !matches!(g.media_id, MediaId::Event(_));
     let cleanup = if code == "foreign_torrent"
         || code == "submission_failed"
         || code == "no_metadata"
@@ -1950,7 +2149,26 @@ pub async fn fail(
         g.info_hash.clone(),
         g.title.clone(),
     );
-    let (code_s, message_s) = (code.to_string(), message.to_string());
+    // A sport download's reasons are shown from the event and the code, never from what a client
+    // or the engine said (it can carry the torrent's own names). The codes the import raises
+    // itself carry sentences built from the stored event and are kept.
+    let message = match g.media_id {
+        MediaId::Event(_) => {
+            // An event's reason is a typed value: the import's own is kept, the rest is the one
+            // its failure code stands for. What a client or the engine said goes to the log.
+            if crate::sport::reason::Reason::decode(message).is_none() {
+                tracing::warn!(grab = %g.id, code, "sport download failed: {message}");
+                crate::sport::reason::Reason::from_code(code).encode()
+            } else {
+                message.to_string()
+            }
+        }
+        MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+            message.to_string()
+        }
+    };
+    let is_event = matches!(g.media_id, MediaId::Event(_));
+    let (code_s, message_s) = (code.to_string(), message);
     let target = research_target(&st.index(), g, now);
     let now_s = ts(now);
     st.store
@@ -1969,7 +2187,7 @@ pub async fn fail(
                     params![media_s, release_ref, hash, title, code_s, id, now_s],
                 )?;
             }
-            library::event(&tx, &now_s, "download_failed", Some(&media_s), Some(&target_s), Some(&id), &format!("{title}: {message_s}"), Some(&json!({ "failure": code_s, "blocklisted": blocklist, "research": research })))?;
+            library::event(&tx, &now_s, "download_failed", Some(&media_s), Some(&target_s), Some(&id), &if is_event { message_s.clone() } else { format!("{title}: {message_s}") }, Some(&json!({ "failure": code_s, "blocklisted": blocklist, "research": research })))?;
             if research {
                 crate::worker::queue_command(&tx, "search", Some(target), &now_s)?;
             }
@@ -2051,7 +2269,7 @@ pub async fn poll(
         report.polled += 1;
         let post_cat = post
             .as_ref()
-            .and_then(|(m, s)| match media_kind(g.media_id) {
+            .and_then(|(m, s)| match policy_kind(g.media_id) {
                 MediaKind::Movie => m.clone(),
                 MediaKind::Series => s.clone(),
             });
@@ -2315,7 +2533,7 @@ async fn our_torrent(st: &AppState, g: &Grab) -> Result<Option<TorrentInfo>, Act
 
 fn post_category(st: &AppState, g: &Grab) -> Option<String> {
     let l = st.current()?;
-    client_policy(st, &l.settings, media_kind(g.media_id))
+    client_policy(st, &l.settings, policy_kind(g.media_id))
         .ok()?
         .post_import_category
 }
@@ -2750,6 +2968,22 @@ async fn prepare_removal(
     g: &Grab,
     t: &TorrentInfo,
 ) -> Result<Vec<TrackedFile>, String> {
+    let r = prepare_removal_checked(st, g, t).await;
+    match (&r, g.media_id) {
+        // A sport grab's reasons are shown; the file names that caused them are not.
+        (Err(why), MediaId::Event(_)) => {
+            tracing::warn!(grab = %g.id, "not removing a sport download's files: {why}");
+            Err("a file of the download could not be checked for removal; it is left alone".into())
+        }
+        _ => r,
+    }
+}
+
+async fn prepare_removal_checked(
+    st: &AppState,
+    g: &Grab,
+    t: &TorrentInfo,
+) -> Result<Vec<TrackedFile>, String> {
     let (save_root, local_root) = st
         .cfg
         .client_paths()
@@ -2825,13 +3059,9 @@ async fn prepare_removal(
             )
         })?
         .ok_or("the torrent disappeared while checking")?;
-    let library_roots: Vec<PathBuf> = st
-        .cfg
-        .library
-        .iter()
-        .flat_map(|l| l.movies.iter().chain(&l.tv))
-        .cloned()
-        .collect();
+    // (every library root, the sport root included: a torrent's files must never be removed
+    // from, or written into, a file Arr filed)
+    let library_roots: Vec<PathBuf> = st.cfg.library.iter().flat_map(|l| l.roots()).collect();
     let mut out = vec![];
     for f in &files {
         let rel = paths::safe_rel(&f.name).ok_or_else(|| {
@@ -2842,7 +3072,15 @@ async fn prepare_removal(
         })?;
         for candidate in [rel.clone(), paths::with_suffix(&rel, ".!qB")] {
             let abs = local_save.join(&candidate);
-            if library_roots.iter().any(|r| abs.starts_with(r)) {
+            // (by where the file really is: a link in its path does not hide a library root)
+            let sport = st.cfg.library.as_ref().and_then(|l| l.sport_root());
+            let mut inside = library_roots.iter().any(|r| abs.starts_with(r));
+            if !inside && let Some(s) = &sport {
+                // (the sport root is also compared by where it and the file really are; a path
+                // that cannot be resolved stops the removal rather than being guessed at)
+                inside = paths::resolved(&abs)?.starts_with(paths::resolved(s)?);
+            }
+            if inside {
                 return Err("a torrent file maps into a library root".into());
             }
             match paths::check_no_symlinks(local_root, &abs) {

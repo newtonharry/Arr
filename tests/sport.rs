@@ -715,8 +715,9 @@ async fn the_worker_runs_the_refresh_and_not_before_it_is_due() {
     assert!(report.tasks.contains(&"sports".to_string()), "{report:?}");
     // Fourteen NBA games (six played yesterday) and the two cards still to come.
     assert_eq!(count(&e, "sport_events").await, 16);
-    // Not due again for a quarter of an hour.
-    let report = e.tick_at(now + time::Duration::minutes(1)).await;
+    // Not due again at once (a minute on the quick first pass over the team lists, a quarter
+    // of an hour after it).
+    let report = e.tick_at(now + time::Duration::seconds(20)).await;
     assert!(!report.tasks.contains(&"sports".to_string()), "{report:?}");
     let status = stored(&e, "SELECT last_status FROM tasks WHERE name = 'sports'").await;
     assert_eq!(status, ["ok"]);
@@ -2770,4 +2771,63 @@ async fn a_team_list_that_dropped_an_entry_is_recorded_as_not_whole() {
         .insert(EPL.to_string(), list(true));
     let (_, whole) = read(&e, now + time::Duration::days(8)).await.expect("read");
     assert!(whole);
+}
+
+#[tokio::test]
+async fn the_first_pass_over_the_team_lists_goes_a_league_a_minute_and_then_slows() {
+    let e = start_exec(ExecOptions::default()).await;
+    let wanted = arr::sport::catalog::LEAGUES
+        .iter()
+        .filter(|l| l.teams)
+        .count();
+    let next_run = |e: &Exec| -> OffsetDateTime {
+        let s: String = e
+            .state
+            .store
+            .blocking(|c| {
+                Ok(c.query_row(
+                    "SELECT next_run FROM tasks WHERE name = 'sports'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).unwrap()
+    };
+    let quick = |e: &Exec| {
+        e.state
+            .sports
+            .as_ref()
+            .unwrap()
+            .catalogue_quick
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    assert!(quick(&e), "a fresh start is on the quick pass");
+    let mut reads = 0;
+    let mut runs = 0;
+    while quick(&e) {
+        let before = OffsetDateTime::now_utc();
+        let r = sports_task(&e).await;
+        runs += 1;
+        assert!(runs <= wanted + 2, "never finishes: {r}");
+        let n = r["catalogue_teams"].as_array().unwrap().len();
+        assert!(n <= 1, "one league a run on the quick pass: {r}");
+        reads += n;
+        let gap = next_run(&e) - before;
+        if quick(&e) {
+            assert!(
+                gap < time::Duration::seconds(90),
+                "the next run is about a minute away: {gap}"
+            );
+        } else {
+            assert!(
+                gap > time::Duration::minutes(10),
+                "then the usual pace: {gap}"
+            );
+        }
+    }
+    assert_eq!(reads, wanted, "every league with teams was read once");
+    // After that, the usual pace: nothing is due, so nothing is read.
+    let r = sports_task(&e).await;
+    assert_eq!(r["catalogue_teams"], json!([]), "{r}");
 }

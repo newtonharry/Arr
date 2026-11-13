@@ -61,13 +61,18 @@ fn refused(message: impl Into<String>) -> ApiError {
     ApiError::conflict(ErrorCode::DeleteRefused, message)
 }
 
+#[deny(clippy::wildcard_enum_match_arm)]
 async fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
     let id = parse_media_id(raw)?;
+    // Sport files can't be deleted from Arr yet: say so before looking for a folder.
+    if let MediaId::Event(_) = id {
+        return Err(refused("sport files can't be deleted from Arr yet"));
+    }
     let Some(root) = st
         .cfg
         .library
         .as_ref()
-        .and_then(|l| crate::ingest::root_for(l, crate::downloads::media_kind(id)))
+        .and_then(|l| crate::ingest::root_for(l, crate::downloads::policy_kind(id)))
         .map(|p| p.to_path_buf())
     else {
         return Err(refused("there is no library folder to delete from"));
@@ -94,7 +99,7 @@ async fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
             let id = match id {
                 MediaId::Season(_, n) => MediaId::Season(key, n),
                 MediaId::Episode(_, n, e) => MediaId::Episode(key, n, e),
-                _ => s.id,
+                MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Event(_) => s.id,
             };
             let unknown = s
                 .episodes
@@ -108,10 +113,11 @@ async fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
                 .count();
             (id, s.title.clone(), unknown, s.root_folder.clone())
         }
+        MediaId::Event(_) => return Err(refused("sport files can't be deleted from Arr yet")),
     };
     // The same root check import and scan make: evidence from another root must not be
     // resolved against this one.
-    let media = crate::downloads::media_kind(id);
+    let media = crate::downloads::policy_kind(id);
     if !crate::ingest::root_matches(st, media, item_root.as_deref()) {
         return Err(refused(
             "this title's folder is not the library folder Arr is set up to use",
@@ -158,7 +164,7 @@ async fn scope(st: &AppState, raw: &str) -> Result<Scope, ApiError> {
     Ok(Scope {
         id,
         title,
-        media: crate::downloads::media_kind(id),
+        media: crate::downloads::policy_kind(id),
         root,
         videos,
         unknown,

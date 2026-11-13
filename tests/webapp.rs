@@ -653,15 +653,13 @@ async fn the_app_has_its_sport_screens_and_promises_nothing_it_does_not_do() {
     ] {
         assert!(js.contains(want), "app.js lacks {want}");
     }
-    // What a person reads about sport says nothing of downloading, results or Plex: sport is a
-    // schedule, and there are no scores. (Comments are left out; they say why, in the open.)
+    // What a person reads about sport says nothing of results or scores. (It says what Arr is
+    // getting when a person picks a copy, by hand; comments are left out, they say why.)
     let start = js.find("// ---------- sport:").unwrap();
     let end = js.find("// ---------- home ----------").unwrap();
     let comments = regex::Regex::new(r"//[^\n]*").unwrap();
     let copy = comments.replace_all(&js[start..end], "").to_lowercase();
-    for word in [
-        "download", "score", "result", "winner", "won ", "plex", "watch", "record",
-    ] {
+    for word in ["score", "result", "winner", "won ", "watch", "record"] {
         assert!(!copy.contains(word), "sport copy mentions {word}");
     }
     // Sport is not in the search box's words, so nothing about it shows when it is off.
@@ -2818,4 +2816,86 @@ async fn text_assets_and_json_are_gzipped_on_request_and_images_are_not() {
         .unwrap();
     assert_eq!(r.status(), 200);
     assert!(r.headers().get("content-encoding").is_none());
+}
+
+/// A server for the headless-browser rig (`cargo test -- --ignored rig_server`): a UFC card two
+/// days ago with three copies, one of them with a caution, in a followed league; the app's
+/// address and a session cookie are written to `$RIG_OUT`, and it serves until `$RIG_STOP`
+/// exists. Not a test of anything.
+#[tokio::test]
+#[ignore]
+async fn rig_server() {
+    let out = std::env::var("RIG_OUT").expect("RIG_OUT");
+    let stop = std::env::var("RIG_STOP").expect("RIG_STOP");
+    let e = start_exec(ExecOptions {
+        tmdb: true,
+        ..Default::default()
+    })
+    .await;
+    let start = (OffsetDateTime::now_utc() - time::Duration::days(2))
+        .replace_minute(0)
+        .unwrap()
+        .replace_second(0)
+        .unwrap()
+        .replace_nanosecond(0)
+        .unwrap();
+    let at = start.format(&Rfc3339).unwrap();
+    e.state
+        .store
+        .with(move |c| {
+            c.execute(
+                "INSERT INTO sport_events (id, league, season, starts_at_utc, ends_at_utc, name, short_name, home_id, home_name, away_id, away_name, round, venue, state, first_seen_utc, updated_utc)
+                 VALUES ('event:ufc:600061499', 'ufc', NULL, ?1, NULL, 'UFC 499: Alpha vs. Bravo', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'played', ?1, ?1)",
+                [at],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (s, _, _) = e
+        .json(
+            e.post("/api/v1/sport/follow")
+                .json(&json!({ "league": "ufc" })),
+        )
+        .await;
+    assert!(s == 200 || s == 201);
+    let when = (start + time::Duration::hours(30))
+        .format(&Rfc3339)
+        .unwrap();
+    let mut releases = vec![];
+    for (title, seeders) in [
+        (
+            "UFC.499.Alpha.vs.Bravo.Main.Card.1080p.WEB-DL.H264-DARKSPORT",
+            60,
+        ),
+        ("UFC.499.Alpha.vs.Bravo.Main.Card.720p.WEB-DL.H264", 20),
+        ("UFC.499.Prelims.1080p.WEB-DL.H264-DARKSPORT", 30),
+    ] {
+        let (_, mut r) = e.publish(
+            title,
+            title,
+            vec![(format!("{title}.mkv"), mkv(3))],
+            1.5,
+            false,
+        );
+        r["publishDate"] = json!(when);
+        r["seeders"] = json!(seeders);
+        releases.push(r);
+    }
+    e.search_results("UFC 499", releases);
+    e.search_results("UFC alpha bravo", vec![]);
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    std::fs::write(
+        &out,
+        json!({ "base": site.base, "cookie": cookie }).to_string(),
+    )
+    .unwrap();
+    for _ in 0..1200 {
+        if std::path::Path::new(&stop).exists() {
+            return;
+        }
+        e.tick().await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }

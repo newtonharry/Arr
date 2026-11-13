@@ -769,7 +769,7 @@ const WOMEN: &[&str] = &[
     "girls",
 ];
 
-const SHOULDER_WORDS: &[&str] = &[
+pub(crate) const SHOULDER_WORDS: &[&str] = &[
     "countdown",
     "embedded",
     "vlog",
@@ -810,7 +810,7 @@ const SHOULDER_WORDS: &[&str] = &[
     "compacto",
 ];
 
-const SHOULDER_SEQUENCES: &[(&[&str], &str)] = &[
+pub(crate) const SHOULDER_SEQUENCES: &[(&[&str], &str)] = &[
     (&["weigh", "in"], "weigh-in"),
     (&["weigh", "ins"], "weigh-in"),
     (&["press", "conference"], "press conference"),
@@ -835,7 +835,7 @@ const SHOULDER_SEQUENCES: &[(&[&str], &str)] = &[
     (&["top", "10"], "top 10"),
 ];
 
-const NON_EVENT_WORDS: &[&str] = &[
+pub(crate) const NON_EVENT_WORDS: &[&str] = &[
     "update",
     "updates",
     "dlc",
@@ -1259,7 +1259,7 @@ fn words_of(toks: &[Tok]) -> Vec<&str> {
 /// "main" one fight). Parts that differ conflict; equal ones are one. `part_sport` is whether
 /// "round N", "day N" and "final round" name a part of the event (a golf tournament, a fight
 /// card) and not a stage.
-fn scan_parts<'a>(w: &[&'a str], part_sport: bool) -> (Vec<PartHint>, Vec<&'a str>) {
+pub(crate) fn scan_parts<'a>(w: &[&'a str], part_sport: bool) -> (Vec<PartHint>, Vec<&'a str>) {
     let mut parts = vec![];
     let mut used: Vec<&'a str> = vec![];
     let mut i = 0;

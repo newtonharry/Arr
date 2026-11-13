@@ -802,8 +802,46 @@ pub(super) async fn event_copies(
             "Arr is judging other requests right now",
         ));
     };
-    let found = found.for_part(want);
+    let mut found = found.for_part(want);
+    // A copy that failed for this event before is not offered again; the others are saved so
+    // that one of them can be picked ("Get this one") by its reference, for a week.
+    let (ev_save, listed) = (ev.clone(), found.candidates.clone());
+    let (kept, failed_before) =
+        st.store
+            .with(move |c| {
+                let mut blocked: std::collections::HashMap<
+                    crate::ids::MediaId,
+                    std::collections::HashSet<String>,
+                > = Default::default();
+                let (mut kept, mut hidden) = (vec![], 0usize);
+                for cand in listed {
+                    let Some(t) = sport::get::target_of(&ev_save, cand.m.part) else {
+                        continue;
+                    };
+                    if let std::collections::hash_map::Entry::Vacant(v) = blocked.entry(t) {
+                        v.insert(downloads::blocked_for(c, t)?);
+                    }
+                    let set = &blocked[&t];
+                    let by_hash =
+                        cand.release.info_hash.as_deref().is_some_and(|h| {
+                            set.contains(&format!("hash:{}", h.to_ascii_lowercase()))
+                        });
+                    if set.contains(&cand.release_ref) || by_hash {
+                        hidden += 1;
+                    } else {
+                        kept.push(cand);
+                    }
+                }
+                sport::get::save_listed(c, &ev_save, &kept, now)?;
+                Ok((kept, hidden))
+            })
+            .await
+            .map_err(internal("sport links"))?;
+    found.candidates = kept;
     let mut skipped: BTreeMap<&'static str, usize> = BTreeMap::new();
+    if failed_before > 0 {
+        skipped.insert("failed before for this event", failed_before);
+    }
     for (code, n) in &found.skipped {
         *skipped.entry(code.plain()).or_default() += n;
     }
@@ -839,6 +877,99 @@ pub(super) async fn event_copies(
         "age_secs": cached_age.map(|a| a.as_secs()),
     });
     ok(v)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GetBody {
+    /// A copy's `id` from the last copies answer for this event.
+    id: String,
+    /// Required for a copy that carries a caution.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `POST /sport/event/{id}/get`: a person picks one listed copy. The reference is the copy's
+/// `id` (`rel_` and 24 hex: a one-way hash of the release's identity), good for the event's
+/// part that was listed with it and for seven days after it was last listed. It names nothing
+/// that was not listed for this event, so it cannot be made up to fetch something else. A copy
+/// with a caution needs `confirm: true`; nothing is ever picked automatically.
+pub(super) async fn event_get(
+    State(st): St,
+    p: Result<Path<String>, PathRejection>,
+    ApiJson(body): ApiJson<GetBody>,
+) -> ApiResult {
+    sports(&st)?;
+    let Path(raw) =
+        p.map_err(|e| ApiError::bad_request(ErrorCode::InvalidRequest, e.body_text()))?;
+    let (id, id_part) = event_id_of(&raw)?;
+    let r = body.id.clone();
+    if !(r.len() == 28 && r.starts_with("rel_") && r[4..].bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(ApiError::bad_request(
+            ErrorCode::InvalidRequest,
+            "id must look like rel_<24 hex>",
+        ));
+    }
+    let id2 = id.clone();
+    let now = OffsetDateTime::now_utc();
+    let (ev, listed) = st
+        .store
+        .with(move |c| {
+            let ev = data::event(c, &id2)?;
+            let listed = sport::get::load_listed(c, &id2, &r, now)?;
+            Ok((ev, listed))
+        })
+        .await
+        .map_err(internal("sport pick"))?;
+    let ev = ev
+        .ok_or_else(|| ApiError::not_found("no such event; GET /api/v1/sport/events lists them"))?;
+    let listed = listed.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::ReleaseNotFound,
+            "this copy is not listed for this event (or its listing is more than a week old); look for copies again",
+        )
+    })?;
+    if let (Some(a), crate::ids::MediaId::Event(t)) = (id_part, listed.link.target)
+        && a != t.part
+    {
+        return Err(ApiError::bad_request(
+            ErrorCode::InvalidRequest,
+            "the id and the copy name different parts",
+        ));
+    }
+    if !listed.sure && !body.confirm {
+        let reason = listed.reason.as_deref().unwrap_or("unverified_text");
+        let note = sport::caution_note(reason);
+        let mut e = ApiError::conflict(
+            ErrorCode::ConfirmationNeeded,
+            format!("{note} Send the same request with \"confirm\": true to get it anyway."),
+        );
+        e.details = Some(json!({ "caution": { "reason": reason, "note": note } }));
+        return Err(e);
+    }
+    let name = sport::get::display_name(
+        &ev,
+        match listed.link.target {
+            crate::ids::MediaId::Event(t) => t.part,
+            _ => sport::Part::Whole,
+        },
+    );
+    let provider = st.provider_label(listed.link.indexer_id);
+    let g = downloads::enqueue(
+        &st,
+        downloads::EnqueueRequest {
+            link: listed.link,
+            plan_id: None,
+            origin: "interactive",
+        },
+    )
+    .await
+    .map_err(|e| enqueue_error(e, &provider))?;
+    created(json!({
+        "grab": grab_json(&st, &g).await,
+        "message": format!("Arr is getting {name}. It will appear in Plex under Sport."),
+    }))
 }
 
 /// The answer when Arr cannot take the request now: no copies, and when to ask again.

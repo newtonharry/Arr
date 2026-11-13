@@ -15,7 +15,7 @@
 use crate::api::AppState;
 use crate::catalog::FileEvidence;
 use crate::config::LibraryConfig;
-use crate::downloads::{self, Grab, media_kind};
+use crate::downloads::{self, Grab, policy_kind};
 use crate::ids::MediaId;
 use crate::import::rfc3339;
 use crate::library;
@@ -24,6 +24,7 @@ use crate::probe::{self, Probe};
 use crate::quality::Quality;
 use crate::release::{self, Numbering, Revision};
 use crate::settings::{MediaKind, MediaManagement};
+use crate::sport::reason::{FileOp as FO, Landed, Reason as R};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
@@ -37,7 +38,7 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mk3d", "webm", "mp4", "m4v", "mov", "avi", "ts", "m2ts", "mpg", "mpeg", "wmv", "asf",
 ];
 /// Other native video extensions: reported, not imported.
-const OTHER_VIDEO: &[&str] = &[
+pub const OTHER_VIDEO: &[&str] = &[
     "iso", "img", "vob", "flv", "divx", "xvid", "ogm", "ogv", "rm", "rmvb", "3gp", "wtv", "dvr-ms",
     "strm",
 ];
@@ -64,6 +65,22 @@ pub fn root_for(lib: &LibraryConfig, media: MediaKind) -> Option<&Path> {
     match media {
         MediaKind::Movie => lib.movies.as_deref(),
         MediaKind::Series => lib.tv.as_deref(),
+    }
+}
+
+/// Where sport lands: `[library] sport`, else a `Sport` folder beside the movies root (so it is
+/// on the same drive as the library and the downloads beside it, and a hard link works).
+pub fn sport_root(lib: &LibraryConfig) -> Option<PathBuf> {
+    lib.sport_root()
+}
+
+/// The root a media id is filed under. Explicit for every kind: an event is filed under the
+/// sport root and never under a movie or TV root.
+pub fn library_root(lib: &LibraryConfig, id: MediaId) -> Option<PathBuf> {
+    match id {
+        MediaId::Movie { .. } => lib.movies.clone(),
+        MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => lib.tv.clone(),
+        MediaId::Event(_) => sport_root(lib),
     }
 }
 
@@ -167,6 +184,44 @@ pub struct Planned {
     pub dest_name: String,
     pub replace: Option<Replacement>,
     pub runtime: Option<u32>,
+    /// Folders the destination root must stay apart from, by where they really are (a sport
+    /// import: the downloads and the other library roots). Empty for movies and series, whose
+    /// import is unchanged.
+    pub keep_apart: Vec<PathBuf>,
+}
+
+/// Whether `root` (and, after publishing, `file`) is still apart from every folder in `apart`,
+/// by where things really are. An error is a plain sentence; a path that cannot be resolved
+/// counts as not apart.
+fn confined(root: &Path, file: Option<&Path>, apart: &[PathBuf]) -> Result<(), R> {
+    // (a path that cannot be resolved: the plain sentence names no payload text, only the
+    // configured folders)
+    let unusable = |detail: String| {
+        tracing::warn!("sport root cannot be resolved: {detail}");
+        R::SportFolderUnusable
+    };
+    let under = paths::resolved(root).map_err(unusable)?;
+    for a in apart {
+        if paths::overlap(root, a).map_err(unusable)? {
+            return Err(R::SportFolderApart);
+        }
+    }
+    if let Some(f) = file {
+        let real = paths::resolved(f).map_err(unusable)?;
+        if !real.starts_with(&under) {
+            return Err(R::TakenBack {
+                landed: Landed::NotSportFolder,
+            });
+        }
+        for a in apart {
+            if real.starts_with(paths::resolved(a).map_err(unusable)?) {
+                return Err(R::TakenBack {
+                    landed: Landed::InsideDownloads,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +570,7 @@ pub fn select(
                     ),
                     replace,
                     runtime: item.runtime,
+                    keep_apart: vec![],
                 });
             }
             many => {
@@ -524,7 +580,8 @@ pub fn select(
                 ));
             }
         },
-        _ => {
+        // (a sport download never reaches here: `import_event` takes it first)
+        MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) | MediaId::Event(_) => {
             let mut claimed: std::collections::BTreeMap<MediaId, String> = Default::default();
             for (f, rel) in &videos {
                 let base = rel.rsplit('/').next().unwrap_or(rel);
@@ -626,6 +683,7 @@ pub fn select(
                     dest_name: library::clean_name(&name, replace_illegal),
                     replace,
                     runtime: info.and_then(|i| i.0).or(item.runtime),
+                    keep_apart: vec![],
                 });
             }
         }
@@ -664,6 +722,50 @@ pub enum Outcome {
 }
 
 /// Imports every due completed grab (bounded per pass).
+/// What an error from the download client says at import time: for a sport grab the typed
+/// reason (sign-in failed, unreachable, ...; the client's text goes to the log), for any other
+/// the label and the error as before.
+fn client_blocked(g: &Grab, label: &str, e: &crate::upstream::UpstreamError) -> String {
+    match g.media_id {
+        MediaId::Event(_) => {
+            tracing::warn!(grab = %g.id, "client error at import: {label} {}", e.describe());
+            R::from_upstream(e).encode()
+        }
+        MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+            format!("{label} {}", e.describe())
+        }
+    }
+}
+
+/// A place the import can be made to stop dead, for tests of crash recovery: `(grab id, point)`.
+/// The points are `after_stage`, `after_link` (published but the staged copy not yet removed),
+/// `after_published`, `after_commit` and `before_apply`. Stopping there leaves exactly what a
+/// crash at that line leaves: the import's own writes so far, and the grab `importing`.
+#[doc(hidden)]
+pub static CRASH_AT: std::sync::Mutex<Vec<(String, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[derive(Debug)]
+struct Crashed;
+impl std::fmt::Display for Crashed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped for a crash test")
+    }
+}
+impl std::error::Error for Crashed {}
+
+fn failpoint(grab_id: &str, point: &'static str) -> Result<(), FileError> {
+    let hit = CRASH_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(g, p)| g == grab_id && *p == point);
+    if hit {
+        return Err(FileError::Internal(Crashed.into()));
+    }
+    Ok(())
+}
+
 pub async fn import_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
     let now_s = rfc3339(now);
     let due = st
@@ -698,8 +800,19 @@ pub async fn import_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         }
         let outcome = match import_grab(st, &g, now).await {
             Ok(o) => o,
+            // (a crash test's stop: nothing more is written, as if the process had died)
+            Err(e) if e.downcast_ref::<Crashed>().is_some() => continue,
+            // A sport grab's error text is never shown: it can carry the payload's own names.
+            Err(e) if matches!(g.media_id, MediaId::Event(_)) => {
+                tracing::warn!(grab = %g.id, "sport import failed internally: {e:#}");
+                Outcome::Blocked(R::Internal.encode())
+            }
             Err(e) => Outcome::Blocked(format!("{e:#}")),
         };
+        if matches!(outcome, Outcome::Imported { .. }) && failpoint(&g.id, "before_apply").is_err()
+        {
+            continue;
+        }
         if apply(st, &g, outcome, now).await? {
             done += 1;
         }
@@ -765,7 +878,7 @@ async fn apply(st: &AppState, g: &Grab, outcome: Outcome, now: OffsetDateTime) -
                 })
                 .await?;
             if let (Some(qb), Some(l)) = (&st.client, st.current())
-                && let Ok(p) = downloads::client_policy(st, &l.settings, media_kind(g.media_id))
+                && let Ok(p) = downloads::client_policy(st, &l.settings, policy_kind(g.media_id))
                 && let Some(cat) = p.post_import_category
             {
                 let _ = qb.set_category(&g.info_hash, &cat).await;
@@ -775,6 +888,14 @@ async fn apply(st: &AppState, g: &Grab, outcome: Outcome, now: OffsetDateTime) -
             Ok(true)
         }
         Outcome::Blocked(reason) => {
+            // (a sport grab's text is only what the code built from the stored event)
+            let reason = match g.media_id {
+                MediaId::Event(_) => crate::sport::reason::classify(&reason),
+                MediaId::Movie { .. }
+                | MediaId::Series(_)
+                | MediaId::Season(..)
+                | MediaId::Episode(..) => reason,
+            };
             let next = rfc3339(
                 now + Duration::from_secs((300u64 << attempts.clamp(0, 6) as u32).min(6 * 3600)),
             );
@@ -850,6 +971,7 @@ async fn apply(st: &AppState, g: &Grab, outcome: Outcome, now: OffsetDateTime) -
     }
 }
 
+#[deny(clippy::wildcard_enum_match_arm)]
 fn item_info(st: &AppState, g: &Grab, mm: &MediaManagement) -> Result<ItemInfo, String> {
     let index = st.index();
     match g.media_id {
@@ -928,7 +1050,11 @@ fn item_info(st: &AppState, g: &Grab, mm: &MediaManagement) -> Result<ItemInfo, 
                 original_language: s.original_language.clone(),
             })
         }
-        _ => Err("grab media id is not a movie or series".into()),
+        // (a sport event has its own import, `import_event`; a season or an episode is a
+        // target of a series grab, never a grab's media id)
+        MediaId::Season(..) | MediaId::Episode(..) | MediaId::Event(_) => {
+            Err("grab media id is not a movie or series".into())
+        }
     }
 }
 
@@ -936,7 +1062,7 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
     let Some(l) = st.current() else {
         return Ok(Outcome::Blocked("no configuration import is active".into()));
     };
-    let media = media_kind(g.media_id);
+    let media = policy_kind(g.media_id);
     let blockers = l.settings.import_blockers(media);
     if !blockers.is_empty() {
         let codes: Vec<&str> = blockers.iter().map(|b| b.code.as_str()).collect();
@@ -965,17 +1091,21 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
     } else {
         "qBittorrent"
     };
-    let Some(root) = root_for(&lib, media).map(Path::to_path_buf) else {
+    let Some(root) = library_root(&lib, g.media_id) else {
         return Ok(Outcome::Blocked(format!(
             "no [library] root for {}",
-            media.label()
+            if matches!(g.media_id, MediaId::Event(_)) {
+                "sport"
+            } else {
+                media.label()
+            }
         )));
     };
     let info = match qb.info(std::slice::from_ref(&g.info_hash)).await {
         Ok(list) => list
             .into_iter()
             .find(|t| t.hash.eq_ignore_ascii_case(&g.info_hash)),
-        Err(e) => return Ok(Outcome::Blocked(format!("{} {}", qb.label(), e.describe()))),
+        Err(e) => return Ok(Outcome::Blocked(client_blocked(g, qb.label(), &e))),
     };
     let Some(t) = info else {
         return Ok(Outcome::Blocked(format!("the torrent is not in {cname}")));
@@ -1004,7 +1134,7 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
     let files = match qb.files(&g.info_hash).await {
         Ok(Some(f)) => f,
         Ok(None) => return Ok(Outcome::Blocked(format!("the torrent is not in {cname}"))),
-        Err(e) => return Ok(Outcome::Blocked(format!("{} {}", qb.label(), e.describe()))),
+        Err(e) => return Ok(Outcome::Blocked(client_blocked(g, qb.label(), &e))),
     };
     let entries: Vec<FileEntry> = files
         .iter()
@@ -1015,6 +1145,23 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
             wanted: f.priority != 0,
         })
         .collect();
+    // A sport download is filed by its own path: one video, named from the stored event, into
+    // `sport_files`. It shares the staging, the journal and the recovery, and nothing else.
+    if let MediaId::Event(e) = g.media_id {
+        return import_event(
+            st,
+            g,
+            e,
+            &lib,
+            &mm,
+            &root,
+            &entries,
+            &local_save,
+            &local_root,
+            now,
+        )
+        .await;
+    }
     // Reconcile the destination right before planning: a file another application (for
     // example the native app) put into the item's folder since the last scan is recognised
     // now, so this download never adds a second copy. Covered targets are then skipped, or
@@ -1108,7 +1255,7 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
                 .get(&s)
                 .and_then(|m| m.get(&n))
                 .and_then(|x| x.1.clone()),
-            _ => None,
+            MediaId::Series(_) | MediaId::Season(..) | MediaId::Event(_) => None,
         };
         let check = if !policy_on {
             Err("revision upgrades are not enabled by the imported policy".to_string())
@@ -1326,6 +1473,247 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
     })
 }
 
+/// Imports the one video of a sport download.
+///
+/// The payload is judged again before anything is filed: nothing in it may be an executable or
+/// an archive (the download fails, is blocklisted for this event and is handled as a failed
+/// download is: removed per `removeFailedDownloads`); it must hold exactly one video (more is
+/// `import_blocked`, waiting for a person); the probed video must be of a plausible duration and
+/// size for the sport and part (`sport::get::bounds`; otherwise the download fails as an
+/// invalid media file does for a movie). A part that is already filed is never overwritten.
+#[allow(clippy::too_many_arguments)]
+async fn import_event(
+    st: &AppState,
+    g: &Grab,
+    e: crate::ids::EventRef,
+    lib: &LibraryConfig,
+    mm: &MediaManagement,
+    root: &Path,
+    entries: &[FileEntry],
+    local_save: &Path,
+    local_root: &Path,
+    now: OffsetDateTime,
+) -> Result<Outcome> {
+    let event_id = e.event_id();
+    let id2 = event_id.clone();
+    let (ev, filed, known) = st
+        .store
+        .with(move |c| {
+            let ev = crate::sport::data::event(c, &id2)?;
+            let known = match &ev {
+                Some(ev) => Some(crate::sport::get::known_for(c, ev)?),
+                None => None,
+            };
+            Ok((
+                ev,
+                crate::sport::files::filed_by(c, &id2, &e.part.slug().unwrap_or_default())?,
+                known,
+            ))
+        })
+        .await?;
+    let known = known.unwrap_or_default();
+    let Some(ev) = ev else {
+        return Ok(Outcome::Blocked(R::EventGone.encode()));
+    };
+    let Some(league) = crate::sport::catalog::find(e.league) else {
+        return Ok(Outcome::Blocked(R::LeagueUnknown.encode()));
+    };
+    // Every sentence below is built from the stored event, never from the torrent's own names
+    // (a file or a torrent can be called anything, including how the game went).
+    match filed {
+        // A file this very download filed (a crash between its commit and the grab being marked
+        // imported): the bookkeeping is finished, nothing is filed again.
+        Some(Some(by)) if by == g.id => {
+            return Ok(Outcome::Imported {
+                files: 1,
+                skipped: vec![],
+                missing: vec![],
+                unfiled: vec![],
+                notes: vec!["already filed by this download".into()],
+            });
+        }
+        Some(_) => {
+            return Ok(Outcome::Blocked(R::AlreadyHave.encode()));
+        }
+        None => {}
+    }
+    let wanted: Vec<&FileEntry> = entries.iter().filter(|f| f.wanted).collect();
+    if let Some(bad) = crate::sport::get::unsafe_file(wanted.iter().map(|f| f.name.as_str())) {
+        // (the extension is one of a fixed list, or a rar or zip volume's: never the file's name)
+        let ext = bad.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+
+        return Ok(Outcome::Failed(
+            "unsafe_payload",
+            R::unsafe_file(if crate::sport::get::known_unsafe_ext(&ext) {
+                &ext
+            } else {
+                "archive"
+            })
+            .encode(),
+        ));
+    }
+    // The torrent's own name and EVERY video file of the payload (hidden, sample and extras
+    // folders included, before any of them is filtered out) are judged against the stored event
+    // and the part picked, and the videos are counted over the whole payload. One exhaustive
+    // classification of what that finds.
+    let all_names: Vec<String> = entries.iter().map(|f| f.name.clone()).collect();
+    match crate::sport::get::judge_payload(
+        &ev,
+        &known,
+        g.client_name.as_deref(),
+        &all_names,
+        e.part,
+    ) {
+        crate::sport::get::PayloadCheck::Fine => {}
+        crate::sport::get::PayloadCheck::Contradicts(why) => {
+            return Ok(Outcome::Failed("wrong_payload", why.encode()));
+        }
+        crate::sport::get::PayloadCheck::SeveralVideos => {
+            return Ok(Outcome::Blocked(R::SeveralVideos.encode()));
+        }
+    }
+    let videos: Vec<(&FileEntry, String)> = wanted
+        .iter()
+        .filter(|f| f.complete)
+        .filter_map(|f| candidate(&f.name).map(|rel| (*f, rel)))
+        .collect();
+    let (file, rel) = match videos.as_slice() {
+        [one] => (one.0, one.1.clone()),
+        _ => {
+            return Ok(Outcome::Blocked(R::NoVideo.encode()));
+        }
+    };
+    let ext = ext_of(&rel).unwrap_or_else(|| "mkv".into());
+    let (dest_dir, dest_name) = {
+        let (dir, _) = crate::sport::get::destination(&ev, e.part, &ext, true);
+        // What is in the folder already, lower-cased: a name another event holds, ignoring case,
+        // is not reused (it would be one file on a file system that ignores case).
+        let taken: Vec<String> = std::fs::read_dir(root.join(&dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|f| f.file_name().into_string().ok())
+            .map(|n| n.to_lowercase())
+            .collect();
+        crate::sport::get::destination_among(
+            &ev,
+            e.part,
+            &ext,
+            mm.replace_illegal_characters,
+            &taken,
+        )
+    };
+    let planned = Planned {
+        source: local_save.join(&rel),
+        // (what the journal and the history call it; the source path is `source`)
+        rel: "the video".to_string(),
+        size: file.size,
+        targets: vec![g.media_id],
+        dest_dir: dest_dir.clone(),
+        dest_name,
+        replace: None,
+        runtime: None,
+        keep_apart: vec![],
+    };
+    let canonical = match probe::validate(&planned.source, &[local_root]) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(grab = %g.id, "sport download not usable: {err}");
+            return Ok(Outcome::Blocked(R::CannotUse.encode()));
+        }
+    };
+    if let Err(err) = std::fs::File::open(&canonical) {
+        return Ok(Outcome::Blocked(
+            R::Unreadable {
+                kind: err.kind().into(),
+            }
+            .encode(),
+        ));
+    }
+    let pr = match probe::run(&lib.ffprobe, &canonical, lib.probe_timeout).await {
+        Ok(pr) => pr,
+        Err(err) => {
+            tracing::warn!(grab = %g.id, "sport download failed the media probe: {err}");
+            return Ok(Outcome::Failed("invalid_media", R::NotPlayable.encode()));
+        }
+    };
+    // (`sample_detection = false` turns the bounds off, as it does the movie sample check)
+    if let Some(why) = crate::sport::get::implausible_reason(
+        crate::sport::get::bounds(league.sport, e.part),
+        file.size,
+        pr.duration_secs,
+    )
+    .filter(|_| lib.sample_detection)
+    {
+        return Ok(Outcome::Failed(
+            "invalid_media",
+            R::Implausible { why }.encode(),
+        ));
+    }
+    let grab_quality: Option<Quality> = g
+        .quality
+        .as_deref()
+        .and_then(|q| serde_json::from_value(json!(q)).ok());
+    let eff = match crate::quality::effective(grab_quality, pr.width, pr.height) {
+        Ok(q) => q,
+        Err(err) => {
+            tracing::warn!(grab = %g.id, "sport download quality: {err}");
+            return Ok(Outcome::Failed("wrong_quality", R::WrongQuality.encode()));
+        }
+    };
+    // The sport root is confined again here, by where it really is (a link in its path, made
+    // after the configuration was read, is not followed into the downloads or another library);
+    // `publish` checks again just before the file goes in place and once more after it has.
+    let apart: Vec<PathBuf> = [local_root, local_save]
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(lib.movies.clone())
+        .chain(lib.tv.clone())
+        .collect();
+    if let Err(why) = confined(root, None, &apart) {
+        tracing::warn!(grab = %g.id, "sport root not confined: {why:?}");
+        return Ok(Outcome::Blocked(why.encode()));
+    }
+    let planned = Planned {
+        keep_apart: apart,
+        ..planned
+    };
+    // The sport root is made the first time; it is never made at startup.
+    if let Err(err) = std::fs::create_dir_all(root) {
+        return Ok(Outcome::Blocked(
+            R::CannotCreateFolder {
+                kind: err.kind().into(),
+            }
+            .encode(),
+        ));
+    }
+    match import_file(
+        st,
+        g,
+        root,
+        lib,
+        mm,
+        &planned,
+        &pr,
+        Some(eff),
+        g.revision.unwrap_or_default(),
+        now,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(FileError::Blocked(b)) => return Ok(Outcome::Blocked(b)),
+        Err(FileError::Internal(err)) => return Err(err),
+    }
+    Ok(Outcome::Imported {
+        files: 1,
+        skipped: vec![],
+        missing: vec![],
+        unfiled: vec![],
+        notes: vec![format!("saved in {}", root.join(&dest_dir).display())],
+    })
+}
+
 enum FileError {
     Blocked(String),
     Internal(anyhow::Error),
@@ -1373,7 +1761,12 @@ async fn import_file(
     .map_err(|e| FileError::Internal(e.into()))??;
     // Phase 2: a copy is a new file and is probed again; a hardlink is the probed inode.
     let probe_text = if staged.method == "copy" {
-        let canonical = probe::validate(&staged.staged, &[root]).map_err(FileError::Blocked)?;
+        let canonical = probe::validate(&staged.staged, &[root]).map_err(|e| {
+            FileError::Blocked(match g.media_id {
+                MediaId::Event(_) => R::CopyProbeFailed.encode(),
+                _ => e,
+            })
+        })?;
         match probe::run(&lib.ffprobe, &canonical, lib.probe_timeout).await {
             Ok(pr) => pr.evidence(),
             Err(e) => {
@@ -1381,14 +1774,24 @@ async fn import_file(
                     st.store.clone(),
                     staged.journal,
                     staged.staged.clone(),
-                    format!("copied file failed the media probe: {e}"),
+                    match g.media_id {
+                        MediaId::Event(_) => R::CopyProbeFailed.encode(),
+                        _ => format!("copied file failed the media probe: {e}"),
+                    },
                 );
                 tokio::task::spawn_blocking(move || rollback_staged(&store, j, &path, &why))
                     .await
                     .map_err(|e| FileError::Internal(e.into()))??;
-                return Err(FileError::Blocked(format!(
-                    "the copied file failed the media probe: {e}"
-                )));
+                tracing::warn!(grab = %g.id, "the copied file failed the media probe: {e}");
+                return Err(FileError::Blocked(match g.media_id {
+                    MediaId::Event(_) => R::CopyProbeFailed.encode(),
+                    MediaId::Movie { .. }
+                    | MediaId::Series(_)
+                    | MediaId::Season(..)
+                    | MediaId::Episode(..) => {
+                        format!("the copied file failed the media probe: {e}")
+                    }
+                }));
             }
         }
     } else {
@@ -1417,6 +1820,18 @@ async fn import_file(
 }
 
 fn journal_set(c: &Connection, id: i64, state: &str, error: Option<&str>) -> Result<()> {
+    // The journal's `error` is returned by a route: for a sport grab it is only ever a sentence
+    // the code built.
+    let sport: bool = c
+        .query_row(
+            "SELECT g.media_id LIKE 'event:%' FROM import_journal j JOIN grabs g ON g.id = j.grab_id WHERE j.id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let safe = error.filter(|_| sport).map(crate::sport::reason::classify);
+    let error = if sport { safe.as_deref() } else { error };
     c.execute(
         "UPDATE import_journal SET state = ?2, error = COALESCE(?3, error), updated_at = ?4 WHERE id = ?1",
         params![id, state, error, rfc3339(OffsetDateTime::now_utc())],
@@ -1435,32 +1850,62 @@ fn stage(
     quality: Option<String>,
     revision: Revision,
 ) -> Result<Staged, FileError> {
+    // A sport import's reasons are typed values (`sport::reason`); the others keep their text.
+    let sport = !p.keep_apart.is_empty();
+    let op = |what: crate::sport::reason::FileOp, kind: Option<std::io::ErrorKind>| R::FileOp {
+        what,
+        kind: kind.map(Into::into),
+    };
     let src_meta = std::fs::symlink_metadata(&p.source).map_err(|e| {
-        FileError::Blocked(format!("{}: cannot stat the source: {}", p.rel, e.kind()))
+        FileError::Blocked(if sport {
+            op(FO::StatSource, Some(e.kind())).encode()
+        } else {
+            format!("{}: cannot stat the source: {}", p.rel, e.kind())
+        })
     })?;
     if !src_meta.file_type().is_file() {
-        return Err(FileError::Blocked(format!(
-            "{} is not a regular file",
-            p.rel
-        )));
+        return Err(FileError::Blocked(if sport {
+            op(FO::NotRegular, None).encode()
+        } else {
+            format!("{} is not a regular file", p.rel)
+        }));
     }
     if p.size > 0 && src_meta.len() != p.size {
-        return Err(FileError::Blocked(format!(
-            "{}: size on disk differs from the torrent",
-            p.rel
-        )));
+        return Err(FileError::Blocked(if sport {
+            op(FO::SizeDiffers, None).encode()
+        } else {
+            format!("{}: size on disk differs from the torrent", p.rel)
+        }));
     }
-    let dest_dir = paths::ensure_dirs(root, &p.dest_dir).map_err(FileError::Blocked)?;
+    let dest_dir = paths::ensure_dirs(root, &p.dest_dir).map_err(|e| {
+        FileError::Blocked(if sport {
+            {
+                tracing::warn!("sport folder unusable: {e}");
+                R::SportFolderUnusable.encode()
+            }
+        } else {
+            e
+        })
+    })?;
     let dest = dest_dir.join(&p.dest_name);
     let replaced_abs = p.replace.as_ref().map(|r| root.join(&r.path));
     if std::fs::symlink_metadata(&dest).is_ok() && replaced_abs.as_deref() != Some(dest.as_path()) {
-        return Err(FileError::Blocked(format!(
-            "{} already exists in the library; nothing is overwritten",
-            dest.strip_prefix(root).unwrap_or(&dest).display()
-        )));
+        return Err(FileError::Blocked(if sport {
+            R::DestinationTaken.encode()
+        } else {
+            format!(
+                "{} already exists in the library; nothing is overwritten",
+                dest.strip_prefix(root).unwrap_or(&dest).display()
+            )
+        }));
     }
-    let (dest_dev, _) = crate::fsutil::file_id(&dest_dir)
-        .map_err(|e| FileError::Blocked(format!("cannot stat the destination: {}", e.kind())))?;
+    let (dest_dev, _) = crate::fsutil::file_id(&dest_dir).map_err(|e| {
+        FileError::Blocked(if sport {
+            op(FO::StatDestination, Some(e.kind())).encode()
+        } else {
+            format!("cannot stat the destination: {}", e.kind())
+        })
+    })?;
     let same_fs = crate::fsutil::file_id(&p.source).is_ok_and(|(dev, _)| dev == dest_dev);
     let mut method = if hardlinks && same_fs {
         "hardlink"
@@ -1470,12 +1915,21 @@ fn stage(
     let free = paths::free_bytes(&dest_dir).unwrap_or(0);
     let needed = if method == "copy" { src_meta.len() } else { 0 };
     if free < needed.saturating_add(min_free) {
-        return Err(FileError::Blocked(format!(
-            "not enough free space in the library ({} MiB free; {} MiB needed plus the {} MiB minimum)",
-            free / 1_048_576,
-            needed / 1_048_576,
-            min_free / 1_048_576
-        )));
+        return Err(FileError::Blocked(if sport {
+            R::NoSpace {
+                free_mib: free / 1_048_576,
+                needed_mib: needed / 1_048_576,
+                min_mib: min_free / 1_048_576,
+            }
+            .encode()
+        } else {
+            format!(
+                "not enough free space in the library ({} MiB free; {} MiB needed plus the {} MiB minimum)",
+                free / 1_048_576,
+                needed / 1_048_576,
+                min_free / 1_048_576
+            )
+        }));
     }
     let targets =
         serde_json::to_string(&p.targets.iter().map(|t| t.to_string()).collect::<Vec<_>>())
@@ -1484,7 +1938,13 @@ fn stage(
         .strip_prefix(root)
         .ok()
         .and_then(paths::rel_string)
-        .ok_or_else(|| FileError::Blocked("destination escaped the root".into()))?;
+        .ok_or_else(|| {
+            FileError::Blocked(if sport {
+                op(FO::EscapedRoot, None).encode()
+            } else {
+                "destination escaped the root".into()
+            })
+        })?;
     let journal = store.blocking(|c| {
         c.execute(
             "INSERT INTO import_journal (grab_id, source, root, dest, targets, size, method, state, replaced_file_id, replaced_path, quality, revision_version, revision_real, updated_at)
@@ -1536,8 +1996,15 @@ fn stage(
     }
     if let Err(e) = result {
         let _ = std::fs::remove_file(&staged);
-        store.blocking(|c| journal_set(c, journal, "rolled_back", Some(&e)))?;
-        return Err(FileError::Blocked(format!("{}: {e}", p.rel)));
+        let (stored, shown) = if sport {
+            tracing::warn!(grab = %grab_id, "staging failed: {e}");
+            let r = op(FO::LinkOrCopy, None).encode();
+            (r.clone(), r)
+        } else {
+            (e.clone(), format!("{}: {e}", p.rel))
+        };
+        store.blocking(|c| journal_set(c, journal, "rolled_back", Some(&stored)))?;
+        return Err(FileError::Blocked(shown));
     }
     let ino = crate::fsutil::file_id(&staged)
         .map(|(_, ino)| ino)
@@ -1549,6 +2016,7 @@ fn stage(
         )?;
         Ok(())
     })?;
+    failpoint(grab_id, "after_stage")?;
     Ok(Staged {
         journal,
         staged,
@@ -1624,6 +2092,17 @@ fn publish(
             Err(_) => {} // already gone: a plain import that retires the stale row
         }
     }
+    // A sport import checks again, immediately before the file goes in place, that its root is
+    // still apart from the downloads and the other libraries by where it really is (a movie
+    // or series import checks its root and what is below it when it stages, and not again).
+    if !p.keep_apart.is_empty()
+        && let Err(why) = confined(root, None, &p.keep_apart)
+    {
+        let _ = std::fs::remove_file(&s.staged);
+        let why = why.encode();
+        store.blocking(|c| journal_set(c, s.journal, "rolled_back", Some(&why)))?;
+        return Err(FileError::Blocked(why));
+    }
     if let Err(e) = std::fs::hard_link(&s.staged, &s.dest) {
         // Restore the original before reporting.
         if let (Some(b), Some(r)) = (&backup, &p.replace) {
@@ -1635,18 +2114,43 @@ fn publish(
                 c,
                 s.journal,
                 "rolled_back",
-                Some(&format!("publish failed: {}", e.kind())),
+                Some(&match g.media_id {
+                    MediaId::Event(_) => R::PublishFailed {
+                        kind: e.kind().into(),
+                    }
+                    .encode(),
+                    _ => format!("publish failed: {}", e.kind()),
+                }),
             )
         })?;
-        return Err(FileError::Blocked(format!(
-            "cannot publish {}: {}",
-            s.dest.display(),
-            e.kind()
-        )));
+        return Err(FileError::Blocked(match g.media_id {
+            MediaId::Event(_) => R::PublishFailed {
+                kind: e.kind().into(),
+            }
+            .encode(),
+            MediaId::Movie { .. }
+            | MediaId::Series(_)
+            | MediaId::Season(..)
+            | MediaId::Episode(..) => format!("cannot publish {}: {}", s.dest.display(), e.kind()),
+        }));
+    }
+    failpoint(&g.id, "after_link")?;
+    // ...and once more with the file in place: where it really is must be under the sport root
+    // and outside every download folder, or it is taken back through the journal. (Movies and
+    // series do not verify after publishing.)
+    if !p.keep_apart.is_empty()
+        && let Err(why) = confined(root, Some(&s.dest), &p.keep_apart)
+    {
+        let _ = std::fs::remove_file(&s.dest);
+        let _ = std::fs::remove_file(&s.staged);
+        let why = why.encode();
+        store.blocking(|c| journal_set(c, s.journal, "rolled_back", Some(&why)))?;
+        return Err(FileError::Blocked(why));
     }
     let _ = std::fs::remove_file(&s.staged);
     let _ = crate::fsutil::fsync_dir(&s.dest_dir);
     store.blocking(|c| journal_set(c, s.journal, "published", None))?;
+    failpoint(&g.id, "after_published")?;
     let dest_rel = s
         .dest
         .strip_prefix(root)
@@ -1673,9 +2177,26 @@ fn publish(
         {
             tx.execute("UPDATE files SET present = 0 WHERE id = ?1", [r.file_id])?;
         }
-        // A stale row for the same path (e.g. a scan of an earlier copy) is retired.
-        tx.execute("UPDATE files SET present = 0 WHERE media_id = ?1 AND path = ?2 AND present = 1", params![g.media_id.to_string(), dest_rel])?;
-        library::insert_file(&tx, &g.media_id.to_string(), &ev, &p.targets, Some(&g.id), mtime)?;
+        match g.media_id {
+            // A sport file is recorded in `sport_files` and nowhere else: the `files` table
+            // is never written for an event.
+            MediaId::Event(e) => crate::sport::files::insert(
+                &tx,
+                &e.event_id(),
+                &e.part.slug().unwrap_or_default(),
+                &dest_rel,
+                p.size,
+                quality.as_deref(),
+                probe_text,
+                &g.id,
+                &now_s,
+            )?,
+            MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) => {
+                // A stale row for the same path (e.g. a scan of an earlier copy) is retired.
+                tx.execute("UPDATE files SET present = 0 WHERE media_id = ?1 AND path = ?2 AND present = 1", params![g.media_id.to_string(), dest_rel])?;
+                library::insert_file(&tx, &g.media_id.to_string(), &ev, &p.targets, Some(&g.id), mtime)?;
+            }
+        }
         tx.execute("UPDATE import_journal SET state = 'committed', probe = ?2, updated_at = ?3 WHERE id = ?1", params![s.journal, probe_text, now_s])?;
         tx.execute("UPDATE grabs SET imported_files = imported_files + 1 WHERE id = ?1", [&g.id])?;
         library::event(
@@ -1685,12 +2206,20 @@ fn publish(
             Some(&g.media_id.to_string()),
             Some(&p.targets[0].to_string()),
             Some(&g.id),
-            &format!("{} -> {dest_rel} ({})", p.rel, s.method),
+            &match g.media_id {
+                // (a sport grab's title is the event's own name: the history begins with it)
+                MediaId::Event(_) => format!("{}: filed as {dest_rel} ({})", g.title, s.method),
+                MediaId::Movie { .. }
+                | MediaId::Series(_)
+                | MediaId::Season(..)
+                | MediaId::Episode(..) => format!("{} -> {dest_rel} ({})", p.rel, s.method),
+            },
             Some(&json!({ "method": s.method, "targets": p.targets, "replaced": p.replace.as_ref().map(|r| r.path.clone()), "probe": probe_text })),
         )?;
         tx.commit()?;
         Ok(())
     })?;
+    failpoint(&g.id, "after_commit")?;
     if let Some(b) = backup {
         let _ = std::fs::remove_file(&b);
         store.blocking(|c| journal_set(c, s.journal, "backup_removed", None))?;

@@ -575,7 +575,7 @@ async fn process(
             Match::Movie(id) => id,
             Match::Season(k, s) => MediaId::Season(k, s),
         };
-        let media = downloads::media_kind(id);
+        let media = downloads::policy_kind(id);
         if !r
             .indexer_id
             .and_then(|i| u32::try_from(i).ok())

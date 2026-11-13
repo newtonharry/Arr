@@ -81,6 +81,9 @@ pub struct FakeState {
     pub add_fails: bool,
     /// The next add is refused (the client answers "not added").
     pub refuse_next_add: bool,
+    /// Every add fails as invalid, with this text in the answer (an engine that names the
+    /// torrent in its error).
+    pub add_invalid_text: Option<String>,
     /// Where data is written, and the save path the application knows (set when attached).
     pub download_dir: PathBuf,
     pub save_path: String,
@@ -281,6 +284,11 @@ impl Fake {
     pub async fn add(&self, req: &AddRequest) -> Result<bool, UpstreamError> {
         let mut s = self.lock();
         s.gate("add".into())?;
+        if let Some(t) = s.add_invalid_text.clone() {
+            return Err(UpstreamError::BadResponse {
+                reason: format!("invalid torrent: {t}"),
+            });
+        }
         let (hash, magnet) = match &req.payload {
             Payload::Torrent(b) => (
                 crate::torrent::info_hash(b).map_err(|_| UpstreamError::BadResponse {

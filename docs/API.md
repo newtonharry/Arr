@@ -543,6 +543,24 @@ whole event (its first early prelim). Copies are looked for only after it.
   `/media/{id}/releases`), an unknown event (`404`) and a malformed id or part (`400`) are errors.
   What the matcher accepts is in `ARCHITECTURE.md`.
 
+### Picking a copy of a sport event
+
+`POST /api/v1/sport/event/{id}/get` with `{"id": "rel_<24 hex>", "confirm": false}` starts the
+download of one copy listed by `GET .../copies` for that event in the last week: the shows'
+download client, a grab for the event's part, named from the stored event. `201 {grab, message}`.
+`id` is the copy's `id`: a one-way reference that exists only for copies that were listed for
+this event (`404 release_not_found` for anything else, including a copy listed for another event
+or more than a week ago). A copy whose `caution` is not null needs `"confirm": true`, or the
+answer is `409 confirmation_needed` with `error.details.caution`. Other refusals: `409
+already_have` (that part is already filed), `409 not_played_yet` (not over, cancelled or
+postponed), `409 blocklisted`, `already_queued`, `client_not_configured`, as for any download.
+Arr never picks a copy on its own. The download shows in `/queue` and `/feed` under the event's
+name (`UFC 334: Gane vs. Hokit - Main card`); `client_name` is `null` for it, and a failed one has
+`why` (one plain sentence) and `find_another` (the event id, to look for copies again) in
+`needs_you`. The copy is filed under the Sport folder (`[library] sport`, by default beside the
+movies root) as `<League>/<Season>/<League> - <date> - <Event>[ - <Part>].<ext>`, recorded in its
+own table, never in the movie and series listings. Sport files cannot be deleted from Arr yet.
+
 A team's label in follows, the league page and search is the one in the stored team list, which
 a successful read of the list corrects; `since` never changes. An event's own `home`, `away`,
 `name` and `short_name` are as of its last refresh. A request that waits for the schedule source

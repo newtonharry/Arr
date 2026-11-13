@@ -52,6 +52,33 @@ pub fn create_tables(c: &Connection) -> Result<()> {
             abbreviation TEXT,
             PRIMARY KEY (league, team_id)
         );
+        -- The files sport has filed. Its own table: the movie and series `files` table and
+        -- the scan never see a sport row. One present file per event and part.
+        CREATE TABLE IF NOT EXISTS sport_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            part TEXT NOT NULL DEFAULT '',
+            path TEXT NOT NULL,
+            size INTEGER,
+            quality TEXT,
+            probe TEXT,
+            grab_id TEXT,
+            present INTEGER NOT NULL DEFAULT 1,
+            imported_utc TEXT NOT NULL,
+            observed_utc TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS sport_files_one ON sport_files(event_id, part) WHERE present = 1;
+        CREATE INDEX IF NOT EXISTS sport_files_by_event ON sport_files(event_id);
+        -- What a listed copy was judged to be when the copies answer saved it, so a pick is
+        -- decided on what the person was shown (a `likely` copy needs a confirmation).
+        CREATE TABLE IF NOT EXISTS sport_picks (
+            release_ref TEXT NOT NULL,
+            target TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            reason TEXT,
+            seen_utc TEXT NOT NULL,
+            PRIMARY KEY (release_ref, target)
+        );
         -- Fixtures a schedule read listed but did not store because they were over before the
         -- league was followed. They are never served: they are only evidence, so that no other
         -- fixture fits is judged over everything the recorded stretch listed, and not only

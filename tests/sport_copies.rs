@@ -318,7 +318,7 @@ async fn no_text_a_release_wrote_reaches_the_client() {
 }
 
 #[tokio::test]
-async fn looking_for_copies_changes_nothing() {
+async fn looking_for_copies_starts_nothing_and_only_keeps_the_links_of_what_it_lists() {
     let (e, start) = ufc_setup().await;
     stock(
         &e,
@@ -333,11 +333,16 @@ async fn looking_for_copies_changes_nothing() {
     let (s, v, _) = copies(&e, "event:ufc:600061400", "?part=main&fresh=true").await;
     assert_eq!(s, 200);
     assert_eq!(v["copies"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        table_counts(&e).await,
-        before,
-        "no table gained or lost a row"
-    );
+    // The listed copies' links are kept for a week (so one can be picked); nothing else gained
+    // or lost a row, and nothing was sent to a download client.
+    let after = table_counts(&e).await;
+    for ((t, b), (_, a)) in before.iter().zip(&after) {
+        if t == "release_links" {
+            assert_eq!(*a, b + 1, "{t}");
+        } else {
+            assert_eq!(a, b, "{t} changed");
+        }
+    }
     // The route reads: it has no write verb, and nothing was sent to a download client.
     let (s, _, _) = e
         .json(e.post("/api/v1/sport/event/event:ufc:600061400/copies"))

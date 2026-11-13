@@ -18,12 +18,33 @@ pub enum SeriesKey {
     Tvmaze(u32),
 }
 
+/// One sport event, or one part of it: `event:<league>:<espn id>[:<part>]`. The league is the
+/// catalogue's own slug, so the id stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EventRef {
+    pub league: &'static str,
+    pub espn: u64,
+    pub part: crate::sport::Part,
+}
+
+impl EventRef {
+    /// The event's own id, without a part: how `sport_events` and `sport_files` key it.
+    pub fn event_id(&self) -> String {
+        format!("event:{}:{}", self.league, self.espn)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MediaId {
-    Movie { tmdb: u32 },
+    Movie {
+        tmdb: u32,
+    },
     Series(SeriesKey),
     Season(SeriesKey, u16),
     Episode(SeriesKey, u16, u16),
+    /// A sport event (or a part of one). It is not a title: it has no catalogue entry, no
+    /// profile and no `media` row, and it is kept out of every movie and series list.
+    Event(EventRef),
 }
 
 impl MediaId {
@@ -33,12 +54,13 @@ impl MediaId {
             MediaId::Series(_) => "series",
             MediaId::Season(..) => "season",
             MediaId::Episode(..) => "episode",
+            MediaId::Event(_) => "event",
         }
     }
 
     pub fn series_key(&self) -> Option<SeriesKey> {
         match *self {
-            MediaId::Movie { .. } => None,
+            MediaId::Movie { .. } | MediaId::Event(_) => None,
             MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => Some(k),
         }
     }
@@ -60,6 +82,13 @@ impl fmt::Display for MediaId {
             MediaId::Series(k) => write!(f, "series:{k}"),
             MediaId::Season(k, s) => write!(f, "season:{k}:{s}"),
             MediaId::Episode(k, s, e) => write!(f, "episode:{k}:{s}:{e}"),
+            MediaId::Event(e) => {
+                write!(f, "event:{}:{}", e.league, e.espn)?;
+                match e.part.slug() {
+                    Some(p) => write!(f, ":{p}"),
+                    None => Ok(()),
+                }
+            }
         }
     }
 }
@@ -111,6 +140,22 @@ impl FromStr for MediaId {
                 )),
             }
         };
+        let event = |slug: &str, id: &str, part| -> Result<MediaId, MediaIdError> {
+            let league = crate::sport::catalog::find(slug)
+                .ok_or_else(|| MediaIdError("event league is not one Arr knows".into()))?;
+            let valid = !id.is_empty()
+                && id.len() <= 18
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && !id.starts_with('0');
+            let espn = id.parse::<u64>().ok().filter(|_| valid).ok_or_else(|| {
+                MediaIdError("event id must be digits without leading zeros".into())
+            })?;
+            Ok(MediaId::Event(EventRef {
+                league: league.slug,
+                espn,
+                part,
+            }))
+        };
         let season = |p: &str| number(p, "season", u32::from(MAX_SEASON)).map(|v| v as u16);
         let episode = |p: &str| number(p, "episode", u32::from(MAX_EPISODE)).map(|v| v as u16);
         match parts.as_slice() {
@@ -125,8 +170,13 @@ impl FromStr for MediaId {
                 season(s)?,
                 episode(e)?,
             )),
+            ["event", slug, id] => event(slug, id, crate::sport::Part::Whole),
+            ["event", slug, id, part] => match crate::sport::Part::from_slug(part) {
+                Some(p) => event(slug, id, p),
+                None => Err(MediaIdError("event part is not one a sport has".into())),
+            },
             _ => Err(MediaIdError(
-                "expected movie:tmdb:<id>, series:<tvdb|tvmaze>:<id>, season:<ns>:<id>:<season> or episode:<ns>:<id>:<season>:<episode>".into(),
+                "expected movie:tmdb:<id>, series:<tvdb|tvmaze>:<id>, season:<ns>:<id>:<season>, episode:<ns>:<id>:<season>:<episode> or event:<league>:<id>[:<part>]".into(),
             )),
         }
     }

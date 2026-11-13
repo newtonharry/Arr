@@ -237,7 +237,10 @@ fn walk(root: &Path, items: &[Item], recorded_files: usize) -> Walk {
             }
             let targets = match item.media_id {
                 MediaId::Movie { .. } => vec![item.media_id],
-                _ => {
+                MediaId::Series(_)
+                | MediaId::Season(..)
+                | MediaId::Episode(..)
+                | MediaId::Event(_) => {
                     let base = rel.rsplit('/').next().unwrap_or(&rel);
                     match release::parse(base).numbering {
                         Numbering::Episodes { season, episodes }
@@ -334,6 +337,8 @@ pub async fn scan(st: &AppState, now: OffsetDateTime, explicit: bool) -> Result<
         });
         let mut items = vec![];
         let mut owned_items = 0usize;
+        // (movies and TV only: sport files are never scanned, listed or owned as titles, they
+        // are recorded in `sport_files` at import and nowhere else)
         match media {
             MediaKind::Movie => {
                 for m in index
@@ -600,7 +605,10 @@ fn item_for(
                 identity: crate::identity::Identity::movie(m),
             })
         }
-        other => {
+        // A sport event is never scanned: it has no catalogue folder, and its files are
+        // `sport_files`, not `files`.
+        MediaId::Event(_) => None,
+        other @ (MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..)) => {
             let s = index.series(other.series_key()?)?;
             let folder = s
                 .folder
@@ -636,7 +644,7 @@ pub async fn scan_item(
             json!({ "status": "not_configured", "detail": "no [library] roots are configured" }),
         );
     };
-    let media = crate::downloads::media_kind(media_id);
+    let media = crate::downloads::policy_kind(media_id);
     let Some(root) = ingest::root_for(&lib, media).map(Path::to_path_buf) else {
         return Ok(
             json!({ "status": "not_configured", "detail": format!("no [library] root for {}", media.label()) }),
@@ -645,10 +653,12 @@ pub async fn scan_item(
     let index = st.index();
     let root_folder = match media_id {
         MediaId::Movie { tmdb } => index.movie(tmdb).and_then(|m| m.root_folder.clone()),
-        other => other
-            .series_key()
-            .and_then(|k| index.series(k))
-            .and_then(|s| s.root_folder.clone()),
+        MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
+            index.series(k).and_then(|s| s.root_folder.clone())
+        }
+        MediaId::Event(_) => {
+            return Ok(json!({ "status": "not_scanned", "detail": "sport files are not scanned" }));
+        }
     };
     if !ingest::root_matches(st, media, root_folder.as_deref()) {
         return Ok(

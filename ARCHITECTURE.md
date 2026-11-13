@@ -461,7 +461,7 @@ RSS reports retrieval status separately and never promises gap-free coverage.
 Sport is a module (`src/sport/`) and a set of tables (`sport_follows`, `sport_events`,
 `sport_teams`, `sport_refresh`, added with `CREATE TABLE IF NOT EXISTS` inside schema 3, so an
 older release ignores them) that sits beside movies and series. It is **not** a third media kind:
-no `MediaId` variant, no download, no import and no Plex call exists for sport yet. A search for the releases of one event exists, and only reads.
+no title and no catalogue entry. Phase D (below) joins it to the grab, journal and import machinery as `MediaId::Event`; before it, only a search for the releases of one event existed.
 
 What exists (phase one: schedules and follows):
 
@@ -524,6 +524,171 @@ follows:
 - **Known limit.** A positive rule for names cannot prove that a proper noun is not a result
   written in title case ("Smith Overcomes Jones" is made of capitalised words); the reject list is
   what stands behind that case, and a result phrased without any listed word would pass it.
+
+### Picking and filing (phase D)
+
+A person picks a copy by hand; nothing is ever picked automatically.
+
+- **`MediaId::Event(EventRef { league, espn, part })`** (`event:<league>:<id>[:<part>]`) reuses
+  `grabs`, `grab_targets`, `release_links`, `import_journal`, the poller, the outbox and the
+  client. It uses the shows' settings (`policy_kind`): the shows' download client, category,
+  indexers, seed goals and import settings, so sport downloading needs TV downloading set up.
+  Every `match` on a `MediaId` is explicit: there is no `_ =>` arm that treats "not a movie" as a
+  series, and `clippy::wildcard_enum_match_arm` is denied on the functions that match one. Every
+  route that takes a title id goes through `parse_media_id`, which refuses an event id
+  (`invalid_media_id`); a test sends an event id to every route in `ROUTES` that takes a media id.
+  The delete routes refuse events (`delete_refused`).
+- **The copy reference.** `GET .../copies` saves, for a week from the last listing, the link
+  material of each copy it lists (`release_links`, target = event and part) and what it was judged
+  to be (`sport_picks`). A copy's `id` is `rel_` and 24 hex of a SHA-256 of the release's identity:
+  one-way, and good only with the event it was listed for (a row is looked up by the reference
+  *and* the event). `POST .../get {id, confirm}` finds that row or answers `404 release_not_found`;
+  it cannot fetch anything that was not listed for that event. A copy that carried a caution
+  needs `confirm: true` (`409 confirmation_needed`, with the caution). The grab's title is the
+  event's name (`UFC 334: Gane vs. Hokit - Main card`), never the release's; the grab view does not
+  show the torrent's name either.
+- **Gates in `enqueue`** (all explicit for events): the sport root must exist as a setting
+  (`execution_blocker_for`); the event must exist in the store, not be cancelled, postponed or
+  unlisted, and be over (`gate_now`, in the grab's transaction, so a cancel racing the fetch wins);
+  a part that already has a file is refused (`already_have`); coverage, the blocklist and the
+  duplicate-torrent check are the shows'. The payload's own names are judged by the sport matcher
+  against the event: only a positive contradiction (another league, number, fighters, teams, date,
+  season, round, tournament, or a show about the event) fails it as `wrong_payload`, blocklisted.
+  A failed download is not searched for again automatically.
+- **Import (`ingest::import_event`).** The payload is judged again after the download, before
+  anything is filed. Nothing wanted in it may be an executable or an archive (including rar and
+  split-zip volumes): the download fails as `unsafe_payload`. It must hold exactly one video
+  (`import_blocked`, "more than one video file; this copy needs picking apart by hand"). The
+  probed video must be of a plausible duration and size for the sport and part
+  (`sport::get::bounds`): soccer 45 min to 4.5 h; basketball and rugby 60 min to 4.5 h; a fight
+  card: the whole 90 min to 9 h, main card 45 min to 4.5 h, prelims 30 min to 4 h, early prelims
+  15 min to 3 h; a golf round 30 min to 10 h, a whole tournament 30 min to 48 h; for all, a file
+  of at least 100 MiB and at most 150 GiB. Outside them the download fails as `invalid_media`.
+  `[library] sample_detection = false` turns the bounds off, as it does the movie sample check.
+  What happens to a refused payload is what happens to a movie's: a *failed* outcome (unsafe,
+  invalid media, wrong payload or quality) marks the grab failed, blocklists the release for this
+  event, stops the torrent and removes it per `removeFailedDownloads`, and the feed says why in one
+  sentence with "Find another copy"; a *blocked* outcome (more than one video, a part already filed,
+  a file at the destination) keeps the grab in `import_blocked`, retried with a backoff, in "Needs
+  you".
+- **Where it lands.** `[library] sport` (default: a `Sport` folder beside the movies root, so it is
+  on the same drive and a hard link works; made on the first import, never at startup):
+  `<Sport>/<League>/<Season>/<League> - <YYYY-MM-DD> - <Event>[ - <Part>].<ext>`, named only from the
+  stored event. The file is recorded in `sport_files` (one present file per event and part), never
+  in `files`; the movie and series tables, the scan, the catalogue and every list never see it.
+  Nothing existing is overwritten (`stage` refuses a file at the destination; a part already filed
+  is refused first). Staging, the journal and the startup recovery are the shared ones: a crash
+  before the file is in place rolls the staged and published inode back and leaves the download
+  intact; a crash after the commit leaves the file and its `sport_files` row, which are written in
+  one transaction.
+- **Plex.** `[plex] sport_section` / `sport_path` (default: a `Sport` folder beside `movies_path`).
+  After an import the `plex_refresh` command finds the section whose location is the sport folder,
+  or the one remembered, or creates a plain "Other Videos" library once: `POST library/sections`
+  with the token header and the query `name=Sport`, `type=movie`, `agent=com.plexapp.agents.none`,
+  `scanner=Plex Video Files Scanner`, `language=en-US`, `location=<the Plex-side sport folder>`.
+  It then scans `<League>/<Season>`. If Plex cannot be asked, or refuses, the import still
+  succeeded and the command says "Saved in <folder>; add it to Plex as an Other Videos library".
+  This request is tested only against a fake.
+- **Library roots.** The effective sport root (`[library] sport`, else a folder beside the movies
+  root named `sport` beside `movies` and `Sport` beside `Movies`) is a library root:
+  `LibraryConfig::roots()` lists movies, TV and sport, and config validation (qBittorrent
+  `local_path`, the embedded `download_dir`, and the sport root against movies and TV) and a
+  download's removal both use it. Sites that list only movies and TV say why in a comment (the
+  scan, the storage and bootstrap numbers, which never see sport).
+- **Links and picks.** `load_link` never lets an event's link answer for any other target or the
+  reverse; a pick finds its listing only within seven days (`load_listed` enforces the cutoff, the
+  prune only reclaims space).
+- **Payload judgement.** Every matcher refusal code is classified once, exhaustively
+  (`sport::get::evidence_of`): contradictions fail the download, missing evidence is tolerated; an
+  explicitly different part also fails. The torrent's name and each folder and file name of the
+  video are judged again before filing. Every sentence a client can read about a sport download is
+  built from the stored event; the torrent's own text goes to the log only.
+- **Payload names** are not release titles: `sport::payload` is a scanner of its own over the
+  words of a name (the torrent's name, each folder of every entry, and each video's own name;
+  component boundaries are hard, and the one reading across one is a league or series word at the
+  end of a component joined to a number that is the whole of the next). It looks only for
+  positive claims and tolerates the rest; a form outside
+  this list claims nothing, by design (a stated residual). What it recognises:
+  - *Dates*: numeric with a four-digit year first, in the middle or last, with any separator
+    (`.`, `-`, `_`, space or none: `2026.01.01`, `01.2026.01`, `01-01-2026`, `20260101`,
+    `01012026`), a two-digit year (`01.01.26`), and English month names or abbreviations as day,
+    month, year or month, day, year (`Jan.01.2026`, `1 January 2026`). A season span (`2026-27`)
+    is never a date.
+    Where day and month are ambiguous it contradicts only if no reading is within a day of the
+    event (or outside the tournament, for golf). Not dates: a labelled checksum or id
+    (`CRC32.20240101`), a hex run (`[ABCD1234]`), anything inside a resolution, codec or audio
+    token, a lone year.
+  - *Card numbers* (fight cards): every `<league or series word> <number>`, in each component and
+    across a boundary only for a league word ending one component and a number that is the whole
+    of the next (`UFC/333/video.mkv`); one number is tolerated when the stored name has none, two
+    different ones are not.
+  - *Pairs*: `vs`, `v`, `versus`, `x`, a spaced hyphen. Each side alone, cleaned of league, series,
+    date, part, round and technical words at both ends: a club resolving to another team of the
+    league contradicts even if the other side is right; a fighter does when the side's last word
+    is the surname of a fighter in another stored event within a year and not of this event; a
+    side that resolves to nobody (given names, initials) is tolerated. No shared words is never a
+    contradiction by itself.
+  - *Parts* (fight cards): prelims, prelim, preliminary card, preliminaries, early prelims, early
+    preliminary card, main card, main event (a single bout), full event, full card, complete,
+    and the Spanish and Portuguese forms (preliminares, cartelera preliminar, cartelera
+    principal, estelar, card principal, card preliminar); any part other than the one picked,
+    whole event included in both directions, or two in one name, contradicts. Golf: a round number
+    must be the round picked. Team sports: `Round 12`, `Matchweek 9` are a competition round,
+    compared with the stored round if there is one, never a part.
+  - *Markers*: the shoulder words and the multi-word shoulder sequences of the release parser
+    (`Press Conference`, `Weigh In`, `Post Fight`, ...), non-event words, and season-and-episode
+    patterns (`S01E02`, `S01.E02`, `S01 E02`, `1x02`, `Episode 2`, `Ep 2`).
+  - *Other competitions* (catalogue aliases not part of the event's own name), other sports'
+    labels, and for golf a known major that is not the event's own.
+  Component boundaries are hard (no date, season or pair runs across one); every folder of every
+  entry is judged, the base name only of a video. Videos are counted over every extension the code
+  knows as video (importable or not); a `Sample/` folder holding a video is a second video and
+  refuses in this cut.
+- **Roots and links.** `paths::resolved` tolerates only a missing component; no permission, a
+  dangling link or a loop fails closed. The sport root is compared by where it really is at load,
+  before staging, again just before the file is published and, with the file in place, the filed
+  file's resolved path must be under the sport root and outside every download folder or it is
+  taken back through the journal. Movies and series check their root and what is below it when
+  they stage, and nothing at the other points.
+- **Residual risk (accepted).** The import checks that the sport root is apart from the downloads
+  before staging, just before publishing and, after publishing, that the filed file resolved under
+  the sport root. A local user able to replace an ancestor directory of the library root between
+  those checks and the write is not stopped: file operations are not anchored to directory
+  handles. Movie and series imports have the same property today (they check the root and what is
+  below it, once, at staging), and that user can already redirect those imports.
+- **Closed records.** A `Reason` or `HistoryEvent` has no free string field: each field is a number
+  with a range, a bool, or a value of a closed enum (a claim, a part, a file operation, an I/O error
+  kind, where a filed video landed). The event's name, league and part are never stored; they are
+  filled in at render time from the stored event. A stored value decodes only if it is short, a
+  single record of a known kind, in exactly the canonical form this code writes (an extra field,
+  other spacing, an out-of-range number, a nested or repeated prefix all fail), and then renders;
+  anything else renders as one generic sentence. A unit test replaces every string in a record of
+  every variant with hostile text and asserts the decode fails. The Plex step's result
+  (`commands.result`, returned by `GET /commands` and `GET /commands/{id}`) is reduced for a sport
+  event's command to whether the folder was refreshed and at which scope, or one fixed sentence.
+- **Typed reasons and history.** Nothing a client, the engine or the payload wrote reaches a
+  client for a sport grab. A reason is a `sport::reason::Reason` value stored encoded in
+  `grabs.last_error`, `cleanup_detail` and `import_journal.error` and rendered where it is shown;
+  a history line is a `sport::reason::HistoryEvent` (decided by the line's kind alone, text and
+  data not kept) stored in `events.message` by `library::event`. Every read renders through one
+  function and anything that is not a typed record is one generic sentence: `downloads::view`
+  (via `sport_read`) for the queue, queue item, grab actions and the attention list,
+  `get::history_message` for `/history` and the queue item's events, `get::grab_title` for a
+  grab's title and a blocklist entry's, `grab_brief` for status, and `feed_facts` for the feed
+  (the MCP tools and push bodies read these routes' output).
+- **Names.** The part and extension are reserved first and the event name is cut by bytes with a
+  short tag of the event id; each component avoids trailing dots and spaces, control characters and
+  reserved Windows names; a name another event holds (ignoring case) gets the tag.
+- **Plex.** A section is created only when the Sport-side folder is known: `plex.sport_path`, or
+  Plex's own `GET services/browse/<base64 path>?includeFiles=1` shows the video just filed in the
+  inferred folder. A remembered section is scoped to the Plex machine identifier (`GET identity`)
+  and root, and its folder is checked on each reuse.
+- **Crash tests.** `ingest::CRASH_AT` stops an import at `after_stage`, `after_link`,
+  `after_published`, `after_commit` or `before_apply` with exactly what a crash there leaves.
+- **Unfollowing** deletes nothing (a follow row only); sport files cannot be deleted from Arr yet.
+- **The first pass over team lists** after a fresh start reads one league a minute (the worker's
+  `sports` task runs every minute while any league with teams has never been read and is not
+  waiting out a failure), then two every 15 minutes as before.
 
 ### Release matching
 

@@ -209,8 +209,66 @@ pub fn queue_command(
     Ok(id)
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// A command as stored. It has no `Serialize`: a client only ever gets `PublicCommand`, which
+/// `public()` makes (so a route cannot return a stored row by accident).
+#[derive(Debug, Clone)]
 pub struct Command {
+    pub id: String,
+    pub name: String,
+    pub media_id: Option<String>,
+    pub state: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub result: Option<Value>,
+    pub attempts: i64,
+}
+
+impl Command {
+    /// The command as a client may read it. The result of a sport event's command (the Plex step)
+    /// can hold text from the person's own Plex server (a library's title) and their folders, so
+    /// only fixed values are returned: whether the folder was refreshed and where, or a fixed
+    /// sentence saying the step did not run.
+    pub fn public(mut self) -> PublicCommand {
+        if self
+            .media_id
+            .as_deref()
+            .is_some_and(|m| m.starts_with("event:"))
+        {
+            self.result = self.result.take().map(|r| {
+                if r["refreshed"] == true {
+                    serde_json::json!({
+                        "refreshed": true,
+                        "section": r["section"].as_u64(),
+                        "scope": if r["scope"] == "folder" { "folder" } else { "section" },
+                    })
+                } else if r.get("skipped").is_some() || r.get("note").is_some() {
+                    serde_json::json!({
+                        "refreshed": false,
+                        "note": "Plex was not updated; the video is in the Sport folder (Arr's log has the details)",
+                    })
+                } else {
+                    serde_json::json!({})
+                }
+            });
+        }
+        PublicCommand {
+            id: self.id,
+            name: self.name,
+            media_id: self.media_id,
+            state: self.state,
+            created_at: self.created_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            result: self.result,
+            attempts: self.attempts,
+        }
+    }
+}
+
+/// A command as a client may read it: the only serialisable form of `Command`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicCommand {
     pub id: String,
     pub name: String,
     pub media_id: Option<String>,
@@ -385,7 +443,16 @@ fn interval(st: &AppState, name: &str) -> Option<Duration> {
         "prune" => Some(Duration::from_secs(86_400)),
         "bin" => Some(Duration::from_secs(3_600)),
         // Cheap when nothing is due: it looks at the follows and which leagues were read when.
-        "sports" => st.sports.as_ref().map(|_| Duration::from_secs(15 * 60)),
+        // (a minute while the first pass over the catalogue's team lists is still going)
+        "sports" => st.sports.as_ref().map(|s| {
+            Duration::from_secs(
+                if s.catalogue_quick.load(std::sync::atomic::Ordering::Relaxed) {
+                    60
+                } else {
+                    15 * 60
+                },
+            )
+        }),
         _ => None,
     }
 }
@@ -574,7 +641,7 @@ async fn claim(
         .await
 }
 
-enum CommandOutcome {
+pub(crate) enum CommandOutcome {
     Done(Value),
     /// More work remains (batched commands): back to the queue.
     Continue(Value),
@@ -646,7 +713,10 @@ async fn run_command(st: &AppState, cmd: &Command, now: OffsetDateTime) -> Comma
                 let (Some(plex), Some(id)) = (&st.plex, media) else {
                     return Ok(CommandOutcome::Done(json!({ "skipped": "Plex is not configured" })));
                 };
-                let kind = crate::downloads::media_kind(id);
+                if let MediaId::Event(e) = id {
+                    return Ok(crate::sport::get::refresh_plex(st, plex, e).await);
+                }
+                let kind = crate::downloads::policy_kind(id);
                 let Some(section) = plex.section_for(kind) else {
                     return Ok(CommandOutcome::Done(json!({ "skipped": format!("no Plex section configured for {}", kind.label()) })));
                 };
@@ -655,10 +725,10 @@ async fn run_command(st: &AppState, cmd: &Command, now: OffsetDateTime) -> Comma
                 let index = st.index();
                 let folder = match id {
                     MediaId::Movie { tmdb } => index.movie(tmdb).and_then(|m| m.folder.clone()),
-                    other => other
-                        .series_key()
-                        .and_then(|k| index.series(k))
-                        .and_then(|s| s.folder.clone()),
+                    MediaId::Series(k) | MediaId::Season(k, _) | MediaId::Episode(k, _, _) => {
+                        index.series(k).and_then(|s| s.folder.clone())
+                    }
+                    MediaId::Event(_) => None,
                 };
                 let path = folder.as_deref().and_then(|f| plex.plex_path(kind, f));
                 match plex.refresh_import(section, path.as_deref()).await {
@@ -744,7 +814,9 @@ fn search_targets(st: &AppState, id: MediaId, now: OffsetDateTime) -> Vec<MediaI
             }
             seasons.into_iter().map(|n| MediaId::Season(k, n)).collect()
         }
-        other => vec![other],
+        MediaId::Movie { .. } | MediaId::Season(..) | MediaId::Episode(..) => vec![id],
+        // Nothing is searched for a sport event on a schedule in this phase: a person picks.
+        MediaId::Event(_) => vec![],
     }
 }
 
@@ -986,11 +1058,17 @@ pub async fn refresh_metadata(
 ) -> Result<Value> {
     let movies = match only {
         Some(MediaId::Movie { .. }) | None => refresh_movies(st, only, now).await?,
-        _ => json!({ "skipped": "not requested" }),
+        Some(
+            MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..) | MediaId::Event(_),
+        ) => {
+            json!({ "skipped": "not requested" })
+        }
     };
     let series = match only {
-        Some(MediaId::Movie { .. }) => json!({ "skipped": "not requested" }),
-        _ => refresh_series(st, only, now).await?,
+        Some(MediaId::Movie { .. } | MediaId::Event(_)) => json!({ "skipped": "not requested" }),
+        Some(MediaId::Series(_) | MediaId::Season(..) | MediaId::Episode(..)) | None => {
+            refresh_series(st, only, now).await?
+        }
     };
     Ok(json!({ "series": series, "movies": movies }))
 }
@@ -1085,7 +1163,7 @@ async fn refresh_series(
     // A season or episode refresh means its series.
     let only = only.map(|m| match m {
         MediaId::Season(k, _) | MediaId::Episode(k, _, _) => MediaId::Series(k),
-        other => other,
+        other @ (MediaId::Movie { .. } | MediaId::Series(_) | MediaId::Event(_)) => other,
     });
     let only_s = only.map(|m| m.to_string());
     let ids: Vec<String> = st

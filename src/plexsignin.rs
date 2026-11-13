@@ -226,8 +226,10 @@ pub async fn sections(base_url: Url, token: Secret) -> Result<Vec<Section>, Upst
         token,
         movie_section: None,
         tv_section: None,
+        sport_section: None,
         movies_path: None,
         tv_path: None,
+        sport_path: None,
         timeout: PLEX_TIMEOUT,
     })
     .sections()
