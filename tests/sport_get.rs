@@ -175,13 +175,14 @@ async fn a_picked_copy_is_filed_under_sport_named_from_the_event() {
     // from the torrent.
     let files = files_under(&sport_root(&e));
     assert_eq!(files.len(), 1, "{files:?}");
-    let rel = files[0]
-        .strip_prefix(sport_root(&e))
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    // Compared folder by folder: the separator is the platform's own.
+    let rel = files[0].strip_prefix(sport_root(&e)).unwrap().to_path_buf();
     let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
-    assert!(rel.starts_with(&format!("UFC/{}/", start.year())), "{rel}");
+    assert_eq!(
+        rel.parent().unwrap(),
+        std::path::Path::new("UFC").join(start.year().to_string()),
+        "{rel:?}"
+    );
     assert!(name.starts_with("UFC - "), "{name}");
     assert!(
         name.contains("Gane vs. Hokit") && name.ends_with("Main card.mkv"),

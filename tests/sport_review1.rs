@@ -832,7 +832,7 @@ fn file_names_fit_keep_their_parts_apart_and_are_safe_everywhere() {
     let e = ev("event:ufc:3", "NUL", Some("2026"));
     let (dir, name) = destination(&e, Part::Whole, "mkv", true);
     assert!(!name.to_lowercase().starts_with("nul"), "{name}");
-    assert_eq!(dir.to_string_lossy(), "UFC/2026");
+    assert_eq!(dir, std::path::Path::new("UFC").join("2026"));
     // A name another event holds, ignoring case, is not reused.
     let one = ev("event:ufc:5", "Same Name", Some("2026"));
     let two = ev("event:ufc:6", "SAME NAME", Some("2026"));
