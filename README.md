@@ -357,11 +357,16 @@ The installer prints this block with your paths filled in:
 }
 ```
 
-The assistant gets seven tools: `search_titles`, `add_media`, `media_status`, `requests`,
-`library`, `release_choices` and `start_download`. Ask "what's in my library" or "which
+The assistant can do what the web app does: `search_titles`, `add_media`, `get_title`,
+`media_status`, `requests`, `library`, `title_details`, sport (`sport_search`, `sport_follow`,
+`sport_events`, `sport_copies`, `sport_get`), quality, copies, the feed, and deleting files
+with the bin (`delete_preview`, `delete_files`, `bin_restore`). See
+[docs/MCP.md](docs/MCP.md) for the full list. Ask "what's in my library" or "which
 seasons of Severance do I have" and it reads your catalog, including everything Arr read
 from Plex. By default it adds what you ask for and Arr picks the release. Ask to "choose a
-release" if you want to pick one yourself.
+release" if you want to pick one yourself. Sport is always picked by hand, and deleting
+files always shows you what would go and waits for your yes first. Changing settings,
+installing updates and signing in stay in the web app.
 
 ### From ChatGPT on your phone or any device
 

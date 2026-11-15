@@ -800,101 +800,128 @@ fn enqueue_error(e: EnqueueError, provider: &str) -> ApiError {
     }
 }
 
-pub fn router(state: Arc<AppState>) -> Router {
-    let protected = Router::new()
-        .route("/api/v1/readiness", get(readiness))
-        .route("/api/v1/capabilities", get(capabilities))
-        .route("/api/v1/diagnostics", get(diagnostics))
-        .route("/api/v1/settings", get(settings))
-        .route("/api/v1/migration-report", get(migration_report))
-        .route("/api/v1/library", post(library_add))
-        .route("/api/v1/library/movies", get(library_movies))
-        .route("/api/v1/library/series", get(library_series))
-        .route("/api/v1/library/roots", get(library_roots))
-        .route("/api/v1/storage", get(storage))
-        .route(
+/// Every route behind the bearer token, with its handlers. The router is built from this list
+/// (and the parity test of the MCP server reads the same list), so a route cannot exist without
+/// being listed: see `AGENTS.md` for what adding one means.
+fn protected_routes() -> Vec<(&'static str, axum::routing::MethodRouter<Arc<AppState>>)> {
+    vec![
+        ("/api/v1/readiness", get(readiness)),
+        ("/api/v1/capabilities", get(capabilities)),
+        ("/api/v1/diagnostics", get(diagnostics)),
+        ("/api/v1/settings", get(settings)),
+        ("/api/v1/migration-report", get(migration_report)),
+        ("/api/v1/library", post(library_add)),
+        ("/api/v1/library/movies", get(library_movies)),
+        ("/api/v1/library/series", get(library_series)),
+        ("/api/v1/library/roots", get(library_roots)),
+        ("/api/v1/storage", get(storage)),
+        (
             "/api/v1/library/{media_id}",
             axum::routing::patch(library_patch).delete(library_remove),
-        )
-        .route("/api/v1/wanted", get(wanted))
-        .route("/api/v1/calendar", get(calendar))
-        .route("/api/v1/discover", get(discover))
-        .route("/api/v1/people", get(people))
-        .route("/api/v1/people/{person_id}", get(person))
-        .route("/api/v1/media/{media_id}", get(media))
-        .route("/api/v1/media/{media_id}/releases", get(releases))
-        .route("/api/v1/plans", post(create_plan).get(list_plans))
-        .route("/api/v1/plans/{plan_id}", get(get_plan))
-        .route("/api/v1/plans/{plan_id}/cancel", post(cancel_plan))
-        .route("/api/v1/plans/{plan_id}/execute", post(execute_plan))
-        .route("/api/v1/grabs", post(grab))
-        .route("/api/v1/queue", get(queue))
-        .route("/api/v1/queue/{grab_id}", get(queue_item))
-        .route("/api/v1/queue/{grab_id}/pause", post(queue_pause))
-        .route("/api/v1/queue/{grab_id}/resume", post(queue_resume))
-        .route("/api/v1/queue/{grab_id}/cancel", post(queue_cancel))
-        .route("/api/v1/queue/{grab_id}/retry", post(queue_retry))
-        .route("/api/v1/history", get(history))
-        .route("/api/v1/blocklist", get(blocklist))
-        .route("/api/v1/blocklist/{entry_id}", delete(blocklist_remove))
-        .route("/api/v1/commands", post(command_create).get(command_list))
-        .route("/api/v1/commands/{command_id}", get(command_get))
-        .route("/api/v1/system/tasks", get(system_tasks))
-        .route("/api/v1/requests", get(requests))
-        .route("/api/v1/ownership", get(ownership))
-        .route("/api/v1/status/{media_id}", get(media_status))
-        .route("/api/v1/attention", get(attention))
-        .route("/api/v1/feed", get(feed))
-        .route("/api/v1/sport/search", get(sport::search))
-        .route("/api/v1/sport/leagues", get(sport::leagues))
-        .route("/api/v1/sport/league/{slug}", get(sport::league))
-        .route("/api/v1/sport/follow", post(sport::follow))
-        .route("/api/v1/sport/unfollow", post(sport::unfollow))
-        .route("/api/v1/sport/following", get(sport::following))
-        .route("/api/v1/sport/events", get(sport::events))
-        .route("/api/v1/sport/event/{id}/copies", get(sport::event_copies))
-        .route("/api/v1/sport/event/{id}/get", post(sport::event_get))
-        .route("/api/v1/ideas", get(ideas))
-        .route("/api/v1/ideas/hide", post(ideas_hide))
-        .route("/api/v1/ideas/hide/{media_id}", delete(ideas_unhide))
-        .route("/api/v1/quick-add", post(quick_add))
-        .route("/api/v1/follow", post(titles::follow))
-        .route("/api/v1/stop", post(titles::stop))
-        .route("/api/v1/remove", post(titles::remove))
-        .route("/api/v1/delete/preview", post(delete::preview))
-        .route("/api/v1/delete", post(delete::delete))
-        .route("/api/v1/bin", get(delete::bin))
-        .route("/api/v1/bin/{delete_id}/restore", post(delete::restore))
-        .route("/api/v1/bin/{delete_id}", delete(delete::purge))
-        .route("/api/v1/quality", post(options::quality))
-        .route("/api/v1/copies/{media_id}", get(options::copies))
-        .route("/api/v1/copies/{media_id}/get", post(options::copies_get))
-        .route("/api/v1/show/{media_id}", get(titles::show))
-        .route("/api/v1/show/{media_id}/season/{n}", get(titles::season))
-        .route("/api/v1/movie/{media_id}", get(titles::movie))
-        .route("/api/v1/rss", get(rss_status))
-        .route(
+        ),
+        ("/api/v1/wanted", get(wanted)),
+        ("/api/v1/calendar", get(calendar)),
+        ("/api/v1/discover", get(discover)),
+        ("/api/v1/people", get(people)),
+        ("/api/v1/people/{person_id}", get(person)),
+        ("/api/v1/media/{media_id}", get(media)),
+        ("/api/v1/media/{media_id}/releases", get(releases)),
+        ("/api/v1/plans", post(create_plan).get(list_plans)),
+        ("/api/v1/plans/{plan_id}", get(get_plan)),
+        ("/api/v1/plans/{plan_id}/cancel", post(cancel_plan)),
+        ("/api/v1/plans/{plan_id}/execute", post(execute_plan)),
+        ("/api/v1/grabs", post(grab)),
+        ("/api/v1/queue", get(queue)),
+        ("/api/v1/queue/{grab_id}", get(queue_item)),
+        ("/api/v1/queue/{grab_id}/pause", post(queue_pause)),
+        ("/api/v1/queue/{grab_id}/resume", post(queue_resume)),
+        ("/api/v1/queue/{grab_id}/cancel", post(queue_cancel)),
+        ("/api/v1/queue/{grab_id}/retry", post(queue_retry)),
+        ("/api/v1/history", get(history)),
+        ("/api/v1/blocklist", get(blocklist)),
+        ("/api/v1/blocklist/{entry_id}", delete(blocklist_remove)),
+        ("/api/v1/commands", post(command_create).get(command_list)),
+        ("/api/v1/commands/{command_id}", get(command_get)),
+        ("/api/v1/system/tasks", get(system_tasks)),
+        ("/api/v1/requests", get(requests)),
+        ("/api/v1/ownership", get(ownership)),
+        ("/api/v1/status/{media_id}", get(media_status)),
+        ("/api/v1/attention", get(attention)),
+        ("/api/v1/feed", get(feed)),
+        ("/api/v1/sport/search", get(sport::search)),
+        ("/api/v1/sport/leagues", get(sport::leagues)),
+        ("/api/v1/sport/league/{slug}", get(sport::league)),
+        ("/api/v1/sport/follow", post(sport::follow)),
+        ("/api/v1/sport/unfollow", post(sport::unfollow)),
+        ("/api/v1/sport/following", get(sport::following)),
+        ("/api/v1/sport/events", get(sport::events)),
+        ("/api/v1/sport/event/{id}/copies", get(sport::event_copies)),
+        ("/api/v1/sport/event/{id}/get", post(sport::event_get)),
+        ("/api/v1/ideas", get(ideas)),
+        ("/api/v1/ideas/hide", post(ideas_hide)),
+        ("/api/v1/ideas/hide/{media_id}", delete(ideas_unhide)),
+        ("/api/v1/quick-add", post(quick_add)),
+        ("/api/v1/follow", post(titles::follow)),
+        ("/api/v1/stop", post(titles::stop)),
+        ("/api/v1/remove", post(titles::remove)),
+        ("/api/v1/delete/preview", post(delete::preview)),
+        ("/api/v1/delete", post(delete::delete)),
+        ("/api/v1/bin", get(delete::bin)),
+        ("/api/v1/bin/{delete_id}/restore", post(delete::restore)),
+        ("/api/v1/bin/{delete_id}", delete(delete::purge)),
+        ("/api/v1/quality", post(options::quality)),
+        ("/api/v1/copies/{media_id}", get(options::copies)),
+        ("/api/v1/copies/{media_id}/get", post(options::copies_get)),
+        ("/api/v1/show/{media_id}", get(titles::show)),
+        ("/api/v1/show/{media_id}/season/{n}", get(titles::season)),
+        ("/api/v1/movie/{media_id}", get(titles::movie)),
+        ("/api/v1/rss", get(rss_status)),
+        (
             "/api/v1/update",
             get(system::update_get).post(system::update_post),
-        )
-        .route(
+        ),
+        (
             "/api/v1/settings/app",
             get(system::app_settings_get).post(system::app_settings_post),
-        )
-        .route("/api/v1/system/health", get(system::system_health))
-        .route("/api/v1/setup", get(setup_status).post(setup_apply))
-        .route("/api/v1/setup/plex", get(setup_plex))
-        .route(
+        ),
+        ("/api/v1/system/health", get(system::system_health)),
+        ("/api/v1/setup", get(setup_status).post(setup_apply)),
+        ("/api/v1/setup/plex", get(setup_plex)),
+        (
             "/api/v1/setup/plex/bootstrap",
             get(bootstrap_status).post(bootstrap_batch),
-        )
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth));
-    Router::new()
-        .route("/api/v1/health", get(health))
-        .route(
+        ),
+    ]
+}
+
+/// The routes that need no token.
+fn public_routes() -> Vec<(&'static str, axum::routing::MethodRouter<Arc<AppState>>)> {
+    vec![
+        ("/api/v1/health", get(health)),
+        (
             "/api/v1/openapi.json",
             get(|| async { Json(openapi::document()) }),
-        )
+        ),
+    ]
+}
+
+/// Every path the API serves, public and protected: for the MCP parity test.
+pub fn route_paths() -> Vec<&'static str> {
+    public_routes()
+        .into_iter()
+        .chain(protected_routes())
+        .map(|(p, _)| p)
+        .collect()
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
+    let protected = protected_routes()
+        .into_iter()
+        .fold(Router::new(), |r, (path, handlers)| r.route(path, handlers))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth));
+    public_routes()
+        .into_iter()
+        .fold(Router::new(), |r, (path, handlers)| r.route(path, handlers))
         .merge(protected)
         .fallback(|| async { ApiError::not_found("no such route") })
         .method_not_allowed_fallback(|| async {

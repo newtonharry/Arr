@@ -6,7 +6,7 @@
 //!   (stateless JSON responses), which calls the API router in-process (the same auth,
 //!   limits, deadline and contracts, without depending on the configured listen address).
 //!   Each request passes `Host` and `Origin` validation and its own bearer token (not the API
-//!   token; or an OAuth access token, see `oauth.rs`) before rmcp parses it; bodies, concurrency and time are bounded. The six tools and
+//!   token; or an OAuth access token, see `oauth.rs`) before rmcp parses it; bodies, concurrency and time are bounded. The tools and
 //!   their contracts are identical in both transports.
 //!
 //! It keeps no state and knows no other service. Every tool is one or two REST calls with a
@@ -14,9 +14,16 @@
 //! and the rest), and every failure says what it means for the
 //! request (`outcome`): a write whose reply was lost may have been applied, so it is never
 //! reported as unchanged. An unreachable API is an error: there is no fallback. Tool
-//! arguments carry only titles, canonical media ids and release refs. Monitoring and policy
-//! overrides, paths, URLs, deletion and torrent control cannot be
-//! expressed.
+//! arguments carry only titles, canonical media ids, copy and release refs, and the tokens
+//! the API itself gave. Monitoring and policy overrides, paths, URLs and torrent control
+//! cannot be expressed. Deleting files is a two-step tool pair bound to the API's preview
+//! token and to the person's own yes.
+//!
+//! **Parity with the web app.** Every `/api/v1` route is either covered by a tool or listed
+//! with a reason in [`PARITY`]; a test fails when a route or a path the web app calls has no
+//! entry. See `AGENTS.md`.
+
+mod web;
 
 use crate::ids::MediaId;
 use crate::{config, fsutil};
@@ -52,6 +59,7 @@ const NOT_ADOPTED_ROUTE: &str = "This title is not added to Arr and monitored ye
 const OUTAGE: &str =
     "Nothing else was tried: this adapter has no fallback. Retry later or report the outage.";
 const UNCERTAIN: &str = "The request may have been applied before its reply was lost. Check media_status or requests before repeating it. This adapter never retries a write and has no fallback.";
+const UNCERTAIN_FILES: &str = "Files may have been moved or put back before the reply was lost. Check bin and media_status before repeating anything, and for a delete preview again and ask the person again. This adapter never retries a write and has no fallback.";
 
 /// Refusals the API returns before a handler runs.
 const BEFORE_HANDLER: &[&str] = &[
@@ -276,15 +284,59 @@ pub fn remote(
 enum Effect {
     /// GET: changes nothing.
     Read,
+    /// POST that only looks (the delete preview): changes nothing.
+    Preview,
     /// POST /library.
     Add,
     /// POST /grabs.
     Grab,
     /// POST /stop.
     Stop,
+    /// POST /quick-add (the web app's Get).
+    GetTitle,
+    /// A simple POST of one change (a quality level, a follow, a hidden idea, a retry, a
+    /// removal): refused for its arguments before anything changes.
+    Change,
+    /// The same, as a DELETE (showing an idea again).
+    ChangeDelete,
+    /// POST /sport/event/{id}/get.
+    SportGet,
+    /// POST /copies/{id}/get (may add the title first).
+    CopyGet,
+    /// POST /queue/{id}/pause, `/resume` and `/cancel`.
+    Download,
+    /// POST /commands.
+    Command,
+    /// POST /delete.
+    Delete,
+    /// POST /bin/{id}/restore.
+    Restore,
+    /// DELETE /bin/{id}.
+    Purge,
 }
 
 impl Effect {
+    fn method(self) -> Method {
+        match self {
+            Effect::Read => Method::GET,
+            Effect::ChangeDelete | Effect::Purge => Method::DELETE,
+            _ => Method::POST,
+        }
+    }
+
+    /// A call that changes nothing, whatever it answers.
+    fn changes_nothing(self) -> bool {
+        matches!(self, Effect::Read | Effect::Preview)
+    }
+
+    /// What a write with an unknown outcome tells the assistant to check.
+    fn uncertain(self) -> &'static str {
+        match self {
+            Effect::Delete | Effect::Restore | Effect::Purge => UNCERTAIN_FILES,
+            _ => UNCERTAIN,
+        }
+    }
+
     /// Whether this typed API error is returned before anything changes. Any other error on
     /// a write has an unknown outcome.
     fn refused_unchanged(self, code: &str) -> bool {
@@ -292,11 +344,63 @@ impl Effect {
             return true;
         }
         match self {
-            Effect::Read => true,
+            Effect::Read | Effect::Preview => true,
             // Other errors can follow a committed add (for example a failed automatic search).
             Effect::Add => false,
             // A stop refused for its id or because Arr never had it changed nothing.
             Effect::Stop => matches!(code, "invalid_media_id" | "not_managed"),
+            // The level and the id are checked first; anything later may follow a change
+            // (the level is applied before the title is added).
+            Effect::GetTitle => matches!(code, "invalid_media_id" | "invalid_request"),
+            // Arguments, a missing target or sport being off: refused before the change.
+            Effect::Change | Effect::ChangeDelete => matches!(
+                code,
+                "invalid_request"
+                    | "invalid_query"
+                    | "invalid_media_id"
+                    | "not_found"
+                    | "not_managed"
+                    | "provider_not_configured"
+                    | "catalog_not_imported"
+            ),
+            // Every refusal of a grab comes before the download is recorded, and so do the
+            // sport checks (the event, the listing, the caution, whether it is over).
+            // A download action may act on the client before it is refused: only a missing
+            // download or a malformed id is certain to have changed nothing.
+            Effect::Download => matches!(code, "not_found" | "invalid_request"),
+            Effect::Command => matches!(
+                code,
+                "invalid_request"
+                    | "invalid_media_id"
+                    | "execution_disabled"
+                    | "catalog_not_imported"
+            ),
+            Effect::SportGet => {
+                Effect::Grab.refused_unchanged(code)
+                    || matches!(
+                        code,
+                        "not_found"
+                            | "confirmation_needed"
+                            | "already_have"
+                            | "not_played_yet"
+                            | "quality_changed"
+                            | "provider_not_configured"
+                    )
+            }
+            // The title may have been added before the download was refused, so only what is
+            // checked first counts as unchanged.
+            Effect::CopyGet => {
+                matches!(code, "invalid_media_id" | "invalid_request" | "not_managed")
+            }
+            // The tool previews again and compares the token itself, so what reaches the API's
+            // delete is the previewed scope. A refusal there (a download finishing, a file
+            // that would not move) may follow downloads that were already cancelled.
+            Effect::Delete => {
+                matches!(code, "invalid_media_id" | "invalid_request" | "not_managed")
+            }
+            Effect::Restore | Effect::Purge => {
+                matches!(code, "not_found" | "invalid_request" | "delete_refused")
+            }
             // Every refusal of a grab comes before the download is recorded (a contradicting
             // payload is blocklisted).
             Effect::Grab => matches!(
@@ -406,11 +510,7 @@ impl Adapter {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Value, CallToolResult> {
-        let method = if effect == Effect::Read {
-            Method::GET
-        } else {
-            Method::POST
-        };
+        let method = effect.method();
         let (status, raw) = match &self.transport {
             Transport::Http { http, base } => {
                 self.send_http(http, base, method, effect, segments, query, body)
@@ -764,7 +864,7 @@ impl ServerHandler for Adapter {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Movie and TV requests for the arr server. To answer what the user already has, use library (their whole catalog, including everything imported from Plex) or media_status for one title. To add something, find it with search_titles, then call add_media with its canonical media id: that is the default, automatic path (monitored, then searched and downloaded by this server's own policy). Add exactly the scope the user asked for; do not replace a requested season with individual episodes unless the user agrees. release_choices and start_download are a manual mode, only for when the user explicitly asks to choose a release: start_download downloads only the exact release the user chose. An add_media result's automatic field says what happened; a blocked plan with no release yet is normal with execution enabled, and plans are never executed by hand. Repeating an add or a download creates no duplicate. Errors are returned as is with their outcome; there is no fallback, and a write with an unknown outcome is checked with media_status or requests before it is repeated. If movie search reports that it isn't set up, tell the user what that message says; TV works without it.",
+                "Movie, TV and sport for the arr server: everything the web app can do, a person can ask you to do. To answer what the user already has, use library (their whole catalog, including everything imported from Plex) or media_status for one title; title_details, feed, calendar, wanted, history and storage answer the rest. To add something, find it with search_titles, then call add_media with its canonical media id: that is the default, automatic path (monitored, then searched and downloaded by this server's own policy). Add exactly the scope the user asked for; do not replace a requested season with individual episodes unless the user agrees. get_title is the web app's Get button (a whole show, or a quality the person picked: smaller, standard or best); set_quality changes the level of a title Arr has. release_choices and start_download, and copies and get_copy, are a manual mode, only for when the user explicitly asks to choose a copy: they download only the exact copy the user chose, never one you picked. Sport is hand-pick only: sport_search, sport_league, sport_follow and sport_events show and follow what the user cares about, sport_copies lists the copies of one finished event and nothing is recommended or picked for them; sport_get downloads the one copy they chose, and a copy with a caution answers confirmation_needed: show the user the caution and call again with confirm true only after they say yes. Sport results and scores are never shown. Deleting files is two steps and needs the user's explicit yes to the exact scope: delete_preview shows what would go (show it all to the user), delete_files moves it to the bin with the preview's token and confirmed true; bin and bin_restore put it back within 7 days; bin_empty is permanent. Never delete, restore over, or empty anything the user did not name, and never pass confirmed on your own. remove_title and stop never touch files. An add_media result's automatic field says what happened; a blocked plan with no release yet is normal with execution enabled, and plans are never executed by hand. Repeating an add or a download creates no duplicate. Errors are returned as is with their outcome; there is no fallback, and a write with an unknown outcome is checked (media_status, requests, bin) before it is repeated. If movie search reports that it isn't set up, tell the user what that message says; TV works without it. Changing server settings, installing updates and signing in are done in the web app only.",
             )
     }
 
@@ -815,7 +915,10 @@ impl ServerHandler for Adapter {
                 Ok(a) => self.start_download(a).await,
                 Err(r) => r,
             },
-            _ => return Err(ErrorData::invalid_params("tool not found", None)),
+            name => match self.dispatch(name, args).await {
+                Some(r) => r,
+                None => return Err(ErrorData::invalid_params("tool not found", None)),
+            },
         };
         Ok(result.into())
     }
@@ -935,7 +1038,7 @@ fn tools() -> Vec<Tool> {
         .destructive(false)
         .idempotent(true)
         .open_world(true);
-    vec![
+    let mut list = vec![
         tool::<SearchTitles>(
             "search_titles",
             "Find movies or series by title. Results carry canonical media ids and whether each title is already known here (in_catalog).",
@@ -969,14 +1072,16 @@ fn tools() -> Vec<Tool> {
         tool::<MediaArg>(
             "release_choices",
             "Manual mode only, when the user explicitly asks to see or choose releases (adding something does not need it: use add_media). Searches the indexers for a movie, season or episode and lists releases with this server's decision; approved releases carry a release_ref.",
-            read,
+            read.clone(),
         ),
         tool::<StartDownload>(
             "start_download",
             "Manual mode only: downloads the one approved release the user explicitly chose from release_choices, for the same canonical id. Never choose a release on the user's behalf; add_media is the automatic default. A unit that is already being downloaded is refused (already_queued), so repeating this creates no duplicate. Titles still managed by Sonarr/Radarr are refused with not_adopted.",
             write,
         ),
-    ]
+    ];
+    list.extend(web::tool_list(&read));
+    list
 }
 
 // ------------------------------------------------------------------ results
@@ -1038,7 +1143,9 @@ fn canonical(raw: &str, scope: Scope) -> Result<String, CallToolResult> {
         Ok(MediaId::Series(_)) if scope == Scope::Acquirable => Err(invalid(
             "whole series are not added through this tool: ask the user which season or episode they want",
         )),
-        Ok(MediaId::Event(_)) => Err(invalid("sport events are not available through this tool")),
+        Ok(MediaId::Event(_)) => Err(invalid(
+            "sport events are not available through this tool: use the sport_* tools",
+        )),
         Ok(id) => Ok(id.to_string()),
         Err(_) => Err(invalid(
             "media_id must be a canonical id such as movie:tmdb:603, season:tvdb:372264:1 or episode:tvdb:372264:1:2",
@@ -1153,7 +1260,7 @@ fn respond(r: Result<Value, CallToolResult>) -> CallToolResult {
 /// by the API before any change) or `unknown`.
 fn outcome(effect: Effect, sent: bool, refused_unchanged: bool) -> &'static str {
     match effect {
-        Effect::Read => "nothing_changed",
+        e if e.changes_nothing() => "nothing_changed",
         _ if !sent => "not_sent",
         _ if refused_unchanged => "not_applied",
         _ => "unknown",
@@ -1174,7 +1281,7 @@ fn unusable(effect: Effect, sent: bool, code: &str, message: &str) -> CallToolRe
     CallToolResult::structured_error(json!({
         "error": { "code": code, "message": message },
         "outcome": outcome,
-        "guidance": if outcome == "unknown" { UNCERTAIN } else { OUTAGE },
+        "guidance": if outcome == "unknown" { effect.uncertain() } else { OUTAGE },
     }))
 }
 
@@ -1194,10 +1301,408 @@ fn api_error(effect: Effect, error: Value, status: u16) -> CallToolResult {
     let outcome = outcome(effect, true, effect.refused_unchanged(&code));
     let mut v = json!({ "error": error, "http_status": status, "outcome": outcome });
     if outcome == "unknown" {
-        v["guidance"] = json!(UNCERTAIN);
+        v["guidance"] = json!(effect.uncertain());
     }
     if code == "not_adopted" {
         v["routing"] = json!(NOT_ADOPTED_ROUTE);
     }
+    if code == "confirmation_needed" {
+        v["routing"] = json!(web::CONFIRM_ROUTE);
+    }
     CallToolResult::structured_error(v)
+}
+
+// ------------------------------------------------------------------ parity with the web app
+
+/// How an API route (or a path the web app calls) is covered for an assistant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parity {
+    /// This MCP tool does it.
+    Tool(&'static str),
+    /// Only the web app does it, on purpose: it makes no sense in a chat (the web app's own
+    /// sign-in and session, push notifications, installing an update, changing server
+    /// settings). Never because a feature is new, hard or risky.
+    WebOnly(&'static str),
+    /// A route for the person who runs the server, or for automation and client developers:
+    /// neither the web app nor a household member uses it. The reason says why no tool
+    /// carries it.
+    Operator(&'static str),
+}
+
+/// Every user-facing route and what covers it: `(method, path pattern, coverage)`. Paths are
+/// the router's own patterns. The parity test (`tests/mcp_parity.rs`) fails when a route of
+/// the router, or a path the web app calls, is missing here, or an entry names a tool that is
+/// not registered, or a tool is in no entry. Adding a route means adding its tool, or its
+/// reason, here in the same change (see `AGENTS.md`).
+pub const PARITY: &[(&str, &str, Parity)] = &[
+    // Titles, library and downloads.
+    ("POST", "/api/v1/library", Parity::Tool("add_media")),
+    ("GET", "/api/v1/library/movies", Parity::Tool("library")),
+    ("GET", "/api/v1/library/series", Parity::Tool("library")),
+    (
+        "DELETE",
+        "/api/v1/library/{media_id}",
+        Parity::Tool("remove_title"),
+    ),
+    (
+        "PATCH",
+        "/api/v1/library/{media_id}",
+        Parity::Operator(
+            "a raw edit of monitoring, profile and folders for native-app style clients; a person says what they want (add_media, stop, set_quality, follow_series) and never edits a record",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/library/roots",
+        Parity::Tool("library_folders"),
+    ),
+    ("GET", "/api/v1/storage", Parity::Tool("storage")),
+    ("GET", "/api/v1/wanted", Parity::Tool("wanted")),
+    ("GET", "/api/v1/calendar", Parity::Tool("calendar")),
+    ("GET", "/api/v1/discover", Parity::Tool("search_titles")),
+    ("GET", "/api/v1/people", Parity::Tool("people_search")),
+    ("GET", "/api/v1/people/{person_id}", Parity::Tool("person")),
+    (
+        "GET",
+        "/api/v1/media/{media_id}",
+        Parity::Operator(
+            "the raw catalog record for scripts; title_details and media_status show a person the same facts",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/media/{media_id}/releases",
+        Parity::Tool("release_choices"),
+    ),
+    ("POST", "/api/v1/grabs", Parity::Tool("start_download")),
+    ("GET", "/api/v1/queue", Parity::Tool("requests")),
+    ("GET", "/api/v1/requests", Parity::Tool("requests")),
+    ("GET", "/api/v1/queue/{grab_id}", Parity::Tool("download")),
+    (
+        "POST",
+        "/api/v1/queue/{grab_id}/pause",
+        Parity::Tool("pause_download"),
+    ),
+    (
+        "POST",
+        "/api/v1/queue/{grab_id}/resume",
+        Parity::Tool("resume_download"),
+    ),
+    (
+        "POST",
+        "/api/v1/queue/{grab_id}/cancel",
+        Parity::Tool("cancel_download"),
+    ),
+    (
+        "POST",
+        "/api/v1/queue/{grab_id}/retry",
+        Parity::Tool("retry_download"),
+    ),
+    ("GET", "/api/v1/history", Parity::Tool("history")),
+    ("GET", "/api/v1/blocklist", Parity::Tool("blocklist")),
+    (
+        "DELETE",
+        "/api/v1/blocklist/{entry_id}",
+        Parity::Tool("unblock"),
+    ),
+    (
+        "GET",
+        "/api/v1/ownership",
+        Parity::Operator(
+            "a bulk ownership report for scripts; a person asks about one title, and media_status and library answer that",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/status/{media_id}",
+        Parity::Tool("media_status"),
+    ),
+    ("GET", "/api/v1/attention", Parity::Tool("attention")),
+    ("GET", "/api/v1/feed", Parity::Tool("feed")),
+    // The web app's own routes for a title page.
+    ("POST", "/api/v1/quick-add", Parity::Tool("get_title")),
+    ("POST", "/api/v1/follow", Parity::Tool("follow_series")),
+    ("POST", "/api/v1/stop", Parity::Tool("stop")),
+    ("POST", "/api/v1/remove", Parity::Tool("remove_title")),
+    ("POST", "/api/v1/quality", Parity::Tool("set_quality")),
+    ("GET", "/api/v1/copies/{media_id}", Parity::Tool("copies")),
+    (
+        "POST",
+        "/api/v1/copies/{media_id}/get",
+        Parity::Tool("get_copy"),
+    ),
+    (
+        "GET",
+        "/api/v1/movie/{media_id}",
+        Parity::Tool("title_details"),
+    ),
+    (
+        "GET",
+        "/api/v1/show/{media_id}",
+        Parity::Tool("title_details"),
+    ),
+    (
+        "GET",
+        "/api/v1/show/{media_id}/season/{n}",
+        Parity::Tool("title_details"),
+    ),
+    ("GET", "/api/v1/ideas", Parity::Tool("ideas")),
+    ("POST", "/api/v1/ideas/hide", Parity::Tool("hide_idea")),
+    (
+        "DELETE",
+        "/api/v1/ideas/hide/{media_id}",
+        Parity::Tool("hide_idea"),
+    ),
+    // Deleting files and the bin.
+    (
+        "POST",
+        "/api/v1/delete/preview",
+        Parity::Tool("delete_preview"),
+    ),
+    ("POST", "/api/v1/delete", Parity::Tool("delete_files")),
+    ("GET", "/api/v1/bin", Parity::Tool("bin")),
+    (
+        "POST",
+        "/api/v1/bin/{delete_id}/restore",
+        Parity::Tool("bin_restore"),
+    ),
+    (
+        "DELETE",
+        "/api/v1/bin/{delete_id}",
+        Parity::Tool("bin_empty"),
+    ),
+    // Sport.
+    ("GET", "/api/v1/sport/search", Parity::Tool("sport_search")),
+    (
+        "GET",
+        "/api/v1/sport/leagues",
+        Parity::Tool("sport_leagues"),
+    ),
+    (
+        "GET",
+        "/api/v1/sport/league/{slug}",
+        Parity::Tool("sport_league"),
+    ),
+    ("POST", "/api/v1/sport/follow", Parity::Tool("sport_follow")),
+    (
+        "POST",
+        "/api/v1/sport/unfollow",
+        Parity::Tool("sport_unfollow"),
+    ),
+    (
+        "GET",
+        "/api/v1/sport/following",
+        Parity::Tool("sport_following"),
+    ),
+    ("GET", "/api/v1/sport/events", Parity::Tool("sport_events")),
+    (
+        "GET",
+        "/api/v1/sport/event/{id}/copies",
+        Parity::Tool("sport_copies"),
+    ),
+    (
+        "POST",
+        "/api/v1/sport/event/{id}/get",
+        Parity::Tool("sport_get"),
+    ),
+    // Health.
+    (
+        "GET",
+        "/api/v1/system/health",
+        Parity::Tool("system_health"),
+    ),
+    // Web only, on purpose.
+    (
+        "GET",
+        "/api/v1/update",
+        Parity::WebOnly(
+            "whether an update is available and installing it restarts the server; the person at the web app decides",
+        ),
+    ),
+    (
+        "POST",
+        "/api/v1/update",
+        Parity::WebOnly(
+            "installing an update restarts the server; the person at the web app decides",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/settings/app",
+        Parity::WebOnly("server settings are changed (and read for changing) in the web app only"),
+    ),
+    (
+        "POST",
+        "/api/v1/settings/app",
+        Parity::WebOnly("changing server settings is done in the web app only"),
+    ),
+    (
+        "GET",
+        "/app/api/me",
+        Parity::WebOnly("the web app's own sign-in session: who is signed in"),
+    ),
+    (
+        "POST",
+        "/app/api/signout",
+        Parity::WebOnly("the web app's own sign-in session: signing out"),
+    ),
+    (
+        "GET",
+        "/app/api/v1/notifications/key",
+        Parity::WebOnly("push notifications are subscribed from the device's browser"),
+    ),
+    (
+        "POST",
+        "/app/api/v1/notifications/subscribe",
+        Parity::WebOnly("push notifications are subscribed from the device's browser"),
+    ),
+    (
+        "DELETE",
+        "/app/api/v1/notifications/subscribe",
+        Parity::WebOnly("push notifications are subscribed from the device's browser"),
+    ),
+    // Operator and automation: neither the web app nor a household member uses these.
+    (
+        "GET",
+        "/api/v1/health",
+        Parity::Operator("a liveness probe for service managers; nobody asks it in a chat"),
+    ),
+    (
+        "GET",
+        "/api/v1/openapi.json",
+        Parity::Operator(
+            "the API's schema, for people writing clients; not something a person asks for",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/readiness",
+        Parity::Operator(
+            "a readiness probe for deployments; system_health is how a person asks whether Arr is well",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/capabilities",
+        Parity::Operator(
+            "what the API supports, for people writing clients; a person asks Arr to do things, not what it can",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/diagnostics",
+        Parity::Operator(
+            "a support bundle of internals for whoever debugs the server; not an answer a person wants in a chat",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/settings",
+        Parity::Operator(
+            "the raw server configuration; settings are the web app's settings page, and a chat has no need of the raw file",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/migration-report",
+        Parity::Operator(
+            "a one-off report from importing a Sonarr or Radarr setup, read once at migration time",
+        ),
+    ),
+    (
+        "POST",
+        "/api/v1/plans",
+        Parity::Operator(
+            "plans are the automation's own steps; a person asks for a title (add_media, get_title) and never manages a plan",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/plans",
+        Parity::Operator(
+            "plans are the automation's own steps; a person asks for a title (add_media, get_title) and never manages a plan",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/plans/{plan_id}",
+        Parity::Operator(
+            "plans are the automation's own steps; a person asks for a title (add_media, get_title) and never manages a plan",
+        ),
+    ),
+    (
+        "POST",
+        "/api/v1/plans/{plan_id}/cancel",
+        Parity::Operator(
+            "plans are the automation's own steps; a person asks for a title (add_media, get_title) and never manages a plan",
+        ),
+    ),
+    (
+        "POST",
+        "/api/v1/plans/{plan_id}/execute",
+        Parity::Operator(
+            "plans are the automation's own steps and are never executed by hand; a person asks for a title instead",
+        ),
+    ),
+    ("POST", "/api/v1/commands", Parity::Tool("run_command")),
+    ("GET", "/api/v1/commands", Parity::Tool("command_status")),
+    (
+        "GET",
+        "/api/v1/commands/{command_id}",
+        Parity::Tool("command_status"),
+    ),
+    (
+        "GET",
+        "/api/v1/system/tasks",
+        Parity::Operator(
+            "the schedule of the server's own timers; a person asks for a job with run_command and sees it with command_status",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/rss",
+        Parity::Operator(
+            "the RSS poller's internals; run_command rss_sync checks now, and system_health says if something is wrong",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/setup",
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
+    ),
+    (
+        "POST",
+        "/api/v1/setup",
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/setup/plex",
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
+    ),
+    (
+        "GET",
+        "/api/v1/setup/plex/bootstrap",
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
+    ),
+    (
+        "POST",
+        "/api/v1/setup/plex/bootstrap",
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
+    ),
+];
+
+/// The names of every registered tool.
+pub fn tool_names() -> Vec<String> {
+    tools().into_iter().map(|t| t.name.to_string()).collect()
 }

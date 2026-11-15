@@ -87,7 +87,7 @@ API schema is served at `GET /api/v1/openapi.json`. Endpoint details are in
 | `sport` | sport schedules, follows and release matching, a module of its own beside movies and series (`catalog`: the built-in leagues and their names; `espn`: the schedule client and the fixtures-only parser; `data`: the `sport_*` tables; `refresh`: keeping followed leagues current, and the worker's `sports` task; `release`: the release-name parser; `names`: team and fighter name rules; `matcher`: whether a release is a stored event; `find`: the search texts and the judging of an answer). The HTTP handlers are `api/sport.rs` |
 | `worker` | background loop: commands (leased), downloads pass, scheduled tasks, request retries, metadata refresh, startup recovery |
 | `api`, `openapi`, `error` | axum router, auth, limits, typed errors, OpenAPI document |
-| `mcp` | the MCP adapter: six tools over the REST API (stdio over HTTP, or remote over the in-process router), closed input schemas, typed errors with their outcome, no fallback; the remote `/mcp` mount |
+| `mcp` | the MCP adapter: tools for everything the web app does, over the REST API, with a parity table and test (`AGENTS.md`) (stdio over HTTP, or remote over the in-process router), closed input schemas, typed errors with their outcome, no fallback; the remote `/mcp` mount |
 
 ## Private state directory
 

@@ -1,6 +1,6 @@
 # MCP: stdio adapter and remote Streamable HTTP
 
-Two transports serve the same seven tools with the same contracts, both built on rmcp 3.6.0,
+Two transports serve the same tools with the same contracts, both built on rmcp 3.6.0,
 the official Rust SDK, which does all JSON-RPC framing, lifecycle and version negotiation:
 
 - **stdio** — `arr mcp`, a separate process that is a client of a running server's
@@ -68,6 +68,107 @@ the SDK:
 | `release_choices` | `media_id`: a movie, season or episode | `GET /api/v1/media/{media_id}/releases` |
 | `start_download` | `media_id`, `release_ref` (`rel_` + 24 lowercase hex) | `POST /api/v1/grabs {"media_id", "release_ref"}` |
 
+### Everything the web app can do
+
+An assistant can do anything a person can do in the web app, through the same API routes, so
+with the same checks, confirmations and refusals. Each tool is one REST call, and its result
+is the API's JSON: no field is added, hidden or reworded. These tools come after the
+original eight.
+
+| tool | arguments | REST call |
+|---|---|---|
+| `get_title` | `media_id` (movie, series, season or episode), `level`? (`smaller`, `standard`, `best`) | `POST /api/v1/quick-add`: the web app's Get button. A show is followed and its latest season fetched. The answer is the web app's (`outcome`, `message`), not `automatic` |
+| `set_quality` | `media_id` (movie or series), `level` | `POST /api/v1/quality` |
+| `follow_series` | `media_id` (series), `on`, `level`? | `POST /api/v1/follow` |
+| `remove_title` | `media_id` (movie or series) | `POST /api/v1/remove`: stops tracking, cancels unfinished downloads, touches no file |
+| `copies` | `media_id` (movie, season or episode), `level`? | `GET /api/v1/copies/{media_id}`: plain-words copies with the server's `recommended` marked; the choice is the person's |
+| `get_copy` | `media_id`, `id` (`rel_` + 24 hex), `level`? | `POST /api/v1/copies/{media_id}/get` |
+| `retry_download` | `grab_id` | `POST /api/v1/queue/{grab_id}/retry` |
+| `title_details` | `media_id` (movie, series or season) | `GET /api/v1/movie/{id}`, `/show/{id}` or `/show/{id}/season/{n}` |
+| `people_search`, `person` | `q`; `person_id` | `GET /api/v1/people?q=`, `GET /api/v1/people/{person_id}` |
+| `feed`, `attention`, `ideas`, `storage`, `system_health` | none | `GET /api/v1/feed`, `/attention`, `/ideas`, `/storage`, `/system/health` |
+| `hide_idea` | `media_id` (series), `hidden`? (default true) | `POST /api/v1/ideas/hide`, or `DELETE /api/v1/ideas/hide/{media_id}` with `hidden: false` |
+| `calendar` | `start`?, `end`? (RFC 3339) | `GET /api/v1/calendar` |
+| `wanted`, `history` | `media_id`?, `limit`?, `offset?` (`history` also `kind`?) | `GET /api/v1/wanted`, `GET /api/v1/history` |
+| `sport_search` | `q` | `GET /api/v1/sport/search` |
+| `sport_leagues`, `sport_following` | none | `GET /api/v1/sport/leagues`, `/sport/following` |
+| `sport_league` | `league` | `GET /api/v1/sport/league/{slug}` |
+| `sport_follow`, `sport_unfollow` | `league`, `team_id`? | `POST /api/v1/sport/follow`, `/sport/unfollow` |
+| `sport_events` | `from`?, `to`?, `league`? | `GET /api/v1/sport/events` |
+| `sport_copies` | `event_id`, `part`?, `fresh`? | `GET /api/v1/sport/event/{id}/copies` |
+| `sport_get` | `event_id`, `id` (`rel_` + 24 hex), `confirm`? | `POST /api/v1/sport/event/{id}/get` |
+| `download` | `grab_id` (`grb_` + 24 hex) | `GET /api/v1/queue/{grab_id}`: one download with its events and import steps (a sport download shows the event's name, never release text) |
+| `pause_download`, `resume_download`, `cancel_download` | `grab_id` | `POST /api/v1/queue/{grab_id}/pause`, `/resume`, `/cancel` (no body: data is kept, nothing is blocklisted). A refusal other than "no such download" is `unknown`, because the API may have acted on the download client first |
+| `blocklist` | `media_id`? | `GET /api/v1/blocklist`. A sport entry shows the stored event's name and a reason from a closed list (anything else is `other`); the API does this, the tool adds nothing |
+| `unblock` | `id` | `DELETE /api/v1/blocklist/{id}` |
+| `run_command` | `name` (`rescan`, `search_missing`, `rss_sync`, `refresh_metadata`, `search`, `plex_refresh`), `media_id`? | `POST /api/v1/commands`. `search` and `plex_refresh` need a title, the others take none; `poll_downloads` and `cleanup_downloads` are not offered. Queued, not finished |
+| `command_status` | `id`? (`cmd_` + 24 hex), `limit`?, `offset`? | `GET /api/v1/commands/{id}`, or `GET /api/v1/commands` without an id |
+| `library_folders` | none | `GET /api/v1/library/roots` |
+| `delete_preview` | `media_id` | `POST /api/v1/delete/preview` |
+| `delete_files` | `media_id`, `token`, `confirmed`, `keep_wanted`? | `POST /api/v1/delete/preview` again, then `POST /api/v1/delete` |
+| `bin` | none | `GET /api/v1/bin` |
+| `bin_restore` | `delete_id` | `POST /api/v1/bin/{delete_id}/restore` |
+| `bin_empty` | `delete_id`, `bytes`, `confirmed` | `GET /api/v1/bin`, then `DELETE /api/v1/bin/{delete_id}` |
+
+**Sport is hand-pick only.** Nothing recommends or picks a copy: `sport_copies` lists what
+the API lists and `sport_get` downloads the one the person chose. A copy with a caution
+answers `409 confirmation_needed` (`not_applied`) with a `routing` note telling the
+assistant to show the person the caution and to call again with `confirm: true` only after
+they say yes. Scores and results are never returned (the API does not return them), and no
+release text, link, magnet or hash is either. Sport events are still refused by the
+movie and series tools, with a pointer to the `sport_*` tools.
+
+**Deleting files is two steps and needs the person's yes.**
+- `delete_preview` shows what would go (files, sizes, the downloads that only seed them,
+  anything blocking) and a `token`. It deletes nothing.
+- `delete_files` is described as destructive and tells the assistant to show the preview
+  and get an explicit yes to exactly that scope. It requires `confirmed: true` and the
+  preview's `token`.
+- **Bound to its preview.** The tool previews the scope again itself and compares the
+  token with the one it was given. The API's token is a digest over the media id, each
+  file's path, kind, size and modified time, and each download the preview lists with its
+  `removed` decision, so a download that appears after the preview refuses the delete too. A token for another scope, a stale one or an
+  invented one is refused locally (`changed`, `not_applied`) before anything is sent to
+  `POST /delete`, and the API checks the same token once more before it moves a file. A
+  preview with no files, or one that is `blocked`, is refused the same way.
+- **What it does.** Files go to the bin (`<library folder>/.arr-bin`), never straight to
+  nothing. Downloads that only seed them are removed with their data. By default Arr stops
+  wanting the title; `keep_wanted: true` makes it fetch a new copy.
+- **Putting it back.** `bin` lists entries (`delete_id`, title, files, bytes, `purge_at`);
+  `bin_restore` moves the files back within 7 days (a file whose place was taken stays in
+  the bin and is reported; nothing is wanted again).
+- **Emptying for good.** `bin_empty` is permanent. It reads the bin first and only empties
+  an entry that still has the `bytes` the person was shown, with `confirmed: true`.
+- **Failure.** A delete or bin failure with an unknown outcome comes with guidance to check
+  `bin` and `media_status` and to preview again.
+
+**Annotations (all tools).** Reads and `delete_preview` are `readOnlyHint: true`. The
+original writes are `destructiveHint: false`, `idempotentHint: true`; `remove_title`,
+`delete_files` and `bin_empty` are `destructiveHint: true`.
+
+**Parity.** The table `PARITY` in `src/mcp.rs` lists every API route (and every path the web
+app calls) with the tool that covers it, or a reason it has none:
+- **Web only, on purpose:** the web app's sign-in and session (`/app/api/me`, `signout`),
+  push notifications (`/notifications/key`, `subscribe`), installing an update (`/update`)
+  and changing server settings (`/settings/app`).
+- **Operator:** routes that serve probes, scripts and client developers rather than a
+  person's request (liveness and readiness, openapi, capabilities, diagnostics, the raw
+  settings and migration report, first-run setup, plans, the timers list, the RSS poller,
+  bulk ownership, the raw catalog record, `PATCH /library/{id}`), each with the reason a
+  person would not need it in a chat. Things a person does with Arr itself (pausing or
+  cancelling a download, the blocklist, background jobs, library folders) are tools.
+
+The test also scans `src/` and fails when a route is registered anywhere but the shared route
+lists in `src/api.rs` (other routers, such as the web app's pages, the setup wizard and the
+OAuth endpoints, are allowlisted by file with a reason), and its reader of `app.js` refuses
+what it cannot see (an aliased helper, an extra `fetch`, a computed route name it does not
+know).
+
+`tests/mcp_parity.rs` fails when a route of the real router, or a path `src/webapp/app.js`
+calls, has no entry, when an entry names a tool that is not registered, or when a tool is in
+no entry. Adding a route means adding its tool (or its reason) in the same change; see
+`AGENTS.md`.
+
 **Default and manual mode.** The server instructions and the tool descriptions say this,
 and the tools test checks the key phrases:
 - **Default.** `add_media` is the automatic way to add what the user asked for. The server
@@ -88,15 +189,13 @@ here: the refusal tells the assistant to ask the user which season or episode th
 `add_media` sends only `media_id`, so the REST defaults apply: monitored, and searched
 automatically.
 
-**Annotations.** Reads are `readOnlyHint: true`. Writes are `destructiveHint: false` and
-`idempotentHint: true`.
-
 **Not expressible** as tool arguments:
 - `native_handoff_confirmed` and `preserve_monitoring` (retired REST fields) and adoption in general;
 - `monitored`, `monitor`, `quality_profile`, `root_folder` and `metadata`;
 - `search: false` and `refresh`;
 - paths, URLs and endpoints;
-- deletion, queue or torrent control, categories and plan execution.
+- paths, torrent control, categories and plan execution. Files are deleted only through
+  `delete_preview` and `delete_files` as described above.
 
 An unknown property is refused as `invalid_arguments` before any request.
 
@@ -144,9 +243,9 @@ a successful `add_media`. The REST API and every other tool's results are unchan
 | `nothing_changed` | any read |
 | `not_sent` | invalid arguments, or no connection to the API was made |
 | `not_applied` | a typed refusal the API returns before changing anything (an explicit list in `src/mcp.rs`): request-level refusals; for grabs, the validation, `release_not_found`, `not_adopted`, execution-blocker, `already_queued`, `duplicate_torrent`, `blocklisted`, payload and upstream refusals |
-| `unknown` | any other write failure: a timeout after connecting, a lost or unusable reply, a redirect, or a typed error that can follow a committed add |
+| `unknown` | any other write failure (each write names its own list in `src/mcp.rs`; a delete's is the shortest, because a refusal after it cancelled downloads is not a no-op): a timeout after connecting, a lost or unusable reply, a redirect, or a typed error that can follow a committed add |
 
-`unknown` comes with guidance: check `media_status` or `requests` before repeating. A write
+`unknown` comes with guidance: check `media_status` or `requests` (`bin` for files) before repeating. A write
 is never retried, and there is no fallback of any kind.
 
 **A typed error after a committed add.** `POST /library` can commit an add and then answer
@@ -178,7 +277,7 @@ to anything but `--api-url` would be seen.
 - **`tools_are_listed_with_strict_schemas_under_every_negotiated_protocol`.**
   - **Lifecycles.** Four of them; the versions above are asserted against the SDK's own
     constants.
-  - **Listing.** The same seven tools under each.
+  - **Listing.** The same tools under each, the original eight first.
   - **Schemas.** Closed schemas with exact properties and required fields; annotations.
     No forbidden property appears anywhere in any schema. The published `media_id`
     patterns accept exactly the ids each tool takes.
@@ -224,6 +323,32 @@ to anything but `--api-url` would be seen.
     line is a JSON-RPC 2.0 message.
   - Start-up refusals (mode 644, credentials or a query in the URL, a non-HTTP scheme)
     write nothing to stdout and leak nothing on stderr.
+
+**Parity tests.**
+- `tests/mcp_parity.rs` (see Parity above): every route of the real router (its methods are
+  found by asking the running router, its paths come from the list the router is built
+  from), every path `src/webapp/app.js` calls, and every tool is in `PARITY`. The OpenAPI
+  route list is compared with the router too. The failure message says what to add.
+- `tests/mcp.rs`, for the web-app tools:
+  - `the_read_tools_say_what_the_web_apps_routes_say`: each read tool answers what its
+    route answers (or the same typed refusal, `nothing_changed`), and arguments that could
+    escape a path are refused before any request;
+  - `titles_get_a_quality_follow_and_hide_through_the_same_routes_as_the_web_app`,
+    `get_title_is_the_web_apps_get_with_a_quality_and_repeating_it_creates_no_duplicate` and
+    `a_copy_picked_by_hand_is_downloaded_through_the_same_route_as_the_web_app`: the
+    quality, follow, hide, retry, remove, get and copy tools, with their outcomes;
+  - `sport_is_found_followed_and_picked_by_hand_with_the_caution_shown_first`: follow,
+    schedule, copies without any recommendation or leak, `confirmation_needed` with its
+    routing note, the unlisted copy refused, one grab, a repeat that creates no duplicate;
+  - `files_are_deleted_only_as_previewed_and_confirmed_then_restored_or_emptied_from_the_bin`:
+    no yes means no request; a made-up, stale or other scope's token moves nothing; the
+    previewed scope is deleted, restored and emptied, and a bin entry whose size differs
+    from what the person saw is not emptied.
+
+- `downloads_are_paused_resumed_cancelled_and_shown_and_a_sport_one_shows_no_release_text`
+  and `background_jobs_are_asked_for_by_a_few_names_and_read_back_and_folders_are_listed`:
+  the download, blocklist, command and folder tools; a sport download and a sport blocklist
+  entry carrying a release's text come out as the event's name and a closed reason only.
 
 **Review regression tests.**
 - `tests/mcp_parent_review.rs`: a committed `POST` whose reply is delayed past the timeout,
@@ -297,7 +422,7 @@ limit and handlers as any HTTP request, without a loopback socket and without de
 configured listen address (a `0.0.0.0` listen is never dialled). Shutdown stops the MCP service
 with the server; nothing re-enters startup.
 
-**Separate credential.** The MCP token reaches only the seven tools; it is refused by the REST
+**Separate credential.** The MCP token reaches only the tools; it is refused by the REST
 API, and the API token is refused at `/mcp`. Startup refuses an MCP token equal to the API
 token, a missing token file, and a non-loopback listener without explicit `allowed_hosts`.
 With `allow_non_loopback`, `/mcp` is still never served unauthenticated.

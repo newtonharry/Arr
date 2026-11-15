@@ -154,7 +154,7 @@ response bodies or credentials.
   finished goes with its data (a hardlinked copy frees no space while the torrent seeds)
   only when everything it holds is inside the delete: a season pack that also holds episodes
   being kept stays, with `removed: false` and a reason. `token` is a digest of the exact
-  files with their sizes and modified times. A symbolic link, a file that is not regular, one
+  files with their sizes and modified times and of each download listed with its `removed` decision (a download that appears afterwards changes it). A symbolic link, a file that is not regular, one
   that resolves outside the library folder or one in the bin refuses the whole preview with
   `409 delete_refused`.
 - **`POST /api/v1/delete`** with `{"media_id", "token", "keep_wanted"?}` deletes those files

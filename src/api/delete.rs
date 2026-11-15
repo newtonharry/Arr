@@ -275,6 +275,24 @@ fn whole_show_blocked(sc: &Scope, plans: &[DownloadPlan]) -> Option<&'static str
         )
 }
 
+/// What a delete presents: the files' token and, for each download the delete meets, whether
+/// it would go (in a stable order). A download that appears or changes between the preview and
+/// the delete changes the token, so it is never cancelled under a token that did not show it.
+fn delete_token(media_id: &str, files: &[trash::BinFile], plans: &[DownloadPlan]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut grabs: Vec<String> = plans
+        .iter()
+        .map(|p| format!("{}\0{}", p.grab.id, p.removed))
+        .collect();
+    grabs.sort();
+    let mut h = Sha256::new();
+    h.update(trash::token(media_id, files).as_bytes());
+    for g in grabs {
+        h.update(format!("\n{g}"));
+    }
+    hex::encode(h.finalize())
+}
+
 /// `POST /delete/preview`: what a delete of this movie, show, season or episode would take.
 pub(super) async fn preview(State(st): St, ApiJson(body): ApiJson<PreviewBody>) -> ApiResult {
     st.loaded()?;
@@ -283,6 +301,7 @@ pub(super) async fn preview(State(st): St, ApiJson(body): ApiJson<PreviewBody>) 
     let mut shown = vec![];
     let plans = plan_downloads(&st, &sc).await?;
     let blocked = whole_show_blocked(&sc, &plans);
+    let token = delete_token(&sc.id.to_string(), &files, &plans);
     for p in plans {
         let g = p.grab;
         let mut row =
@@ -296,7 +315,7 @@ pub(super) async fn preview(State(st): St, ApiJson(body): ApiJson<PreviewBody>) 
         "media_id": sc.id, "title": sc.title, "files": files,
         "library_bytes": files.iter().map(|f| f.bytes).sum::<u64>(),
         "downloads": shown, "unknown": sc.unknown, "blocked": blocked,
-        "token": trash::token(&sc.id.to_string(), &files),
+        "token": token,
     }))
 }
 
@@ -311,12 +330,6 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     if files.is_empty() {
         return Err(refused("There are no files Arr knows of to delete."));
     }
-    if trash::token(&id_s, &files) != body.token {
-        return Err(ApiError::conflict(
-            ErrorCode::Changed,
-            "The files changed since you looked. Look again before deleting.",
-        ));
-    }
     for f in files.iter_mut().filter(|f| f.kind == "video") {
         f.rows = sc.rows.get(&f.path).cloned().unwrap_or_default();
     }
@@ -328,6 +341,14 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     {
         let _grabs = st.worker.grabs.lock().await;
         let plans = plan_downloads(&st, &sc).await?;
+        // The files and the downloads must be what the preview showed, before anything is
+        // cancelled or moved.
+        if delete_token(&id_s, &files, &plans) != body.token {
+            return Err(ApiError::conflict(
+                ErrorCode::Changed,
+                "The files changed since you looked. Look again before deleting.",
+            ));
+        }
         if plans.iter().any(|p| p.finishing) {
             return Err(ApiError::conflict(
                 ErrorCode::ActiveDownloads,
