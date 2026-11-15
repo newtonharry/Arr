@@ -372,7 +372,7 @@ pub fn purge_dir(root: &Path, delete_id: &str) -> Result<()> {
             Ok(m) if m.is_dir() => {}
             Ok(_) => anyhow::bail!("the bin is not a plain folder"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if fs::read_dir(root).is_ok_and(|mut rd| rd.next().is_some()) {
+                if fs::read_dir(root).is_ok_and(|mut rd| rd.next().is_some_and(|e| e.is_ok())) {
                     return Ok(());
                 }
                 anyhow::bail!("the library folder is empty or cannot be reached (not mounted?)");
