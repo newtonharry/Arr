@@ -36,7 +36,7 @@ const TOOLS: [&str; 8] = [
 ];
 
 /// The tools added for parity with the web app, after the original eight, in order.
-const WEB_TOOLS: [&str; 33] = [
+const WEB_TOOLS: [&str; 42] = [
     "sport_search",
     "sport_leagues",
     "sport_league",
@@ -67,6 +67,15 @@ const WEB_TOOLS: [&str; 33] = [
     "system_health",
     "delete_preview",
     "delete_files",
+    "download",
+    "pause_download",
+    "resume_download",
+    "cancel_download",
+    "blocklist",
+    "unblock",
+    "run_command",
+    "command_status",
+    "library_folders",
     "bin",
     "bin_restore",
     "bin_empty",
@@ -471,7 +480,12 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
     }
 
     // The tools for the web app's other features: strict, honest about what they change.
-    let destructive = ["remove_title", "delete_files", "bin_empty"];
+    let destructive = [
+        "remove_title",
+        "delete_files",
+        "bin_empty",
+        "cancel_download",
+    ];
     let read_only = [
         "sport_search",
         "sport_leagues",
@@ -492,6 +506,10 @@ async fn tools_are_listed_with_strict_schemas_under_every_negotiated_protocol() 
         "title_details",
         "system_health",
         "delete_preview",
+        "download",
+        "blocklist",
+        "command_status",
+        "library_folders",
         "bin",
     ];
     for t in &tools[TOOLS.len()..] {
@@ -2094,5 +2112,165 @@ async fn files_are_deleted_only_as_previewed_and_confirmed_then_restored_or_empt
     // A sport event's files cannot be deleted from here.
     let (code, _) = failed_owned(s.call("delete_preview", json!({ "media_id": EVENT })).await);
     assert_eq!(code, "invalid_arguments");
+    s.finish().await;
+}
+
+// ------------------------------------------------------------------ downloads, blocklist, jobs
+
+#[tokio::test]
+async fn downloads_are_paused_resumed_cancelled_and_shown_and_a_sport_one_shows_no_release_text() {
+    let e = start_exec(managed()).await;
+    let start = (time::OffsetDateTime::now_utc() - time::Duration::days(2))
+        .replace_minute(0)
+        .unwrap()
+        .replace_second(0)
+        .unwrap()
+        .replace_nanosecond(0)
+        .unwrap();
+    insert_event(&e, start).await;
+    let name = "UFC.334.Gane.vs.Hokit.Main.Card.1080p.WEB-DL.H264-DARKSPORT";
+    let (_hash, mut rel) = e.publish(
+        name,
+        name,
+        vec![(format!("{name}.mkv"), mkv(3))],
+        1.5,
+        false,
+    );
+    rel["publishDate"] = json!(rfc(start + time::Duration::hours(30)));
+    e.search_results("UFC 334", vec![rel]);
+    e.search_results("UFC gane hokit", vec![]);
+    let s = session(&e).await;
+    let v = ok(&s
+        .call("sport_copies", json!({ "event_id": EVENT, "fresh": true }))
+        .await)
+    .clone();
+    let id = v["copies"][0]["id"].as_str().unwrap().to_string();
+    let v = ok(&s
+        .call("sport_get", json!({ "event_id": EVENT, "id": id }))
+        .await)
+    .clone();
+    let grab = v["grab"]["id"].as_str().unwrap().to_string();
+
+    // The download in detail: the event's name, never the release's own text.
+    let v = ok(&s.call("download", json!({ "grab_id": grab })).await).clone();
+    let text = v.to_string();
+    assert!(text.contains("UFC 334"), "{text}");
+    assert!(
+        !text.contains("DARKSPORT") && !text.contains("WEB-DL"),
+        "{text}"
+    );
+    assert_no_leaks(&text);
+    // Pause, resume, cancel: the API's own answers, a made-up id changes nothing.
+    // Still queued: refused, and since an action may have touched the client first, the
+    // outcome is reported as unknown (conservatively).
+    let r = s.call("pause_download", json!({ "grab_id": grab })).await;
+    let (code, v) = failed(&r);
+    assert_eq!(
+        (code, &v["outcome"]),
+        ("grab_state", &json!("unknown")),
+        "{v}"
+    );
+    e.tick().await;
+    ok(&s.call("pause_download", json!({ "grab_id": grab })).await);
+    ok(&s.call("resume_download", json!({ "grab_id": grab })).await);
+    let r = s
+        .call(
+            "pause_download",
+            json!({ "grab_id": "grb_000000000000000000000000" }),
+        )
+        .await;
+    let (code, v) = failed(&r);
+    assert_eq!(
+        (code, &v["outcome"]),
+        ("not_found", &json!("not_applied")),
+        "{v}"
+    );
+    let (code, v) = failed_owned(s.call("download", json!({ "grab_id": "grb_../x" })).await);
+    assert_eq!(
+        (code.as_str(), &v["outcome"]),
+        ("invalid_arguments", &json!("not_sent"))
+    );
+    let v = ok(&s.call("cancel_download", json!({ "grab_id": grab })).await).clone();
+    assert_no_leaks(&v.to_string());
+    assert!(!v.to_string().contains("DARKSPORT"), "{v}");
+
+    // A sport blocklist entry shows the event's name and a closed reason, not release text.
+    let at = rfc(start);
+    let g = grab.clone();
+    e.state
+        .store
+        .with(move |c| {
+            c.execute(
+                "INSERT INTO blocklist (media_id, release_ref, title, reason, grab_id, created_at) VALUES (?1, 'rel_000000000000000000000001', 'UFC.334.Gane.vs.Hokit.Main.Card.1080p.WEB-DL.H264-DARKSPORT', 'torrent says DARKSPORT won 2-0', ?2, ?3)",
+                rusqlite::params![EVENT, g, at],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let v = ok(&s.call("blocklist", json!({})).await).clone();
+    let text = v.to_string();
+    assert!(
+        !text.contains("DARKSPORT") && !text.contains("WEB-DL") && !text.contains("2-0"),
+        "{text}"
+    );
+    assert!(text.contains("UFC 334"), "{text}");
+    assert_eq!(v["items"][0]["reason"], "other", "{v}");
+    let id = v["items"][0]["id"].as_u64().unwrap();
+    // Forgiving it removes that entry, once.
+    let v = ok(&s.call("unblock", json!({ "id": id })).await).clone();
+    assert_eq!(v["removed"], id, "{v}");
+    let r = s.call("unblock", json!({ "id": id })).await;
+    let (code, v) = failed(&r);
+    assert_eq!(
+        (code, &v["outcome"]),
+        ("not_found", &json!("not_applied")),
+        "{v}"
+    );
+    s.finish().await;
+}
+
+#[tokio::test]
+async fn background_jobs_are_asked_for_by_a_few_names_and_read_back_and_folders_are_listed() {
+    let e = start_exec(managed()).await;
+    let s = session(&e).await;
+    let v = ok(&s.call("run_command", json!({ "name": "rescan" })).await).clone();
+    let id = v["id"].as_str().expect("a command id").to_string();
+    assert!(id.starts_with("cmd_"), "{v}");
+    let v = ok(&s.call("command_status", json!({ "id": id })).await).clone();
+    assert_eq!(v["command"]["name"], "rescan", "{v}");
+    let v = ok(&s.call("command_status", json!({ "limit": 5 })).await).clone();
+    assert!(v["total"].as_u64().unwrap() >= 1, "{v}");
+    // Only the names a person would use, and a title only where one is needed.
+    for args in [
+        json!({ "name": "poll_downloads" }),
+        json!({ "name": "search" }),
+        json!({ "name": "rescan", "media_id": "movie:tmdb:603" }),
+        json!({ "name": "search", "media_id": EVENT }),
+    ] {
+        let (code, v) = failed_owned(s.call("run_command", args).await);
+        assert_eq!(
+            (code.as_str(), &v["outcome"]),
+            ("invalid_arguments", &json!("not_sent")),
+            "{v}"
+        );
+    }
+    ok(&s
+        .call(
+            "run_command",
+            json!({ "name": "search", "media_id": "movie:tmdb:603" }),
+        )
+        .await);
+    let v = agrees(
+        &e,
+        &s,
+        "library_folders",
+        json!({}),
+        "/api/v1/library/roots",
+        true,
+    )
+    .await;
+    assert!(v["roots"].is_array(), "{v}");
+    agrees(&e, &s, "blocklist", json!({}), "/api/v1/blocklist", true).await;
     s.finish().await;
 }

@@ -303,6 +303,10 @@ enum Effect {
     SportGet,
     /// POST /copies/{id}/get (may add the title first).
     CopyGet,
+    /// POST /queue/{id}/pause, `/resume` and `/cancel`.
+    Download,
+    /// POST /commands.
+    Command,
     /// POST /delete.
     Delete,
     /// POST /bin/{id}/restore.
@@ -361,6 +365,16 @@ impl Effect {
             ),
             // Every refusal of a grab comes before the download is recorded, and so do the
             // sport checks (the event, the listing, the caution, whether it is over).
+            // A download action may act on the client before it is refused: only a missing
+            // download or a malformed id is certain to have changed nothing.
+            Effect::Download => matches!(code, "not_found" | "invalid_request"),
+            Effect::Command => matches!(
+                code,
+                "invalid_request"
+                    | "invalid_media_id"
+                    | "execution_disabled"
+                    | "catalog_not_imported"
+            ),
             Effect::SportGet => {
                 Effect::Grab.refused_unchanged(code)
                     || matches!(
@@ -1334,15 +1348,13 @@ pub const PARITY: &[(&str, &str, Parity)] = &[
         "PATCH",
         "/api/v1/library/{media_id}",
         Parity::Operator(
-            "a native-app style edit of monitoring, profile and folders; the assistant's controls over these are deliberately narrow: add_media, stop, set_quality and follow_series",
+            "a raw edit of monitoring, profile and folders for native-app style clients; a person says what they want (add_media, stop, set_quality, follow_series) and never edits a record",
         ),
     ),
     (
         "GET",
         "/api/v1/library/roots",
-        Parity::Operator(
-            "library folders and their scan status, for the person who runs the server",
-        ),
+        Parity::Tool("library_folders"),
     ),
     ("GET", "/api/v1/storage", Parity::Tool("storage")),
     ("GET", "/api/v1/wanted", Parity::Tool("wanted")),
@@ -1354,7 +1366,7 @@ pub const PARITY: &[(&str, &str, Parity)] = &[
         "GET",
         "/api/v1/media/{media_id}",
         Parity::Operator(
-            "the raw catalog record; title_details and media_status show the same facts",
+            "the raw catalog record for scripts; title_details and media_status show a person the same facts",
         ),
     ),
     (
@@ -1365,31 +1377,21 @@ pub const PARITY: &[(&str, &str, Parity)] = &[
     ("POST", "/api/v1/grabs", Parity::Tool("start_download")),
     ("GET", "/api/v1/queue", Parity::Tool("requests")),
     ("GET", "/api/v1/requests", Parity::Tool("requests")),
-    (
-        "GET",
-        "/api/v1/queue/{grab_id}",
-        Parity::Operator("one row of what requests lists"),
-    ),
+    ("GET", "/api/v1/queue/{grab_id}", Parity::Tool("download")),
     (
         "POST",
         "/api/v1/queue/{grab_id}/pause",
-        Parity::Operator(
-            "download-client control for the operator; neither the web app nor a household member pauses single downloads",
-        ),
+        Parity::Tool("pause_download"),
     ),
     (
         "POST",
         "/api/v1/queue/{grab_id}/resume",
-        Parity::Operator(
-            "download-client control for the operator; neither the web app nor a household member pauses single downloads",
-        ),
+        Parity::Tool("resume_download"),
     ),
     (
         "POST",
         "/api/v1/queue/{grab_id}/cancel",
-        Parity::Operator(
-            "stop cancels a title's unfinished downloads, which is what a person means",
-        ),
+        Parity::Tool("cancel_download"),
     ),
     (
         "POST",
@@ -1397,20 +1399,18 @@ pub const PARITY: &[(&str, &str, Parity)] = &[
         Parity::Tool("retry_download"),
     ),
     ("GET", "/api/v1/history", Parity::Tool("history")),
-    (
-        "GET",
-        "/api/v1/blocklist",
-        Parity::Operator("releases that failed before, for the operator to inspect"),
-    ),
+    ("GET", "/api/v1/blocklist", Parity::Tool("blocklist")),
     (
         "DELETE",
         "/api/v1/blocklist/{entry_id}",
-        Parity::Operator("releases that failed before, for the operator to forgive"),
+        Parity::Tool("unblock"),
     ),
     (
         "GET",
         "/api/v1/ownership",
-        Parity::Operator("a bulk ownership report; media_status and library answer per title"),
+        Parity::Operator(
+            "a bulk ownership report for scripts; a person asks about one title, and media_status and library answer that",
+        ),
     ),
     (
         "GET",
@@ -1565,114 +1565,140 @@ pub const PARITY: &[(&str, &str, Parity)] = &[
     (
         "GET",
         "/api/v1/health",
-        Parity::Operator("liveness probe for service managers"),
+        Parity::Operator("a liveness probe for service managers; nobody asks it in a chat"),
     ),
     (
         "GET",
         "/api/v1/openapi.json",
-        Parity::Operator("the API's schema, for developers"),
+        Parity::Operator(
+            "the API's schema, for people writing clients; not something a person asks for",
+        ),
     ),
     (
         "GET",
         "/api/v1/readiness",
-        Parity::Operator("readiness probe for deployments; system_health is the person's view"),
+        Parity::Operator(
+            "a readiness probe for deployments; system_health is how a person asks whether Arr is well",
+        ),
     ),
     (
         "GET",
         "/api/v1/capabilities",
-        Parity::Operator("what the API supports, for client developers"),
+        Parity::Operator(
+            "what the API supports, for people writing clients; a person asks Arr to do things, not what it can",
+        ),
     ),
     (
         "GET",
         "/api/v1/diagnostics",
-        Parity::Operator("a support bundle for the person who runs the server"),
+        Parity::Operator(
+            "a support bundle of internals for whoever debugs the server; not an answer a person wants in a chat",
+        ),
     ),
     (
         "GET",
         "/api/v1/settings",
-        Parity::Operator("the effective server configuration, for the person who runs the server"),
+        Parity::Operator(
+            "the raw server configuration; settings are the web app's settings page, and a chat has no need of the raw file",
+        ),
     ),
     (
         "GET",
         "/api/v1/migration-report",
-        Parity::Operator("a one-off report from importing a Sonarr or Radarr setup"),
+        Parity::Operator(
+            "a one-off report from importing a Sonarr or Radarr setup, read once at migration time",
+        ),
     ),
     (
         "POST",
         "/api/v1/plans",
         Parity::Operator(
-            "plans are the automation's own steps: add_media creates and runs one; nobody manages them by hand",
+            "plans are the automation's own steps; a person asks for a title (add_media, get_title) and never manages a plan",
         ),
     ),
     (
         "GET",
         "/api/v1/plans",
-        Parity::Operator("plans are the automation's own steps"),
+        Parity::Operator(
+            "plans are the automation's own steps; a person asks for a title (add_media, get_title) and never manages a plan",
+        ),
     ),
     (
         "GET",
         "/api/v1/plans/{plan_id}",
-        Parity::Operator("plans are the automation's own steps"),
+        Parity::Operator(
+            "plans are the automation's own steps; a person asks for a title (add_media, get_title) and never manages a plan",
+        ),
     ),
     (
         "POST",
         "/api/v1/plans/{plan_id}/cancel",
-        Parity::Operator("plans are the automation's own steps"),
+        Parity::Operator(
+            "plans are the automation's own steps; a person asks for a title (add_media, get_title) and never manages a plan",
+        ),
     ),
     (
         "POST",
         "/api/v1/plans/{plan_id}/execute",
-        Parity::Operator("plans are the automation's own steps; they are never executed by hand"),
+        Parity::Operator(
+            "plans are the automation's own steps and are never executed by hand; a person asks for a title instead",
+        ),
     ),
-    (
-        "POST",
-        "/api/v1/commands",
-        Parity::Operator("operator jobs such as a rescan or a backlog search"),
-    ),
-    (
-        "GET",
-        "/api/v1/commands",
-        Parity::Operator("operator jobs such as a rescan or a backlog search"),
-    ),
+    ("POST", "/api/v1/commands", Parity::Tool("run_command")),
+    ("GET", "/api/v1/commands", Parity::Tool("command_status")),
     (
         "GET",
         "/api/v1/commands/{command_id}",
-        Parity::Operator("operator jobs such as a rescan or a backlog search"),
+        Parity::Tool("command_status"),
     ),
     (
         "GET",
         "/api/v1/system/tasks",
-        Parity::Operator("the background tasks, for the person who runs the server"),
+        Parity::Operator(
+            "the schedule of the server's own timers; a person asks for a job with run_command and sees it with command_status",
+        ),
     ),
     (
         "GET",
         "/api/v1/rss",
-        Parity::Operator("the RSS poller's status, for the person who runs the server"),
+        Parity::Operator(
+            "the RSS poller's internals; run_command rss_sync checks now, and system_health says if something is wrong",
+        ),
     ),
     (
         "GET",
         "/api/v1/setup",
-        Parity::Operator("first-run setup, done at the server (the setup wizard)"),
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
     ),
     (
         "POST",
         "/api/v1/setup",
-        Parity::Operator("first-run setup, done at the server (the setup wizard)"),
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
     ),
     (
         "GET",
         "/api/v1/setup/plex",
-        Parity::Operator("first-run setup, done at the server (the setup wizard)"),
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
     ),
     (
         "GET",
         "/api/v1/setup/plex/bootstrap",
-        Parity::Operator("first-run setup, done at the server (the setup wizard)"),
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
     ),
     (
         "POST",
         "/api/v1/setup/plex/bootstrap",
-        Parity::Operator("first-run setup, done at the server (the setup wizard)"),
+        Parity::Operator(
+            "first-run setup, done once at the server with the setup wizard before anyone chats with Arr",
+        ),
     ),
 ];
 

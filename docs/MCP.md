@@ -97,6 +97,13 @@ original eight.
 | `sport_events` | `from`?, `to`?, `league`? | `GET /api/v1/sport/events` |
 | `sport_copies` | `event_id`, `part`?, `fresh`? | `GET /api/v1/sport/event/{id}/copies` |
 | `sport_get` | `event_id`, `id` (`rel_` + 24 hex), `confirm`? | `POST /api/v1/sport/event/{id}/get` |
+| `download` | `grab_id` (`grb_` + 24 hex) | `GET /api/v1/queue/{grab_id}`: one download with its events and import steps (a sport download shows the event's name, never release text) |
+| `pause_download`, `resume_download`, `cancel_download` | `grab_id` | `POST /api/v1/queue/{grab_id}/pause`, `/resume`, `/cancel` (no body: data is kept, nothing is blocklisted). A refusal other than "no such download" is `unknown`, because the API may have acted on the download client first |
+| `blocklist` | `media_id`? | `GET /api/v1/blocklist`. A sport entry shows the stored event's name and a reason from a closed list (anything else is `other`); the API does this, the tool adds nothing |
+| `unblock` | `id` | `DELETE /api/v1/blocklist/{id}` |
+| `run_command` | `name` (`rescan`, `search_missing`, `rss_sync`, `refresh_metadata`, `search`, `plex_refresh`), `media_id`? | `POST /api/v1/commands`. `search` and `plex_refresh` need a title, the others take none; `poll_downloads` and `cleanup_downloads` are not offered. Queued, not finished |
+| `command_status` | `id`? (`cmd_` + 24 hex), `limit`?, `offset`? | `GET /api/v1/commands/{id}`, or `GET /api/v1/commands` without an id |
+| `library_folders` | none | `GET /api/v1/library/roots` |
 | `delete_preview` | `media_id` | `POST /api/v1/delete/preview` |
 | `delete_files` | `media_id`, `token`, `confirmed`, `keep_wanted`? | `POST /api/v1/delete/preview` again, then `POST /api/v1/delete` |
 | `bin` | none | `GET /api/v1/bin` |
@@ -143,9 +150,12 @@ app calls) with the tool that covers it, or a reason it has none:
 - **Web only, on purpose:** the web app's sign-in and session (`/app/api/me`, `signout`),
   push notifications (`/notifications/key`, `subscribe`), installing an update (`/update`)
   and changing server settings (`/settings/app`).
-- **Operator:** routes for the person who runs the server or for automation (probes,
-  diagnostics, setup, plans, commands, blocklist, per-download pause and resume, the raw
-  catalog record, bulk ownership), each with its reason in the table.
+- **Operator:** routes that serve probes, scripts and client developers rather than a
+  person's request (liveness and readiness, openapi, capabilities, diagnostics, the raw
+  settings and migration report, first-run setup, plans, the timers list, the RSS poller,
+  bulk ownership, the raw catalog record, `PATCH /library/{id}`), each with the reason a
+  person would not need it in a chat. Things a person does with Arr itself (pausing or
+  cancelling a download, the blocklist, background jobs, library folders) are tools.
 
 `tests/mcp_parity.rs` fails when a route of the real router, or a path `src/webapp/app.js`
 calls, has no entry, when an entry names a tool that is not registered, or when a tool is in
@@ -327,6 +337,11 @@ to anything but `--api-url` would be seen.
     no yes means no request; a made-up, stale or other scope's token moves nothing; the
     previewed scope is deleted, restored and emptied, and a bin entry whose size differs
     from what the person saw is not emptied.
+
+- `downloads_are_paused_resumed_cancelled_and_shown_and_a_sport_one_shows_no_release_text`
+  and `background_jobs_are_asked_for_by_a_few_names_and_read_back_and_folders_are_listed`:
+  the download, blocklist, command and folder tools; a sport download and a sport blocklist
+  entry carrying a release's text come out as the event's name and a closed reason only.
 
 **Review regression tests.**
 - `tests/mcp_parent_review.rs`: a committed `POST` whose reply is delayed past the timeout,

@@ -373,7 +373,94 @@ const SHAPES: &[(&str, &str, &str)] = &[
     ("bin_restore", "delete_id", DELETE_ID),
     ("bin_empty", "delete_id", DELETE_ID),
     ("delete_files", "token", TOKEN),
+    ("download", "grab_id", GRAB_ID),
+    ("pause_download", "grab_id", GRAB_ID),
+    ("resume_download", "grab_id", GRAB_ID),
+    ("cancel_download", "grab_id", GRAB_ID),
+    ("command_status", "id", r"^cmd_[0-9a-f]{24}$"),
 ];
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DownloadArg {
+    /// A download's id from requests or the feed (grb_ and 24 hex).
+    #[schemars(regex(pattern = GRAB_ID))]
+    grab_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BlocklistArg {
+    /// Only this canonical id.
+    #[serde(default)]
+    #[schemars(regex(pattern = ANY_ID))]
+    media_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Unblock {
+    /// An entry's id from blocklist.
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991u64))]
+    id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+enum CommandName {
+    Rescan,
+    SearchMissing,
+    RssSync,
+    RefreshMetadata,
+    Search,
+    PlexRefresh,
+}
+
+impl CommandName {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CommandName::Rescan => "rescan",
+            CommandName::SearchMissing => "search_missing",
+            CommandName::RssSync => "rss_sync",
+            CommandName::RefreshMetadata => "refresh_metadata",
+            CommandName::Search => "search",
+            CommandName::PlexRefresh => "plex_refresh",
+        }
+    }
+
+    fn needs_title(&self) -> bool {
+        matches!(self, CommandName::Search | CommandName::PlexRefresh)
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RunCommand {
+    /// rescan (look through the library folders again), search_missing (look for everything missing), rss_sync (check the indexers' newest releases now), refresh_metadata (refresh titles' details), search (look for one title; needs media_id), plex_refresh (ask Plex to look again at one title; needs media_id).
+    name: CommandName,
+    /// The title for search and plex_refresh (a canonical id); not for the others.
+    #[serde(default)]
+    #[schemars(regex(pattern = ANY_ID))]
+    media_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CommandStatus {
+    /// A command's id from run_command (cmd_ and 24 hex). Leave out to list the latest commands.
+    #[serde(default)]
+    #[schemars(regex(pattern = r"^cmd_[0-9a-f]{24}$"))]
+    id: Option<String>,
+    /// Commands per page when listing (default 50).
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 100))]
+    limit: Option<u32>,
+    /// Where the page starts when listing.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 1_000_000))]
+    offset: Option<u32>,
+}
 
 pub(super) fn tool_list(read: &ToolAnnotations) -> Vec<Tool> {
     let write = ToolAnnotations::new()
@@ -540,6 +627,51 @@ pub(super) fn tool_list(read: &ToolAnnotations) -> Vec<Tool> {
             "delete_files",
             "DELETES FILES: moves a movie, show, season or episode out of the library into the bin, where it can be put back for 7 days (bin_restore), then it is gone for good. Only call it after delete_preview of exactly this media_id, after you have shown the person the preview (title, files, sizes) and they explicitly said yes to deleting exactly that; then pass the preview's token unchanged and confirmed true. Never infer consent, never delete a wider scope than the person named, and never reuse a token for another scope. If anything changed since the preview Arr refuses (changed): preview again and ask again. By default Arr stops wanting the title; keep_wanted true makes it fetch a new copy instead.",
             destructive.clone(),
+        ),
+        tool::<DownloadArg>(
+            "download",
+            "One download in detail: its state and progress, what Arr did with it (events) and how its import went. Take the grab_id from requests or the feed.",
+            read.clone(),
+        ),
+        tool::<DownloadArg>(
+            "pause_download",
+            "Pause one unfinished download. Resume it with resume_download.",
+            write_idem.clone(),
+        ),
+        tool::<DownloadArg>(
+            "resume_download",
+            "Resume a paused download.",
+            write_idem.clone(),
+        ),
+        tool::<DownloadArg>(
+            "cancel_download",
+            "Cancel one download (its id is from requests); its data is kept and nothing already in Plex is touched. To stop getting a whole title use stop. Confirm with the person which download first.",
+            destructive.clone(),
+        ),
+        tool::<BlocklistArg>(
+            "blocklist",
+            "Copies Arr will not try again because they failed before, newest first, optionally for one title. Sport entries show the event's name and a plain reason, never a release's own text.",
+            read.clone(),
+        ),
+        tool::<Unblock>(
+            "unblock",
+            "Take one entry off the blocklist (its id is from blocklist) so Arr may try that copy again. Forgiving a copy deletes nothing.",
+            write_idem.clone(),
+        ),
+        tool::<RunCommand>(
+            "run_command",
+            "Ask Arr to do a background job now: rescan the library folders, look for everything that is missing, check the indexers' newest releases, refresh details, search for one title, or ask Plex to look again at one title. It is queued, not finished: read the result with command_status. Asking for one that is already pending does not queue another. Only with execution enabled.",
+            write_idem.clone(),
+        ),
+        tool::<CommandStatus>(
+            "command_status",
+            "The state and result of one background job (by id from run_command), or the latest jobs when no id is given.",
+            read.clone(),
+        ),
+        tool::<NoArgs>(
+            "library_folders",
+            "The library folders Arr watches and the status of their last rescan (ok, unavailable, incomplete, empty_suspect); only ok scans change what is owned.",
+            read.clone(),
         ),
         tool::<NoArgs>(
             "bin",
@@ -910,6 +1042,70 @@ impl Adapter {
                 }
             }),
             "delete_files" => run!(DeleteFiles, |a| self.delete_files(a)),
+            "download" => run!(DownloadArg, |a| self
+                .read(&["api", "v1", "queue", &a.grab_id], &[])),
+            "pause_download" => run!(DownloadArg, |a| self.write(
+                Effect::Download,
+                &["api", "v1", "queue", &a.grab_id, "pause"],
+                None
+            )),
+            "resume_download" => run!(DownloadArg, |a| self.write(
+                Effect::Download,
+                &["api", "v1", "queue", &a.grab_id, "resume"],
+                None
+            )),
+            "cancel_download" => run!(DownloadArg, |a| self.write(
+                Effect::Download,
+                &["api", "v1", "queue", &a.grab_id, "cancel"],
+                None
+            )),
+            "blocklist" => run!(BlocklistArg, |a| async {
+                let mut q = vec![];
+                if let Some(m) = &a.media_id {
+                    match id_of(m, any_title, "a title") {
+                        Ok(id) => q.push(("media_id", id.to_string())),
+                        Err(r) => return r,
+                    }
+                }
+                self.read(&["api", "v1", "blocklist"], &q).await
+            }),
+            "unblock" => run!(Unblock, |a| self.write(
+                Effect::ChangeDelete,
+                &["api", "v1", "blocklist", &a.id.to_string()],
+                None
+            )),
+            "run_command" => run!(RunCommand, |a| async {
+                let media = match (&a.media_id, a.name.needs_title()) {
+                    (Some(m), true) => match id_of(m, any_title, "a title") {
+                        Ok(id) => Some(id.to_string()),
+                        Err(r) => return r,
+                    },
+                    (None, true) => {
+                        return invalid("this command needs a media_id");
+                    }
+                    (Some(_), false) => {
+                        return invalid("this command takes no media_id");
+                    }
+                    (None, false) => None,
+                };
+                let mut body = json!({ "name": a.name.as_str() });
+                if let Some(m) = media {
+                    body["media_id"] = json!(m);
+                }
+                self.write(Effect::Command, &["api", "v1", "commands"], Some(body))
+                    .await
+            }),
+            "command_status" => run!(CommandStatus, |a| async {
+                match &a.id {
+                    Some(id) => self.read(&["api", "v1", "commands", id], &[]).await,
+                    None => {
+                        self.read(&["api", "v1", "commands"], &page_query(a.limit, a.offset))
+                            .await
+                    }
+                }
+            }),
+            "library_folders" => run!(NoArgs, |_a| self
+                .read(&["api", "v1", "library", "roots"], &[])),
             "bin" => run!(NoArgs, |_a| self.read(&["api", "v1", "bin"], &[])),
             "bin_restore" => run!(BinRestore, |a| self.write(
                 Effect::Restore,
