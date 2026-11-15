@@ -319,9 +319,18 @@ pub(super) async fn preview(State(st): St, ApiJson(body): ApiJson<PreviewBody>) 
     }))
 }
 
-/// `POST /delete`: moves the files into the bin and stops wanting them.
+/// `POST /delete`: moves the files into the bin and stops wanting them. A request that is
+/// dropped (the server deadline, a client that gives up) must not split the move from its
+/// record, so the delete runs as its own task, which holds the bin's lock, and the request
+/// waits for it.
 pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) -> ApiResult {
     st.loaded()?;
+    tokio::spawn(delete_unit(st, body))
+        .await
+        .map_err(|e| ApiError::internal("delete", e))?
+}
+
+async fn delete_unit(st: Arc<AppState>, body: DeleteBody) -> ApiResult {
     let _guard = trash::LOCK.lock().await;
     let now = OffsetDateTime::now_utc();
     let sc = scope(&st, &body.media_id).await?;
@@ -338,6 +347,7 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     // there). A download being added to Plex is left to finish and the delete waits. One that
     // cannot be removed stays and keeps seeding. Decided and done under the grabs lock.
     let mut seeding = 0;
+    let mut removed: Vec<String> = vec![];
     {
         let _grabs = st.worker.grabs.lock().await;
         let plans = plan_downloads(&st, &sc).await?;
@@ -376,7 +386,7 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
             )
             .await;
             match r {
-                Ok(_) => {}
+                Ok(_) => removed.push(p.grab.title.clone()),
                 Err(downloads::ActionError::Conflict("finishing", _)) => {
                     return Err(ApiError::conflict(
                         ErrorCode::ActiveDownloads,
@@ -395,18 +405,6 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     }
     // The files move, or none do.
     let delete_id = crate::fsutil::random_hex(8).map_err(internal("delete"))?;
-    let (root, did, moving) = (sc.root.clone(), delete_id.clone(), files.clone());
-    tokio::task::spawn_blocking(move || trash::mv(&root, &did, &moving))
-        .await
-        .map_err(|e| ApiError::internal("delete", e))?
-        .map_err(|f| match f {
-            Fail::Changed(why) => ApiError::conflict(ErrorCode::Changed, why),
-            Fail::Refused(why) => refused(why),
-            Fail::Io(why) => ApiError::conflict(
-                ErrorCode::MoveFailed,
-                format!("{why}. Nothing was deleted."),
-            ),
-        })?;
     let bytes: u64 = files.iter().map(|f| f.bytes).sum();
     let entry = Entry {
         delete_id: delete_id.clone(),
@@ -418,6 +416,46 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
         deleted_at: rfc3339(now),
         purge_at: trash::purge_at(now),
     };
+    // The entry is written before anything moves, so a crash once the files are in the bin
+    // still leaves a way back. (After a crash before the move, its restore finds nothing in
+    // the bin and its purge drops it.)
+    let pending = entry.clone();
+    st.store
+        .with(move |c| trash::insert(c, &pending))
+        .await
+        .map_err(internal("delete"))?;
+    let (root, did, moving) = (sc.root.clone(), delete_id.clone(), files.clone());
+    let moved = tokio::task::spawn_blocking(move || trash::mv(&root, &did, &moving))
+        .await
+        .map_err(|e| ApiError::internal("delete", e))?;
+    if let Err(f) = moved {
+        // A file the move could not put back is still in the bin: the entry stays for it.
+        if !sc.root.join(trash::BIN).join(&delete_id).exists() {
+            let did = delete_id.clone();
+            let _ = st.store.with(move |c| trash::keep(c, &did, &[])).await;
+        }
+        // Downloads that already went with their data are named: they are not coming back.
+        let said = |why: String, none: &str| {
+            if removed.is_empty() {
+                format!("{why}{none}")
+            } else {
+                format!(
+                    "{why}. No file was moved, but these downloads were already removed with their data: {}.",
+                    removed.join(", ")
+                )
+            }
+        };
+        return Err(match f {
+            Fail::Changed(why) => ApiError::conflict(ErrorCode::Changed, said(why, "")),
+            Fail::Refused(why) => refused(said(why, "")),
+            Fail::Io(why) => {
+                ApiError::conflict(ErrorCode::MoveFailed, said(why, ". Nothing was deleted."))
+            }
+        });
+    }
+    if trash::test_point(&sc.root, "crash_after_move") {
+        return Err(ApiError::internal("delete", "stopped for a crash test"));
+    }
     let owner = sc.owner().to_string();
     let plex = st.plex.is_some();
     let (mut entry2, owner2, id2) = (entry.clone(), owner.clone(), id_s.clone());
@@ -456,7 +494,7 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
                 "UPDATE media SET scanned_at = ?2 WHERE id = ?1",
                 params![owner2, at],
             )?;
-            trash::insert(&tx, &entry2)?;
+            trash::keep(&tx, &entry2.delete_id, &entry2.files)?;
             library::event(
                 &tx,
                 at,
@@ -477,7 +515,18 @@ pub(super) async fn delete(State(st): St, ApiJson(body): ApiJson<DeleteBody>) ->
     if let Err(e) = recorded {
         // Without a record there would be no way back: put the files where they were.
         let (root, did, back) = (sc.root.clone(), delete_id.clone(), files.clone());
-        let _ = tokio::task::spawn_blocking(move || trash::put_back(&root, &did, &back)).await;
+        let done = tokio::task::spawn_blocking(move || trash::put_back(&root, &did, &back)).await;
+        let left: Vec<BinFile> = files
+            .iter()
+            .filter(|f| {
+                !done
+                    .as_ref()
+                    .is_ok_and(|d| d.restored.iter().any(|r| r.path == f.path))
+            })
+            .cloned()
+            .collect();
+        let did = delete_id.clone();
+        let _ = st.store.with(move |c| trash::keep(c, &did, &left)).await;
         return Err(internal("delete")(e));
     }
     st.reload_index().await.map_err(internal("index"))?;

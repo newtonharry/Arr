@@ -25,6 +25,22 @@ pub const KEEP_DAYS: i64 = 7;
 /// Deletes, restores and purges run one at a time.
 pub static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Places a delete can be made to wait or stop dead, for tests: `(library root, point)`. The
+/// points are `hold_after_move` (the move waits three seconds once its files are in the bin)
+/// and `crash_after_move` (the delete stops there, leaving what a crash there leaves).
+#[doc(hidden)]
+pub static TEST_AT: std::sync::Mutex<Vec<(PathBuf, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[doc(hidden)]
+pub fn test_point(root: &Path, point: &str) -> bool {
+    TEST_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(r, p)| *p == point && same_dir(r, root))
+}
+
 /// Subtitles, metadata and artwork that travel with a video of the same name.
 const SIDECARS: &[&str] = &[
     "srt", "ass", "ssa", "sub", "idx", "vtt", "nfo", "jpg", "jpeg", "png", "webp", "tbn", "gif",
@@ -247,6 +263,9 @@ pub fn mv(root: &Path, delete_id: &str, files: &[BinFile]) -> Result<(), Fail> {
     for (src, _) in &moved {
         prune_empty(&root_c, src);
     }
+    if test_point(root, "hold_after_move") {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
     Ok(())
 }
 
@@ -302,9 +321,16 @@ pub fn put_back(root: &Path, delete_id: &str, files: &[BinFile]) -> Restored {
             skip("its folder cannot be made");
             continue;
         }
-        if fs::rename(&src, &dest).is_err() {
-            skip("it could not be moved");
-            continue;
+        match move_no_clobber(&src, &dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                skip("something is already there");
+                continue;
+            }
+            Err(_) => {
+                skip("it could not be moved");
+                continue;
+            }
         }
         prune_empty(&bin, &src);
         out.restored.push(f.clone());
@@ -312,7 +338,32 @@ pub fn put_back(root: &Path, delete_id: &str, files: &[BinFile]) -> Restored {
     out
 }
 
-/// Deletes one bin entry's folder, and only that.
+/// Puts `src` at `dest` unless something is there, never replacing it: a hard link (which
+/// fails when the name is taken), then the old name goes. Where a hard link is not possible
+/// the name is claimed with a new empty file and the rename replaces only that.
+fn move_no_clobber(src: &Path, dest: &Path) -> std::io::Result<()> {
+    match fs::hard_link(src, dest) {
+        Ok(()) => fs::remove_file(src).inspect_err(|_| {
+            let _ = fs::remove_file(dest);
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => claim_and_rename(src, dest),
+    }
+}
+
+fn claim_and_rename(src: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    fs::rename(src, dest).inspect_err(|_| {
+        let _ = fs::remove_file(dest);
+    })
+}
+
+/// Deletes one bin entry's folder, and only that. A folder that is not there is gone only
+/// when the library is: an unmounted drive shows an empty folder (or none), and then the
+/// entry waits for it.
 pub fn purge_dir(root: &Path, delete_id: &str) -> Result<()> {
     let bin = root.join(BIN);
     let dir = bin.join(delete_id);
@@ -320,7 +371,12 @@ pub fn purge_dir(root: &Path, delete_id: &str) -> Result<()> {
         match fs::symlink_metadata(p) {
             Ok(m) if m.is_dir() => {}
             Ok(_) => anyhow::bail!("the bin is not a plain folder"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if fs::read_dir(root).is_ok_and(|mut rd| rd.next().is_some_and(|e| e.is_ok())) {
+                    return Ok(());
+                }
+                anyhow::bail!("the library folder is empty or cannot be reached (not mounted?)");
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -486,6 +542,25 @@ mod tests {
             kind: "video".into(),
             stamp: stamp(&m),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_restore_never_replaces_a_file_that_took_the_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("in-bin.mkv"), tmp.path().join("taken.mkv"));
+        for publish in [move_no_clobber, claim_and_rename] {
+            fs::write(&src, "binned").unwrap();
+            fs::write(&dest, "new").unwrap();
+            let e = publish(&src, &dest).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
+            assert_eq!(fs::read_to_string(&src).unwrap(), "binned");
+            fs::remove_file(&dest).unwrap();
+            publish(&src, &dest).unwrap();
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "binned");
+            assert!(!src.exists());
+            fs::remove_file(&dest).unwrap();
         }
     }
 
