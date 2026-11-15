@@ -87,6 +87,10 @@ pub struct FakeState {
     /// While set, an add waits for a permit before doing anything (as a magnet waiting for its
     /// metadata); `add held` is logged when it starts waiting.
     pub hold_add: Option<Arc<tokio::sync::Semaphore>>,
+    /// Accepted adds are kept here, out of sight, until the test moves them into `torrents`
+    /// (a client slow to list what it took).
+    pub hide_adds: bool,
+    pub hidden: BTreeMap<String, FakeTorrent>,
     /// Where data is written, and the save path the application knows (set when attached).
     pub download_dir: PathBuf,
     pub save_path: String,
@@ -388,7 +392,11 @@ impl Fake {
                 seeding_time_limit: req.seeding_time_limit_minutes.unwrap_or(-2),
                 speed: 0,
             };
-            s.torrents.insert(hash, t);
+            if s.hide_adds {
+                s.hidden.insert(hash, t);
+            } else {
+                s.torrents.insert(hash, t);
+            }
         }
         if s.down_after_add {
             s.down_after_add = false;

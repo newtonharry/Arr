@@ -1861,7 +1861,7 @@ pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         .store
         .with(move |c| select(c, "state IN ('queued', 'unconfirmed') AND next_attempt_at <= ?1 ORDER BY created_at LIMIT 20", &[&now_s]))
         .await?;
-    retry_late_adds(st, &qb).await?;
+    retry_late_adds(st, &qb, now).await?;
     let mut confirmed = 0;
     for g in due {
         let (g, add) = {
@@ -1910,14 +1910,27 @@ pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         let found = verified.clone().flatten();
         let _guard = st.worker.grabs.lock().await;
         if !still_submitting(st, &g.id).await? {
-            if !abandon_add(&qb, &g, verified, add.post.as_deref()).await {
-                // Checked and removed again on a later pass (see `retry_late_adds`).
-                let id = g.id.clone();
+            // Only an add the client turned down is known to have left nothing behind: one it
+            // took, or whose outcome is unknown, may still show up later.
+            let nothing_added = match &answer {
+                Ok(false) => true,
+                Ok(true) => false,
+                Err(e) => {
+                    let text = e.describe();
+                    text.contains("invalid") || crate::upstream::describes_missing_metadata(&text)
+                }
+            };
+            if !taken_by_another(st, &g).await?
+                && !abandon_add(&qb, &g, verified, add.post.as_deref(), nothing_added).await
+            {
+                // Checked and removed again on a later pass (see `retry_late_adds`); a torrent
+                // still not there counts as never added once the grace period is over.
+                let (id, until) = (g.id.clone(), ts(now + LATE_ADD_GRACE));
                 st.store
                     .with(move |c| {
                         c.execute(
-                            "UPDATE grabs SET lease_owner = ?2 WHERE id = ?1",
-                            params![id, LATE_ADD],
+                            "UPDATE grabs SET lease_owner = ?2, lease_until = ?3 WHERE id = ?1",
+                            params![id, LATE_ADD, until],
                         )?;
                         Ok(())
                     })
@@ -1963,6 +1976,24 @@ async fn still_submitting(st: &AppState, id: &str) -> Result<bool> {
 /// the torrent the add may have left in the client is not yet known to be gone.
 const LATE_ADD: &str = "late_add";
 
+/// How long an add the client took (or may have taken) can stay out of sight before its
+/// absence counts as nothing having been added (a magnet's metadata can take minutes).
+const LATE_ADD_GRACE: Duration = Duration::from_secs(30 * 60);
+
+/// Whether another active download of the same torrent owns it now (it is left to that one).
+async fn taken_by_another(st: &AppState, g: &Grab) -> Result<bool> {
+    let (hash, gid) = (g.info_hash.clone(), g.id.clone());
+    st.store
+        .with(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM grabs WHERE info_hash = ?1 AND active = 1 AND id != ?2)",
+                params![hash, gid],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+}
+
 /// The client's torrent with this hash: `None` when the client did not answer.
 async fn lookup(qb: &Client, hash: &str) -> Option<Option<TorrentInfo>> {
     let list = qb.info(&[hash.to_string()]).await.ok()?;
@@ -1972,16 +2003,23 @@ async fn lookup(qb: &Client, hash: &str) -> Option<Option<TorrentInfo>> {
 /// An add that finished after its grab was cancelled (or otherwise taken off it): a torrent
 /// it left in the client is removed again (its data is kept: nothing about it was checked for
 /// removal), and nothing about it is recorded on the grab. Returns whether that is settled
-/// (the torrent is gone or not ours); otherwise it is tried again on a later pass.
+/// (the torrent is gone or not ours); otherwise it is tried again on a later pass. A torrent
+/// not there settles it only when `absent_settles` (the add left nothing, or the grace period
+/// for one to show up is over).
 async fn abandon_add(
     qb: &Client,
     g: &Grab,
     verified: Option<Option<TorrentInfo>>,
     post: Option<&str>,
+    absent_settles: bool,
 ) -> bool {
     let t = match verified {
         None => {
             tracing::warn!(grab = %g.id, "the download changed while it was being added; {} did not answer, so the added torrent is checked again later", qb.label());
+            return false;
+        }
+        Some(None) if !absent_settles => {
+            tracing::info!(grab = %g.id, "the download changed while it was being added; the added torrent is not in {} yet, so it is checked again later", qb.label());
             return false;
         }
         Some(found) => match found.filter(|t| ours(t, g, post)) {
@@ -2005,31 +2043,33 @@ async fn abandon_add(
 }
 
 /// Retries removing the torrents of adds that finished after their grab was cancelled.
-async fn retry_late_adds(st: &AppState, qb: &Client) -> Result<()> {
+async fn retry_late_adds(st: &AppState, qb: &Client, now: OffsetDateTime) -> Result<()> {
     let late = st
         .store
         .with(|c| select(c, "lease_owner = ?1", &[&LATE_ADD]))
         .await?;
+    let now_s = ts(now);
     for g in late {
         let _guard = st.worker.grabs.lock().await;
-        let (hash, gid) = (g.info_hash.clone(), g.id.clone());
-        // A download of the same torrent started since owns it now: it is left to that one.
-        let taken: bool = st
+        let (gid, now_s) = (g.id.clone(), now_s.clone());
+        let grace_over: bool = st
             .store
             .with(move |c| {
                 Ok(c.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM grabs WHERE info_hash = ?1 AND active = 1 AND id != ?2)",
-                    params![hash, gid],
+                    "SELECT lease_until IS NULL OR lease_until <= ?2 FROM grabs WHERE id = ?1",
+                    params![gid, now_s],
                     |r| r.get(0),
                 )?)
             })
             .await?;
-        if taken
+        // A download of the same torrent started since owns it now: it is left to that one.
+        if taken_by_another(st, &g).await?
             || abandon_add(
                 qb,
                 &g,
                 lookup(qb, &g.info_hash).await,
                 post_category(st, &g).as_deref(),
+                grace_over,
             )
             .await
         {

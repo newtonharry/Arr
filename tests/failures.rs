@@ -721,3 +721,71 @@ async fn a_late_torrent_the_client_could_not_be_asked_about_is_removed_once_it_a
         "the late torrent is removed once the client answers"
     );
 }
+
+#[tokio::test]
+async fn a_late_add_the_client_lists_only_later_is_still_removed() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash, gate, pass) = cancelled_during_its_add(&e, 2).await;
+    // The client takes the add but does not list it yet: its absence proves nothing.
+    e.fake.lock().unwrap().hide_adds = true;
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    // The torrent then shows up: a later pass removes it.
+    {
+        let mut f = e.fake.lock().unwrap();
+        f.hide_adds = false;
+        let t = f.hidden.remove(&hash).expect("the add was taken");
+        f.torrents.insert(hash.clone(), t);
+    }
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!((g.state.as_str(), g.active), ("cancelled", false));
+    assert!(
+        !e.fake.lock().unwrap().torrents.contains_key(&hash),
+        "the late torrent is removed once the client lists it"
+    );
+    // Once it is gone, nothing more is tried.
+    let lease: Option<String> = e
+        .state
+        .store
+        .blocking(move |c| {
+            Ok(
+                c.query_row("SELECT lease_owner FROM grabs WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    assert_eq!(lease, None);
+}
+
+#[tokio::test]
+async fn a_late_add_never_removes_the_torrent_of_a_newer_download() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash, gate, pass) = cancelled_during_its_add(&e, 4).await;
+    // The same torrent is asked for again before the cancelled add finishes.
+    let (s, v, text) = e
+        .json(e.post("/api/v1/plans").json(
+            &json!({ "media_id": "episode:tvdb:372264:1:4", "execute": true, "replan": true }),
+        ))
+        .await;
+    assert_eq!(s, 201, "{text}");
+    let newer = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("{text}"))
+        .to_string();
+    assert_ne!(newer, id);
+    assert_eq!(e.grab_row(&newer).info_hash, hash, "{text}");
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    let f = e.fake.lock().unwrap();
+    assert!(
+        !f.log.iter().any(|l| l == &format!("delete {hash}")),
+        "{:?}",
+        f.log
+    );
+    assert!(
+        f.torrents.contains_key(&hash),
+        "the newer download keeps it"
+    );
+}
