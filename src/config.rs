@@ -1587,13 +1587,11 @@ pub fn parse_config(
     if let (Some(q), Some(l)) = (&qbittorrent, &library) {
         for root in l.roots() {
             let root = &root;
-            // (movies and TV are compared as written, as before; sport, which is new, is also
-            // compared by where it really is)
-            let is_sport = l.sport_root().as_ref() == Some(root);
-            let real = is_sport
-                && crate::paths::overlap(root, &q.local_path)
-                    .map_err(|e| anyhow::anyhow!("library.sport: {e}"))?;
-            if root.starts_with(&q.local_path) || q.local_path.starts_with(root) || real {
+            // Compared as written and by where each really is, so a symlink cannot hide one
+            // inside the other; a root that cannot be resolved is refused.
+            let real = crate::paths::overlap(root, &q.local_path)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", root_key(l, root)))?;
+            if paths_overlap(root, &q.local_path) || real {
                 bail!(
                     "qbittorrent.local_path and the library roots must not contain each other ({} vs {})",
                     q.local_path.display(),
@@ -1605,10 +1603,8 @@ pub fn parse_config(
     if let (Some(e), Some(l)) = (&embedded, &library) {
         for root in l.roots() {
             let root = &root;
-            let is_sport = l.sport_root().as_ref() == Some(root);
-            let real = is_sport
-                && crate::paths::overlap(root, &e.download_dir)
-                    .map_err(|e| anyhow::anyhow!("library.sport: {e}"))?;
+            let real = crate::paths::overlap(root, &e.download_dir)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", root_key(l, root)))?;
             if paths_overlap(root, &e.download_dir) || real {
                 bail!(
                     "embedded.download_dir and the library roots must not contain each other ({} vs {})",
@@ -2230,6 +2226,17 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
+/// The config key a library root came from, for error messages.
+fn root_key(l: &LibraryConfig, root: &Path) -> &'static str {
+    if l.movies.as_deref() == Some(root) {
+        "library.movies"
+    } else if l.tv.as_deref() == Some(root) {
+        "library.tv"
+    } else {
+        "library.sport"
+    }
+}
+
 /// Template written by `init`. Placeholders only; no secrets inline: the standalone layout
 /// (native indexers, embedded engine).
 pub fn template(listen: &str) -> String {
@@ -2340,6 +2347,49 @@ mod tests {
             load(&cfg).unwrap().library.unwrap().sport_root().unwrap(),
             PathBuf::from("/srv/lib/Sport")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn movie_and_tv_roots_reached_through_a_symlink_into_downloads_are_refused() {
+        let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n[execution]\nenabled = true\n[migration]\nmode = \"coexistence\"\n";
+        let real = tempfile::tempdir().unwrap();
+        let dl = real.path().join("dl");
+        std::fs::create_dir(&dl).unwrap();
+        // `alias` is the downloads folder under another name; the roots below it do not exist yet.
+        let alias = real.path().join("alias");
+        std::os::unix::fs::symlink(&dl, &alias).unwrap();
+        let (dl, alias) = (dl.display(), alias.display());
+        let emb = format!("[embedded]\ndownload_dir = \"{dl}\"\nlisten = \"127.0.0.1:0\"\n");
+        let qb = format!(
+            "[qbittorrent]\nbase_url = \"http://127.0.0.1:8080\"\nsave_path = \"/dl\"\nlocal_path = \"{dl}\"\n"
+        );
+        let sport = format!("sport = \"{}/sport\"\n", real.path().display());
+        for client in [&emb, &qb] {
+            for (lib, key) in [
+                (format!("movies = \"{alias}/Movies\"\n{sport}"), "movies"),
+                (
+                    format!(
+                        "movies = \"{}/lib/Movies\"\ntv = \"{alias}/TV\"\n{sport}",
+                        real.path().display()
+                    ),
+                    "tv",
+                ),
+            ] {
+                let (_t, cfg) = setup(&format!("{base}[library]\n{lib}{client}"));
+                let err = format!("{:#}", load(&cfg).unwrap_err());
+                assert!(err.contains("must not contain each other"), "{key}: {err}");
+            }
+        }
+        // The same roots beside the downloads, not yet created, are fine.
+        let lib = format!(
+            "movies = \"{0}/lib/Movies\"\ntv = \"{0}/lib/TV\"\n{sport}",
+            real.path().display()
+        );
+        for client in [&emb, &qb] {
+            let (_t, cfg) = setup(&format!("{base}[library]\n{lib}{client}"));
+            load(&cfg).unwrap();
+        }
     }
 
     #[cfg(unix)]

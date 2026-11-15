@@ -134,8 +134,19 @@ fn list_videos(
             continue;
         };
         let name = entry.file_name().to_string_lossy().to_string();
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
+        let meta = match std::fs::symlink_metadata(entry.path()) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // gone meanwhile
+            Err(e) => {
+                // Listed but not looked at (a folder without search permission, say): the walk
+                // cannot say what is there, so it is incomplete rather than missing files.
+                errors.push(format!(
+                    "{}: {}",
+                    entry.path().strip_prefix(root).unwrap_or(dir).display(),
+                    e.kind()
+                ));
+                continue;
+            }
         };
         if meta.file_type().is_symlink() {
             continue; // never followed
@@ -221,8 +232,12 @@ fn walk(root: &Path, items: &[Item], recorded_files: usize) -> Walk {
             continue;
         }
         let mut vids = vec![];
-        if dir.is_dir() {
-            list_videos(&dir, root, 1, &mut vids, &mut budget, &mut errors);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.is_dir() => list_videos(&dir, root, 1, &mut vids, &mut budget, &mut errors),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // (cannot be looked at: unknown, not empty)
+            Err(e) => errors.push(format!("{}: {}", item.folder, e.kind())),
         }
         let mut found = vec![];
         for (rel, size, mtime) in vids {
@@ -491,7 +506,8 @@ pub async fn scan(st: &AppState, now: OffsetDateTime, explicit: bool) -> Result<
 type Applied = std::result::Result<(usize, usize), (usize, usize)>;
 
 /// Whether a recorded file is still present at `root/rel`, unchanged (size and mtime when
-/// recorded) and reached without a symbolic link.
+/// recorded) and reached without a symbolic link. A file that cannot be looked at (no
+/// permission, say) is not known to be gone, so it counts as still there.
 fn still_there(root: &Path, rel: Option<&str>, size: Option<i64>, mtime: Option<i64>) -> bool {
     let Some(rel) = rel.and_then(crate::paths::safe_rel) else {
         return false;
@@ -500,11 +516,17 @@ fn still_there(root: &Path, rel: Option<&str>, size: Option<i64>, mtime: Option<
     if crate::paths::check_no_symlinks(root, &path).is_err() {
         return false;
     }
-    std::fs::symlink_metadata(&path).is_ok_and(|m| {
-        m.file_type().is_file()
-            && size.is_none_or(|s| s as u64 == m.len())
-            && mtime.is_none_or(|t| t == crate::fsutil::mtime(&m))
-    })
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) => {
+            m.file_type().is_file()
+                && size.is_none_or(|s| s as u64 == m.len())
+                && mtime.is_none_or(|t| t == crate::fsutil::mtime(&m))
+        }
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
 }
 
 fn apply(
@@ -799,4 +821,67 @@ pub fn roots(c: &rusqlite::Connection) -> Result<Vec<serde_json::Value>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    /// A folder that can be listed but not searched (read without execute), holding a video.
+    /// None when this process can look inside it anyway (running as root).
+    fn unsearchable(t: &Path) -> Option<PathBuf> {
+        let dir = t.join("Film (2001)");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("Film.2001.1080p.mkv"), b"x").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if std::fs::symlink_metadata(dir.join("Film.2001.1080p.mkv")).is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return None;
+        }
+        Some(dir)
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_looked_at_makes_the_walk_incomplete() {
+        let t = tempfile::tempdir().unwrap();
+        let Some(dir) = unsearchable(t.path()) else {
+            return;
+        };
+        let (mut out, mut budget, mut errors) = (vec![], MAX_ENTRIES, vec![]);
+        list_videos(&dir, t.path(), 1, &mut out, &mut budget, &mut errors);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn a_recorded_file_that_cannot_be_looked_at_is_not_counted_as_gone() {
+        let t = tempfile::tempdir().unwrap();
+        let Some(dir) = unsearchable(t.path()) else {
+            return;
+        };
+        let kept = still_there(
+            t.path(),
+            Some("Film (2001)/Film.2001.1080p.mkv"),
+            Some(1),
+            None,
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(kept, "presence unknown: the claim stays");
+        // Really gone, or a file where its folder was: retired as before.
+        assert!(!still_there(
+            t.path(),
+            Some("Film (2001)/Other.mkv"),
+            None,
+            None
+        ));
+        assert!(!still_there(
+            t.path(),
+            Some("Film (2001)/Film.2001.1080p.mkv/x.mkv"),
+            None,
+            None
+        ));
+    }
 }
