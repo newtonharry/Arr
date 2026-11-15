@@ -40,28 +40,56 @@ fn path_matches(pattern: &str, path: &str) -> bool {
             .all(|(p, a)| p == a || (p.starts_with('{') && !a.is_empty()))
 }
 
-/// Computed route names the web app is known to use, and what they stand for: `/v1/{}/{}` is
-/// `P.kind` (a movie or a show page) and `/v1/library/{}` is the movies or the series list.
-/// A computed segment in any other place is read as an id and must match a route parameter.
-fn expand(path: &str) -> Vec<String> {
-    let segs: Vec<&str> = path.split('/').collect();
-    let known: [(&[&str], usize, &[&str]); 2] = [
-        (&["", "v1", "{}", "{}"], 2, &["movie", "show"]),
-        (&["", "v1", "library", "{}"], 3, &["movies", "series"]),
-    ];
-    for (shape, at, values) in known {
-        if segs == shape {
-            return values
-                .iter()
-                .map(|v| {
-                    let mut s = segs.clone();
-                    s[at] = v;
-                    s.join("/")
+/// Computed route names the web app is known to use, keyed by the exact expression in
+/// `app.js`: `P.kind` is the page kind (a movie or a show page) and `S.kind` the list kind
+/// (movies or series). Any other expression in the place of a route name is refused.
+const KNOWN_NAMES: &[(&str, &[&str])] = &[
+    ("P.kind", &["movie", "show"]),
+    ("S.kind", &["movies", "series"]),
+];
+
+/// Resolves the computed segments (`{expr}`) of a path read from `app.js`. A known expression
+/// stands for its route names. Any other computed segment must follow a literal segment (it is
+/// an id, and the table must have a route parameter there); a computed segment that does not
+/// (a route name such as `{section}` right after the root or after another computed segment)
+/// is an error.
+fn resolve(path: &str) -> Result<Vec<String>, String> {
+    let mut variants: Vec<Vec<String>> = vec![vec![]];
+    let mut prev_literal = false;
+    for seg in path.split('/') {
+        let computed = seg.contains('{');
+        let options: Vec<String> = if !computed {
+            vec![seg.to_string()]
+        } else if let Some(values) = seg
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .and_then(|e| KNOWN_NAMES.iter().find(|(k, _)| *k == e))
+            .map(|(_, v)| *v)
+        {
+            values.iter().map(|v| v.to_string()).collect()
+        } else if prev_literal {
+            vec!["{}".to_string()]
+        } else {
+            return Err(format!(
+                "tests/mcp_parity.rs cannot tell what the computed route name {seg} in `{path}` stands for; use a literal, or add its exact expression to KNOWN_NAMES"
+            ));
+        };
+        variants = variants
+            .into_iter()
+            .flat_map(|v| {
+                options.iter().map(move |o| {
+                    let mut v = v.clone();
+                    v.push(o.clone());
+                    v
                 })
-                .collect();
+            })
+            .collect();
+        prev_literal = !computed || !options.iter().any(|o| o == "{}");
+        if seg.is_empty() {
+            prev_literal = false;
         }
     }
-    vec![path.to_string()]
+    Ok(variants.into_iter().map(|v| v.join("/")).collect())
 }
 
 /// The text of a call's argument list (after the opening parenthesis at `open`) and where it
@@ -166,7 +194,6 @@ fn piece(p: &str) -> String {
             let mut rest = inner;
             while let Some(i) = rest.find("${") {
                 out.push_str(&rest[..i]);
-                out.push_str("{}");
                 let mut depth = 0;
                 let mut end = rest.len();
                 for (j, c) in rest[i + 1..].char_indices() {
@@ -176,6 +203,7 @@ fn piece(p: &str) -> String {
                             depth -= 1;
                             if depth == 0 {
                                 end = i + 1 + j + 1;
+                                out.push_str(&format!("\u{1}{}\u{2}", rest[i + 2..end - 1].trim()));
                                 break;
                             }
                         }
@@ -187,7 +215,7 @@ fn piece(p: &str) -> String {
             out.push_str(rest);
             out
         }
-        _ => "{}".into(),
+        _ => format!("\u{1}{p}\u{2}"),
     }
 }
 
@@ -202,8 +230,39 @@ fn paths_of(arg: &str) -> Vec<String> {
         .into_iter()
         .map(|b| {
             let joined: String = split_top(b, '+').into_iter().map(piece).collect();
-            let joined = joined.split('?').next().unwrap_or_default().to_string();
-            joined.replace("{}{}", "{}")
+            // The query string starts at the first `?` outside a computed expression.
+            let (mut cut, mut inside) = (joined.len(), false);
+            for (i, c) in joined.char_indices() {
+                match c {
+                    '\u{1}' => inside = true,
+                    '\u{2}' => inside = false,
+                    '?' if !inside => {
+                        cut = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // Render literals as they are and computed pieces as `{expression}`; computed
+            // pieces side by side (an id and a trailing query expression) are one.
+            let mut out = String::new();
+            let mut prev_expr = false;
+            for chunk in joined[..cut].split('\u{1}') {
+                match chunk.split_once('\u{2}') {
+                    Some((expr, lit)) => {
+                        if !prev_expr {
+                            out.push_str(&format!("{{{expr}}}"));
+                        }
+                        out.push_str(lit);
+                        prev_expr = lit.is_empty();
+                    }
+                    None => {
+                        out.push_str(chunk);
+                        prev_expr = false;
+                    }
+                }
+            }
+            out
         })
         .collect()
 }
@@ -260,13 +319,18 @@ fn web_calls_in(js: &str) -> Result<Vec<(String, String)>, String> {
                     "tests/mcp_parity.rs cannot read the path of this app.js call (keep the first argument a string, a template or a `+` of them, or teach the test): {helper}({args:.80}"
                 ));
             }
-            for p in paths.iter().flat_map(|p| expand(p)) {
-                out.push((method.clone(), format!("{prefix}{p}")));
+            for p in &paths {
+                for p in resolve(p)? {
+                    out.push((method.clone(), format!("{prefix}{p}")));
+                }
             }
         }
     }
     // Every other way to reach the server would bypass the helpers above.
-    let fetches = js.matches("fetch(").count();
+    let fetches = regex::Regex::new(r"\bfetch\s*\(")
+        .unwrap()
+        .find_iter(js)
+        .count();
     if fetches != 3 {
         return Err(format!(
             "app.js has {fetches} `fetch(` calls; the three inside the api, sportReq and quietGet helpers are the only ones this test knows. A new one must go through a helper, or teach the test."
@@ -400,6 +464,17 @@ fn the_web_call_reader_cannot_be_walked_around() {
         unmatched(&calls, &table).is_empty(),
         "movie and show pages exist"
     );
+    // The computed name must be one the test knows by its exact expression; `section` is not.
+    assert!(run("await api(`/v1/${section}/${id}`);").is_err());
+    let calls = run("await api(`/v1/library/${S.kind}?${qs}`);").unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        unmatched(&calls, &table).is_empty(),
+        "movies and series lists exist"
+    );
+    // A `fetch` with whitespace or a newline before its parenthesis is counted too.
+    assert!(run("fetch\n('/app/api/x');").is_err());
+    assert!(run("fetch ('/app/api/x');").is_err());
     // Aliasing a helper or a stray fetch would hide calls, so it is refused.
     assert!(run("const a = api; a('/v1/health');").is_err());
     assert!(web_calls_in("fetch('/x');").is_err());
@@ -461,6 +536,20 @@ const OTHER_ROUTERS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Registrations in the other routers whose path is not a string literal, by exact text, with
+/// nothing to say about `/api/v1`: none today.
+const KNOWN_COMPUTED: &[&str] = &[];
+
+/// The text of a plain (`"..."`) or raw (`r"..."`, `r#"..."#`) string literal.
+fn string_literal(s: &str) -> Option<&str> {
+    let raw = s.strip_prefix('r').unwrap_or(s);
+    let hashes = raw.len() - raw.trim_start_matches('#').len();
+    let body = raw[hashes..].strip_prefix('"')?;
+    let end = format!("\"{}", "#".repeat(hashes));
+    let body = body.strip_suffix(end.as_str())?;
+    (s.starts_with('r') || hashes == 0).then_some(body)
+}
+
 /// What `src/api.rs` may pass to a registration call: the folds over the shared route lists
 /// and the merges of whole routers that are not API routes.
 const API_RS_ARGS: &[&str] = &["path, handlers", "protected", "api", "web"];
@@ -476,7 +565,7 @@ fn registration_violations(file: &str, src: &str, parity_paths: &BTreeSet<String
         let whole = m.get(0).unwrap();
         let args = call_args(src, whole.end() - 1).unwrap_or_default().trim();
         let first = split_top(args, ',')[0].trim();
-        let literal = first.strip_prefix('"').and_then(|s| s.split('"').next());
+        let literal = string_literal(first);
         let what = format!("{file}: .{}({:.50})", &m[1], args.replace('\n', " "));
         if file == "src/api.rs" {
             if !API_RS_ARGS.contains(&args) {
@@ -499,8 +588,10 @@ fn registration_violations(file: &str, src: &str, parity_paths: &BTreeSet<String
                     "{what}: this file is not one of the known routers; add it to OTHER_ROUTERS with a reason, or move the route into the lists"
                 ));
             }
-        } else if !OTHER_ROUTERS.iter().any(|(f, _)| *f == file) && &m[1] != "merge" {
-            out.push(format!("{what}: a route registered with a computed path"));
+        } else if &m[1] != "merge" && !KNOWN_COMPUTED.contains(&first) {
+            out.push(format!(
+                "{what}: a route registered with a path that is not a string literal (list its exact text in KNOWN_COMPUTED if it is not an API route)"
+            ));
         }
     }
     out
@@ -574,4 +665,10 @@ fn the_registration_guard_trips_on_a_route_added_outside_the_lists() {
     assert!(!check("src/webapp.rs", r#".route("/app/api/sneaky", get(h))"#).is_empty());
     assert!(check("src/webapp.rs", r#".route("/app/api/me", get(h))"#).is_empty());
     assert!(!check("src/new_module.rs", r#".route("/thing", get(h))"#).is_empty());
+    // A raw string is a literal like any other, and a computed path is refused even in an
+    // allowlisted file.
+    assert!(!check("src/webapp.rs", r#".route(r"/api/v1/sneaky", get(h))"#).is_empty());
+    assert!(!check("src/webapp.rs", r##".route(r#"/api/v1/sneaky"#, get(h))"##).is_empty());
+    assert!(!check("src/webapp.rs", ".route(some_path, get(h))").is_empty());
+    assert!(!check("src/webapp.rs", r#".route(&format!("/api/{v}/x"), get(h))"#).is_empty());
 }
