@@ -702,3 +702,35 @@ async fn the_installer_is_told_it_restarts_arr_and_a_person_is_asked_to() {
         "Added Knaben as search source 2, next to The Pirate Bay. Run `arr setup` and restart Arr to use it.",
     );
 }
+
+#[tokio::test(flavor = "multi_thread")] // the mock answers while this thread waits on arr
+async fn a_change_whose_caller_stops_waiting_is_still_checked_and_put_back() {
+    // TMDB answers slowly, and refuses the key.
+    let tmdb = serve(Router::new().route(
+        "/3/movie/603",
+        get(|| async {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            (StatusCode::UNAUTHORIZED, r#"{"status_code":7}"#)
+        }),
+    ))
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = install(tmp.path(), tmdb, "");
+    let before = std::fs::read(&config).unwrap();
+    let secret = config.with_file_name("secrets/tmdb_credential");
+    // The caller (a web request, say) gives up while the key is being tried.
+    let gave_up = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        arr::set::run(&config, "tmdb-key", Some("wrong-key")),
+    )
+    .await;
+    assert!(gave_up.is_err(), "the check was still running");
+    // The check finishes anyway, and the refused key does not stay.
+    let mut waited = 0;
+    while (secret.exists() || std::fs::read(&config).unwrap() != before) && waited < 100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        waited += 1;
+    }
+    assert!(!secret.exists(), "the refused key was removed again");
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+}

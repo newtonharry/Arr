@@ -1386,8 +1386,8 @@ pub struct PersonPage {
 /// Whether something has not come out yet: a release date after today, else a later year.
 pub fn not_out_yet(date: Option<&str>, year: Option<u16>) -> bool {
     let today = time::OffsetDateTime::now_utc().date();
-    match date.filter(|d| d.len() >= 10) {
-        Some(d) => d[..10] > *today.to_string(),
+    match date.and_then(|d| d.get(..10)) {
+        Some(d) => d > today.to_string().as_str(),
         None => year.is_some_and(|y| i32::from(y) > today.year()),
     }
 }
@@ -2312,5 +2312,14 @@ mod title_extras_tests {
         let merged = merge(plex, bare);
         assert_eq!(merged.genre_names(), ["Comedy"]);
         assert_eq!(merged.cast()[0].name, "P");
+    }
+
+    #[test]
+    fn a_date_cut_inside_a_character_falls_back_to_the_year() {
+        // Byte 10 falls inside "é": no panic, the year decides.
+        assert!(!not_out_yet(Some("123456789é"), Some(2000)));
+        assert!(not_out_yet(Some("123456789é"), Some(9999)));
+        assert!(not_out_yet(Some("9999-01-01"), None));
+        assert!(!not_out_yet(Some("2000-01-01"), Some(9999)));
     }
 }

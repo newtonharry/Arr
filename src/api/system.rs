@@ -214,9 +214,25 @@ pub(super) async fn app_settings_post(
     if body.name == "torrent-port" {
         check_port(&st, value).await?;
     }
-    let _one_at_a_time = st.settings_lock.lock().await;
-    let path = crate::lifecycle::config_path(&st.cfg.state_dir);
-    if let Err(e) = crate::set::run(&path, &body.name, Some(value)).await {
+    // Changed, then restarted, in a task of its own (holding the lock): a dropped request
+    // neither lets a second change in part way nor leaves a change without its restart.
+    let (state, name, v) = (st.clone(), body.name.clone(), value.to_string());
+    let changed = tokio::spawn(async move {
+        let _one_at_a_time = state.settings_lock.lock().await;
+        let path = crate::lifecycle::config_path(&state.cfg.state_dir);
+        crate::set::run(&path, &name, Some(&v)).await?;
+        tracing::info!(setting = %name, "a setting was changed from the web app; restarting");
+        // Let this answer reach the phone first.
+        let restart = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            restart.restart.request();
+        });
+        anyhow::Ok(())
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("the change stopped part way: {e}")));
+    if let Err(e) = changed {
         // The words are `arr set`'s, with anything that names a folder or address removed.
         return Err(ApiError::bad_request(
             ErrorCode::InvalidRequest,
@@ -225,13 +241,6 @@ pub(super) async fn app_settings_post(
                 .replace("from <url>", "from TMDB's API settings page"),
         ));
     }
-    tracing::info!(setting = %body.name, "a setting was changed from the web app; restarting");
-    // Let this answer reach the phone first.
-    let state = st.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        state.restart.request();
-    });
     ok(json!({
         "changed": true,
         "restarting": true,

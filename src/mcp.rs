@@ -182,8 +182,10 @@ async fn remote_guard(
             .map(str::trim);
         let static_token =
             presented.is_some_and(|t| bool::from(t.as_bytes().ct_eq(g.token.expose().as_bytes())));
-        let oauth_token =
-            presented.is_some_and(|t| g.oauth.as_ref().is_some_and(|o| o.verify_access(t)));
+        let oauth_token = match (presented, &g.oauth) {
+            (Some(t), Some(o)) if !static_token => o.verify_access(t).await,
+            _ => false,
+        };
         if !static_token && !oauth_token {
             let mut r = refuse(
                 StatusCode::UNAUTHORIZED,

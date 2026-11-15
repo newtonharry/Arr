@@ -1165,3 +1165,42 @@ async fn concurrency_limit_and_request_deadline() {
         (503, Some("request_timeout"))
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_index_reload_never_replaces_a_newer_one() {
+    let e = start_exec(ExecOptions::default()).await;
+    let monitored = |e: &Exec| {
+        e.state
+            .index()
+            .catalog
+            .movies
+            .iter()
+            .map(|m| m.monitored)
+            .collect::<Vec<_>>()
+    };
+    let set = |e: &Exec, on: bool| {
+        e.state
+            .store
+            .blocking(move |c| Ok(c.execute("UPDATE media SET monitored = ?1", [on])?))
+            .unwrap();
+    };
+    set(&e, true);
+    e.state.reload_index().await.unwrap();
+    assert!(!monitored(&e).is_empty() && monitored(&e).iter().all(|m| *m));
+    // A reads the catalog, then is slow to put its index in place; meanwhile the catalog
+    // changes and B reloads.
+    api::RELOAD_PAUSE
+        .lock()
+        .unwrap()
+        .push((e.state.cfg.state_dir.clone(), 1000));
+    let state = e.state.clone();
+    let a = tokio::spawn(async move { state.reload_index().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    set(&e, false);
+    e.state.reload_index().await.unwrap();
+    a.await.unwrap();
+    assert!(
+        monitored(&e).iter().all(|m| !*m),
+        "the newest catalog is the one in use"
+    );
+}
