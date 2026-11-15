@@ -1132,6 +1132,38 @@ fn item_info(st: &AppState, g: &Grab, mm: &MediaManagement) -> Result<ItemInfo, 
 }
 
 async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Outcome> {
+    // An earlier attempt of this grab that stopped on an error part way (a database write
+    // refused after the original was moved aside, say) left its journal rows unfinished. They
+    // are rolled back now, as at startup, before anything is planned again: a later attempt
+    // links the same source inode, which a stale row would take for its own. (Nothing else
+    // imports this grab: it is leased to this import.)
+    let gid = g.id.clone();
+    let left = st
+        .store
+        .with(move |c| {
+            let notes = recover_rows(c, Some(&gid))?;
+            let left: i64 = c.query_row(
+                "SELECT COUNT(*) FROM import_journal WHERE grab_id = ?1 AND state IN ('planned', 'staged', 'backed_up', 'published')",
+                [&gid],
+                |r| r.get(0),
+            )?;
+            for n in notes {
+                tracing::warn!(grab = %gid, "{n}");
+            }
+            Ok(left)
+        })
+        .await?;
+    if left > 0 {
+        return Ok(Outcome::Blocked(match g.media_id {
+            MediaId::Event(_) => R::Internal.encode(),
+            MediaId::Movie { .. }
+            | MediaId::Series(_)
+            | MediaId::Season(..)
+            | MediaId::Episode(..) => {
+                "an earlier attempt of this import could not be rolled back (see the log)".into()
+            }
+        }));
+    }
     let Some(l) = st.current() else {
         return Ok(Outcome::Blocked("no configuration import is active".into()));
     };
@@ -2393,12 +2425,18 @@ fn publish(
 /// published inode is removed (only if it is still ours) and a moved-aside original is
 /// restored. Committed rows with a leftover backup have it removed.
 pub fn recover(c: &Connection) -> Result<Vec<String>> {
+    recover_rows(c, None)
+}
+
+/// `recover`, for every row or only one grab's. Returns notes; a row that could not be
+/// recovered keeps its state.
+fn recover_rows(c: &Connection, grab: Option<&str>) -> Result<Vec<String>> {
     let mut notes = vec![];
     let mut stmt = c.prepare(
-        "SELECT id, root, dest, state, staged, staged_ino, replaced_path, backup, backup_ino FROM import_journal WHERE state IN ('planned', 'staged', 'backed_up', 'published', 'committed') AND (state != 'committed' OR backup IS NOT NULL)",
+        "SELECT id, root, dest, state, staged, staged_ino, replaced_path, backup, backup_ino FROM import_journal WHERE state IN ('planned', 'staged', 'backed_up', 'published', 'committed') AND (state != 'committed' OR backup IS NOT NULL) AND (?1 IS NULL OR grab_id = ?1)",
     )?;
     let rows: Vec<JournalRow> = stmt
-        .query_map([], |r| {
+        .query_map([grab], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,

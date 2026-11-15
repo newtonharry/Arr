@@ -1031,3 +1031,65 @@ async fn a_cancel_is_not_held_up_by_a_running_import_and_wins() {
         walk(&folder)
     );
 }
+
+#[tokio::test]
+async fn a_database_error_after_the_original_is_moved_aside_is_undone_before_a_retry() {
+    let mut e = parity(revisions(), true).await;
+    let old = place_old_file(&e);
+    let original = std::fs::read(&old).unwrap();
+    let proper = "Parity.Show.S01E01.PROPER.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(
+        proper,
+        proper,
+        vec![(format!("{proper}.mkv"), mkv(3))],
+        1.5,
+        false,
+    );
+    e.search_results("Parity Show S01E01", vec![r]);
+    let (s, v, text) = e.json(e.post("/api/v1/plans").json(&json!({ "media_id": "episode:tvdb:999002:1:1", "revisions": true, "replan": true, "execute": true }))).await;
+    assert_eq!(s, 201, "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    // The database refuses the write that follows moving the original aside.
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute_batch("CREATE TRIGGER refuse_backed_up BEFORE UPDATE OF state ON import_journal WHEN NEW.state = 'backed_up' BEGIN SELECT RAISE(ABORT, 'refused for a test'); END;")?;
+            Ok(())
+        })
+        .unwrap();
+    e.complete(&hash);
+    e.tick().await;
+    assert_eq!(e.grab_row(&id).state, "import_blocked");
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute_batch("DROP TRIGGER refuse_backed_up;")?;
+            Ok(())
+        })
+        .unwrap();
+    // Retried without a restart: the first attempt is undone, then the replacement is made.
+    let (s, _, text) = e.json(e.post(&format!("/api/v1/queue/{id}/retry"))).await;
+    assert_eq!(s, 200, "{text}");
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!(g.state, "imported", "{:?}", g.last_error);
+    let new = e.tv.join(format!("Parity Show/Season 1/{proper}.mkv"));
+    assert!(new.is_file() && !old.exists());
+    // A restart finds nothing to undo: the replacement stays.
+    let recovery = e.restart().await;
+    assert!(
+        recovery["journal"].as_array().unwrap().is_empty(),
+        "{recovery}"
+    );
+    assert!(new.is_file() && !old.exists(), "the replacement was kept");
+    assert!(
+        walk(&e.tv).iter().all(|p| !p.contains(".um-")),
+        "{:?}",
+        walk(&e.tv)
+    );
+    let _ = original;
+}
