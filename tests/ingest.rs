@@ -1093,3 +1093,120 @@ async fn a_database_error_after_the_original_is_moved_aside_is_undone_before_a_r
     );
     let _ = original;
 }
+
+/// A grab whose replacement of the episode stops on a database error right after the original
+/// is moved aside (the journal row stays unfinished). Returns the grab, the hash, the original
+/// file, and the replacement's name.
+async fn blocked_after_the_original_is_moved_aside(
+    e: &Exec,
+) -> (String, String, std::path::PathBuf, &'static str) {
+    let old = place_old_file(e);
+    let proper = "Parity.Show.S01E01.PROPER.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(
+        proper,
+        proper,
+        vec![(format!("{proper}.mkv"), mkv(3))],
+        1.5,
+        false,
+    );
+    e.search_results("Parity Show S01E01", vec![r]);
+    let (s, v, text) = e.json(e.post("/api/v1/plans").json(&json!({ "media_id": "episode:tvdb:999002:1:1", "revisions": true, "replan": true, "execute": true }))).await;
+    assert_eq!(s, 201, "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute_batch("CREATE TRIGGER refuse_backed_up BEFORE UPDATE OF state ON import_journal WHEN NEW.state = 'backed_up' BEGIN SELECT RAISE(ABORT, 'refused for a test'); END;")?;
+            Ok(())
+        })
+        .unwrap();
+    e.complete(&hash);
+    e.tick().await;
+    assert_eq!(e.grab_row(&id).state, "import_blocked");
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute_batch("DROP TRIGGER refuse_backed_up;")?;
+            Ok(())
+        })
+        .unwrap();
+    (id, hash, old, proper)
+}
+
+fn unfinished_rows(e: &Exec) -> i64 {
+    e.state
+        .store
+        .blocking(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM import_journal WHERE state IN ('planned', 'staged', 'backed_up', 'published')",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_cancelled_attempt_is_undone_before_the_same_torrent_is_imported_again() {
+    let mut e = parity(revisions(), true).await;
+    let (id, hash, old, proper) = blocked_after_the_original_is_moved_aside(&e).await;
+    // Cancelled (not blocklisted) and grabbed again.
+    let (s, _, text) = e
+        .json(
+            e.post(&format!("/api/v1/queue/{id}/cancel"))
+                .json(&json!({})),
+        )
+        .await;
+    assert_eq!(s, 200, "{text}");
+    let (s, v, text) = e.json(e.post("/api/v1/plans").json(&json!({ "media_id": "episode:tvdb:999002:1:1", "revisions": true, "replan": true, "execute": true }))).await;
+    assert_eq!(s, 201, "{text}");
+    let again = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("{text}"))
+        .to_string();
+    assert_ne!(again, id);
+    e.tick().await;
+    e.complete(&hash);
+    e.tick().await;
+    let g = e.grab_row(&again);
+    assert_eq!(g.state, "imported", "{:?}", g.last_error);
+    let new = e.tv.join(format!("Parity Show/Season 1/{proper}.mkv"));
+    assert!(new.is_file() && !old.exists());
+    // A restart finds nothing to undo: the new import stays.
+    let recovery = e.restart().await;
+    assert!(
+        recovery["journal"].as_array().unwrap().is_empty(),
+        "{recovery}"
+    );
+    assert!(new.is_file(), "the new import was kept");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_row_whose_files_cannot_be_looked_at_is_not_taken_as_rolled_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut e = parity(revisions(), true).await;
+    let (_id, _hash, old, _proper) = blocked_after_the_original_is_moved_aside(&e).await;
+    assert_eq!(unfinished_rows(&e), 1);
+    // The season folder can be listed but not looked inside.
+    let season = old.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&season, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if std::fs::symlink_metadata(season.join("x"))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Still able to look inside (running as root): nothing to show here.
+        std::fs::set_permissions(&season, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    e.restart().await;
+    assert_eq!(unfinished_rows(&e), 1, "the row is kept for a later start");
+    // Once the folder can be read again, a start puts the original back.
+    std::fs::set_permissions(&season, std::fs::Permissions::from_mode(0o755)).unwrap();
+    e.restart().await;
+    assert_eq!(unfinished_rows(&e), 0);
+    assert!(old.is_file(), "the original is back");
+}

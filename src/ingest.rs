@@ -1137,14 +1137,16 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
     // are rolled back now, as at startup, before anything is planned again: a later attempt
     // links the same source inode, which a stale row would take for its own. (Nothing else
     // imports this grab: it is leased to this import.)
-    let gid = g.id.clone();
+    // Rows of a finished grab of the same torrent (cancelled part way, then grabbed again) are
+    // rolled back too: they would take this import's files for their own at the next start.
+    let (gid, hash) = (g.id.clone(), g.info_hash.clone());
     let left = st
         .store
         .with(move |c| {
-            let notes = recover_rows(c, Some(&gid))?;
+            let notes = recover_rows(c, Some((&gid, &hash)))?;
             let left: i64 = c.query_row(
-                "SELECT COUNT(*) FROM import_journal WHERE grab_id = ?1 AND state IN ('planned', 'staged', 'backed_up', 'published')",
-                [&gid],
+                &format!("SELECT COUNT(*) FROM import_journal WHERE {GRAB_ROWS} AND state IN ('planned', 'staged', 'backed_up', 'published')"),
+                params![gid, hash],
                 |r| r.get(0),
             )?;
             for n in notes {
@@ -2428,15 +2430,22 @@ pub fn recover(c: &Connection) -> Result<Vec<String>> {
     recover_rows(c, None)
 }
 
-/// `recover`, for every row or only one grab's. Returns notes; a row that could not be
-/// recovered keeps its state.
-fn recover_rows(c: &Connection, grab: Option<&str>) -> Result<Vec<String>> {
+/// The journal rows an import of a grab answers for: its own, and those of finished grabs of
+/// the same torrent (one cancelled part way, say), whose files share its source inodes.
+/// `?1` is the grab id, `?2` its info hash.
+const GRAB_ROWS: &str =
+    "(grab_id = ?1 OR grab_id IN (SELECT id FROM grabs WHERE info_hash = ?2 AND active = 0))";
+
+/// `recover`, for every row or only those a grab answers for (its id and info hash). Returns
+/// notes; a row that could not be recovered keeps its state.
+fn recover_rows(c: &Connection, grab: Option<(&str, &str)>) -> Result<Vec<String>> {
     let mut notes = vec![];
-    let mut stmt = c.prepare(
-        "SELECT id, root, dest, state, staged, staged_ino, replaced_path, backup, backup_ino FROM import_journal WHERE state IN ('planned', 'staged', 'backed_up', 'published', 'committed') AND (state != 'committed' OR backup IS NOT NULL) AND (?1 IS NULL OR grab_id = ?1)",
-    )?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT id, root, dest, state, staged, staged_ino, replaced_path, backup, backup_ino FROM import_journal WHERE state IN ('planned', 'staged', 'backed_up', 'published', 'committed') AND (state != 'committed' OR backup IS NOT NULL) AND (?1 IS NULL OR {GRAB_ROWS})"
+    ))?;
+    let (gid, hash) = (grab.map(|g| g.0), grab.map(|g| g.1));
     let rows: Vec<JournalRow> = stmt
-        .query_map([grab], |r| {
+        .query_map(params![gid, hash], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -2451,12 +2460,19 @@ fn recover_rows(c: &Connection, grab: Option<&str>) -> Result<Vec<String>> {
         })?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
-    let ino_of = |p: &Path| {
-        std::fs::symlink_metadata(p)
-            .ok()
-            .filter(|m| m.file_type().is_file())
-            .and_then(|_| crate::fsutil::file_id(p).ok())
-            .map(|(_, ino)| ino as i64)
+    // A file's inode; `None` when nothing (or no regular file) is there. Any other failure to
+    // look is an error, so the row is not taken as recovered.
+    let ino_of = |p: &Path| -> Result<Option<i64>> {
+        match std::fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("cannot look at {}", p.display()))),
+            Ok(m) if !m.file_type().is_file() => Ok(None),
+            Ok(_) => Ok(Some(
+                crate::fsutil::file_id(p)
+                    .with_context(|| format!("cannot look at {}", p.display()))?
+                    .1 as i64,
+            )),
+        }
     };
     // Each row is recovered on its own: one that cannot be (an original that cannot be put
     // back) keeps its state and records why, for the next start, and the others go on.
@@ -2490,17 +2506,26 @@ type JournalRow = (
 fn recover_row(
     c: &Connection,
     (id, root, dest, state, staged, staged_ino, replaced, backup, backup_ino): JournalRow,
-    ino_of: &dyn Fn(&Path) -> Option<i64>,
+    ino_of: &dyn Fn(&Path) -> Result<Option<i64>>,
     notes: &mut Vec<String>,
 ) -> Result<()> {
+    // Removes a file; one already gone is fine, any other failure keeps the row unfinished.
+    let remove = |p: &Path| -> Result<()> {
+        match std::fs::remove_file(p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(anyhow::Error::new(e).context(format!("cannot remove {}", p.display())))
+            }
+            _ => Ok(()),
+        }
+    };
     let root = PathBuf::from(root);
     let dest_abs = root.join(&dest);
     if state == "committed" {
         if let Some(b) = backup.as_deref().map(PathBuf::from)
-            && ino_of(&b).is_some()
-            && ino_of(&b) == backup_ino
+            && let Some(ino) = ino_of(&b)?
+            && Some(ino) == backup_ino
         {
-            let _ = std::fs::remove_file(&b);
+            remove(&b)?;
         }
         journal_set(c, id, "backup_removed", None)?;
         notes.push(format!(
@@ -2509,20 +2534,29 @@ fn recover_row(
         return Ok(());
     }
     if let Some(sp) = staged.as_deref().map(PathBuf::from)
-        && ino_of(&sp).is_some()
-        && (staged_ino.is_none() || ino_of(&sp) == staged_ino)
+        && let Some(ino) = ino_of(&sp)?
+        && (staged_ino.is_none() || Some(ino) == staged_ino)
     {
-        let _ = std::fs::remove_file(&sp);
+        remove(&sp)?;
     }
     // Our published (or linked-before-recorded) inode is removed; anything else is kept.
-    if staged_ino.is_some() && ino_of(&dest_abs) == staged_ino {
-        let _ = std::fs::remove_file(&dest_abs);
+    if staged_ino.is_some() && ino_of(&dest_abs)? == staged_ino {
+        remove(&dest_abs)?;
     }
     if let (Some(b), Some(r)) = (backup.as_deref().map(PathBuf::from), replaced.as_deref()) {
         let original = root.join(r);
-        if ino_of(&b).is_some()
-            && ino_of(&b) == backup_ino
-            && std::fs::symlink_metadata(&original).is_err()
+        let free = match std::fs::symlink_metadata(&original) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("cannot look at {}", original.display()))
+                );
+            }
+            Ok(_) => false,
+        };
+        if let Some(ino) = ino_of(&b)?
+            && Some(ino) == backup_ino
+            && free
         {
             std::fs::rename(&b, &original)
                 .with_context(|| format!("journal {id}: cannot restore {}", original.display()))?;
