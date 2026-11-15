@@ -1877,7 +1877,7 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
                 .auth_header(token.to_string()),
         )
     };
-    // The initialize handshake, then the seven tools.
+    // The initialize handshake, then the tools.
     let client = ClientConfig::default()
         .serve(transport(MCP_TOKEN))
         .await
@@ -1889,8 +1889,9 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
         .iter()
         .map(|t| t.name.to_string())
         .collect();
+    // The original eight come first; the rest are the web app's other features.
     assert_eq!(
-        tools,
+        tools[..8],
         [
             "search_titles",
             "add_media",
@@ -1902,6 +1903,7 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
             "start_download"
         ]
     );
+    assert_eq!(tools, arr::mcp::tool_names());
     let call = |name: &str, args: Value| {
         CallToolRequestParams::new(name.to_string())
             .with_arguments(args.as_object().unwrap().clone())
@@ -1980,7 +1982,10 @@ async fn remote_mcp_serves_the_same_tools_over_streamable_http_with_its_own_bear
         )
         .await
         .expect("discover");
-    assert_eq!(client.list_all_tools().await.unwrap().len(), 8);
+    assert_eq!(
+        client.list_all_tools().await.unwrap().len(),
+        arr::mcp::tool_names().len()
+    );
     let _ = client.cancel().await;
     // Authentication comes before initialisation; the API token is not an MCP token.
     assert!(
