@@ -613,29 +613,35 @@ async fn a_failing_download_step_does_not_stop_the_rest_of_the_pass() {
     assert!(message.contains("submit"), "{message}");
 }
 
-#[tokio::test]
-async fn a_cancel_while_an_add_waits_is_answered_and_the_late_torrent_is_removed() {
-    let e = start_exec(ExecOptions::default()).await;
-    let title = "Slow.Horses.S01E05.1080p.WEB-DL.x264-HLD";
+/// A pass whose add of the episode's torrent the client holds open (as the engine does while
+/// a magnet's metadata arrives), and the grab cancelled meanwhile. Returns the grab, the
+/// hash, the gate that lets the add go on, and the pass.
+async fn cancelled_during_its_add(
+    e: &Exec,
+    ep: u16,
+) -> (
+    String,
+    String,
+    std::sync::Arc<tokio::sync::Semaphore>,
+    tokio::task::JoinHandle<Result<(), String>>,
+) {
+    let title = format!("Slow.Horses.S01E{ep:02}.1080p.WEB-DL.x264-HLD");
     let (hash, r) = e.publish(
-        title,
-        title,
+        &title,
+        &title,
         vec![(format!("{title}.mkv"), mkv(1))],
         1.5,
         false,
     );
-    e.search_results("Slow Horses S01E05", vec![r]);
+    e.search_results(&format!("Slow Horses S01E{ep:02}"), vec![r]);
     let (s, v, text) = e
-        .json(e.post("/api/v1/plans").json(
-            &json!({ "media_id": "episode:tvdb:372264:1:5", "execute": true, "replan": true }),
-        ))
+        .json(e.post("/api/v1/plans").json(&json!({ "media_id": format!("episode:tvdb:372264:1:{ep}"), "execute": true, "replan": true })))
         .await;
     assert_eq!(s, 201, "{text}");
     let id = v["plan"]["execution"]["grabs"][0]
         .as_str()
         .unwrap_or_else(|| panic!("{text}"))
         .to_string();
-    // The client holds the add open, as the engine does while a magnet's metadata arrives.
     let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     e.fake.lock().unwrap().hold_add = Some(gate.clone());
     let state = e.state.clone();
@@ -670,7 +676,14 @@ async fn a_cancel_while_an_add_waits_is_answered_and_the_late_torrent_is_removed
         "{text}"
     );
     assert!(!pass.is_finished());
+    e.fake.lock().unwrap().hold_add = None;
+    (id, hash, gate, pass)
+}
 
+#[tokio::test]
+async fn a_cancel_while_an_add_waits_is_answered_and_the_late_torrent_is_removed() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash, gate, pass) = cancelled_during_its_add(&e, 5).await;
     // The add then completes: its torrent is removed again and nothing is recorded.
     gate.add_permits(1);
     pass.await.unwrap().unwrap();
@@ -686,5 +699,25 @@ async fn a_cancel_while_an_add_waits_is_answered_and_the_late_torrent_is_removed
     assert!(
         !f.torrents.contains_key(&hash),
         "the late torrent is not left behind"
+    );
+}
+
+#[tokio::test]
+async fn a_late_torrent_the_client_could_not_be_asked_about_is_removed_once_it_answers() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash, gate, pass) = cancelled_during_its_add(&e, 6).await;
+    // The client takes the add, then stops answering: the torrent cannot be checked.
+    e.fake.lock().unwrap().down_after_add = true;
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    assert!(e.fake.lock().unwrap().torrents.contains_key(&hash));
+    // Once it answers again, a later pass removes the torrent.
+    e.fake.lock().unwrap().down = false;
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!((g.state.as_str(), g.active), ("cancelled", false));
+    assert!(
+        !e.fake.lock().unwrap().torrents.contains_key(&hash),
+        "the late torrent is removed once the client answers"
     );
 }

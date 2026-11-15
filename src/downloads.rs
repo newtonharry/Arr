@@ -1861,6 +1861,7 @@ pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         .store
         .with(move |c| select(c, "state IN ('queued', 'unconfirmed') AND next_attempt_at <= ?1 ORDER BY created_at LIMIT 20", &[&now_s]))
         .await?;
+    retry_late_adds(st, &qb).await?;
     let mut confirmed = 0;
     for g in due {
         let (g, add) = {
@@ -1905,17 +1906,23 @@ pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         // submission, and its outcome is applied only if the grab is still leased afterwards.
         let answer = qb.add(&add.req).await;
         // 3. Verify by hash whatever the answer was.
-        let found = qb
-            .info(std::slice::from_ref(&g.info_hash))
-            .await
-            .ok()
-            .and_then(|l| {
-                l.into_iter()
-                    .find(|t| t.hash.eq_ignore_ascii_case(&g.info_hash))
-            });
+        let verified = lookup(&qb, &g.info_hash).await;
+        let found = verified.clone().flatten();
         let _guard = st.worker.grabs.lock().await;
         if !still_submitting(st, &g.id).await? {
-            abandon_add(&qb, &g, found.as_ref(), add.post.as_deref()).await;
+            if !abandon_add(&qb, &g, verified, add.post.as_deref()).await {
+                // Checked and removed again on a later pass (see `retry_late_adds`).
+                let id = g.id.clone();
+                st.store
+                    .with(move |c| {
+                        c.execute(
+                            "UPDATE grabs SET lease_owner = ?2 WHERE id = ?1",
+                            params![id, LATE_ADD],
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+            }
             continue;
         }
         if finish_submit(st, &qb, &g, add, answer, found, now).await? {
@@ -1952,22 +1959,90 @@ async fn still_submitting(st: &AppState, id: &str) -> Result<bool> {
         .await
 }
 
+/// Marks a grab whose add finished after it was cancelled (or otherwise taken off it) while
+/// the torrent the add may have left in the client is not yet known to be gone.
+const LATE_ADD: &str = "late_add";
+
+/// The client's torrent with this hash: `None` when the client did not answer.
+async fn lookup(qb: &Client, hash: &str) -> Option<Option<TorrentInfo>> {
+    let list = qb.info(&[hash.to_string()]).await.ok()?;
+    Some(list.into_iter().find(|t| t.hash.eq_ignore_ascii_case(hash)))
+}
+
 /// An add that finished after its grab was cancelled (or otherwise taken off it): a torrent
 /// it left in the client is removed again (its data is kept: nothing about it was checked for
-/// removal), and nothing about it is recorded on the grab.
-async fn abandon_add(qb: &Client, g: &Grab, found: Option<&TorrentInfo>, post: Option<&str>) {
-    let Some(t) = found.filter(|t| ours(t, g, post)) else {
-        tracing::info!(grab = %g.id, "the download changed while it was being added; nothing was left to remove");
-        return;
+/// removal), and nothing about it is recorded on the grab. Returns whether that is settled
+/// (the torrent is gone or not ours); otherwise it is tried again on a later pass.
+async fn abandon_add(
+    qb: &Client,
+    g: &Grab,
+    verified: Option<Option<TorrentInfo>>,
+    post: Option<&str>,
+) -> bool {
+    let t = match verified {
+        None => {
+            tracing::warn!(grab = %g.id, "the download changed while it was being added; {} did not answer, so the added torrent is checked again later", qb.label());
+            return false;
+        }
+        Some(found) => match found.filter(|t| ours(t, g, post)) {
+            Some(t) => t,
+            None => {
+                tracing::info!(grab = %g.id, "the download changed while it was being added; nothing was left to remove");
+                return true;
+            }
+        },
     };
     match qb.delete(&t.hash, false).await {
         Ok(()) => {
-            tracing::info!(grab = %g.id, "the download changed while it was being added; the added torrent was removed again")
+            tracing::info!(grab = %g.id, "the download changed while it was being added; the added torrent was removed again");
+            true
         }
         Err(e) => {
-            tracing::warn!(grab = %g.id, "the download changed while it was being added; removing the added torrent failed: {} {}", qb.label(), e.describe())
+            tracing::warn!(grab = %g.id, "the download changed while it was being added; removing the added torrent failed ({} {}); tried again later", qb.label(), e.describe());
+            false
         }
     }
+}
+
+/// Retries removing the torrents of adds that finished after their grab was cancelled.
+async fn retry_late_adds(st: &AppState, qb: &Client) -> Result<()> {
+    let late = st
+        .store
+        .with(|c| select(c, "lease_owner = ?1", &[&LATE_ADD]))
+        .await?;
+    for g in late {
+        let _guard = st.worker.grabs.lock().await;
+        let (hash, gid) = (g.info_hash.clone(), g.id.clone());
+        // A download of the same torrent started since owns it now: it is left to that one.
+        let taken: bool = st
+            .store
+            .with(move |c| {
+                Ok(c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM grabs WHERE info_hash = ?1 AND active = 1 AND id != ?2)",
+                    params![hash, gid],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
+        if taken
+            || abandon_add(
+                qb,
+                &g,
+                lookup(qb, &g.info_hash).await,
+                post_category(st, &g).as_deref(),
+            )
+            .await
+        {
+            update(
+                st,
+                &g.id,
+                "UPDATE grabs SET lease_owner = NULL, lease_until = NULL WHERE id = ?1 AND lease_owner = ?2",
+                vec![text(LATE_ADD)],
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Reconciles by hash and, when an add is needed, marks the grab `unconfirmed` and leased to

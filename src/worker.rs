@@ -388,6 +388,15 @@ pub fn recover(st: &AppState, now: OffsetDateTime) -> Result<Value> {
     })
 }
 
+/// A task that is aborted when its handle is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Runs the loop until the process ends.
 pub fn spawn(st: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -399,7 +408,11 @@ pub fn spawn(st: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             // Each pass runs in its own task: a panic in one pass is logged and the loop goes
             // on, so downloads, imports and scheduled tasks never stop until a restart.
             let s2 = st.clone();
-            match tokio::spawn(async move { tick(&s2, OffsetDateTime::now_utc()).await }).await {
+            // (aborting the worker aborts its current pass too)
+            let mut pass = AbortOnDrop(tokio::spawn(async move {
+                tick(&s2, OffsetDateTime::now_utc()).await
+            }));
+            match (&mut pass.0).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::error!(error = %format!("{e:#}"), "worker pass failed"),
                 Err(e) => {
