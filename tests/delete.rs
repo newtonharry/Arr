@@ -1081,3 +1081,130 @@ async fn a_whole_show_is_refused_up_front_while_a_shared_download_must_stay() {
     let (s, v) = delete(&e, SHOW, token, true).await;
     assert_eq!(s, 200, "{v}");
 }
+
+/// The bin's entries, once the bin lists `n` of them (a delete the deadline cut off finishes
+/// on its own).
+async fn bin_entries(e: &Exec, n: usize) -> Vec<Value> {
+    for _ in 0..100 {
+        let (_, b) = call(e, e.get("/api/v1/bin")).await;
+        let list = b["entries"].as_array().unwrap().clone();
+        if list.len() == n {
+            return list;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the bin never listed {n} entries");
+}
+
+fn test_at(root: &Path, point: &'static str, on: bool) {
+    let mut at = arr::trash::TEST_AT.lock().unwrap();
+    at.retain(|(r, p)| !(r == root && *p == point));
+    if on {
+        at.push((root.to_path_buf(), point));
+    }
+}
+
+/// A delete the server's deadline cuts off while the files move still records them: the bin
+/// lists the entry and it can be put back.
+#[tokio::test]
+async fn a_delete_cut_off_by_the_deadline_still_records_what_it_moved() {
+    let e = start_exec(ExecOptions {
+        server_extra: "request_timeout_secs = 1\n".into(),
+        ..Default::default()
+    })
+    .await;
+    let original = e.movies.join(RELOADED);
+    let (_, p) = preview(&e, "movie:tmdb:604").await;
+    test_at(&e.movies, "hold_after_move", true);
+    let (s, v) = delete(&e, "movie:tmdb:604", p["token"].as_str().unwrap(), false).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (503, Some("request_timeout")),
+        "{v}"
+    );
+    let entries = bin_entries(&e, 1).await;
+    test_at(&e.movies, "hold_after_move", false);
+    let id = entries[0]["delete_id"].as_str().unwrap().to_string();
+    assert!(!original.exists());
+    assert!(bin_file(&e.movies, &id, RELOADED).is_file());
+    // It runs to the end: the title is not wanted any more.
+    for _ in 0..100 {
+        if movie(&e, "reloaded").await["monitored"] == json!(false) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(movie(&e, "reloaded").await["monitored"], json!(false));
+}
+
+/// A crash once the files are in the bin, before the delete is recorded, still leaves an entry
+/// that lists them and puts them back.
+#[tokio::test]
+async fn a_crash_after_the_move_leaves_an_entry_that_puts_the_files_back() {
+    let mut e = start_exec(ExecOptions::default()).await;
+    let original = e.movies.join(RELOADED);
+    let bytes = std::fs::read(&original).unwrap();
+    let (_, p) = preview(&e, "movie:tmdb:604").await;
+    test_at(&e.movies, "crash_after_move", true);
+    let (s, v) = delete(&e, "movie:tmdb:604", p["token"].as_str().unwrap(), false).await;
+    test_at(&e.movies, "crash_after_move", false);
+    assert_eq!(s, 500, "{v}");
+    assert!(!original.exists());
+    e.restart().await;
+    let entries = bin_entries(&e, 1).await;
+    let id = entries[0]["delete_id"].as_str().unwrap().to_string();
+    assert_eq!(entries[0]["media_id"], "movie:tmdb:604");
+    assert!(bin_file(&e.movies, &id, RELOADED).is_file());
+    let (s, r) = call(&e, e.post(&format!("/api/v1/bin/{id}/restore"))).await;
+    assert_eq!((s, r["restored"].clone()), (200, json!(1)), "{r}");
+    assert_eq!(std::fs::read(&original).unwrap(), bytes);
+    bin_entries(&e, 0).await;
+}
+
+/// The hourly purge meets a library that is not mounted (an empty folder where it should be):
+/// the entry stays, and goes once the library is back.
+#[tokio::test]
+async fn the_bin_keeps_an_entry_while_the_library_is_not_mounted() {
+    let e = start_exec(ExecOptions::default()).await;
+    let id = remove(&e, "movie:tmdb:604", false).await["delete_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let aside = e.movies.with_file_name("movies-unmounted");
+    std::fs::rename(&e.movies, &aside).unwrap();
+    std::fs::create_dir(&e.movies).unwrap();
+    let later = OffsetDateTime::now_utc() + Duration::from_secs(8 * 86_400);
+    arr::worker::run_task(&e.state, "bin", later).await.unwrap();
+    assert_eq!(bin_entries(&e, 1).await[0]["delete_id"], json!(id));
+    std::fs::remove_dir(&e.movies).unwrap();
+    std::fs::rename(&aside, &e.movies).unwrap();
+    arr::worker::run_task(&e.state, "bin", later).await.unwrap();
+    bin_entries(&e, 0).await;
+    assert!(!e.movies.join(format!(".arr-bin/{id}")).exists());
+}
+
+/// A move that fails after the delete removed downloads with their data says which went,
+/// instead of "nothing was deleted".
+#[tokio::test]
+async fn a_failed_move_names_the_downloads_already_removed() {
+    let e = start_exec(ExecOptions::default()).await;
+    imported_matrix(&e).await;
+    let (_, p) = preview(&e, "movie:tmdb:603").await;
+    let title = p["downloads"][0]["title"].as_str().unwrap().to_string();
+    // A file where the bin's folder must go: nothing can move.
+    std::fs::write(e.movies.join(".arr-bin"), b"in the way").unwrap();
+    let (s, v) = delete(&e, "movie:tmdb:603", p["token"].as_str().unwrap(), false).await;
+    assert_eq!(s, 409, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("already removed") && msg.contains(&title),
+        "{msg}"
+    );
+    assert!(
+        e.movies
+            .join(format!("The Matrix (1999)/{MATRIX}.mkv"))
+            .is_file()
+    );
+    let (_, b) = call(&e, e.get("/api/v1/bin")).await;
+    assert!(b["entries"].as_array().unwrap().is_empty(), "{b}");
+}
