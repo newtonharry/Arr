@@ -125,8 +125,9 @@ movie and series tools, with a pointer to the `sport_*` tools.
   and get an explicit yes to exactly that scope. It requires `confirmed: true` and the
   preview's `token`.
 - **Bound to its preview.** The tool previews the scope again itself and compares the
-  token with the one it was given. The API's token is a digest over the media id and each
-  file's path, kind, size and modified time. A token for another scope, a stale one or an
+  token with the one it was given. The API's token is a digest over the media id, each
+  file's path, kind, size and modified time, and each download the preview lists with its
+  `removed` decision, so a download that appears after the preview refuses the delete too. A token for another scope, a stale one or an
   invented one is refused locally (`changed`, `not_applied`) before anything is sent to
   `POST /delete`, and the API checks the same token once more before it moves a file. A
   preview with no files, or one that is `blocked`, is refused the same way.
@@ -156,6 +157,12 @@ app calls) with the tool that covers it, or a reason it has none:
   bulk ownership, the raw catalog record, `PATCH /library/{id}`), each with the reason a
   person would not need it in a chat. Things a person does with Arr itself (pausing or
   cancelling a download, the blocklist, background jobs, library folders) are tools.
+
+The test also scans `src/` and fails when a route is registered anywhere but the shared route
+lists in `src/api.rs` (other routers, such as the web app's pages, the setup wizard and the
+OAuth endpoints, are allowlisted by file with a reason), and its reader of `app.js` refuses
+what it cannot see (an aliased helper, an extra `fetch`, a computed route name it does not
+know).
 
 `tests/mcp_parity.rs` fails when a route of the real router, or a path `src/webapp/app.js`
 calls, has no entry, when an entry names a tool that is not registered, or when a tool is in

@@ -438,6 +438,73 @@ async fn a_changed_file_refuses_the_delete() {
     assert_eq!(s, 409, "{v}");
 }
 
+/// A download that appears for the scope after the preview was shown is not cancelled under
+/// that preview's token: the token covers the downloads the preview listed.
+#[tokio::test]
+async fn a_download_that_appears_after_the_preview_refuses_the_delete_and_nothing_moves() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (grab, hash) = imported_matrix(&e).await;
+    let video = e
+        .movies
+        .join("The Matrix (1999)")
+        .join(format!("{MATRIX}.mkv"));
+    let (s, p) = preview(&e, "movie:tmdb:603").await;
+    assert_eq!(s, 200, "{p}");
+    let token = p["token"].as_str().unwrap().to_string();
+    // The same preview again gives the same token.
+    assert_eq!(
+        preview(&e, "movie:tmdb:603").await.1["token"],
+        token.as_str()
+    );
+    // Another download of the same title appears (a copy of the first one's row).
+    let g = grab.clone();
+    e.state
+        .store
+        .blocking(move |c| {
+            let cols: Vec<String> = c
+                .prepare("SELECT name FROM pragma_table_info('grabs')")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let select: Vec<String> = cols
+                .iter()
+                .map(|n| match n.as_str() {
+                    "id" => "'grb_ffffffffffffffffffffffff'".to_string(),
+                    "info_hash" => "'ffffffffffffffffffffffffffffffffffffffff'".to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            c.execute(
+                &format!(
+                    "INSERT INTO grabs ({}) SELECT {} FROM grabs WHERE id = ?1",
+                    cols.join(", "),
+                    select.join(", ")
+                ),
+                [&g],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (s, v) = delete(&e, "movie:tmdb:603", &token, false).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("changed")),
+        "{v}"
+    );
+    assert!(video.is_file(), "nothing moved");
+    assert_eq!(e.grab_row(&grab).state, "imported", "nothing cancelled");
+    assert!(
+        e.fake.lock().unwrap().torrents.contains_key(&hash),
+        "the torrent is still there"
+    );
+    let (_, b) = call(&e, e.get("/api/v1/bin")).await;
+    assert!(b["entries"].as_array().unwrap().is_empty());
+    // A fresh preview shows it and its token deletes.
+    let (_, p) = preview(&e, "movie:tmdb:603").await;
+    assert_eq!(p["downloads"].as_array().unwrap().len(), 2, "{p}");
+    let (s, v) = delete(&e, "movie:tmdb:603", p["token"].as_str().unwrap(), false).await;
+    assert_eq!(s, 200, "{v}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_symlink_is_refused() {
