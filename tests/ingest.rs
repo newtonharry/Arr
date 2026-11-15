@@ -1137,6 +1137,7 @@ async fn blocked_after_the_original_is_moved_aside(
     (id, hash, old, proper)
 }
 
+#[cfg(unix)]
 fn unfinished_rows(e: &Exec) -> i64 {
     e.state
         .store
