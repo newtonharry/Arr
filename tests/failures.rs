@@ -625,6 +625,20 @@ async fn cancelled_during_its_add(
     std::sync::Arc<tokio::sync::Semaphore>,
     tokio::task::JoinHandle<Result<(), String>>,
 ) {
+    cancelled_during_its_add_at(e, ep, OffsetDateTime::now_utc()).await
+}
+
+/// `cancelled_during_its_add`, for a pass that started at `at`.
+async fn cancelled_during_its_add_at(
+    e: &Exec,
+    ep: u16,
+    at: OffsetDateTime,
+) -> (
+    String,
+    String,
+    std::sync::Arc<tokio::sync::Semaphore>,
+    tokio::task::JoinHandle<Result<(), String>>,
+) {
     let title = format!("Slow.Horses.S01E{ep:02}.1080p.WEB-DL.x264-HLD");
     let (hash, r) = e.publish(
         &title,
@@ -642,11 +656,23 @@ async fn cancelled_during_its_add(
         .as_str()
         .unwrap_or_else(|| panic!("{text}"))
         .to_string();
+    // Due for a pass dated `at`.
+    let gid = id.clone();
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute(
+                "UPDATE grabs SET next_attempt_at = '1970-01-01T00:00:00Z' WHERE id = ?1",
+                [gid],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     e.fake.lock().unwrap().hold_add = Some(gate.clone());
     let state = e.state.clone();
     let pass = tokio::spawn(async move {
-        arr::worker::tick(&state, OffsetDateTime::now_utc())
+        arr::worker::tick(&state, at)
             .await
             .map(|_| ())
             .map_err(|e| format!("{e:#}"))
@@ -787,5 +813,29 @@ async fn a_late_add_never_removes_the_torrent_of_a_newer_download() {
     assert!(
         f.torrents.contains_key(&hash),
         "the newer download keeps it"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_pass_still_gives_a_late_add_its_full_grace_period() {
+    let e = start_exec(ExecOptions::default()).await;
+    // The pass began an hour ago (slow reads before this add, a long wait for metadata).
+    let at = OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let (_id, hash, gate, pass) = cancelled_during_its_add_at(&e, 2, at).await;
+    e.fake.lock().unwrap().hide_adds = true;
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    // A pass now, with the torrent still not listed, keeps watching for it.
+    e.tick().await;
+    {
+        let mut f = e.fake.lock().unwrap();
+        f.hide_adds = false;
+        let t = f.hidden.remove(&hash).expect("the add was taken");
+        f.torrents.insert(hash.clone(), t);
+    }
+    e.tick().await;
+    assert!(
+        !e.fake.lock().unwrap().torrents.contains_key(&hash),
+        "the late torrent is removed once the client lists it"
     );
 }

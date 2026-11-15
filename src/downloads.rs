@@ -1925,7 +1925,9 @@ pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
             {
                 // Checked and removed again on a later pass (see `retry_late_adds`); a torrent
                 // still not there counts as never added once the grace period is over.
-                let (id, until) = (g.id.clone(), ts(now + LATE_ADD_GRACE));
+                // The grace period starts now, not when this pass began (a slow pass, a slow add).
+                let start = now.max(OffsetDateTime::now_utc());
+                let (id, until) = (g.id.clone(), ts(start + LATE_ADD_GRACE));
                 st.store
                     .with(move |c| {
                         c.execute(
