@@ -219,6 +219,10 @@ pub(super) async fn app_settings_post(
     let (state, name, v) = (st.clone(), body.name.clone(), value.to_string());
     let changed = tokio::spawn(async move {
         let _one_at_a_time = state.settings_lock.lock().await;
+        // Arr is about to stop: a change now could be cut off part way.
+        if state.restart.requested() {
+            anyhow::bail!("Arr is restarting to use the last change; try again in a moment");
+        }
         let path = crate::lifecycle::config_path(&state.cfg.state_dir);
         crate::set::run(&path, &name, Some(&v)).await?;
         tracing::info!(setting = %name, "a setting was changed from the web app; restarting");
@@ -226,6 +230,8 @@ pub(super) async fn app_settings_post(
         let restart = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(1500)).await;
+            // Not while another change is being written or checked.
+            let _one_at_a_time = restart.settings_lock.lock().await;
             restart.restart.request();
         });
         anyhow::Ok(())
