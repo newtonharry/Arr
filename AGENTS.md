@@ -26,8 +26,8 @@ things. A capability that ships in the API or the web app ships in MCP in the sa
   server settings. A feature is not web-only because it is new, hard, or risky.
 - **Same rules in both places.** A tool goes through the same route as the web app, so it gets
   the same checks: confirmations (a sport copy with a caution, a delete), refusals, and what is
-  never shown (scores and results, release names, links, hashes, secrets). A tool never
-  bypasses a check the web app relies on.
+  never shown (for sport: scores, results and release names; anywhere: links, magnets, hashes
+  and secrets). A tool never bypasses a check the web app relies on.
 - **Destructive tools say so.** A tool that deletes or cannot be undone tells the assistant, in
   its description, to confirm the exact scope with the person first. It is built so the
   scope it acts on is the scope that was previewed.
