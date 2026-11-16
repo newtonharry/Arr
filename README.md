@@ -273,12 +273,19 @@ To remove Arr, Plex Media Server, or both:
 curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.sh | sh
 ```
 
+On Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.ps1 | iex
+```
+
 It shows what it found, asks what to remove and whether to delete each one's data (Arr's
 config, secrets and database; Plex's library database, watch history and settings), and asks
 once more before changing anything. It never deletes your movie and TV files or the download
 folder. Plex is removed however it was installed: the system package, snap, a Docker container
 or the macOS app. Add `--dry-run` to see what it would do, or `--yes --all --delete-data` to
-remove everything without questions (`--help` lists the options).
+remove everything without questions (`--help` lists the options). On Windows the same choices
+are environment variables, listed at the top of [`uninstall.ps1`](uninstall.ps1).
 
 ### Let an AI agent install it
 

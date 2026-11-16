@@ -47,3 +47,4 @@ summary{cursor:pointer;font-weight:700;padding:.7rem 0}details p{margin:0 0 1rem
 footer{display:flex;align-items:center;justify-content:center;gap:.8rem;padding:2rem 1.25rem 3rem;text-align:center;color:var(--muted)}footer p{margin:0}
 @media (max-width:520px){.cmd{flex-direction:column;align-items:stretch}.copy{width:100%}.top nav a:first-child{display:none}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;scroll-behavior:auto!important}}
+.remove{text-align:center}.remove>p{max-width:38rem;margin:0 auto 1.2rem}.remove .label{font-weight:700;margin:.2rem 0 .5rem}.remove .label:not(:first-child){margin-top:1rem}

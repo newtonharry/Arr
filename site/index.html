@@ -16,6 +16,7 @@
   <nav aria-label="Main">
     <a href="#how">How it works</a>
     <a href="#faq">FAQ</a>
+    <a href="#remove">Uninstall</a>
     <a href="https://github.com/newtonharry/Arr">GitHub</a>
   </nav>
 </header>
@@ -103,8 +104,24 @@
   <details><summary>Can I use it from my phone when I'm out?</summary><p>Yes. Arr's app is made for phones. To open it away from home, Arr gets a private web address (a free ngrok account) and lets in only the Google accounts you choose. The same address lets ChatGPT on your phone use Arr too. The installer sets it up on Windows, macOS and Linux: answer yes when a first install offers it, or later run the Windows line again after <code>$env:ARR_REMOTE = '1'</code>, or add <code>-s -- --remote</code> after <code>sh</code> on macOS and Linux. It takes about 15 minutes, and the installer tells you what to copy from ngrok and Google. <a href="https://github.com/newtonharry/Arr/blob/main/docs/REMOTE.md">The step-by-step guide</a>.</p></details>
   <details><summary>Do I need an AI assistant?</summary><p>No. Everything is in Arr's app. If you use ChatGPT, Claude or another assistant that speaks MCP, it can do the same things for you: search, add, check on downloads, follow sport, and delete files (it always shows you what would go and asks first). <a href="https://github.com/newtonharry/Arr/blob/main/docs/MCP.md">What it can do</a>.</p></details>
   <details><summary>Something's not working. What do I do?</summary><p>Run the install command again. It checks and repairs Arr, updates it, and keeps your setup. If Plex has stopped accepting Arr's sign-in, it walks you through signing in again. <a href="https://github.com/newtonharry/Arr#somethings-wrong-or-you-want-to-change-a-setting">What a re-run does, and how to change a setting</a>.</p></details>
-  <details><summary>How do I remove it?</summary><p>Paste <code>curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.sh | sh</code> into a terminal. It asks whether to remove Arr, Plex or both, and whether to delete their settings too. Your movies and shows are never touched.</p></details>
   <details><summary>Which systems does it run on?</summary><p>Windows 10 and 11 (64-bit), macOS, and Linux on x86_64 or ARM64 (including Raspberry Pi OS).</p></details>
+</section>
+
+<section id="remove" class="section remove">
+  <h2>Uninstall</h2>
+  <p>One line removes Arr, Plex or both. It shows what it found, asks what to remove and whether to delete their settings too, and asks once more before changing anything. Your movies and shows are never touched.</p>
+  <div class="install">
+    <p class="label">Linux &amp; macOS, in a terminal</p>
+    <div class="cmd">
+      <code id="rm-unix">curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.sh | sh</code>
+      <button class="copy" type="button" data-target="rm-unix" hidden>Copy</button>
+    </div>
+    <p class="label">Windows, in PowerShell</p>
+    <div class="cmd">
+      <code id="rm-win">irm https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.ps1 | iex</code>
+      <button class="copy" type="button" data-target="rm-win" hidden>Copy</button>
+    </div>
+  </div>
 </section>
 </main>
 
