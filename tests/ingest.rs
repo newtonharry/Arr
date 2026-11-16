@@ -726,3 +726,488 @@ async fn a_lower_resolution_proper_is_not_an_exact_quality_revision() {
             .all(|p| !p.contains(".um-") && !p.contains("-LOW"))
     );
 }
+
+// ------------------------------------------------------------------- crash safety of the import
+
+const MATRIX: &str = "The.Matrix.1999.1080p.WEB-DL.x264-UM";
+
+/// A grab of The Matrix, sent to the client (not yet complete). Returns (grab id, hash).
+async fn grab_movie(e: &Exec) -> (String, String) {
+    let (hash, r) = e.publish(
+        MATRIX,
+        MATRIX,
+        vec![(format!("{MATRIX}.mkv"), mkv(2))],
+        8.0,
+        false,
+    );
+    e.search_results("The Matrix 1999", vec![r]);
+    let (s, v, text) = e
+        .json(
+            e.post("/api/v1/plans")
+                .json(&json!({ "media_id": "movie:tmdb:603", "execute": true })),
+        )
+        .await;
+    assert_eq!(s, 201, "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    (id, hash)
+}
+
+/// Completes `hash` and stops the import of `grab` dead at `point`, then restarts.
+async fn crash_at(e: &mut Exec, grab: &str, hash: &str, point: &'static str) -> serde_json::Value {
+    e.complete(hash);
+    arr::ingest::CRASH_AT
+        .lock()
+        .unwrap()
+        .push((grab.to_string(), point));
+    e.tick().await;
+    arr::ingest::CRASH_AT
+        .lock()
+        .unwrap()
+        .retain(|(g, _)| g != grab);
+    assert_eq!(
+        e.grab_row(grab).state,
+        "importing",
+        "{point}: left mid-import"
+    );
+    e.restart().await
+}
+
+fn library_files(root: &Path) -> Vec<String> {
+    let mut v = walk(root);
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn a_movie_crash_after_the_commit_is_finished_not_blocked_by_its_own_file() {
+    for point in ["after_commit", "before_apply"] {
+        let mut e = start_exec(ExecOptions::default()).await;
+        let (id, hash) = grab_movie(&e).await;
+        crash_at(&mut e, &id, &hash, point).await;
+        let folder = e.movies.join("The Matrix (1999)");
+        let dest = folder.join(format!("{MATRIX}.mkv"));
+        let before = library_files(&folder);
+        assert_eq!(before, [dest.display().to_string()], "{point}");
+        let bytes = std::fs::read(&dest).unwrap();
+        assert_eq!(e.grab_row(&id).state, "completed", "{point}");
+        e.tick().await;
+        e.tick().await;
+        let g = e.grab_row(&id);
+        assert_eq!(g.state, "imported", "{point}: {:?}", g.last_error);
+        assert_ne!(g.cleanup, "none", "{point}: clean-up never ran");
+        assert_eq!(
+            library_files(&folder),
+            before,
+            "{point}: nothing filed again"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes, "{point}");
+    }
+}
+
+#[tokio::test]
+async fn a_series_crash_after_the_commit_is_finished_not_blocked_by_its_own_file() {
+    for point in ["after_commit", "before_apply"] {
+        let mut e = parity(ExecOptions::default(), true).await;
+        let title = "Parity.Show.S01E02.1080p.WEB-DL.x264-UM";
+        let (id, hash) = grab_episode(&e, 2, title, vec![(format!("{title}.mkv"), mkv(2))]).await;
+        crash_at(&mut e, &id, &hash, point).await;
+        let folder = e.tv.join("Parity Show");
+        let before = library_files(&folder);
+        assert_eq!(before.len(), 2, "{point}: {before:?}");
+        assert!(episode_owned(&e, 2), "{point}");
+        e.tick().await;
+        e.tick().await;
+        let g = e.grab_row(&id);
+        assert_eq!(g.state, "imported", "{point}: {:?}", g.last_error);
+        assert_ne!(g.cleanup, "none", "{point}: clean-up never ran");
+        assert_eq!(
+            library_files(&folder),
+            before,
+            "{point}: nothing filed again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_crash_right_after_the_original_is_moved_aside_restores_it() {
+    let mut e = parity(revisions(), true).await;
+    let old = place_old_file(&e);
+    let original = std::fs::read(&old).unwrap();
+    let proper = "Parity.Show.S01E01.PROPER.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(
+        proper,
+        proper,
+        vec![(format!("{proper}.mkv"), mkv(3))],
+        1.5,
+        false,
+    );
+    e.search_results("Parity Show S01E01", vec![r]);
+    let (s, v, text) = e.json(e.post("/api/v1/plans").json(&json!({ "media_id": "episode:tvdb:999002:1:1", "revisions": true, "replan": true, "execute": true }))).await;
+    assert_eq!(s, 201, "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    let recovery = crash_at(&mut e, &id, &hash, "after_backup").await;
+    assert!(
+        recovery["journal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("restored the original")),
+        "{recovery}"
+    );
+    assert_eq!(std::fs::read(&old).unwrap(), original, "original restored");
+    assert!(
+        walk(&e.tv).iter().all(|p| !p.contains(".um-")),
+        "no backup or staging leftovers: {:?}",
+        walk(&e.tv)
+    );
+    assert_eq!(e.grab_row(&id).state, "completed");
+    // The next import replaces it properly.
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!(g.state, "imported", "{:?}", g.last_error);
+    assert!(!old.exists());
+    assert!(
+        e.tv.join(format!("Parity Show/Season 1/{proper}.mkv"))
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn a_staging_name_already_taken_is_never_removed() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash) = grab_movie(&e).await;
+    // Another state folder sharing the library staged its own files under journal ids this
+    // database also uses.
+    let folder = e.movies.join("The Matrix (1999)");
+    std::fs::create_dir_all(&folder).unwrap();
+    let theirs: Vec<_> = (1..=5)
+        .map(|n| folder.join(format!(".um-import-{n}.partial")))
+        .collect();
+    for p in &theirs {
+        std::fs::write(p, b"not ours").unwrap();
+    }
+    e.complete(&hash);
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!(g.state, "imported", "{:?}", g.last_error);
+    for p in &theirs {
+        assert_eq!(std::fs::read(p).unwrap(), b"not ours", "{}", p.display());
+    }
+    assert!(folder.join(format!("{MATRIX}.mkv")).is_file());
+}
+
+#[tokio::test]
+async fn one_journal_row_that_cannot_be_recovered_does_not_stop_the_others() {
+    let mut e = parity(ExecOptions::default(), true).await;
+    let season = e.tv.join("Parity Show/Season 1");
+    // Row 900: an original moved aside whose folder has since gone: it cannot be put back.
+    let backup = season.join(".um-backup-900.orig");
+    std::fs::write(&backup, b"original").unwrap();
+    // Row 901: a plain import interrupted while staged.
+    let staged = season.join(".um-import-901.partial");
+    std::fs::write(&staged, mkv(2)).unwrap();
+    let tv = e.tv.display().to_string();
+    let (b, s) = (ino(&backup) as i64, ino(&staged) as i64);
+    let (backup_s, staged_s) = (backup.display().to_string(), staged.display().to_string());
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute("INSERT INTO grabs (id, media_id, target, release_ref, info_hash, title, category, save_path, remove_completed, remove_failed, origin, payload_kind, payload, state, active, next_attempt_at, created_at, updated_at)
+                       VALUES ('grb_000000000000000000000001', 'series:tvdb:999002', 'episode:tvdb:999002:1:1', 'rel_x', ?1, 't', 'tv-sonarr', '/downloads', 1, 1, 'interactive', 'magnet', x'00', 'importing', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')", ["b".repeat(40)])?;
+            let ins = "INSERT INTO import_journal (id, grab_id, source, root, dest, targets, size, method, state, staged, staged_ino, replaced_path, backup, backup_ino, updated_at) VALUES (?1, 'grb_000000000000000000000001', '/x', ?2, ?3, '[]', 1, 'hardlink', ?4, ?5, ?6, ?7, ?8, ?9, '2026-01-01T00:00:00Z')";
+            c.execute(ins, rusqlite::params![900, tv, "Gone/x.mkv", "backed_up", Option::<String>::None, Option::<i64>::None, "Gone/x.mkv", backup_s, b])?;
+            c.execute(ins, rusqlite::params![901, tv, "Parity Show/Season 1/y.mkv", "staged", staged_s, s, Option::<String>::None, Option::<String>::None, Option::<i64>::None])?;
+            Ok(())
+        })
+        .unwrap();
+    let recovery = e.restart().await;
+    let notes = recovery["journal"].to_string();
+    assert!(notes.contains("journal 900: recovery failed"), "{recovery}");
+    assert!(notes.contains("journal 901: rolled back"), "{recovery}");
+    assert!(!staged.exists(), "the other row was recovered");
+    assert!(backup.exists(), "the backup is kept for the next start");
+    assert_eq!(
+        e.grab_row("grb_000000000000000000000001").state,
+        "completed",
+        "the interrupted import is retried"
+    );
+    let (state, error): (String, Option<String>) = e
+        .state
+        .store
+        .blocking(|c| {
+            Ok(c.query_row(
+                "SELECT state, error FROM import_journal WHERE id = 900",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(state, "backed_up", "left for the next start");
+    assert!(error.unwrap().contains("recovery failed"));
+}
+
+#[tokio::test]
+async fn an_import_whose_lease_ran_out_is_retried_without_a_restart() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash) = grab_movie(&e).await;
+    e.complete(&hash);
+    // Left `importing` by an import that stopped part way (its lease long gone).
+    let id2 = id.clone();
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute("UPDATE grabs SET state = 'importing', completed_at = '2026-01-01T00:00:00Z', lease_owner = 'w_gone', lease_until = '2026-01-01T00:00:00Z' WHERE id = ?1", [id2])?;
+            Ok(())
+        })
+        .unwrap();
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!(g.state, "imported", "{:?}", g.last_error);
+}
+
+#[cfg(unix)] // a shell-script ffprobe
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_is_not_held_up_by_a_running_import_and_wins() {
+    use std::os::unix::fs::PermissionsExt;
+    // An ffprobe that takes its time over media (not over `-version`).
+    let tmp = tempfile::tempdir().unwrap();
+    let real = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v ffprobe")
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let script = tmp.path().join("ffprobe");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ncase \"$*\" in *-version*) ;; *) sleep 3;; esac\nexec {real} \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = start_exec(ExecOptions {
+        library_extra: format!("ffprobe = '{}'\n", script.display()),
+        ..Default::default()
+    })
+    .await;
+    let (id, hash) = grab_movie(&e).await;
+    e.complete(&hash);
+    let st = e.state.clone();
+    let pass = tokio::spawn(async move {
+        arr::worker::tick(&st, time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+    });
+    let waited = std::time::Instant::now();
+    while e.grab_row(&id).state != "importing" {
+        assert!(waited.elapsed().as_secs() < 20, "the import never started");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let asked = std::time::Instant::now();
+    let (s, v, text) = e.json(e.post(&format!("/api/v1/queue/{id}/cancel"))).await;
+    let took = asked.elapsed();
+    assert_eq!(s, 200, "{text}");
+    assert!(
+        took < std::time::Duration::from_millis(2000),
+        "the cancel waited for the import: {took:?}"
+    );
+    let _ = v;
+    assert_eq!(e.grab_row(&id).state, "cancelled");
+    pass.await.unwrap();
+    // The cancel won: nothing was filed and the grab stays cancelled.
+    let g = e.grab_row(&id);
+    assert_eq!(g.state, "cancelled", "{:?}", g.last_error);
+    let folder = e.movies.join("The Matrix (1999)");
+    assert!(
+        walk(&folder).is_empty(),
+        "nothing filed: {:?}",
+        walk(&folder)
+    );
+}
+
+#[tokio::test]
+async fn a_database_error_after_the_original_is_moved_aside_is_undone_before_a_retry() {
+    let mut e = parity(revisions(), true).await;
+    let old = place_old_file(&e);
+    let original = std::fs::read(&old).unwrap();
+    let proper = "Parity.Show.S01E01.PROPER.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(
+        proper,
+        proper,
+        vec![(format!("{proper}.mkv"), mkv(3))],
+        1.5,
+        false,
+    );
+    e.search_results("Parity Show S01E01", vec![r]);
+    let (s, v, text) = e.json(e.post("/api/v1/plans").json(&json!({ "media_id": "episode:tvdb:999002:1:1", "revisions": true, "replan": true, "execute": true }))).await;
+    assert_eq!(s, 201, "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    // The database refuses the write that follows moving the original aside.
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute_batch("CREATE TRIGGER refuse_backed_up BEFORE UPDATE OF state ON import_journal WHEN NEW.state = 'backed_up' BEGIN SELECT RAISE(ABORT, 'refused for a test'); END;")?;
+            Ok(())
+        })
+        .unwrap();
+    e.complete(&hash);
+    e.tick().await;
+    assert_eq!(e.grab_row(&id).state, "import_blocked");
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute_batch("DROP TRIGGER refuse_backed_up;")?;
+            Ok(())
+        })
+        .unwrap();
+    // Retried without a restart: the first attempt is undone, then the replacement is made.
+    let (s, _, text) = e.json(e.post(&format!("/api/v1/queue/{id}/retry"))).await;
+    assert_eq!(s, 200, "{text}");
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!(g.state, "imported", "{:?}", g.last_error);
+    let new = e.tv.join(format!("Parity Show/Season 1/{proper}.mkv"));
+    assert!(new.is_file() && !old.exists());
+    // A restart finds nothing to undo: the replacement stays.
+    let recovery = e.restart().await;
+    assert!(
+        recovery["journal"].as_array().unwrap().is_empty(),
+        "{recovery}"
+    );
+    assert!(new.is_file() && !old.exists(), "the replacement was kept");
+    assert!(
+        walk(&e.tv).iter().all(|p| !p.contains(".um-")),
+        "{:?}",
+        walk(&e.tv)
+    );
+    let _ = original;
+}
+
+/// A grab whose replacement of the episode stops on a database error right after the original
+/// is moved aside (the journal row stays unfinished). Returns the grab, the hash, the original
+/// file, and the replacement's name.
+async fn blocked_after_the_original_is_moved_aside(
+    e: &Exec,
+) -> (String, String, std::path::PathBuf, &'static str) {
+    let old = place_old_file(e);
+    let proper = "Parity.Show.S01E01.PROPER.1080p.WEB-DL.x264-UM";
+    let (hash, r) = e.publish(
+        proper,
+        proper,
+        vec![(format!("{proper}.mkv"), mkv(3))],
+        1.5,
+        false,
+    );
+    e.search_results("Parity Show S01E01", vec![r]);
+    let (s, v, text) = e.json(e.post("/api/v1/plans").json(&json!({ "media_id": "episode:tvdb:999002:1:1", "revisions": true, "replan": true, "execute": true }))).await;
+    assert_eq!(s, 201, "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    e.tick().await;
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute_batch("CREATE TRIGGER refuse_backed_up BEFORE UPDATE OF state ON import_journal WHEN NEW.state = 'backed_up' BEGIN SELECT RAISE(ABORT, 'refused for a test'); END;")?;
+            Ok(())
+        })
+        .unwrap();
+    e.complete(&hash);
+    e.tick().await;
+    assert_eq!(e.grab_row(&id).state, "import_blocked");
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute_batch("DROP TRIGGER refuse_backed_up;")?;
+            Ok(())
+        })
+        .unwrap();
+    (id, hash, old, proper)
+}
+
+#[cfg(unix)]
+fn unfinished_rows(e: &Exec) -> i64 {
+    e.state
+        .store
+        .blocking(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM import_journal WHERE state IN ('planned', 'staged', 'backed_up', 'published')",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_cancelled_attempt_is_undone_before_the_same_torrent_is_imported_again() {
+    let mut e = parity(revisions(), true).await;
+    let (id, hash, old, proper) = blocked_after_the_original_is_moved_aside(&e).await;
+    // Cancelled (not blocklisted) and grabbed again.
+    let (s, _, text) = e
+        .json(
+            e.post(&format!("/api/v1/queue/{id}/cancel"))
+                .json(&json!({})),
+        )
+        .await;
+    assert_eq!(s, 200, "{text}");
+    let (s, v, text) = e.json(e.post("/api/v1/plans").json(&json!({ "media_id": "episode:tvdb:999002:1:1", "revisions": true, "replan": true, "execute": true }))).await;
+    assert_eq!(s, 201, "{text}");
+    let again = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("{text}"))
+        .to_string();
+    assert_ne!(again, id);
+    e.tick().await;
+    e.complete(&hash);
+    e.tick().await;
+    let g = e.grab_row(&again);
+    assert_eq!(g.state, "imported", "{:?}", g.last_error);
+    let new = e.tv.join(format!("Parity Show/Season 1/{proper}.mkv"));
+    assert!(new.is_file() && !old.exists());
+    // A restart finds nothing to undo: the new import stays.
+    let recovery = e.restart().await;
+    assert!(
+        recovery["journal"].as_array().unwrap().is_empty(),
+        "{recovery}"
+    );
+    assert!(new.is_file(), "the new import was kept");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_row_whose_files_cannot_be_looked_at_is_not_taken_as_rolled_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut e = parity(revisions(), true).await;
+    let (_id, _hash, old, _proper) = blocked_after_the_original_is_moved_aside(&e).await;
+    assert_eq!(unfinished_rows(&e), 1);
+    // The season folder can be listed but not looked inside.
+    let season = old.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&season, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if std::fs::symlink_metadata(season.join("x"))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Still able to look inside (running as root): nothing to show here.
+        std::fs::set_permissions(&season, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    e.restart().await;
+    assert_eq!(unfinished_rows(&e), 1, "the row is kept for a later start");
+    // Once the folder can be read again, a start puts the original back.
+    std::fs::set_permissions(&season, std::fs::Permissions::from_mode(0o755)).unwrap();
+    e.restart().await;
+    assert_eq!(unfinished_rows(&e), 0);
+    assert!(old.is_file(), "the original is back");
+}

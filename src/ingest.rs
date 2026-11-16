@@ -738,8 +738,9 @@ fn client_blocked(g: &Grab, label: &str, e: &crate::upstream::UpstreamError) -> 
 }
 
 /// A place the import can be made to stop dead, for tests of crash recovery: `(grab id, point)`.
-/// The points are `after_stage`, `after_link` (published but the staged copy not yet removed),
-/// `after_published`, `after_commit` and `before_apply`. Stopping there leaves exactly what a
+/// The points are `after_stage`, `after_backup` (a replaced file moved aside, before the journal
+/// says so), `after_link` (published but the staged copy not yet removed), `after_published`,
+/// `after_commit` and `before_apply`. Stopping there leaves exactly what a
 /// crash at that line leaves: the import's own writes so far, and the grab `importing`.
 #[doc(hidden)]
 pub static CRASH_AT: std::sync::Mutex<Vec<(String, &'static str)>> =
@@ -766,8 +767,49 @@ fn failpoint(grab_id: &str, point: &'static str) -> Result<(), FileError> {
     Ok(())
 }
 
+/// A stop because the grab stopped being this import's while it ran (a cancel took it): the
+/// file being filed is rolled back and nothing more is written to the grab.
+#[derive(Debug)]
+struct Superseded;
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the download was cancelled while it was being imported")
+    }
+}
+impl std::error::Error for Superseded {}
+
+/// Whether the grab is still `importing` under this instance's lease. Asked with
+/// `st.worker.grabs` held, right before this import writes the library or the grab: every
+/// other writer of a grab (cancel, pause, retry, delete, a pack taking a grab over) holds that
+/// lock too and refuses or leaves alone an `importing` grab, except a plain cancel, which
+/// takes it; the import then stops here.
+async fn still_ours(st: &AppState, id: &str) -> Result<bool> {
+    let (id, owner) = (id.to_string(), st.worker.instance.clone());
+    st.store
+        .with(move |c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM grabs WHERE id = ?1 AND state = 'importing' AND lease_owner = ?2",
+                params![id, owner],
+                |r| r.get::<_, i64>(0),
+            )? > 0)
+        })
+        .await
+}
+
 pub async fn import_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
     let now_s = rfc3339(now);
+    // A grab whose import lease ran out is not being imported (imports run one at a time, in
+    // the worker): it goes back to `completed` and is tried again now, not only after a restart.
+    let n2 = now_s.clone();
+    st.store
+        .with(move |c| {
+            c.execute(
+                "UPDATE grabs SET state = 'completed', lease_owner = NULL, lease_until = NULL, next_attempt_at = ?1, updated_at = ?1 WHERE state = 'importing' AND lease_until <= ?1",
+                [n2],
+            )?;
+            Ok(())
+        })
+        .await?;
     let due = st
         .store
         .with(move |c| {
@@ -780,44 +822,75 @@ pub async fn import_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         .await?;
     let mut done = 0;
     for g in due {
+        match import_one(st, &g, now).await {
+            Ok(true) => done += 1,
+            Ok(false) => {}
+            Err(e) => {
+                // An error part way (the database refusing a write) leaves the grab
+                // `importing`: it goes back to `completed`, tried again after a while.
+                let (id, owner) = (g.id.clone(), st.worker.instance.clone());
+                let (n, retry) = (rfc3339(now), rfc3339(now + Duration::from_secs(300)));
+                let _ = st
+                    .store
+                    .with(move |c| {
+                        c.execute(
+                            "UPDATE grabs SET state = 'completed', lease_owner = NULL, lease_until = NULL, next_attempt_at = ?3, updated_at = ?4 WHERE id = ?1 AND state = 'importing' AND lease_owner = ?2",
+                            params![id, owner, retry, n],
+                        )?;
+                        Ok(())
+                    })
+                    .await;
+                return Err(e);
+            }
+        }
+    }
+    Ok(done)
+}
+
+/// One grab's import. `st.worker.grabs` is held only to take the lease, to file each file
+/// (`import_file`) and to record the outcome, never across the scan, the probes or a copy: the
+/// `importing` state keeps the other writers off the grab meanwhile (see `still_ours`).
+async fn import_one(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<bool> {
+    let (id, owner, until) = (
+        g.id.clone(),
+        st.worker.instance.clone(),
+        rfc3339(now + LEASE),
+    );
+    let leased = {
         let _guard = st.worker.grabs.lock().await;
-        let (id, owner, until) = (
-            g.id.clone(),
-            st.worker.instance.clone(),
-            rfc3339(now + LEASE),
-        );
-        let leased = st
-            .store
+        st.store
             .with(move |c| {
                 Ok(c.execute(
                     "UPDATE grabs SET state = 'importing', lease_owner = ?2, lease_until = ?3 WHERE id = ?1 AND state = 'completed'",
                     params![id, owner, until],
                 )?)
             })
-            .await?;
-        if leased == 0 {
-            continue;
-        }
-        let outcome = match import_grab(st, &g, now).await {
-            Ok(o) => o,
-            // (a crash test's stop: nothing more is written, as if the process had died)
-            Err(e) if e.downcast_ref::<Crashed>().is_some() => continue,
-            // A sport grab's error text is never shown: it can carry the payload's own names.
-            Err(e) if matches!(g.media_id, MediaId::Event(_)) => {
-                tracing::warn!(grab = %g.id, "sport import failed internally: {e:#}");
-                Outcome::Blocked(R::Internal.encode())
-            }
-            Err(e) => Outcome::Blocked(format!("{e:#}")),
-        };
-        if matches!(outcome, Outcome::Imported { .. }) && failpoint(&g.id, "before_apply").is_err()
-        {
-            continue;
-        }
-        if apply(st, &g, outcome, now).await? {
-            done += 1;
-        }
+            .await?
+    };
+    if leased == 0 {
+        return Ok(false);
     }
-    Ok(done)
+    let outcome = match import_grab(st, g, now).await {
+        Ok(o) => o,
+        // (a crash test's stop: nothing more is written, as if the process had died)
+        Err(e) if e.downcast_ref::<Crashed>().is_some() => return Ok(false),
+        // (cancelled meanwhile: the cancel recorded everything)
+        Err(e) if e.downcast_ref::<Superseded>().is_some() => return Ok(false),
+        // A sport grab's error text is never shown: it can carry the payload's own names.
+        Err(e) if matches!(g.media_id, MediaId::Event(_)) => {
+            tracing::warn!(grab = %g.id, "sport import failed internally: {e:#}");
+            Outcome::Blocked(R::Internal.encode())
+        }
+        Err(e) => Outcome::Blocked(format!("{e:#}")),
+    };
+    if matches!(outcome, Outcome::Imported { .. }) && failpoint(&g.id, "before_apply").is_err() {
+        return Ok(false);
+    }
+    let _guard = st.worker.grabs.lock().await;
+    if !still_ours(st, &g.id).await? {
+        return Ok(false);
+    }
+    apply(st, g, outcome, now).await
 }
 
 async fn apply(st: &AppState, g: &Grab, outcome: Outcome, now: OffsetDateTime) -> Result<bool> {
@@ -1059,6 +1132,40 @@ fn item_info(st: &AppState, g: &Grab, mm: &MediaManagement) -> Result<ItemInfo, 
 }
 
 async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Outcome> {
+    // An earlier attempt of this grab that stopped on an error part way (a database write
+    // refused after the original was moved aside, say) left its journal rows unfinished. They
+    // are rolled back now, as at startup, before anything is planned again: a later attempt
+    // links the same source inode, which a stale row would take for its own. (Nothing else
+    // imports this grab: it is leased to this import.)
+    // Rows of a finished grab of the same torrent (cancelled part way, then grabbed again) are
+    // rolled back too: they would take this import's files for their own at the next start.
+    let (gid, hash) = (g.id.clone(), g.info_hash.clone());
+    let left = st
+        .store
+        .with(move |c| {
+            let notes = recover_rows(c, Some((&gid, &hash)))?;
+            let left: i64 = c.query_row(
+                &format!("SELECT COUNT(*) FROM import_journal WHERE {GRAB_ROWS} AND state IN ('planned', 'staged', 'backed_up', 'published')"),
+                params![gid, hash],
+                |r| r.get(0),
+            )?;
+            for n in notes {
+                tracing::warn!(grab = %gid, "{n}");
+            }
+            Ok(left)
+        })
+        .await?;
+    if left > 0 {
+        return Ok(Outcome::Blocked(match g.media_id {
+            MediaId::Event(_) => R::Internal.encode(),
+            MediaId::Movie { .. }
+            | MediaId::Series(_)
+            | MediaId::Season(..)
+            | MediaId::Episode(..) => {
+                "an earlier attempt of this import could not be rolled back (see the log)".into()
+            }
+        }));
+    }
     let Some(l) = st.current() else {
         return Ok(Outcome::Blocked("no configuration import is active".into()));
     };
@@ -1175,6 +1282,27 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
         Ok(i) => i,
         Err(e) => return Ok(Outcome::Blocked(e)),
     };
+    // Files this very download already filed (a crash between their commit and the grab
+    // being marked imported, or an earlier attempt that stopped part way): their targets are
+    // done, are not filed again and do not block the rest.
+    let gid = g.id.clone();
+    let (done_files, done): (usize, Vec<MediaId>) = st
+        .store
+        .with(move |c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM files WHERE grab_id = ?1 AND present = 1",
+                [&gid],
+                |r| r.get(0),
+            )?;
+            let mut stmt = c.prepare(
+                "SELECT DISTINCT t.target FROM files f JOIN file_targets t ON t.file_id = f.id WHERE f.grab_id = ?1 AND f.present = 1",
+            )?;
+            let targets = stmt
+                .query_map([&gid], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((n as usize, targets.iter().filter_map(|t| t.parse().ok()).collect()))
+        })
+        .await?;
     let mut sel = select(
         g,
         &entries,
@@ -1185,6 +1313,8 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
     if let Some(b) = sel.blocker {
         return Ok(Outcome::Blocked(b));
     }
+    sel.planned
+        .retain(|p| !p.targets.iter().all(|t| done.contains(t)));
     // The payload's own names must not contradict the item (whatever the search result
     // claimed). Obfuscated names are judged by the validated grab context.
     if let Some(id) = &item.identity {
@@ -1302,6 +1432,27 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
                 )));
             }
         }
+    }
+    if sel.planned.is_empty() && done_files > 0 {
+        let missing: Vec<MediaId> = g
+            .targets
+            .iter()
+            .map(|t| t.target)
+            .filter(|t| !done.contains(t))
+            .collect();
+        let unfiled = missing
+            .iter()
+            .copied()
+            .filter(|t| sel.unfiled.contains(t))
+            .collect();
+        sel.notes.push("already filed by this download".into());
+        return Ok(Outcome::Imported {
+            files: done_files,
+            skipped: sel.skipped,
+            missing,
+            unfiled,
+            notes: sel.notes,
+        });
     }
     if sel.planned.is_empty() {
         let reasons: Vec<String> = sel
@@ -1423,7 +1574,7 @@ async fn import_grab(st: &AppState, g: &Grab, now: OffsetDateTime) -> Result<Out
         qualities.push(eff);
     }
     let mut imported = 0;
-    let mut covered: Vec<MediaId> = vec![];
+    let mut covered: Vec<MediaId> = done;
     for ((p, pr), eff) in ok_planned.iter().zip(&probes).zip(&qualities) {
         match import_file(
             st,
@@ -1798,6 +1949,18 @@ async fn import_file(
         source_probe.evidence()
     };
     // Phase 3 (blocking): backup a replaced file, publish without clobbering, commit, clean up.
+    // Under the grabs lock, and only while the grab is still this import's: a cancel that came
+    // while the file was staged wins, and the staged file is taken back.
+    let _guard = st.worker.grabs.lock().await;
+    if !still_ours(st, &g.id).await? {
+        let (store, j, path) = (st.store.clone(), staged.journal, staged.staged.clone());
+        tokio::task::spawn_blocking(move || {
+            rollback_staged(&store, j, &path, &Superseded.to_string())
+        })
+        .await
+        .map_err(|e| FileError::Internal(e.into()))??;
+        return Err(FileError::Internal(Superseded.into()));
+    }
     let store = st.store.clone();
     let (g2, root2, p2) = (g.clone(), root.to_path_buf(), p.clone());
     let quality_s = quality.map(|q| q.as_str().to_string());
@@ -1945,6 +2108,10 @@ fn stage(
                 "destination escaped the root".into()
             })
         })?;
+    // The staging name carries a random token besides the journal id (a number only this
+    // database knows): another state folder sharing the library can never pick the same name.
+    let token = crate::fsutil::random_hex(8).map_err(FileError::Internal)?;
+    let staged = |id: i64| dest_dir.join(format!(".um-import-{id}-{token}.partial"));
     let journal = store.blocking(|c| {
         c.execute(
             "INSERT INTO import_journal (grab_id, source, root, dest, targets, size, method, state, replaced_file_id, replaced_path, quality, revision_version, revision_real, updated_at)
@@ -1966,23 +2133,27 @@ fn stage(
             ],
         )?;
         let id = c.last_insert_rowid();
-        let staged = dest_dir.join(format!(".um-import-{id}.partial"));
-        c.execute("UPDATE import_journal SET staged = ?2 WHERE id = ?1", params![id, staged.to_string_lossy()])?;
+        c.execute("UPDATE import_journal SET staged = ?2 WHERE id = ?1", params![id, staged(id).to_string_lossy()])?;
         Ok(id)
     })?;
-    let staged = dest_dir.join(format!(".um-import-{journal}.partial"));
+    let staged = staged(journal);
+    // An error says whether this import created the staged file: one that was already there
+    // (`AlreadyExists`) is someone else's and is never removed or replaced.
     let mut result = if method == "hardlink" {
-        std::fs::hard_link(&p.source, &staged).map_err(|e| format!("cannot hardlink: {}", e.kind()))
+        std::fs::hard_link(&p.source, &staged)
+            .map_err(|e| (false, e.kind(), format!("cannot hardlink: {}", e.kind())))
     } else {
         copy_new(&p.source, &staged)
     };
     // Like native, a refused hardlink (e.g. fs.protected_hardlinks for another user's file)
-    // falls back to a copy when there is room for it.
-    if result.is_err() && method == "hardlink" {
+    // falls back to a copy when there is room for it. (A failed link created nothing.)
+    if let Err((_, kind, _)) = &result
+        && *kind != std::io::ErrorKind::AlreadyExists
+        && method == "hardlink"
+    {
         let room =
             paths::free_bytes(&dest_dir).unwrap_or(0) >= src_meta.len().saturating_add(min_free);
         if room {
-            let _ = std::fs::remove_file(&staged);
             method = "copy";
             result = copy_new(&p.source, &staged);
             store.blocking(|c| {
@@ -1994,8 +2165,10 @@ fn stage(
             })?;
         }
     }
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&staged);
+    if let Err((created, _, e)) = result {
+        if created {
+            let _ = std::fs::remove_file(&staged);
+        }
         let (stored, shown) = if sport {
             tracing::warn!(grab = %grab_id, "staging failed: {e}");
             let r = op(FO::LinkOrCopy, None).encode();
@@ -2026,17 +2199,32 @@ fn stage(
     })
 }
 
-fn copy_new(src: &Path, dst: &Path) -> Result<(), String> {
-    let mut input =
-        std::fs::File::open(src).map_err(|e| format!("cannot open the source: {}", e.kind()))?;
+/// Copies `src` to a new file `dst`. An error says whether `dst` was created by this call (and
+/// may be removed), its kind, and a sentence.
+fn copy_new(src: &Path, dst: &Path) -> Result<(), (bool, std::io::ErrorKind, String)> {
+    let mut input = std::fs::File::open(src).map_err(|e| {
+        (
+            false,
+            e.kind(),
+            format!("cannot open the source: {}", e.kind()),
+        )
+    })?;
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(dst)
-        .map_err(|e| format!("cannot create the staged copy: {}", e.kind()))?;
-    std::io::copy(&mut input, &mut out).map_err(|e| format!("copy failed: {}", e.kind()))?;
+        .map_err(|e| {
+            let kind = e.kind();
+            (
+                false,
+                kind,
+                format!("cannot create the staged copy: {kind}"),
+            )
+        })?;
+    std::io::copy(&mut input, &mut out)
+        .map_err(|e| (true, e.kind(), format!("copy failed: {}", e.kind())))?;
     out.sync_all()
-        .map_err(|e| format!("sync failed: {}", e.kind()))?;
+        .map_err(|e| (true, e.kind(), format!("sync failed: {}", e.kind())))?;
     Ok(())
 }
 
@@ -2069,18 +2257,26 @@ fn publish(
         paths::check_no_symlinks(root, &old).map_err(FileError::Blocked)?;
         match std::fs::symlink_metadata(&old) {
             Ok(m) if m.file_type().is_file() => {
-                let b = old.with_file_name(format!(".um-backup-{}.orig", s.journal));
-                std::fs::rename(&old, &b).map_err(|e| {
-                    FileError::Blocked(format!("cannot move the replaced file aside: {}", e.kind()))
+                // Where the original goes and which file it is are journaled before it moves,
+                // so a crash (or a database error) right after the move still restores it. A
+                // rename keeps the file's identity. (A random token: never another's name.)
+                let token = crate::fsutil::random_hex(8).map_err(FileError::Internal)?;
+                let b = old.with_file_name(format!(".um-backup-{}-{token}.orig", s.journal));
+                let (_, ino) = crate::fsutil::file_id(&old).map_err(|e| {
+                    FileError::Blocked(format!("cannot stat the replaced file: {}", e.kind()))
                 })?;
-                let ino = crate::fsutil::file_id(&b).map(|(_, ino)| ino).unwrap_or(0);
                 store.blocking(|c| {
                     c.execute(
-                        "UPDATE import_journal SET state = 'backed_up', backup = ?2, backup_ino = ?3, updated_at = ?4 WHERE id = ?1",
+                        "UPDATE import_journal SET backup = ?2, backup_ino = ?3, updated_at = ?4 WHERE id = ?1",
                         params![s.journal, b.to_string_lossy(), ino as i64, rfc3339(OffsetDateTime::now_utc())],
                     )?;
                     Ok(())
                 })?;
+                std::fs::rename(&old, &b).map_err(|e| {
+                    FileError::Blocked(format!("cannot move the replaced file aside: {}", e.kind()))
+                })?;
+                failpoint(&g.id, "after_backup")?;
+                store.blocking(|c| journal_set(c, s.journal, "backed_up", None))?;
                 backup = Some(b);
             }
             Ok(_) => {
@@ -2231,23 +2427,25 @@ fn publish(
 /// published inode is removed (only if it is still ours) and a moved-aside original is
 /// restored. Committed rows with a leftover backup have it removed.
 pub fn recover(c: &Connection) -> Result<Vec<String>> {
+    recover_rows(c, None)
+}
+
+/// The journal rows an import of a grab answers for: its own, and those of finished grabs of
+/// the same torrent (one cancelled part way, say), whose files share its source inodes.
+/// `?1` is the grab id, `?2` its info hash.
+const GRAB_ROWS: &str =
+    "(grab_id = ?1 OR grab_id IN (SELECT id FROM grabs WHERE info_hash = ?2 AND active = 0))";
+
+/// `recover`, for every row or only those a grab answers for (its id and info hash). Returns
+/// notes; a row that could not be recovered keeps its state.
+fn recover_rows(c: &Connection, grab: Option<(&str, &str)>) -> Result<Vec<String>> {
     let mut notes = vec![];
-    let mut stmt = c.prepare(
-        "SELECT id, root, dest, state, staged, staged_ino, replaced_path, backup, backup_ino FROM import_journal WHERE state IN ('planned', 'staged', 'backed_up', 'published', 'committed') AND (state != 'committed' OR backup IS NOT NULL)",
-    )?;
-    type Row = (
-        i64,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-    );
-    let rows: Vec<Row> = stmt
-        .query_map([], |r| {
+    let mut stmt = c.prepare(&format!(
+        "SELECT id, root, dest, state, staged, staged_ino, replaced_path, backup, backup_ino FROM import_journal WHERE state IN ('planned', 'staged', 'backed_up', 'published', 'committed') AND (state != 'committed' OR backup IS NOT NULL) AND (?1 IS NULL OR {GRAB_ROWS})"
+    ))?;
+    let (gid, hash) = (grab.map(|g| g.0), grab.map(|g| g.1));
+    let rows: Vec<JournalRow> = stmt
+        .query_map(params![gid, hash], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -2262,62 +2460,119 @@ pub fn recover(c: &Connection) -> Result<Vec<String>> {
         })?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
-    let ino_of = |p: &Path| {
-        std::fs::symlink_metadata(p)
-            .ok()
-            .filter(|m| m.file_type().is_file())
-            .and_then(|_| crate::fsutil::file_id(p).ok())
-            .map(|(_, ino)| ino as i64)
+    // A file's inode; `None` when nothing (or no regular file) is there. Any other failure to
+    // look is an error, so the row is not taken as recovered.
+    let ino_of = |p: &Path| -> Result<Option<i64>> {
+        match std::fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("cannot look at {}", p.display()))),
+            Ok(m) if !m.file_type().is_file() => Ok(None),
+            Ok(_) => Ok(Some(
+                crate::fsutil::file_id(p)
+                    .with_context(|| format!("cannot look at {}", p.display()))?
+                    .1 as i64,
+            )),
+        }
     };
-    for (id, root, dest, state, staged, staged_ino, replaced, backup, backup_ino) in rows {
-        let root = PathBuf::from(root);
-        let dest_abs = root.join(&dest);
-        if state == "committed" {
-            if let Some(b) = backup.as_deref().map(PathBuf::from)
-                && ino_of(&b).is_some()
-                && ino_of(&b) == backup_ino
-            {
-                let _ = std::fs::remove_file(&b);
-            }
-            journal_set(c, id, "backup_removed", None)?;
-            notes.push(format!(
-                "journal {id}: removed the leftover backup of a committed replacement"
-            ));
-            continue;
+    // Each row is recovered on its own: one that cannot be (an original that cannot be put
+    // back) keeps its state and records why, for the next start, and the others go on.
+    for row in rows {
+        let id = row.0;
+        if let Err(e) = recover_row(c, row, &ino_of, &mut notes) {
+            let why = format!("recovery failed: {e:#}");
+            tracing::error!("import journal {id}: {why}");
+            let _ = c.execute(
+                "UPDATE import_journal SET error = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, why, rfc3339(OffsetDateTime::now_utc())],
+            );
+            notes.push(format!("journal {id}: {why}"));
         }
-        if let Some(sp) = staged.as_deref().map(PathBuf::from)
-            && ino_of(&sp).is_some()
-            && (staged_ino.is_none() || ino_of(&sp) == staged_ino)
-        {
-            let _ = std::fs::remove_file(&sp);
-        }
-        // Our published (or linked-before-recorded) inode is removed; anything else is kept.
-        if staged_ino.is_some() && ino_of(&dest_abs) == staged_ino {
-            let _ = std::fs::remove_file(&dest_abs);
-        }
-        if let (Some(b), Some(r)) = (backup.as_deref().map(PathBuf::from), replaced.as_deref()) {
-            let original = root.join(r);
-            if ino_of(&b).is_some()
-                && ino_of(&b) == backup_ino
-                && std::fs::symlink_metadata(&original).is_err()
-            {
-                std::fs::rename(&b, &original).with_context(|| {
-                    format!("journal {id}: cannot restore {}", original.display())
-                })?;
-                notes.push(format!("journal {id}: restored the original {r}"));
-            }
-        }
-        journal_set(
-            c,
-            id,
-            "rolled_back",
-            Some("interrupted; rolled back at startup"),
-        )?;
-        notes.push(format!(
-            "journal {id}: rolled back an interrupted {state} import of {dest}"
-        ));
     }
     Ok(notes)
+}
+
+type JournalRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+fn recover_row(
+    c: &Connection,
+    (id, root, dest, state, staged, staged_ino, replaced, backup, backup_ino): JournalRow,
+    ino_of: &dyn Fn(&Path) -> Result<Option<i64>>,
+    notes: &mut Vec<String>,
+) -> Result<()> {
+    // Removes a file; one already gone is fine, any other failure keeps the row unfinished.
+    let remove = |p: &Path| -> Result<()> {
+        match std::fs::remove_file(p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(anyhow::Error::new(e).context(format!("cannot remove {}", p.display())))
+            }
+            _ => Ok(()),
+        }
+    };
+    let root = PathBuf::from(root);
+    let dest_abs = root.join(&dest);
+    if state == "committed" {
+        if let Some(b) = backup.as_deref().map(PathBuf::from)
+            && let Some(ino) = ino_of(&b)?
+            && Some(ino) == backup_ino
+        {
+            remove(&b)?;
+        }
+        journal_set(c, id, "backup_removed", None)?;
+        notes.push(format!(
+            "journal {id}: removed the leftover backup of a committed replacement"
+        ));
+        return Ok(());
+    }
+    if let Some(sp) = staged.as_deref().map(PathBuf::from)
+        && let Some(ino) = ino_of(&sp)?
+        && (staged_ino.is_none() || Some(ino) == staged_ino)
+    {
+        remove(&sp)?;
+    }
+    // Our published (or linked-before-recorded) inode is removed; anything else is kept.
+    if staged_ino.is_some() && ino_of(&dest_abs)? == staged_ino {
+        remove(&dest_abs)?;
+    }
+    if let (Some(b), Some(r)) = (backup.as_deref().map(PathBuf::from), replaced.as_deref()) {
+        let original = root.join(r);
+        let free = match std::fs::symlink_metadata(&original) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("cannot look at {}", original.display()))
+                );
+            }
+            Ok(_) => false,
+        };
+        if let Some(ino) = ino_of(&b)?
+            && Some(ino) == backup_ino
+            && free
+        {
+            std::fs::rename(&b, &original)
+                .with_context(|| format!("journal {id}: cannot restore {}", original.display()))?;
+            notes.push(format!("journal {id}: restored the original {r}"));
+        }
+    }
+    journal_set(
+        c,
+        id,
+        "rolled_back",
+        Some("interrupted; rolled back at startup"),
+    )?;
+    notes.push(format!(
+        "journal {id}: rolled back an interrupted {state} import of {dest}"
+    ));
+    Ok(())
 }
 
 #[cfg(test)]
