@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
@@ -455,7 +455,7 @@ pub fn check_keys(p256dh: &str, auth: &str) -> Result<(), &'static str> {
 }
 
 pub struct Push {
-    db: Mutex<rusqlite::Connection>,
+    db: Arc<Mutex<rusqlite::Connection>>,
     vapid: Vapid,
 }
 
@@ -476,7 +476,7 @@ impl Push {
              CREATE TABLE IF NOT EXISTS push_sent (item TEXT PRIMARY KEY, at INTEGER);",
         )?;
         Ok(Self {
-            db: Mutex::new(db),
+            db: Arc::new(Mutex::new(db)),
             vapid: Vapid::load_or_create(state_dir)?,
         })
     }
@@ -485,91 +485,115 @@ impl Push {
         self.vapid.public_key()
     }
 
+    /// Runs `f` on the connection on a blocking thread. web.sqlite is shared with the web
+    /// app's sessions and `arr app-link`, so a call can wait on its lock.
+    async fn with<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || f(&db.lock().unwrap_or_else(PoisonError::into_inner)))
+            .await
+            .context("database task failed")?
+    }
+
     /// Adds (or refreshes) a device. False when there are already too many devices.
-    pub fn subscribe(&self, sub: &Sub, session: Option<&str>) -> Result<bool> {
-        let db = self.db.lock().unwrap();
-        let known: i64 = db.query_row(
-            "SELECT COUNT(*) FROM push_subs WHERE endpoint != ?1",
-            [&sub.endpoint],
-            |r| r.get(0),
-        )?;
-        if known >= MAX_SUBS {
-            return Ok(false);
-        }
-        db.execute(
-            "INSERT INTO push_subs (endpoint, p256dh, auth, session, created) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(endpoint) DO UPDATE SET p256dh = ?2, auth = ?3, session = ?4",
-            rusqlite::params![sub.endpoint, sub.p256dh, sub.auth, session, now()],
-        )?;
-        Ok(true)
-    }
-
-    pub fn unsubscribe(&self, endpoint: &str) -> Result<()> {
-        self.db
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM push_subs WHERE endpoint = ?1", [endpoint])?;
-        Ok(())
-    }
-
-    fn subs(&self) -> Vec<Sub> {
-        let db = self.db.lock().unwrap();
-        let Ok(mut st) = db.prepare("SELECT endpoint, p256dh, auth FROM push_subs") else {
-            return vec![];
-        };
-        st.query_map([], |r| {
-            Ok(Sub {
-                endpoint: r.get(0)?,
-                p256dh: r.get(1)?,
-                auth: r.get(2)?,
-            })
+    pub async fn subscribe(&self, sub: Sub, session: Option<String>) -> Result<bool> {
+        self.with(move |db| {
+            let known: i64 = db.query_row(
+                "SELECT COUNT(*) FROM push_subs WHERE endpoint != ?1",
+                [&sub.endpoint],
+                |r| r.get(0),
+            )?;
+            if known >= MAX_SUBS {
+                return Ok(false);
+            }
+            db.execute(
+                "INSERT INTO push_subs (endpoint, p256dh, auth, session, created) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(endpoint) DO UPDATE SET p256dh = ?2, auth = ?3, session = ?4",
+                rusqlite::params![sub.endpoint, sub.p256dh, sub.auth, session, now()],
+            )?;
+            Ok(true)
         })
-        .map(|rows| rows.flatten().collect())
+        .await
+    }
+
+    pub async fn unsubscribe(&self, endpoint: String) -> Result<()> {
+        self.with(move |db| {
+            db.execute("DELETE FROM push_subs WHERE endpoint = ?1", [endpoint])?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn subs(&self) -> Vec<Sub> {
+        self.with(|db| {
+            let Ok(mut st) = db.prepare("SELECT endpoint, p256dh, auth FROM push_subs") else {
+                return Ok(vec![]);
+            };
+            Ok(st
+                .query_map([], |r| {
+                    Ok(Sub {
+                        endpoint: r.get(0)?,
+                        p256dh: r.get(1)?,
+                        auth: r.get(2)?,
+                    })
+                })
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default())
+        })
+        .await
         .unwrap_or_default()
     }
 
     /// Records the items as announced; returns the keys seen before and whether any pass has run.
-    fn seen(&self) -> Result<(HashSet<String>, bool)> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "DELETE FROM push_sent WHERE item != ?1 AND at < ?2",
-            rusqlite::params![INIT_MARK, now() - KEEP_SENT],
-        )?;
-        let mut st = db.prepare("SELECT item FROM push_sent")?;
-        let all: HashSet<String> = st
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<Result<_, _>>()?;
-        let started = all.contains(INIT_MARK);
-        Ok((all, started))
+    async fn seen(&self) -> Result<(HashSet<String>, bool)> {
+        self.with(|db| {
+            db.execute(
+                "DELETE FROM push_sent WHERE item != ?1 AND at < ?2",
+                rusqlite::params![INIT_MARK, now() - KEEP_SENT],
+            )?;
+            let mut st = db.prepare("SELECT item FROM push_sent")?;
+            let all: HashSet<String> = st
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?;
+            let started = all.contains(INIT_MARK);
+            Ok((all, started))
+        })
+        .await
     }
 
-    fn record(&self, keys: impl IntoIterator<Item = String>) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        for k in keys {
-            db.execute(
-                "INSERT OR IGNORE INTO push_sent (item, at) VALUES (?1, ?2)",
-                rusqlite::params![k, now()],
-            )?;
-        }
-        Ok(())
+    async fn record(&self, keys: Vec<String>) -> Result<()> {
+        self.with(move |db| {
+            for k in keys {
+                db.execute(
+                    "INSERT OR IGNORE INTO push_sent (item, at) VALUES (?1, ?2)",
+                    rusqlite::params![k, now()],
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// One pass over a feed reply: announce what is new to every device (nothing is sent when
     /// there are none), remember everything shown. Returns how many new items there were.
     pub async fn pass(&self, feed: &Value) -> Result<usize> {
         let items = items_from_feed(feed);
-        let (seen, started) = self.seen()?;
+        let (seen, started) = self.seen().await?;
         let new: Vec<Item> = fresh(&seen, started, &items).into_iter().cloned().collect();
         self.record(
             items
                 .iter()
                 .map(|i| i.key.clone())
-                .chain((!started).then(|| INIT_MARK.to_string())),
-        )?;
+                .chain((!started).then(|| INIT_MARK.to_string()))
+                .collect(),
+        )
+        .await?;
         if new.is_empty() {
             return Ok(0);
         }
-        let subs = self.subs();
+        let subs = self.subs().await;
         for item in &new {
             let payload = json!({ "title": "Arr", "body": item.body, "url": item.url }).to_string();
             for sub in &subs {
@@ -583,7 +607,7 @@ impl Push {
     async fn send(&self, sub: &Sub, payload: &[u8]) {
         match self.try_send(sub, payload).await {
             Ok(status) if status == 404 || status == 410 => {
-                let _ = self.unsubscribe(&sub.endpoint);
+                let _ = self.unsubscribe(sub.endpoint.clone()).await;
                 tracing::info!("a notification device is gone; forgot it");
             }
             Ok(status) if status >= 400 => {

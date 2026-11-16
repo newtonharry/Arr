@@ -1123,3 +1123,30 @@ async fn a_forwarded_google_link_cannot_complete_someone_elses_sign_in() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_refresh_that_cannot_store_the_new_tokens_keeps_the_old_refresh_token() {
+    let env = Env::new(&[EMAIL]).await;
+    let (_, rt) = mcp_tokens(&env.tokens().await);
+    // Every write of a new token fails.
+    let db = rusqlite::Connection::open(env.dir.path().join("oauth.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_tokens BEFORE INSERT ON tokens BEGIN SELECT RAISE(ABORT, 'full'); END;",
+    )
+    .unwrap();
+    let (s, v) = env
+        .token(&[("grant_type", "refresh_token"), ("refresh_token", &rt)])
+        .await;
+    assert_eq!((s, v["error"].as_str()), (500, Some("server_error")));
+    // Once writes work again, the same refresh token still refreshes, once.
+    db.execute_batch("DROP TRIGGER no_tokens;").unwrap();
+    let (s, v) = env
+        .token(&[("grant_type", "refresh_token"), ("refresh_token", &rt)])
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_ne!(env.mcp_status(Some(&mcp_tokens(&v).0)).await.0, 401);
+    let (s, v) = env
+        .token(&[("grant_type", "refresh_token"), ("refresh_token", &rt)])
+        .await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
+}

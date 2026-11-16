@@ -122,39 +122,45 @@ pub async fn run_as(
         None => None,
     };
 
-    let applied = async {
-        if let Some((path, bytes)) = &plan.file {
-            fsutil::atomic_replace_private(path, bytes)?;
-        }
-        if let Some(text) = &edited {
-            fsutil::atomic_replace_private(config_path, text.as_bytes())?;
-        }
-        let cfg = config::load(config_path).context("Arr wouldn't start with that change")?;
-        check(&plan.check, &cfg, config_path).await
-    }
-    .await;
-    match applied {
-        Ok(None) => Ok(plan.done),
-        Ok(Some(note)) => Ok(format!("{} {note}", plan.done)),
-        Err(e) => {
-            let mut e = format!("{e:#}");
-            if edited.is_some()
-                && let Err(r) = fsutil::atomic_replace_private(config_path, old.as_bytes())
-            {
-                e += &format!(", and couldn't put back {}: {r:#}", config_path.display());
+    // Written, checked and put back as one task: a caller that stops waiting (a request that
+    // is dropped) must not leave a change that was never checked.
+    let config_path = config_path.clone();
+    let unit = tokio::spawn(async move {
+        let applied = async {
+            if let Some((path, bytes)) = &plan.file {
+                fsutil::atomic_replace_private(path, bytes)?;
             }
-            if let Some((path, _)) = &plan.file {
-                let restored = match &old_file {
-                    Some(b) => fsutil::atomic_replace_private(path, b),
-                    None => std::fs::remove_file(path).map_err(Into::into),
-                };
-                if let Err(r) = restored {
-                    e += &format!(", and couldn't put back {}: {r:#}", path.display());
+            if let Some(text) = &edited {
+                fsutil::atomic_replace_private(&config_path, text.as_bytes())?;
+            }
+            let cfg = config::load(&config_path).context("Arr wouldn't start with that change")?;
+            check(&plan.check, &cfg, &config_path).await
+        }
+        .await;
+        match applied {
+            Ok(None) => Ok(plan.done),
+            Ok(Some(note)) => Ok(format!("{} {note}", plan.done)),
+            Err(e) => {
+                let mut e = format!("{e:#}");
+                if edited.is_some()
+                    && let Err(r) = fsutil::atomic_replace_private(&config_path, old.as_bytes())
+                {
+                    e += &format!(", and couldn't put back {}: {r:#}", config_path.display());
                 }
+                if let Some((path, _)) = &plan.file {
+                    let restored = match &old_file {
+                        Some(b) => fsutil::atomic_replace_private(path, b),
+                        None => std::fs::remove_file(path).map_err(Into::into),
+                    };
+                    if let Err(r) = restored {
+                        e += &format!(", and couldn't put back {}: {r:#}", path.display());
+                    }
+                }
+                Err(anyhow::anyhow!(e))
             }
-            Err(anyhow::anyhow!(e))
         }
-    }
+    });
+    unit.await.context("the change stopped part way")?
 }
 
 /// The Knaben entry added to an install that searches The Pirate Bay (its id is chosen).

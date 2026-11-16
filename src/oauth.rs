@@ -29,7 +29,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
@@ -179,7 +179,7 @@ pub struct OAuth {
     hosts: Vec<String>,
     issuer: String,
     http: reqwest::Client,
-    db: Mutex<rusqlite::Connection>,
+    db: Arc<Mutex<rusqlite::Connection>>,
     slots: tokio::sync::Semaphore,
     txns: Mutex<Pending<Txn>>,
     upstream: Mutex<Pending<Upstream>>,
@@ -221,7 +221,7 @@ impl OAuth {
             hosts: allowed_hosts.to_vec(),
             issuer: format!("{}/", cfg.public_url),
             http,
-            db: Mutex::new(db),
+            db: Arc::new(Mutex::new(db)),
             slots: tokio::sync::Semaphore::new(16),
             txns: Pending::new(TXN_TTL),
             upstream: Pending::new(TXN_TTL),
@@ -248,17 +248,23 @@ impl OAuth {
     }
 
     /// Whether `token` is a live access token of an address that is still allowed.
-    pub fn verify_access(&self, token: &str) -> bool {
+    pub async fn verify_access(self: &Arc<Self>, token: &str) -> bool {
         if !token.starts_with(ACCESS_PREFIX) {
             return false;
         }
-        let db = self.db.lock().unwrap();
-        db.query_row(
-            "SELECT email FROM tokens WHERE hash = ?1 AND kind = 'access' AND expires_at > ?2",
-            rusqlite::params![sha256_hex(token), now()],
-            |r| r.get::<_, String>(0),
-        )
-        .is_ok_and(|email| self.email_allowed(&email))
+        let (o, hash) = (self.clone(), sha256_hex(token));
+        // A blocking thread: the database may wait on its lock.
+        tokio::task::spawn_blocking(move || {
+            let db = o.db.lock().unwrap_or_else(PoisonError::into_inner);
+            db.query_row(
+                "SELECT email FROM tokens WHERE hash = ?1 AND kind = 'access' AND expires_at > ?2",
+                rusqlite::params![hash, now()],
+                |r| r.get::<_, String>(0),
+            )
+            .is_ok_and(|email| o.email_allowed(&email))
+        })
+        .await
+        .unwrap_or(false)
     }
 
     fn resource(&self) -> String {
@@ -304,7 +310,12 @@ impl OAuth {
         if !self.trusted(id) {
             return None;
         }
-        if let Some(d) = self.docs.lock().unwrap().get(id) {
+        if let Some(d) = self
+            .docs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+        {
             return Some(d.clone());
         }
         let v = self
@@ -337,13 +348,22 @@ impl OAuth {
             auth_method: text("token_endpoint_auth_method")?,
             jwks_uri: text("jwks_uri"),
         });
-        self.docs.lock().unwrap().cache(id.to_string(), doc.clone());
+        self.docs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cache(id.to_string(), doc.clone());
         Some(doc)
     }
 
     /// The client's RSA signing keys and whether they were just fetched.
     async fn client_keys(&self, uri: &str, fresh: bool) -> Option<(Arc<Vec<Jwk>>, bool)> {
-        if !fresh && let Some(k) = self.jwks.lock().unwrap().get(uri) {
+        if !fresh
+            && let Some(k) = self
+                .jwks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(uri)
+        {
             return Some((k.clone(), false));
         }
         let v = self
@@ -381,27 +401,56 @@ impl OAuth {
         let keys = Arc::new(keys);
         self.jwks
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .cache(uri.to_string(), keys.clone());
         Some((keys, true))
     }
 
     // ---------------------------------------------------------------- tokens
 
-    fn issue_tokens(&self, client_id: &str, sub: &str, email: &str) -> Option<Value> {
+    /// Grants a new token pair. A refresh grant uses up the presented token (rotation) in the
+    /// same transaction that stores the new pair, so a failed write leaves it usable.
+    /// Blocking: call it on a blocking thread.
+    fn grant_tokens(&self, client_id: &str, grant: Grant) -> Result<Value, TokenError> {
+        let mut db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
+        let tx = db.transaction().map_err(|_| server_error())?;
+        let (sub, email) = match grant {
+            Grant::Code { sub, email } => (sub, email),
+            Grant::Refresh(rt) => {
+                let bad = || invalid_grant("invalid or expired refresh token");
+                let row = tx.query_row(
+                    "DELETE FROM tokens WHERE hash = ?1 AND kind = 'refresh' RETURNING sub, email, client_id, expires_at",
+                    [sha256_hex(&rt)],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)),
+                );
+                match row {
+                    Ok((sub, email, cid, exp))
+                        if cid == client_id && exp > now() && self.email_allowed(&email) =>
+                    {
+                        (sub, email)
+                    }
+                    // A presented token that is refused is used up all the same.
+                    Ok(_) => {
+                        let _ = tx.commit();
+                        return Err(bad());
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => return Err(bad()),
+                    Err(_) => return Err(server_error()),
+                }
+            }
+        };
         let (at, rt) = (
             format!("{ACCESS_PREFIX}{}", random_b64(32)),
             format!("{REFRESH_PREFIX}{}", random_b64(32)),
         );
         let t = now();
-        let db = self.db.lock().unwrap();
-        db.execute("DELETE FROM tokens WHERE expires_at <= ?1", [t])
-            .ok()?;
+        tx.execute("DELETE FROM tokens WHERE expires_at <= ?1", [t])
+            .map_err(|_| server_error())?;
         for (tok, kind, ttl) in [
             (&at, "access", self.cfg.access_token_ttl),
             (&rt, "refresh", self.cfg.refresh_token_ttl),
         ] {
-            db.execute(
+            tx.execute(
                 "INSERT INTO tokens (hash, kind, sub, email, client_id, created_at, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
@@ -414,15 +463,26 @@ impl OAuth {
                     t + ttl.as_secs() as i64
                 ],
             )
-            .ok()?;
+            .map_err(|_| server_error())?;
         }
-        Some(json!({
+        tx.commit().map_err(|_| server_error())?;
+        Ok(json!({
             "access_token": at,
             "token_type": "Bearer",
             "expires_in": self.cfg.access_token_ttl.as_secs(),
             "refresh_token": rt,
         }))
     }
+}
+
+/// What a `/token` request was granted on.
+enum Grant {
+    Code {
+        sub: String,
+        email: String,
+    },
+    /// A presented refresh token, not yet checked.
+    Refresh(String),
 }
 
 // -------------------------------------------------------------------- responses
@@ -503,6 +563,13 @@ fn invalid_request(d: &'static str) -> TokenError {
 }
 fn invalid_grant(d: &'static str) -> TokenError {
     TokenError(StatusCode::BAD_REQUEST, "invalid_grant", d)
+}
+fn server_error() -> TokenError {
+    TokenError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "could not store the tokens",
+    )
 }
 
 // -------------------------------------------------------------------- router
@@ -628,7 +695,12 @@ async fn authorize(State(o): Oa, Query(q): Query<HashMap<String, String>>) -> Re
         challenge: challenge.into(),
         state: state.into(),
     };
-    if !o.txns.lock().unwrap().insert(id.clone(), txn) {
+    if !o
+        .txns
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(id.clone(), txn)
+    {
         return error_page(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many sign-ins in progress.",
@@ -664,7 +736,12 @@ struct ConsentForm {
 }
 
 async fn consent(State(o): Oa, Form(f): Form<ConsentForm>) -> Response {
-    let Some(txn) = f.txn.and_then(|t| o.txns.lock().unwrap().take(&t)) else {
+    let Some(txn) = f.txn.and_then(|t| {
+        o.txns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(&t)
+    }) else {
         return error_page(
             StatusCode::BAD_REQUEST,
             "This request expired. Start again.",
@@ -706,14 +783,19 @@ fn start_google(o: &OAuth, txn: Option<Txn>) -> Response {
         ("code_challenge_method", "S256"),
         ("prompt", "select_account"),
     ]);
-    if !o.upstream.lock().unwrap().insert(
-        state,
-        Upstream {
-            txn,
-            verifier,
-            browser: sha256_hex(&browser),
-        },
-    ) {
+    if !o
+        .upstream
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            state,
+            Upstream {
+                txn,
+                verifier,
+                browser: sha256_hex(&browser),
+            },
+        )
+    {
         return error_page(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many sign-ins in progress.",
@@ -753,10 +835,12 @@ async fn callback(
     headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(up) = q
-        .get("state")
-        .and_then(|s| o.upstream.lock().unwrap().take(s))
-    else {
+    let Some(up) = q.get("state").and_then(|s| {
+        o.upstream
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(s)
+    }) else {
         return error_page(
             StatusCode::BAD_REQUEST,
             "This sign-in expired. Start again.",
@@ -799,7 +883,12 @@ async fn callback(
         sub,
         email,
     };
-    if !o.codes.lock().unwrap().insert(code.clone(), entry) {
+    if !o
+        .codes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(code.clone(), entry)
+    {
         return deny("callback_codes_full", "server_error");
     }
     tracing::info!(outcome = "code_issued", "oauth");
@@ -855,7 +944,12 @@ async fn web_callback(o: &OAuth, q: &HashMap<String, String>, verifier: &str) ->
     else {
         return refused("web_identity_refused", "That Google account can't use Arr.");
     };
-    let Some(id) = o.web.create_session("google", Some(&email)) else {
+    let session = o
+        .web
+        .off(move |s| s.create_session("google", Some(&email)))
+        .await
+        .flatten();
+    let Some(id) = session else {
         return refused("web_session_failed", "Could not sign you in. Try again.");
     };
     tracing::info!(outcome = "web_session_issued", "oauth");
@@ -951,7 +1045,12 @@ async fn token(
                 return Err(invalid_request("invalid code_verifier"));
             }
             let bad = || invalid_grant("invalid or expired authorization code");
-            let c = o.codes.lock().unwrap().take(code).ok_or_else(bad)?;
+            let c = o
+                .codes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(code)
+                .ok_or_else(bad)?;
             let computed = B64.encode(Sha256::digest(verifier.as_bytes()));
             if c.client_id != client_id
                 || c.redirect_uri != redirect_uri
@@ -960,28 +1059,17 @@ async fn token(
             {
                 return Err(bad());
             }
-            (c.sub, c.email)
+            Grant::Code {
+                sub: c.sub,
+                email: c.email,
+            }
         }
         Some("refresh_token") => {
             let rt = f.refresh_token.as_deref().ok_or_else(missing)?;
-            let bad = || invalid_grant("invalid or expired refresh token");
             if !rt.starts_with(REFRESH_PREFIX) {
-                return Err(bad());
+                return Err(invalid_grant("invalid or expired refresh token"));
             }
-            // Rotation: the presented token is deleted whatever happens next.
-            let row = o.db.lock().unwrap().query_row(
-                "DELETE FROM tokens WHERE hash = ?1 AND kind = 'refresh' RETURNING sub, email, client_id, expires_at",
-                [sha256_hex(rt)],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)),
-            );
-            match row {
-                Ok((sub, email, cid, exp))
-                    if cid == client_id && exp > now() && o.email_allowed(&email) =>
-                {
-                    (sub, email)
-                }
-                _ => return Err(bad()),
-            }
+            Grant::Refresh(rt.to_string())
         }
         Some(_) => {
             return Err(TokenError(
@@ -992,13 +1080,11 @@ async fn token(
         }
         None => return Err(missing()),
     };
-    let issued = o
-        .issue_tokens(&client_id, &granted.0, &granted.1)
-        .ok_or(TokenError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "could not store the tokens",
-        ))?;
+    // A blocking thread: the database may wait on its lock.
+    let o2 = o.clone();
+    let issued = tokio::task::spawn_blocking(move || o2.grant_tokens(&client_id, granted))
+        .await
+        .unwrap_or_else(|_| Err(server_error()))?;
     tracing::info!(outcome = "tokens_issued", "oauth");
     Ok(Json(issued).into_response())
 }
@@ -1116,7 +1202,7 @@ async fn client_assertion(o: &OAuth, f: &TokenForm, jwt: &str) -> Result<String,
     {
         return Err(bad("assertion claims invalid"));
     }
-    let mut seen = o.jtis.lock().unwrap();
+    let mut seen = o.jtis.lock().unwrap_or_else(PoisonError::into_inner);
     seen.retain(|_, e| *e > t);
     if seen.len() >= MAX_JTIS || seen.insert(format!("{cid}\n{jti}"), exp).is_some() {
         return Err(bad("assertion already used"));

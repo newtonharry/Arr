@@ -85,6 +85,7 @@ impl<'a> Parser<'a> {
             }
             Some(b'd') => {
                 let mut entries: Vec<(&'a [u8], Bencode<'a>, Range<usize>)> = vec![];
+                let mut keys = std::collections::HashSet::new();
                 let mut p = pos + 1;
                 while input.get(p) != Some(&b'e') {
                     let (k, next) = self.value(p, depth + 1)?;
@@ -93,7 +94,8 @@ impl<'a> Parser<'a> {
                     };
                     // A duplicate key (e.g. two `info` dictionaries) could make this parser
                     // and the client disagree about the torrent's identity.
-                    if entries.iter().any(|(e, _, _)| *e == k) {
+                    // (A set, not a scan of earlier keys: a dictionary can have ~10^5 keys.)
+                    if !keys.insert(k) {
                         bail!("duplicate dictionary key");
                     }
                     let (v, end) = self.value(next, depth + 1)?;
@@ -303,6 +305,8 @@ mod tests {
         dup.push(b'e');
         assert!(format!("{:#}", info_hash(&dup).unwrap_err()).contains("duplicate"));
         assert!(parse(b"d1:ai1e1:ai2ee").is_err());
+        // Keys out of order are accepted, as clients accept them.
+        assert!(parse(b"d1:bi1e1:ai2ee").is_ok());
         // A degenerate document with too many values is refused.
         let mut many = b"l".to_vec();
         many.extend(std::iter::repeat_n(b"i0e".as_slice(), 600_000).flatten());
@@ -319,5 +323,18 @@ mod tests {
             names(&t).unwrap(),
             ("a.mkv".to_string(), vec!["a.mkv".to_string()])
         );
+    }
+
+    #[test]
+    fn a_dictionary_with_many_keys_parses_quickly() {
+        // 200k keys: comparing each key with every earlier one would take minutes.
+        let mut d = b"d".to_vec();
+        for i in 0..200_000 {
+            d.extend_from_slice(format!("6:{i:06}i0e").as_bytes());
+        }
+        d.push(b'e');
+        let started = std::time::Instant::now();
+        assert!(matches!(parse(&d).unwrap(), Bencode::Dict(e) if e.len() == 200_000));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

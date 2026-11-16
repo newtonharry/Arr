@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
@@ -120,11 +120,21 @@ impl Sessions {
         }))
     }
 
+    /// Runs `f` on a blocking thread. web.sqlite is shared with notifications and
+    /// `arr app-link`, so a call can wait on its lock; that must not hold up the runtime.
+    pub async fn off<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Self) -> T + Send + 'static,
+    ) -> Option<T> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || f(&s)).await.ok()
+    }
+
     /// A new one-time link token, valid for `LINK_TTL`.
     pub fn create_link(&self) -> Result<String> {
         let token = random_b64(32);
         let t = now();
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         db.execute("DELETE FROM links WHERE expires_at <= ?1", [t])?;
         db.execute(
             "INSERT INTO links (hash, expires_at) VALUES (?1, ?2)",
@@ -135,7 +145,7 @@ impl Sessions {
 
     /// Uses up a link token: true exactly once, while it is live.
     fn consume_link(&self, token: &str) -> bool {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         db.execute(
             "DELETE FROM links WHERE hash = ?1 AND expires_at > ?2",
             rusqlite::params![sha256_hex(token), now()],
@@ -147,7 +157,7 @@ impl Sessions {
     pub fn create_session(&self, kind: &str, email: Option<&str>) -> Option<String> {
         let id = random_b64(32);
         let t = now();
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         db.execute("DELETE FROM sessions WHERE expires_at <= ?1", [t])
             .ok()?;
         db.execute(
@@ -160,7 +170,7 @@ impl Sessions {
 
     /// `(kind, email)` of a live session.
     fn lookup(&self, id: &str) -> Option<(String, Option<String>)> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         db.query_row(
             "SELECT kind, email FROM sessions WHERE hash = ?1 AND expires_at > ?2",
             rusqlite::params![sha256_hex(id), now()],
@@ -171,7 +181,7 @@ impl Sessions {
 
     /// Remembers who first added a title (a movie or a show). Later adds keep the first name.
     fn record_requester(&self, media_id: &str, name: &str) {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = db.execute(
             "INSERT OR IGNORE INTO requested_by (media_id, name, at) VALUES (?1, ?2, ?3)",
             rusqlite::params![media_id, name, now()],
@@ -179,7 +189,7 @@ impl Sessions {
     }
 
     fn requester(&self, media_id: &str) -> Option<String> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         db.query_row(
             "SELECT name FROM requested_by WHERE media_id = ?1",
             [media_id],
@@ -189,7 +199,7 @@ impl Sessions {
     }
 
     fn delete(&self, id: &str) {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = db.execute("DELETE FROM sessions WHERE hash = ?1", [sha256_hex(id)]);
     }
 }
@@ -539,7 +549,7 @@ impl Web {
     }
 
     /// The live session of a request: `(cookie value, email)`.
-    fn session(&self, headers: &HeaderMap) -> Option<(String, Option<String>)> {
+    async fn session(&self, headers: &HeaderMap) -> Option<(String, Option<String>)> {
         let id = headers
             .get_all(header::COOKIE)
             .iter()
@@ -551,7 +561,8 @@ impl Web {
                     .strip_prefix('=')
                     .map(str::to_string)
             })?;
-        let (kind, email) = self.sessions.lookup(&id)?;
+        let key = id.clone();
+        let (kind, email) = self.sessions.off(move |s| s.lookup(&key)).await??;
         if kind == "google" {
             // Only while Google sign-in exists and the address is still allowed.
             let allowed = self
@@ -584,7 +595,7 @@ impl Web {
 /// A poster. Same-origin `<img>` requests carry the cookie but not the app header, so this
 /// checks the session only. No poster is a plain 404: the app keeps its title tile.
 async fn art(State(w): Wa, headers: HeaderMap, UrlPath(id): UrlPath<String>) -> Response {
-    if w.session(&headers).is_none() {
+    if w.session(&headers).await.is_none() {
         return w.unauthorized();
     }
     let Ok(id) = id.parse::<MediaId>() else {
@@ -619,7 +630,7 @@ async fn me(State(w): Wa, headers: HeaderMap) -> Response {
     if let Some(r) = w.check_app(&headers) {
         return r;
     }
-    let Some((_, email)) = w.session(&headers) else {
+    let Some((_, email)) = w.session(&headers).await else {
         return w.unauthorized();
     };
     // Where Arr is reachable from other devices, for "Use Arr on your phone".
@@ -634,10 +645,10 @@ async fn signout(State(w): Wa, headers: HeaderMap) -> Response {
     if let Some(r) = w.check_app(&headers) {
         return r;
     }
-    let Some((id, _)) = w.session(&headers) else {
+    let Some((id, _)) = w.session(&headers).await else {
         return w.unauthorized();
     };
-    w.sessions.delete(&id);
+    w.sessions.off(move |s| s.delete(&id)).await;
     let mut r = StatusCode::NO_CONTENT.into_response();
     let secure = if w.secure(&headers) { "; Secure" } else { "" };
     if let Ok(v) = HeaderValue::from_str(&format!(
@@ -661,7 +672,7 @@ async fn notifications_key(State(w): Wa, headers: HeaderMap) -> Response {
     if let Some(r) = w.check_app(&headers) {
         return r;
     }
-    if w.session(&headers).is_none() {
+    if w.session(&headers).await.is_none() {
         return w.unauthorized();
     }
     no_store(Json(json!({ "key": w.push.public_key() })).into_response())
@@ -685,7 +696,7 @@ async fn notifications_subscribe(State(w): Wa, headers: HeaderMap, body: Bytes) 
     if let Some(r) = w.check_app(&headers) {
         return r;
     }
-    let Some((session, _)) = w.session(&headers) else {
+    let Some((session, _)) = w.session(&headers).await else {
         return w.unauthorized();
     };
     let bad = |m: &str| json_error(StatusCode::BAD_REQUEST, "invalid_request", m);
@@ -706,7 +717,7 @@ async fn notifications_subscribe(State(w): Wa, headers: HeaderMap, body: Bytes) 
         p256dh: keys.p256dh,
         auth: keys.auth,
     };
-    match w.push.subscribe(&sub, Some(&sha256_hex(&session))) {
+    match w.push.subscribe(sub, Some(sha256_hex(&session))).await {
         Ok(true) => no_store(StatusCode::NO_CONTENT.into_response()),
         Ok(false) => json_error(
             StatusCode::CONFLICT,
@@ -730,7 +741,7 @@ async fn notifications_unsubscribe(State(w): Wa, headers: HeaderMap, body: Bytes
     if let Some(r) = w.check_app(&headers) {
         return r;
     }
-    if w.session(&headers).is_none() {
+    if w.session(&headers).await.is_none() {
         return w.unauthorized();
     }
     let Ok(b) = serde_json::from_slice::<UnsubBody>(&body) else {
@@ -740,7 +751,7 @@ async fn notifications_unsubscribe(State(w): Wa, headers: HeaderMap, body: Bytes
             "send {endpoint}",
         );
     };
-    match w.push.unsubscribe(&b.endpoint) {
+    match w.push.unsubscribe(b.endpoint).await {
         Ok(()) => no_store(StatusCode::NO_CONTENT.into_response()),
         Err(_) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -790,9 +801,18 @@ async fn link_consume(State(w): Wa, headers: HeaderMap, Form(f): Form<LinkForm>)
             "<h1>Not allowed</h1><p>Open the sign-in link again.</p>",
         );
     }
-    let session =
-        f.t.filter(|t| token_shaped(t) && w.sessions.consume_link(t))
-            .and_then(|_| w.sessions.create_session("link", None));
+    let session = match f.t.filter(|t| token_shaped(t)) {
+        Some(t) => w
+            .sessions
+            .off(move |s| {
+                s.consume_link(&t)
+                    .then(|| s.create_session("link", None))
+                    .flatten()
+            })
+            .await
+            .flatten(),
+        None => None,
+    };
     let Some(id) = session else {
         return page(
             StatusCode::GONE,
@@ -955,7 +975,7 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     if let Some(r) = w.check_app(&parts.headers) {
         return r;
     }
-    let Some((_, email)) = w.session(&parts.headers) else {
+    let Some((_, email)) = w.session(&parts.headers).await else {
         return w.unauthorized();
     };
     let path = parts
@@ -999,14 +1019,14 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     let Ok(raw) = axum::body::to_bytes(rbody, MAX_PROXY_REPLY).await else {
         return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "reply too large");
     };
-    let raw = annotate(
-        &w.sessions,
-        &parts.method,
-        &parts_path,
-        email.as_deref(),
-        rp.status,
-        raw,
-    );
+    let (method, status) = (parts.method.clone(), rp.status);
+    let Some(raw) = w
+        .sessions
+        .off(move |s| annotate(s, &method, &parts_path, email.as_deref(), status, raw))
+        .await
+    else {
+        return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "API unavailable");
+    };
     let mut out = Response::new(Body::from(raw));
     *out.status_mut() = rp.status;
     for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {

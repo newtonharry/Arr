@@ -165,6 +165,12 @@ impl From<import::LoadedImport> for Loaded {
     }
 }
 
+/// For tests of overlapping reloads: `(state dir, ms)` makes the next index reload of that
+/// install wait that long between reading the catalog and putting the new index in place.
+#[doc(hidden)]
+pub static RELOAD_PAUSE: std::sync::Mutex<Vec<(std::path::PathBuf, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
 pub struct AppState {
     pub cfg: RuntimeConfig,
     /// The active settings import (made by managed setup). Replaced only
@@ -183,6 +189,8 @@ pub struct AppState {
     pub plex: Option<Plex>,
     pub worker: Worker,
     index: RwLock<Arc<CatalogIndex>>,
+    /// Serialises index reloads, so an older snapshot never replaces a newer one.
+    index_lock: tokio::sync::Mutex<()>,
     plans_lock: tokio::sync::Mutex<()>,
     /// Serialises library mutations (add, PATCH, DELETE): each one checks and changes
     /// monitoring against the state the previous one left.
@@ -311,6 +319,7 @@ impl AppState {
             plex: cfg.plex.clone().map(Plex::new),
             worker: Worker::new(),
             index: RwLock::new(Arc::new(index)),
+            index_lock: tokio::sync::Mutex::new(()),
             plans_lock: tokio::sync::Mutex::new(()),
             library_lock: tokio::sync::Mutex::new(()),
             setup_lock: tokio::sync::Mutex::new(()),
@@ -372,7 +381,16 @@ impl AppState {
 
     /// Rebuilds the index from the managed catalog tables.
     pub async fn reload_index(&self) -> anyhow::Result<()> {
+        let _one_at_a_time = self.index_lock.lock().await;
         let idx = self.store.with(|c| library::load_index(c)).await?;
+        let pause = {
+            let mut p = RELOAD_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+            let at = p.iter().position(|(d, _)| *d == self.cfg.state_dir);
+            at.map(|i| p.swap_remove(i).1)
+        };
+        if let Some(ms) = pause {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         *self.index.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(idx);
         Ok(())
     }

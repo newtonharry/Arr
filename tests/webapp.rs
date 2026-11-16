@@ -2541,6 +2541,12 @@ async fn app_settings_show_no_secret_and_a_change_applies_or_is_rejected() {
         waited += 1;
     }
     assert!(e.state.restart.requested(), "Arr asked to restart");
+    // Once Arr is restarting, a further change is refused rather than cut off part way.
+    let before = std::fs::read_to_string(&config_path).unwrap();
+    let (s, v) = site.json(post("downloading", "off")).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v.to_string().contains("restarting"), "{v}");
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
     // The running config is the one it started with until the service manager starts it again.
     let (_, v) = site
         .json(site.app(Method::GET, "/app/api/v1/settings/app", c))
