@@ -788,8 +788,8 @@ async fn a_movie_crash_after_the_commit_is_finished_not_blocked_by_its_own_file(
         let mut e = start_exec(ExecOptions::default()).await;
         let (id, hash) = grab_movie(&e).await;
         crash_at(&mut e, &id, &hash, point).await;
-        let dest = e.movies.join(format!("The Matrix (1999)/{MATRIX}.mkv"));
         let folder = e.movies.join("The Matrix (1999)");
+        let dest = folder.join(format!("{MATRIX}.mkv"));
         let before = library_files(&folder);
         assert_eq!(before, [dest.display().to_string()], "{point}");
         let bytes = std::fs::read(&dest).unwrap();
