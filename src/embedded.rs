@@ -1053,8 +1053,30 @@ impl Embedded {
                         .sum::<u64>()
                 };
                 let before = reached();
-                let fetch = session.add_torrent(AddTorrent::from_url(m.clone()), Some(opts));
-                match tokio::time::timeout(self.cfg.metadata_timeout, fetch).await {
+                // The engine checks the metadata a peer sent inside this call, and some malformed
+                // metadata makes it panic (a piece length of 0 divides by zero) before Arr can
+                // see it. The fetch runs in its own task, so such a panic fails this release
+                // instead of unwinding through the caller (the worker). The task is aborted when
+                // the wait ends first.
+                let (s, url) = (session.clone(), m.clone());
+                let mut fetch = tokio::spawn(async move {
+                    s.add_torrent(AddTorrent::from_url(url), Some(opts)).await
+                });
+                let waited = tokio::time::timeout(self.cfg.metadata_timeout, &mut fetch).await;
+                fetch.abort();
+                let waited = match waited {
+                    Ok(Err(e)) if e.is_panic() => {
+                        return Err(invalid(
+                            "the metadata a peer sent for the magnet is malformed",
+                        ));
+                    }
+                    Ok(Err(_)) => {
+                        return Err(unavailable("the magnet metadata fetch was stopped"));
+                    }
+                    Ok(Ok(r)) => Ok(r),
+                    Err(e) => Err(e),
+                };
+                match waited {
                     // Only a wait in which the engine reached some peer says the magnet is
                     // dead; without one the network may be down, which is no release's fault.
                     Err(_) if reached() > before => {

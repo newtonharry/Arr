@@ -2136,3 +2136,81 @@ async fn a_pack_already_in_the_engine_is_checked_for_the_next_grab_and_its_selec
     assert_eq!(e.grab(&first).state, "imported");
     assert_eq!(e.grab(&first).imported_files, 3);
 }
+
+/// A peer that hands out `info` (a bencoded info dictionary) as the metadata of its hash to
+/// whoever connects, over the extension protocol. Raw BitTorrent wire protocol on loopback.
+async fn metadata_peer(info: Vec<u8>) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let info = info.clone();
+            tokio::spawn(async move {
+                let mut hs = [0u8; 68];
+                if s.read_exact(&mut hs).await.is_err() {
+                    return;
+                }
+                // The same handshake back, with the extension protocol and a peer id of its own.
+                hs[25] |= 0x10;
+                hs[48..68].copy_from_slice(b"-UM0001-metapeer0001");
+                let ext = |id: u8, body: &[u8]| {
+                    let mut m = ((body.len() + 2) as u32).to_be_bytes().to_vec();
+                    m.extend_from_slice(&[20, id]);
+                    m.extend_from_slice(body);
+                    m
+                };
+                let mut out = hs.to_vec();
+                let size = info.len();
+                out.extend(ext(
+                    0,
+                    format!("d1:md11:ut_metadatai3ee13:metadata_sizei{size}ee").as_bytes(),
+                ));
+                // (3 is the engine's own id for ut_metadata)
+                let mut data =
+                    format!("d8:msg_typei1e5:piecei0e10:total_sizei{size}ee").into_bytes();
+                data.extend_from_slice(&info);
+                out.extend(ext(3, &data));
+                if s.write_all(&out).await.is_err() {
+                    return;
+                }
+                let mut buf = [0u8; 4096];
+                while matches!(s.read(&mut buf).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn magnet_metadata_with_a_zero_piece_length_fails_the_release_not_its_caller() {
+    // Metadata the engine would divide by zero on while checking it.
+    let mut info = b"d6:lengthi10e4:name5:a.mkv12:piece lengthi0e6:pieces20:".to_vec();
+    info.extend_from_slice(&[0u8; 20]);
+    info.push(b'e');
+    let hash = {
+        use sha1::Digest;
+        hex::encode(sha1::Sha1::digest(&info))
+    };
+    let peer = metadata_peer(info).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _store, cfg) = standalone_with(
+        tmp.path(),
+        &format!("dht = false\nmetadata_timeout_secs = 30\ninitial_peers = [\"{peer}\"]\n"),
+    );
+    let err = engine
+        .add(&request(
+            arr::prowlarr::Payload::Magnet(format!("magnet:?xt=urn:btih:{hash}")),
+            &cfg.save_path,
+        ))
+        .await
+        .unwrap_err();
+    // An invalid torrent (the submission blocklists it), not a dead magnet or an outage.
+    let text = err.describe();
+    assert!(
+        matches!(&err, arr::upstream::UpstreamError::BadResponse { reason } if reason.contains("invalid") && reason.contains("malformed")),
+        "{text}"
+    );
+    assert!(!arr::upstream::describes_missing_metadata(&text), "{text}");
+    engine.shutdown().await;
+}

@@ -412,3 +412,103 @@ async fn explicit_removal_needs_met_seed_goal_or_override() {
         .await;
     assert_eq!(s, 422);
 }
+
+#[tokio::test]
+async fn a_retried_removal_of_a_moved_torrent_is_blocked_and_deletes_nothing() {
+    let e = start_exec(ExecOptions::default()).await;
+    let i = imported_movie(&e).await;
+    e.seeded(&i.hash, 2.5, 9000, true);
+    // Removal journaled and asked for long ago; the torrent is still there, and has since been
+    // moved to another directory.
+    let files = json!([{ "path": i.source, "size": std::fs::metadata(&i.source).unwrap().len(), "ino": ino(&i.source) }]).to_string();
+    let id = i.id.clone();
+    e.state
+        .store
+        .blocking(move |c| Ok(c.execute("UPDATE grabs SET cleanup = 'removing', cleanup_files = ?2, cleanup_at = '2026-01-01T00:00:00Z' WHERE id = ?1", rusqlite::params![id, files])?))
+        .unwrap();
+    e.fake
+        .lock()
+        .unwrap()
+        .torrents
+        .get_mut(&i.hash)
+        .unwrap()
+        .save_path = format!("{}/elsewhere", arr::paths::client_form(&e.downloads));
+    e.tick().await;
+    let g = e.grab_row(&i.id);
+    assert_eq!(g.cleanup, "blocked", "{:?}", g.cleanup_detail);
+    assert!(
+        g.cleanup_detail.as_deref().unwrap_or("").contains("moved"),
+        "{:?}",
+        g.cleanup_detail
+    );
+    {
+        let f = e.fake.lock().unwrap();
+        assert!(
+            !f.log.iter().any(|l| l == &format!("delete {}", i.hash)),
+            "the client was never asked to delete it: {:?}",
+            f.log
+        );
+        assert!(f.torrents.contains_key(&i.hash));
+    }
+    assert_library_intact(&i).await;
+}
+
+#[tokio::test]
+async fn downloads_that_keep_seeding_do_not_hold_back_the_cleanup_of_others() {
+    let e = start_exec(ExecOptions::default()).await;
+    let i = imported_movie(&e).await;
+    // A hundred older downloads still seeding toward their goal (a torrent of their own).
+    let other = "ab".repeat(20);
+    {
+        let mut f = e.fake.lock().unwrap();
+        let mut t = f.torrents[&i.hash].clone();
+        t.hash = other.clone();
+        f.torrents.insert(other.clone(), t);
+    }
+    let (id, o) = (i.id.clone(), other.clone());
+    e.state
+        .store
+        .blocking(move |c| {
+            for n in 0..100 {
+                c.execute_batch("DROP TABLE IF EXISTS temp.copy")?;
+                c.execute(
+                    "CREATE TEMP TABLE copy AS SELECT * FROM grabs WHERE id = ?1",
+                    [&id],
+                )?;
+                c.execute(
+                    "UPDATE temp.copy SET id = ?1, info_hash = ?2, cleanup_detail = NULL",
+                    rusqlite::params![format!("g_old_{n:03}"), o],
+                )?;
+                c.execute_batch("INSERT INTO grabs SELECT * FROM temp.copy")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Each was looked at once (its reason recorded), long ago; the reason has not changed
+    // since, so nothing moves them along.
+    e.tick().await;
+    e.state
+        .store
+        .blocking(|c| {
+            Ok(c.execute(
+                "UPDATE grabs SET updated_at = '2000-01-01T00:00:00Z', cleanup_detail = (SELECT cleanup_detail FROM grabs WHERE id = 'g_old_000') WHERE id LIKE 'g_old_%'",
+                [],
+            )?)
+        })
+        .unwrap();
+    assert!(e.grab_row("g_old_000").cleanup_detail.is_some());
+    // The newer download meets its goal: a later pass removes it.
+    e.seeded(&i.hash, 2.5, 9000, true);
+    for _ in 0..3 {
+        e.tick().await;
+    }
+    let g = e.grab_row(&i.id);
+    assert!(
+        matches!(g.cleanup.as_str(), "removing" | "cleaned"),
+        "{} {:?}",
+        g.cleanup,
+        g.cleanup_detail
+    );
+    assert!(!e.fake.lock().unwrap().torrents.contains_key(&i.hash));
+    assert_eq!(e.grab_row("g_old_000").cleanup, "seeding");
+}

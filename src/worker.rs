@@ -67,6 +67,8 @@ pub struct Worker {
     unanswered: std::sync::atomic::AtomicBool,
     /// Smoothed download rate of each grab that is moving, kept in memory only (never stored).
     rates: std::sync::Mutex<std::collections::HashMap<String, Rate>>,
+    /// Id of the last download the cleanup pass looked at: the next pass starts after it.
+    cleanup_cursor: std::sync::Mutex<String>,
 }
 
 /// A grab's smoothed download rate and the bytes it still had left when last measured.
@@ -94,7 +96,23 @@ impl Worker {
             stop: Notify::new(),
             unanswered: std::sync::atomic::AtomicBool::new(true),
             rates: Default::default(),
+            cleanup_cursor: Default::default(),
         }
+    }
+
+    /// Where the next cleanup pass starts (after this id; empty: from the start).
+    pub fn cleanup_cursor(&self) -> String {
+        self.cleanup_cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_cleanup_cursor(&self, id: &str) {
+        *self
+            .cleanup_cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = id.to_string();
     }
 
     fn rates(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Rate>> {
@@ -370,6 +388,15 @@ pub fn recover(st: &AppState, now: OffsetDateTime) -> Result<Value> {
     })
 }
 
+/// A task that is aborted when its handle is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Runs the loop until the process ends.
 pub fn spawn(st: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -378,8 +405,19 @@ pub fn spawn(st: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             Err(e) => tracing::error!(error = %format!("{e:#}"), "worker recovery failed"),
         }
         while !st.worker.stopping() {
-            if let Err(e) = tick(&st, OffsetDateTime::now_utc()).await {
-                tracing::error!(error = %format!("{e:#}"), "worker pass failed");
+            // Each pass runs in its own task: a panic in one pass is logged and the loop goes
+            // on, so downloads, imports and scheduled tasks never stop until a restart.
+            let s2 = st.clone();
+            // (aborting the worker aborts its current pass too)
+            let mut pass = AbortOnDrop(tokio::spawn(async move {
+                tick(&s2, OffsetDateTime::now_utc()).await
+            }));
+            match (&mut pass.0).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::error!(error = %format!("{e:#}"), "worker pass failed"),
+                Err(e) => {
+                    tracing::error!(error = %e, "worker pass panicked; the next pass runs as usual")
+                }
             }
             tokio::select! {
                 _ = st.worker.notify.notified() => {}
@@ -396,7 +434,13 @@ pub struct TickReport {
     pub tasks: Vec<String>,
 }
 
+/// Logs a failed step of a pass; the pass carries on with its next step.
+fn step_failed(step: &str, e: &anyhow::Error) {
+    tracing::error!(step, error = %format!("{e:#}"), "worker step failed; the pass goes on");
+}
+
 /// One worker pass. Public so tests and the sandbox harness can drive time explicitly.
+/// A step that fails is logged and the pass goes on with the next one.
 pub async fn tick(st: &AppState, now: OffsetDateTime) -> Result<TickReport> {
     let mut report = TickReport::default();
     if !st.cfg.execution_enabled {
@@ -404,15 +448,24 @@ pub async fn tick(st: &AppState, now: OffsetDateTime) -> Result<TickReport> {
     }
     let mut seen: Vec<String> = vec![];
     for _ in 0..COMMANDS_PER_PASS {
-        let Some(cmd) = claim(st, now, seen.clone()).await? else {
-            break;
+        let cmd = match claim(st, now, seen.clone()).await {
+            Ok(Some(cmd)) => cmd,
+            Ok(None) => break,
+            Err(e) => {
+                step_failed("claim a command", &e);
+                break;
+            }
         };
         seen.push(cmd.id.clone());
         report.commands.push(cmd.name.clone());
         let outcome = run_command(st, &cmd, now).await;
-        finish(st, &cmd, outcome, now).await?;
+        if let Err(e) = finish(st, &cmd, outcome, now).await {
+            step_failed(&cmd.name, &e);
+        }
     }
-    run_task(st, "downloads", now).await?;
+    if let Err(e) = run_task(st, "downloads", now).await {
+        step_failed("downloads", &e);
+    }
     report.tasks.push("downloads".into());
     for name in [
         "rss_sync",
@@ -423,9 +476,15 @@ pub async fn tick(st: &AppState, now: OffsetDateTime) -> Result<TickReport> {
         "bin",
         "sports",
     ] {
-        if due(st, name, now).await? {
-            run_task(st, name, now).await?;
-            report.tasks.push(name.into());
+        match due(st, name, now).await {
+            Ok(true) => {
+                if let Err(e) = run_task(st, name, now).await {
+                    step_failed(name, &e);
+                }
+                report.tasks.push(name.into());
+            }
+            Ok(false) => {}
+            Err(e) => step_failed(name, &e),
         }
     }
     Ok(report)
@@ -524,12 +583,42 @@ pub async fn run_task(st: &AppState, name: &str, now: OffsetDateTime) -> Result<
     result
 }
 
+/// Submit, poll, import, cleanup and plan sync. A step that fails does not stop the ones
+/// after it; the pass then fails naming each failed step.
 async fn downloads_pass(st: &AppState, now: OffsetDateTime) -> Result<Value> {
-    let submitted = crate::downloads::submit_due(st, now).await?;
-    let polled = crate::downloads::poll(st, now, st.cfg.automation.stall_timeout).await?;
-    let imported = crate::ingest::import_due(st, now).await?;
-    let cleanup = crate::downloads::cleanup(st, now).await?;
-    let plans = sync_plans(st, now).await?;
+    let mut failed: Vec<String> = vec![];
+    let mut step = |name: &str, r: Result<Value>| match r {
+        Ok(v) => v,
+        Err(e) => {
+            step_failed(name, &e);
+            failed.push(format!("{name}: {e:#}"));
+            Value::Null
+        }
+    };
+    let submitted = step(
+        "submit",
+        crate::downloads::submit_due(st, now)
+            .await
+            .map(|v| json!(v)),
+    );
+    let polled = step(
+        "poll",
+        crate::downloads::poll(st, now, st.cfg.automation.stall_timeout)
+            .await
+            .map(|v| json!(v)),
+    );
+    let imported = step(
+        "import",
+        crate::ingest::import_due(st, now).await.map(|v| json!(v)),
+    );
+    let cleanup = step(
+        "cleanup",
+        crate::downloads::cleanup(st, now).await.map(|v| json!(v)),
+    );
+    let plans = step("plans", sync_plans(st, now).await.map(|v| json!(v)));
+    if !failed.is_empty() {
+        anyhow::bail!("{}", failed.join("; "));
+    }
     Ok(
         json!({ "submitted": submitted, "poll": polled, "imported": imported, "cleanup": cleanup, "plans_imported": plans }),
     )

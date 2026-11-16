@@ -84,6 +84,13 @@ pub struct FakeState {
     /// Every add fails as invalid, with this text in the answer (an engine that names the
     /// torrent in its error).
     pub add_invalid_text: Option<String>,
+    /// While set, an add waits for a permit before doing anything (as a magnet waiting for its
+    /// metadata); `add held` is logged when it starts waiting.
+    pub hold_add: Option<Arc<tokio::sync::Semaphore>>,
+    /// Accepted adds are kept here, out of sight, until the test moves them into `torrents`
+    /// (a client slow to list what it took).
+    pub hide_adds: bool,
+    pub hidden: BTreeMap<String, FakeTorrent>,
     /// Where data is written, and the save path the application knows (set when attached).
     pub download_dir: PathBuf,
     pub save_path: String,
@@ -282,6 +289,11 @@ impl Fake {
     }
 
     pub async fn add(&self, req: &AddRequest) -> Result<bool, UpstreamError> {
+        let hold = self.lock().hold_add.clone();
+        if let Some(h) = hold {
+            self.lock().log.push("add held".into());
+            let _ = h.acquire().await;
+        }
         let mut s = self.lock();
         s.gate("add".into())?;
         if let Some(t) = s.add_invalid_text.clone() {
@@ -380,7 +392,11 @@ impl Fake {
                 seeding_time_limit: req.seeding_time_limit_minutes.unwrap_or(-2),
                 speed: 0,
             };
-            s.torrents.insert(hash, t);
+            if s.hide_adds {
+                s.hidden.insert(hash, t);
+            } else {
+                s.torrents.insert(hash, t);
+            }
         }
         if s.down_after_add {
             s.down_after_add = false;

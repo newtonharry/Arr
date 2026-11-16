@@ -571,3 +571,271 @@ async fn an_unmonitored_title_is_never_acquired_by_any_path() {
     let (_, q, _) = e.json(e.get("/api/v1/queue?all=true")).await;
     assert_eq!(q["items"], json!([]), "{q}");
 }
+
+#[tokio::test]
+async fn a_failing_download_step_does_not_stop_the_rest_of_the_pass() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash) = downloading_episode(&e, 4, "STP").await;
+    // A queued download whose stored row cannot be read: submitting fails on every pass.
+    e.state
+        .store
+        .blocking(|c| {
+            c.execute(
+                "INSERT INTO grabs (id, media_id, target, release_ref, info_hash, title, category, save_path, remove_completed, remove_failed, origin, payload_kind, payload, state, active, next_attempt_at, created_at, updated_at) VALUES ('g_unreadable', 'not-a-media-id', 'not-a-media-id', 'r', ?1, 't', 'um-tv', '/x', 0, 0, 'auto', 'magnet', x'00', 'queued', 0, '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')",
+                ["0".repeat(40)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    e.complete(&hash);
+    // Late enough that every scheduled task is due again.
+    let report = e
+        .tick_at(OffsetDateTime::now_utc() + Duration::from_secs(2 * 86_400))
+        .await;
+    // Poll and import ran after the failed submit, and the scheduled tasks after them.
+    let g = e.grab_row(&id);
+    assert_eq!(g.state, "imported", "{:?}", g.last_error);
+    for task in ["downloads", "requests", "prune", "bin"] {
+        assert!(report.tasks.iter().any(|t| t == task), "{task}: {report:?}");
+    }
+    let (status, message): (String, String) = e
+        .state
+        .store
+        .blocking(|c| {
+            Ok(c.query_row(
+                "SELECT last_status, last_message FROM tasks WHERE name = 'downloads'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert!(message.contains("submit"), "{message}");
+}
+
+/// A pass whose add of the episode's torrent the client holds open (as the engine does while
+/// a magnet's metadata arrives), and the grab cancelled meanwhile. Returns the grab, the
+/// hash, the gate that lets the add go on, and the pass.
+async fn cancelled_during_its_add(
+    e: &Exec,
+    ep: u16,
+) -> (
+    String,
+    String,
+    std::sync::Arc<tokio::sync::Semaphore>,
+    tokio::task::JoinHandle<Result<(), String>>,
+) {
+    cancelled_during_its_add_at(e, ep, OffsetDateTime::now_utc()).await
+}
+
+/// `cancelled_during_its_add`, for a pass that started at `at`.
+async fn cancelled_during_its_add_at(
+    e: &Exec,
+    ep: u16,
+    at: OffsetDateTime,
+) -> (
+    String,
+    String,
+    std::sync::Arc<tokio::sync::Semaphore>,
+    tokio::task::JoinHandle<Result<(), String>>,
+) {
+    let title = format!("Slow.Horses.S01E{ep:02}.1080p.WEB-DL.x264-HLD");
+    let (hash, r) = e.publish(
+        &title,
+        &title,
+        vec![(format!("{title}.mkv"), mkv(1))],
+        1.5,
+        false,
+    );
+    e.search_results(&format!("Slow Horses S01E{ep:02}"), vec![r]);
+    let (s, v, text) = e
+        .json(e.post("/api/v1/plans").json(&json!({ "media_id": format!("episode:tvdb:372264:1:{ep}"), "execute": true, "replan": true })))
+        .await;
+    assert_eq!(s, 201, "{text}");
+    let id = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("{text}"))
+        .to_string();
+    // Due for a pass dated `at`.
+    let gid = id.clone();
+    e.state
+        .store
+        .blocking(move |c| {
+            c.execute(
+                "UPDATE grabs SET next_attempt_at = '1970-01-01T00:00:00Z' WHERE id = ?1",
+                [gid],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    e.fake.lock().unwrap().hold_add = Some(gate.clone());
+    let state = e.state.clone();
+    let pass = tokio::spawn(async move {
+        arr::worker::tick(&state, at)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    });
+    let held = || e.fake.lock().unwrap().log.iter().any(|l| l == "add held");
+    for _ in 0..1000 {
+        if held() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(held(), "the add reached the client");
+
+    // The cancel is answered while the add still waits: the grab lock is not held for it.
+    let (s, v, text) = tokio::time::timeout(
+        Duration::from_secs(10),
+        e.json(
+            e.post(&format!("/api/v1/queue/{id}/cancel"))
+                .json(&json!({})),
+        ),
+    )
+    .await
+    .expect("the cancel is answered during the add");
+    assert_eq!(
+        (s, v["grab"]["state"].as_str()),
+        (200, Some("cancelled")),
+        "{text}"
+    );
+    assert!(!pass.is_finished());
+    e.fake.lock().unwrap().hold_add = None;
+    (id, hash, gate, pass)
+}
+
+#[tokio::test]
+async fn a_cancel_while_an_add_waits_is_answered_and_the_late_torrent_is_removed() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash, gate, pass) = cancelled_during_its_add(&e, 5).await;
+    // The add then completes: its torrent is removed again and nothing is recorded.
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    let g = e.grab_row(&id);
+    assert_eq!((g.state.as_str(), g.active), ("cancelled", false));
+    assert!(g.submitted_at.is_none(), "{:?}", g.submitted_at);
+    let f = e.fake.lock().unwrap();
+    assert!(
+        f.log.iter().any(|l| l == &format!("delete {hash}")),
+        "{:?}",
+        f.log
+    );
+    assert!(
+        !f.torrents.contains_key(&hash),
+        "the late torrent is not left behind"
+    );
+}
+
+#[tokio::test]
+async fn a_late_torrent_the_client_could_not_be_asked_about_is_removed_once_it_answers() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash, gate, pass) = cancelled_during_its_add(&e, 6).await;
+    // The client takes the add, then stops answering: the torrent cannot be checked.
+    e.fake.lock().unwrap().down_after_add = true;
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    assert!(e.fake.lock().unwrap().torrents.contains_key(&hash));
+    // Once it answers again, a later pass removes the torrent.
+    e.fake.lock().unwrap().down = false;
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!((g.state.as_str(), g.active), ("cancelled", false));
+    assert!(
+        !e.fake.lock().unwrap().torrents.contains_key(&hash),
+        "the late torrent is removed once the client answers"
+    );
+}
+
+#[tokio::test]
+async fn a_late_add_the_client_lists_only_later_is_still_removed() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash, gate, pass) = cancelled_during_its_add(&e, 2).await;
+    // The client takes the add but does not list it yet: its absence proves nothing.
+    e.fake.lock().unwrap().hide_adds = true;
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    // The torrent then shows up: a later pass removes it.
+    {
+        let mut f = e.fake.lock().unwrap();
+        f.hide_adds = false;
+        let t = f.hidden.remove(&hash).expect("the add was taken");
+        f.torrents.insert(hash.clone(), t);
+    }
+    e.tick().await;
+    let g = e.grab_row(&id);
+    assert_eq!((g.state.as_str(), g.active), ("cancelled", false));
+    assert!(
+        !e.fake.lock().unwrap().torrents.contains_key(&hash),
+        "the late torrent is removed once the client lists it"
+    );
+    // Once it is gone, nothing more is tried.
+    let lease: Option<String> = e
+        .state
+        .store
+        .blocking(move |c| {
+            Ok(
+                c.query_row("SELECT lease_owner FROM grabs WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    assert_eq!(lease, None);
+}
+
+#[tokio::test]
+async fn a_late_add_never_removes_the_torrent_of_a_newer_download() {
+    let e = start_exec(ExecOptions::default()).await;
+    let (id, hash, gate, pass) = cancelled_during_its_add(&e, 4).await;
+    // The same torrent is asked for again before the cancelled add finishes.
+    let (s, v, text) = e
+        .json(e.post("/api/v1/plans").json(
+            &json!({ "media_id": "episode:tvdb:372264:1:4", "execute": true, "replan": true }),
+        ))
+        .await;
+    assert_eq!(s, 201, "{text}");
+    let newer = v["plan"]["execution"]["grabs"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("{text}"))
+        .to_string();
+    assert_ne!(newer, id);
+    assert_eq!(e.grab_row(&newer).info_hash, hash, "{text}");
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    let f = e.fake.lock().unwrap();
+    assert!(
+        !f.log.iter().any(|l| l == &format!("delete {hash}")),
+        "{:?}",
+        f.log
+    );
+    assert!(
+        f.torrents.contains_key(&hash),
+        "the newer download keeps it"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_pass_still_gives_a_late_add_its_full_grace_period() {
+    let e = start_exec(ExecOptions::default()).await;
+    // The pass began an hour ago (slow reads before this add, a long wait for metadata).
+    let at = OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let (_id, hash, gate, pass) = cancelled_during_its_add_at(&e, 2, at).await;
+    e.fake.lock().unwrap().hide_adds = true;
+    gate.add_permits(1);
+    pass.await.unwrap().unwrap();
+    // A pass now, with the torrent still not listed, keeps watching for it.
+    e.tick().await;
+    {
+        let mut f = e.fake.lock().unwrap();
+        f.hide_adds = false;
+        let t = f.hidden.remove(&hash).expect("the add was taken");
+        f.torrents.insert(hash.clone(), t);
+    }
+    e.tick().await;
+    assert!(
+        !e.fake.lock().unwrap().torrents.contains_key(&hash),
+        "the late torrent is removed once the client lists it"
+    );
+}

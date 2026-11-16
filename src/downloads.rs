@@ -1861,49 +1861,245 @@ pub async fn submit_due(st: &AppState, now: OffsetDateTime) -> Result<usize> {
         .store
         .with(move |c| select(c, "state IN ('queued', 'unconfirmed') AND next_attempt_at <= ?1 ORDER BY created_at LIMIT 20", &[&now_s]))
         .await?;
+    retry_late_adds(st, &qb, now).await?;
     let mut confirmed = 0;
     for g in due {
-        let _guard = st.worker.grabs.lock().await;
-        // Re-read under the lock: a user action may have changed it.
-        let id = g.id.clone();
-        let Some(g) = st.store.with(move |c| get(c, &id)).await? else {
-            continue;
-        };
-        if !matches!(g.state.as_str(), "queued" | "unconfirmed") {
-            continue;
-        }
-        if g.state == "queued"
-            && let Some(cap) = cap
-        {
-            let rows: Vec<(String, Option<String>)> = st
-                .store
-                .with(|c| {
-                    let mut stmt = c.prepare(
-                        "SELECT state, stalled_since FROM grabs WHERE active = 1 AND state IN ('downloading', 'unconfirmed')",
-                    )?;
-                    let rows = stmt
-                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok(rows)
-                })
-                .await?;
-            if !slot_free(&rows, cap, now) {
+        let (g, add) = {
+            let _guard = st.worker.grabs.lock().await;
+            // Re-read under the lock: a user action may have changed it.
+            let id = g.id.clone();
+            let Some(g) = st.store.with(move |c| get(c, &id)).await? else {
+                continue;
+            };
+            if !matches!(g.state.as_str(), "queued" | "unconfirmed") {
                 continue;
             }
+            if g.state == "queued"
+                && let Some(cap) = cap
+            {
+                let rows: Vec<(String, Option<String>)> = st
+                    .store
+                    .with(|c| {
+                        let mut stmt = c.prepare(
+                            "SELECT state, stalled_since FROM grabs WHERE active = 1 AND state IN ('downloading', 'unconfirmed')",
+                        )?;
+                        let rows = stmt
+                            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(rows)
+                    })
+                    .await?;
+                if !slot_free(&rows, cap, now) {
+                    continue;
+                }
+            }
+            match prepare_submit(st, &qb, &g, now).await? {
+                Submit::Done(done) => {
+                    confirmed += usize::from(done);
+                    continue;
+                }
+                Submit::Add(add) => (g, add),
+            }
+        };
+        // The add can wait minutes (a magnet's metadata), so the grab lock is not held for it:
+        // pausing, cancelling and the other actions go on meanwhile. The grab is leased to this
+        // submission, and its outcome is applied only if the grab is still leased afterwards.
+        let answer = qb.add(&add.req).await;
+        // 3. Verify by hash whatever the answer was.
+        let verified = lookup(&qb, &g.info_hash).await;
+        let found = verified.clone().flatten();
+        let _guard = st.worker.grabs.lock().await;
+        if !still_submitting(st, &g.id).await? {
+            // Only an add the client turned down is known to have left nothing behind: one it
+            // took, or whose outcome is unknown, may still show up later.
+            let nothing_added = match &answer {
+                Ok(false) => true,
+                Ok(true) => false,
+                Err(e) => {
+                    let text = e.describe();
+                    text.contains("invalid") || crate::upstream::describes_missing_metadata(&text)
+                }
+            };
+            if !taken_by_another(st, &g).await?
+                && !abandon_add(&qb, &g, verified, add.post.as_deref(), nothing_added).await
+            {
+                // Checked and removed again on a later pass (see `retry_late_adds`); a torrent
+                // still not there counts as never added once the grace period is over.
+                // The grace period starts now, not when this pass began (a slow pass, a slow add).
+                let start = now.max(OffsetDateTime::now_utc());
+                let (id, until) = (g.id.clone(), ts(start + LATE_ADD_GRACE));
+                st.store
+                    .with(move |c| {
+                        c.execute(
+                            "UPDATE grabs SET lease_owner = ?2, lease_until = ?3 WHERE id = ?1",
+                            params![id, LATE_ADD, until],
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+            }
+            continue;
         }
-        if submit_one(st, &qb, &g, now).await? {
+        if finish_submit(st, &qb, &g, add, answer, found, now).await? {
             confirmed += 1;
         }
     }
     Ok(confirmed)
 }
 
-async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -> Result<bool> {
+/// What a submission does next: nothing more (confirmed or not), or an add to send.
+enum Submit {
+    Done(bool),
+    Add(Box<PendingAdd>),
+}
+
+struct PendingAdd {
+    req: AddRequest,
+    policy: ClientPolicy,
+    post: Option<String>,
+}
+
+/// Whether the grab is still `unconfirmed` and leased to this process's submission (a cancel
+/// or other change while the add was in flight clears the lease).
+async fn still_submitting(st: &AppState, id: &str) -> Result<bool> {
+    let (id, me) = (id.to_string(), st.worker.instance.clone());
+    st.store
+        .with(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM grabs WHERE id = ?1 AND state = 'unconfirmed' AND lease_owner = ?2)",
+                params![id, me],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+}
+
+/// Marks a grab whose add finished after it was cancelled (or otherwise taken off it) while
+/// the torrent the add may have left in the client is not yet known to be gone.
+const LATE_ADD: &str = "late_add";
+
+/// How long an add the client took (or may have taken) can stay out of sight before its
+/// absence counts as nothing having been added (a magnet's metadata can take minutes).
+const LATE_ADD_GRACE: Duration = Duration::from_secs(30 * 60);
+
+/// Whether another active download of the same torrent owns it now (it is left to that one).
+async fn taken_by_another(st: &AppState, g: &Grab) -> Result<bool> {
+    let (hash, gid) = (g.info_hash.clone(), g.id.clone());
+    st.store
+        .with(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM grabs WHERE info_hash = ?1 AND active = 1 AND id != ?2)",
+                params![hash, gid],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+}
+
+/// The client's torrent with this hash: `None` when the client did not answer.
+async fn lookup(qb: &Client, hash: &str) -> Option<Option<TorrentInfo>> {
+    let list = qb.info(&[hash.to_string()]).await.ok()?;
+    Some(list.into_iter().find(|t| t.hash.eq_ignore_ascii_case(hash)))
+}
+
+/// An add that finished after its grab was cancelled (or otherwise taken off it): a torrent
+/// it left in the client is removed again (its data is kept: nothing about it was checked for
+/// removal), and nothing about it is recorded on the grab. Returns whether that is settled
+/// (the torrent is gone or not ours); otherwise it is tried again on a later pass. A torrent
+/// not there settles it only when `absent_settles` (the add left nothing, or the grace period
+/// for one to show up is over).
+async fn abandon_add(
+    qb: &Client,
+    g: &Grab,
+    verified: Option<Option<TorrentInfo>>,
+    post: Option<&str>,
+    absent_settles: bool,
+) -> bool {
+    let t = match verified {
+        None => {
+            tracing::warn!(grab = %g.id, "the download changed while it was being added; {} did not answer, so the added torrent is checked again later", qb.label());
+            return false;
+        }
+        Some(None) if !absent_settles => {
+            tracing::info!(grab = %g.id, "the download changed while it was being added; the added torrent is not in {} yet, so it is checked again later", qb.label());
+            return false;
+        }
+        Some(found) => match found.filter(|t| ours(t, g, post)) {
+            Some(t) => t,
+            None => {
+                tracing::info!(grab = %g.id, "the download changed while it was being added; nothing was left to remove");
+                return true;
+            }
+        },
+    };
+    match qb.delete(&t.hash, false).await {
+        Ok(()) => {
+            tracing::info!(grab = %g.id, "the download changed while it was being added; the added torrent was removed again");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(grab = %g.id, "the download changed while it was being added; removing the added torrent failed ({} {}); tried again later", qb.label(), e.describe());
+            false
+        }
+    }
+}
+
+/// Retries removing the torrents of adds that finished after their grab was cancelled.
+async fn retry_late_adds(st: &AppState, qb: &Client, now: OffsetDateTime) -> Result<()> {
+    let late = st
+        .store
+        .with(|c| select(c, "lease_owner = ?1", &[&LATE_ADD]))
+        .await?;
+    let now_s = ts(now);
+    for g in late {
+        let _guard = st.worker.grabs.lock().await;
+        let (gid, now_s) = (g.id.clone(), now_s.clone());
+        let grace_over: bool = st
+            .store
+            .with(move |c| {
+                Ok(c.query_row(
+                    "SELECT lease_until IS NULL OR lease_until <= ?2 FROM grabs WHERE id = ?1",
+                    params![gid, now_s],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
+        // A download of the same torrent started since owns it now: it is left to that one.
+        if taken_by_another(st, &g).await?
+            || abandon_add(
+                qb,
+                &g,
+                lookup(qb, &g.info_hash).await,
+                post_category(st, &g).as_deref(),
+                grace_over,
+            )
+            .await
+        {
+            update(
+                st,
+                &g.id,
+                "UPDATE grabs SET lease_owner = NULL, lease_until = NULL WHERE id = ?1 AND lease_owner = ?2",
+                vec![text(LATE_ADD)],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Reconciles by hash and, when an add is needed, marks the grab `unconfirmed` and leased to
+/// this submission (under the grab lock).
+async fn prepare_submit(
+    st: &AppState,
+    qb: &Client,
+    g: &Grab,
+    now: OffsetDateTime,
+) -> Result<Submit> {
     let name = client_name(st);
     let loaded = st.current();
     let settings = match loaded.as_deref() {
         Some(l) => &l.settings,
-        None => return Ok(false),
+        None => return Ok(Submit::Done(false)),
     };
     let media = policy_kind(g.media_id);
     let post = client_policy(st, settings, media)
@@ -1917,20 +2113,20 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
         Err(e) => {
             let next = ts(now + backoff(g.attempts));
             update(st, &g.id, "UPDATE grabs SET last_error = ?2, next_attempt_at = ?3, updated_at = ?4 WHERE id = ?1", vec![text(client_text(g, qb.label(), &e)), text(next), text(ts(now))]).await?;
-            return Ok(false);
+            return Ok(Submit::Done(false));
         }
     };
     if let Some(t) = present {
         if ours(&t, g, post.as_deref()) {
             if !settle_pack(st, qb, g, now).await? {
-                return Ok(false);
+                return Ok(Submit::Done(false));
             }
             confirm(st, g, &t, now).await?;
-            return Ok(true);
+            return Ok(Submit::Done(true));
         }
         // Same hash, not ours: never touch or adopt it.
         fail(st, g, "foreign_torrent", &format!("the torrent already exists in {name} under another category or without the unified-media tag; it is left untouched"), false, now).await?;
-        return Ok(false);
+        return Ok(Submit::Done(false));
     }
     if g.attempts >= MAX_SUBMIT_ATTEMPTS {
         // A magnet whose metadata never arrived has no one sharing it: that is the release's
@@ -1958,14 +2154,14 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
             now,
         )
         .await?;
-        return Ok(false);
+        return Ok(Submit::Done(false));
     }
-    // 2. Durable "in flight" marker before the add call.
+    // 2. Durable "in flight" marker before the add call, leased to this submission.
     update(
         st,
         &g.id,
-        "UPDATE grabs SET state = 'unconfirmed', attempts = attempts + 1, next_attempt_at = ?2, updated_at = ?3 WHERE id = ?1",
-        vec![text(ts(now + backoff(g.attempts))), text(ts(now))],
+        "UPDATE grabs SET state = 'unconfirmed', attempts = attempts + 1, next_attempt_at = ?2, updated_at = ?3, lease_owner = ?4, lease_until = ?2 WHERE id = ?1",
+        vec![text(ts(now + backoff(g.attempts))), text(ts(now)), text(st.worker.instance.clone())],
     )
     .await?;
     let policy = match client_policy(st, settings, media) {
@@ -1974,11 +2170,11 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
             update(
                 st,
                 &g.id,
-                "UPDATE grabs SET last_error = ?2 WHERE id = ?1",
+                "UPDATE grabs SET last_error = ?2, lease_owner = NULL, lease_until = NULL WHERE id = ?1",
                 vec![text(e)],
             )
             .await?;
-            return Ok(false);
+            return Ok(Submit::Done(false));
         }
     };
     let id = g.id.clone();
@@ -1996,16 +2192,28 @@ async fn submit_one(st: &AppState, qb: &Client, g: &Grab, now: OffsetDateTime) -
         content_layout: policy.content_layout,
         select: pack_selection(st, g),
     };
-    let answer = qb.add(&req).await;
-    // 3. Verify by hash whatever the answer was.
-    let found = qb
-        .info(std::slice::from_ref(&g.info_hash))
-        .await
-        .ok()
-        .and_then(|l| {
-            l.into_iter()
-                .find(|t| t.hash.eq_ignore_ascii_case(&g.info_hash))
-        });
+    Ok(Submit::Add(Box::new(PendingAdd { req, policy, post })))
+}
+
+/// Applies an add's outcome (under the grab lock, the grab still leased to the submission).
+async fn finish_submit(
+    st: &AppState,
+    qb: &Client,
+    g: &Grab,
+    add: Box<PendingAdd>,
+    answer: Result<bool, UpstreamError>,
+    found: Option<TorrentInfo>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let name = client_name(st);
+    let PendingAdd { policy, post, .. } = *add;
+    update(
+        st,
+        &g.id,
+        "UPDATE grabs SET lease_owner = NULL, lease_until = NULL WHERE id = ?1",
+        vec![],
+    )
+    .await?;
     match (answer, found) {
         (_, Some(t)) if ours(&t, g, post.as_deref()) => {
             if !settle_pack(st, qb, g, now).await? {
@@ -3201,6 +3409,9 @@ pub struct CleanupReport {
 
 /// Evaluates every cleanup-tracked download (imported or failed with removal pending, and
 /// journaled removals).
+/// How many cleanup-tracked downloads one pass looks at.
+const CLEANUP_BATCH: usize = 100;
+
 pub async fn cleanup(st: &AppState, now: OffsetDateTime) -> Result<CleanupReport> {
     let mut report = CleanupReport::default();
     let (Some(qb), Some((save_root, local_root))) = (st.client.clone(), st.cfg.client_paths())
@@ -3209,16 +3420,33 @@ pub async fn cleanup(st: &AppState, now: OffsetDateTime) -> Result<CleanupReport
     };
     let (save_root, local_root) = (save_root.to_string(), local_root.to_path_buf());
     let cname = client_name(st);
+    // A window of at most CLEANUP_BATCH downloads per pass that moves on each pass (by id,
+    // from where the last one stopped, wrapping round), so downloads that keep seeding for a
+    // long time never hold back the ones after them.
+    let after = st.worker.cleanup_cursor();
     let grabs = st
         .store
-        .with(|c| {
-            select(
+        .with(move |c| {
+            let cond = "cleanup IN ('seeding', 'removing')";
+            let mut rows = select(
                 c,
-                "cleanup IN ('seeding', 'removing') ORDER BY updated_at LIMIT 100",
-                &[],
-            )
+                &format!("{cond} AND id > ?1 ORDER BY id LIMIT {CLEANUP_BATCH}"),
+                &[&after],
+            )?;
+            if rows.len() < CLEANUP_BATCH {
+                let more = CLEANUP_BATCH - rows.len();
+                rows.extend(select(
+                    c,
+                    &format!("{cond} AND id <= ?1 ORDER BY id LIMIT {more}"),
+                    &[&after],
+                )?);
+            }
+            Ok(rows)
         })
         .await?;
+    if let Some(last) = grabs.last() {
+        st.worker.set_cleanup_cursor(&last.id);
+    }
     if grabs.is_empty() {
         return Ok(report);
     }
@@ -3253,9 +3481,16 @@ pub async fn cleanup(st: &AppState, now: OffsetDateTime) -> Result<CleanupReport
                         report.blocked += 1;
                         continue;
                     }
-                    // Still present: ask again (idempotent), finish on a later pass.
+                    // Still present: ask again (idempotent), finish on a later pass. The torrent
+                    // and its paths are checked again first, as before the first request: one
+                    // moved or changed since is left alone.
                     if since(g.cleanup_at.as_deref(), now).is_some_and(|d| d >= CLIENT_DELETE_GRACE)
                     {
+                        if let Err(e) = prepare_removal(st, &g, t).await {
+                            set_cleanup(st, &g, "blocked", &e, now).await?;
+                            report.blocked += 1;
+                            continue;
+                        }
                         let _ = qb.delete(&g.info_hash, true).await;
                     }
                     continue;
