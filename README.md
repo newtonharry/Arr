@@ -9,8 +9,9 @@ your TV. It replaces the usual Sonarr, Radarr, Prowlarr and qBittorrent stack. N
 Linux the setup page installs it for you, links it to your Plex account and creates your
 libraries; already run Plex? Arr fits into your existing libraries.
 
-You use Arr from its web app (search, tap Add, and follow it until it's in Plex), through an
-AI assistant over MCP ("add season 2 of Severance"), or through its JSON API.
+You use Arr from its web app, made for phones: search, tap Add, and follow it until it's in
+Plex. If you like, an AI assistant such as ChatGPT or Claude can do the same over MCP ("add
+season 2 of Severance"), and scripts can use its JSON API.
 
 ## Install
 
@@ -41,8 +42,8 @@ The script takes a few minutes. It:
 5. starts Arr as a service (systemd on Linux, launchd on macOS), and can start it when the
    computer starts rather than when you log in (see
    [Starting when the computer starts](#starting-when-the-computer-starts));
-6. offers to set up access from ChatGPT on your phone (see below; you can say no and do it
-   later).
+6. offers to set up remote access, so you can open the web app on your phone away from home
+   and, if you like, use Arr from ChatGPT (see below; you can say no and do it later).
 
 If you're connected to the machine over SSH, the script prints a link to open on the computer
 you're typing on. The link includes a secret code, so nobody else on your network can use
@@ -73,8 +74,8 @@ in `%LOCALAPPDATA%\Arr` (only your account can open it), and its log in
 `%LOCALAPPDATA%\Arr\arr.log`. Windows Firewall may ask whether `arr-background` may accept
 connections: allowing it lets other torrent peers reach you, which makes downloads faster.
 Options are environment variables, listed at the top of
-[`install.ps1`](install.ps1). At the end it offers to set up access from ChatGPT on your phone
-(see below).
+[`install.ps1`](install.ps1). At the end it offers to set up remote access for your phone and
+ChatGPT (see below).
 
 ### Starting when the computer starts
 
@@ -329,7 +330,7 @@ secrets as environment variables so they stay out of the process list.
 Arr serves a small web app, made for phones: search for a movie or show and tap **Add** (a
 show gets its latest season and every new episode), then follow it on the home screen until
 it's in Plex. It also lists what's coming up, ideas from shows with new episodes this week (with IMDb and Rotten Tomatoes scores from Plex and a quick verdict, or their TVmaze viewer rating when Plex has none),
-and your library.
+sport you follow, and your library.
 
 - **With remote access** (below): open your ngrok address, for example
   `https://quiet-river-1234.ngrok-free.app`, on any device and sign in with Google. Only the
@@ -368,12 +369,13 @@ release" if you want to pick one yourself. Sport is always picked by hand, and d
 files always shows you what would go and waits for your yes first. Changing settings,
 installing updates and signing in stay in the web app.
 
-### From ChatGPT on your phone or any device
+### Away from home: the web app on your phone, and ChatGPT
 
-ChatGPT reaches Arr from OpenAI's servers, so Arr needs a public HTTPS address and a sign-in.
-Arr uses a free [ngrok](https://ngrok.com) domain for the address (no router changes) and
-Google sign-in to let in only the accounts you list. Once set up, Arr works in ChatGPT on the
-web, on your phone and on every other device signed in to your ChatGPT account.
+To open the web app when you're out, Arr needs a public HTTPS address and a sign-in. The same
+address lets ChatGPT use Arr: ChatGPT reaches Arr from OpenAI's servers. Arr uses a free
+[ngrok](https://ngrok.com) domain for the address (no router changes) and Google sign-in to let
+in only the accounts you list. Once set up, the web app opens on any device, and Arr works in
+ChatGPT on the web, on your phone and on every other device signed in to your ChatGPT account.
 
 You need a free ngrok account and a Google OAuth client, about 15 minutes of clicking that
 [docs/REMOTE.md](docs/REMOTE.md) walks through. A first install offers it at the end; to add
@@ -392,7 +394,7 @@ $env:ARR_REMOTE = '1'; irm https://raw.githubusercontent.com/newtonharry/Arr/mai
 It asks for each value in turn, opening the ngrok and Google pages where you find them and
 saying what to copy; secrets you paste stay hidden. Then it installs ngrok, configures the sign-in, starts the tunnel in the background (a service on
 Linux, a launchd agent on macOS, a log-on task on Windows), checks the public address and
-prints the steps to add Arr to ChatGPT.
+prints the web app's address and the steps to add Arr to ChatGPT.
 
 ### From the API
 
@@ -463,8 +465,8 @@ right to.
 ## Documentation
 
 - [docs/STANDALONE.md](docs/STANDALONE.md): setting Arr up by hand, step by step.
-- [docs/REMOTE.md](docs/REMOTE.md): using Arr from ChatGPT on your phone (ngrok and Google
-  sign-in).
+- [docs/REMOTE.md](docs/REMOTE.md): using Arr away from home, in the web app on your phone and
+  from ChatGPT (ngrok and Google sign-in).
 - [docs/MCP.md](docs/MCP.md): the MCP tools, remote access and Google sign-in in detail.
 - [docs/API.md](docs/API.md): endpoints, errors and examples.
 - [docs/EMBEDDED-DOWNLOADER.md](docs/EMBEDDED-DOWNLOADER.md): the BitTorrent engine, seeding

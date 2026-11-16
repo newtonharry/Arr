@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Arr: your own movie and TV service, at home</title>
-<meta name="description" content="Arr turns a computer at home into your own movie and TV service. Ask your AI assistant for something to watch and it's found, downloaded and waiting in Plex on your TV. New to Plex? Arr installs it for you.">
+<meta name="description" content="Arr turns a computer at home into your own movie and TV service. Search in Arr's app on your phone, tap Add, and it's found, downloaded and waiting in Plex on your TV. New to Plex? Arr installs it for you.">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="mascot.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
@@ -23,8 +23,8 @@
 <main id="main">
 <section class="hero">
   <img class="mascot" src="mascot.svg" alt="Arr, a friendly round teal helper wearing a tiny captain's hat" width="200" height="200">
-  <h1>Your own movie and TV service.<br>Just ask.</h1>
-  <p class="lead">Arr turns a computer at home into a complete media setup. Tell your AI assistant what you'd like to watch, and it's found, downloaded, sorted and waiting in Plex on your TV. Never used Plex? Arr installs it for you.</p>
+  <h1>Your own movie and TV service.<br>Tap Add, then press play.</h1>
+  <p class="lead">Arr turns a computer at home into a complete media setup. Search in Arr's app on your phone, tap Add, and it's found, downloaded, sorted and waiting in Plex on your TV. Prefer to ask? ChatGPT or Claude can do it for you. Never used Plex? Arr installs it for you.</p>
 
   <div class="install" id="install">
     <div class="tabs" role="tablist" aria-label="Operating system">
@@ -53,18 +53,19 @@
 
 <section id="how" class="section">
   <h2>How it works</h2>
-  <svg class="flow" viewBox="0 0 600 120" role="img" aria-label="A chat bubble leads to a download arrow, which leads to a TV">
+  <svg class="flow" viewBox="0 0 600 120" role="img" aria-label="A phone leads to a download arrow, which leads to a TV">
     <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="5">
-      <path class="s-a" d="M60 28h80a14 14 0 0 1 14 14v28a14 14 0 0 1-14 14h-48l-18 16v-16h-14a14 14 0 0 1-14-14V42a14 14 0 0 1 14-14z"/>
+      <rect class="s-a" x="80" y="12" width="60" height="96" rx="12"/>
+      <path class="s-a" d="M110 44v32M94 60h32M102 96h16"/>
       <path class="s-b" d="M300 22v54m-24-22 24 24 24-24M276 98h48"/>
       <rect class="s-c" x="436" y="26" width="108" height="66" rx="12"/>
       <path class="s-c" d="M470 104h40M474 44l30 15-30 15z"/>
-      <path class="s-line" stroke-width="3" stroke-dasharray="2 9" d="M172 60h84M344 60h72"/>
+      <path class="s-line" stroke-width="3" stroke-dasharray="2 9" d="M156 60h100M344 60h72"/>
     </g>
   </svg>
   <ol class="steps">
-    <li><span class="num">1</span><h3>Ask</h3><p>Tell ChatGPT, or another AI assistant that speaks MCP, something like "add season 2 of Severance".</p></li>
-    <li><span class="num">2</span><h3>Arr gets it</h3><p>Arr finds it, downloads it with its built-in torrent downloader and checks the file is what you asked for.</p></li>
+    <li><span class="num">1</span><h3>Add</h3><p>Search for a movie, a show or a sports event in Arr's app and tap Add. Or ask an AI assistant: "add season 2 of Severance".</p></li>
+    <li><span class="num">2</span><h3>Arr gets it</h3><p>Arr finds it, downloads it with its built-in torrent downloader and checks the file is what you asked for. Follow it on the app's home screen.</p></li>
     <li><span class="num">3</span><h3>Watch</h3><p>It's named the way Plex likes, filed in your library, and Plex is told to scan. Press play.</p></li>
   </ol>
 </section>
@@ -77,7 +78,7 @@
     <article class="card"><span class="ico" aria-hidden="true">&#9998;</span><h3>Set up in your browser</h3><p>Paste one line, sign in with Plex, let Arr find your libraries and click Finish.</p></article>
     <article class="card"><span class="ico" aria-hidden="true">&#9728;</span><h3>Light on memory</h3><p>Around 40 MB in everyday use, compared with roughly 600 MB for the stack it replaces.</p></article>
     <article class="card"><span class="ico" aria-hidden="true">&#8635;</span><h3>Updates if you want</h3><p>Automatic updates are off unless you tick the box. If a new version won't start, Arr puts the old one back.</p></article>
-    <article class="card"><span class="ico" aria-hidden="true">&#9993;</span><h3>Ask from your phone</h3><p>Optional: give ChatGPT a private link to Arr, protected by your Google sign-in, and ask for things from anywhere.</p></article>
+    <article class="card"><span class="ico" aria-hidden="true">&#9993;</span><h3>An app for your phone</h3><p>Search and add, follow downloads into Plex, see what's coming up, get ideas with IMDb and Rotten Tomatoes scores, and follow sport. Optional: open it from anywhere behind your Google sign-in.</p></article>
   </div>
 </section>
 
@@ -86,7 +87,7 @@
   <ul class="ticks">
     <li>A computer to keep your movies and shows on: <strong>Windows</strong>, <strong>Linux</strong> or <strong>macOS</strong>.</li>
     <li>A free Plex account. No Plex yet? Arr installs it for you.</li>
-    <li>An AI assistant that can talk to Arr, such as ChatGPT or Claude.</li>
+    <li>A phone or computer with a web browser, for Arr's app. An AI assistant such as ChatGPT or Claude is optional.</li>
   </ul>
 </section>
 
@@ -99,7 +100,8 @@
   <details><summary>Does Arr send anything about me?</summary><p>Not unless you allow error reports during setup; the box starts unticked. If you do, a report is sent only when something fails. Before it leaves your computer, Arr removes folder paths, titles, names, addresses and anything that looks like a password or token. Nothing about your library is ever sent. Reports go to Arr's Sentry project in the EU. <a href="https://github.com/newtonharry/Arr/blob/main/docs/PRIVACY.md">Exactly what's sent, and how to turn it off</a>.</p></details>
   <details><summary>Where do movie details come from?</summary><p>From Plex's own metadata service, using the Plex sign-in Arr already has, so there is no extra account or key to set up. TV details come from TVmaze. If you like, you can add a free TMDB key as a backup. <a href="https://github.com/newtonharry/Arr/blob/main/docs/TMDB.md">The steps</a>.</p></details>
   <details><summary>What can't it do yet?</summary><p>No quality upgrades of files you already own, no renaming of your existing files, no usenet, and no anime or daily-show numbering. The README has the full list.</p></details>
-  <details><summary>Can I ask from my phone?</summary><p>Yes, from ChatGPT on your phone, tablet or any browser. Arr gets a private web address (a free ngrok account) and lets in only the Google accounts you choose. The installer sets it up on Windows, macOS and Linux: answer yes when a first install offers it, or later run the Windows line again after <code>$env:ARR_REMOTE = '1'</code>, or add <code>-s -- --remote</code> after <code>sh</code> on macOS and Linux. It takes about 15 minutes, and the installer tells you what to copy from ngrok and Google. <a href="https://github.com/newtonharry/Arr/blob/main/docs/REMOTE.md">The step-by-step guide</a>.</p></details>
+  <details><summary>Can I use it from my phone when I'm out?</summary><p>Yes. Arr's app is made for phones. To open it away from home, Arr gets a private web address (a free ngrok account) and lets in only the Google accounts you choose. The same address lets ChatGPT on your phone use Arr too. The installer sets it up on Windows, macOS and Linux: answer yes when a first install offers it, or later run the Windows line again after <code>$env:ARR_REMOTE = '1'</code>, or add <code>-s -- --remote</code> after <code>sh</code> on macOS and Linux. It takes about 15 minutes, and the installer tells you what to copy from ngrok and Google. <a href="https://github.com/newtonharry/Arr/blob/main/docs/REMOTE.md">The step-by-step guide</a>.</p></details>
+  <details><summary>Do I need an AI assistant?</summary><p>No. Everything is in Arr's app. If you use ChatGPT, Claude or another assistant that speaks MCP, it can do the same things for you: search, add, check on downloads, follow sport, and delete files (it always shows you what would go and asks first). <a href="https://github.com/newtonharry/Arr/blob/main/docs/MCP.md">What it can do</a>.</p></details>
   <details><summary>Something's not working. What do I do?</summary><p>Run the install command again. It checks and repairs Arr, updates it, and keeps your setup. If Plex has stopped accepting Arr's sign-in, it walks you through signing in again. <a href="https://github.com/newtonharry/Arr#somethings-wrong-or-you-want-to-change-a-setting">What a re-run does, and how to change a setting</a>.</p></details>
   <details><summary>How do I remove it?</summary><p>Paste <code>curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/uninstall.sh | sh</code> into a terminal. It asks whether to remove Arr, Plex or both, and whether to delete their settings too. Your movies and shows are never touched.</p></details>
   <details><summary>Which systems does it run on?</summary><p>Windows 10 and 11 (64-bit), macOS, and Linux on x86_64 or ARM64 (including Raspberry Pi OS).</p></details>
