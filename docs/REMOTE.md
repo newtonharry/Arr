@@ -1,7 +1,8 @@
-# Use Arr from ChatGPT on your phone or any device
+# Use Arr away from home: on your phone, and from ChatGPT
 
-ChatGPT talks to Arr from OpenAI's servers, so Arr needs an address on the public internet
-and a sign-in that keeps everyone else out. Arr uses:
+To open Arr's web app when you're out, Arr needs an address on the public internet and a
+sign-in that keeps everyone else out. ChatGPT needs the same, because it talks to Arr from
+OpenAI's servers. Arr uses:
 
 - **ngrok** for the public HTTPS address. The free plan gives you one permanent domain, such
   as `quiet-river-1234.ngrok-free.app`, and the tunnel runs next to Arr on your server. You
@@ -9,8 +10,9 @@ and a sign-in that keeps everyone else out. Arr uses:
 - **Google sign-in** to decide who gets in. Arr asks Google who you are and lets in only the
   Google accounts you list.
 
-You set this up once, about 15 minutes. After that, Arr works in ChatGPT on the web, on your
-phone and on every other device signed in to your ChatGPT account.
+You set this up once, about 15 minutes. After that, the web app opens at your ngrok address
+on any device (sign in with Google), and Arr works in ChatGPT on the web, on your phone and on
+every other device signed in to your ChatGPT account.
 
 ## 1. Get an ngrok domain and authtoken
 
