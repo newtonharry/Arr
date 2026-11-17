@@ -249,7 +249,7 @@ async fn plan_downloads(st: &AppState, sc: &Scope) -> Result<Vec<DownloadPlan>, 
         } else if adding {
             (
                 false,
-                Some("It is being added to Plex right now. Try again in a minute."),
+                Some("Arr is adding it to Plex. Try again in a minute."),
                 true,
             )
         } else {
@@ -362,7 +362,7 @@ async fn delete_unit(st: Arc<AppState>, body: DeleteBody) -> ApiResult {
         if plans.iter().any(|p| p.finishing) {
             return Err(ApiError::conflict(
                 ErrorCode::ActiveDownloads,
-                "A download is nearly done and is being added to Plex. Try again in a minute.",
+                "Arr is adding a download to Plex. Try again in a minute.",
             ));
         }
         if !body.keep_wanted
@@ -390,7 +390,7 @@ async fn delete_unit(st: Arc<AppState>, body: DeleteBody) -> ApiResult {
                 Err(downloads::ActionError::Conflict("finishing", _)) => {
                     return Err(ApiError::conflict(
                         ErrorCode::ActiveDownloads,
-                        "A download is nearly done and is being added to Plex. Try again in a minute.",
+                        "Arr is adding a download to Plex. Try again in a minute.",
                     ));
                 }
                 Err(e) if p.grab.active => {
