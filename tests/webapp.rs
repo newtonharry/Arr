@@ -2229,6 +2229,40 @@ async fn notification_routes_need_a_sign_in_and_check_their_input() {
 }
 
 #[tokio::test]
+async fn signing_out_stops_that_devices_notifications_only() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let (a, b) = (site.sign_in(&e).await, site.sign_in(&e).await);
+    for (c, ep) in [
+        (&a, "https://fcm.googleapis.com/fcm/send/a"),
+        (&b, "https://fcm.googleapis.com/fcm/send/b"),
+    ] {
+        let (s, _) = site
+            .json(
+                site.app(Method::POST, "/app/api/v1/notifications/subscribe", Some(c))
+                    .json(&subscription(ep)),
+            )
+            .await;
+        assert_eq!(s, 204);
+    }
+    let r = site
+        .app(Method::POST, "/app/api/signout", Some(&a))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let left: Vec<String> = rusqlite::Connection::open(e.state.cfg.state_dir.join("web.sqlite"))
+        .unwrap()
+        .prepare("SELECT endpoint FROM push_subs")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(left, ["https://fcm.googleapis.com/fcm/send/b"]);
+}
+
+#[tokio::test]
 async fn the_service_worker_is_served_to_the_app_scope() {
     let e = exec().await;
     let site = serve(e.state.clone()).await;

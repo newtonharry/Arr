@@ -648,6 +648,7 @@ async fn signout(State(w): Wa, headers: HeaderMap) -> Response {
     let Some((id, _)) = w.session(&headers).await else {
         return w.unauthorized();
     };
+    let _ = w.push.forget_session(sha256_hex(&id)).await;
     w.sessions.off(move |s| s.delete(&id)).await;
     let mut r = StatusCode::NO_CONTENT.into_response();
     let secure = if w.secure(&headers) { "; Secure" } else { "" };

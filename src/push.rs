@@ -526,6 +526,15 @@ impl Push {
         .await
     }
 
+    /// Forgets the devices a session (by its hash) subscribed, when it signs out.
+    pub async fn forget_session(&self, session: String) -> Result<()> {
+        self.with(move |db| {
+            db.execute("DELETE FROM push_subs WHERE session = ?1", [session])?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn subs(&self) -> Vec<Sub> {
         self.with(|db| {
             let Ok(mut st) = db.prepare("SELECT endpoint, p256dh, auth FROM push_subs") else {

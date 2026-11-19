@@ -356,10 +356,11 @@ async function undoToast(e) {
 const inToast = (n) => !!(n && n.closest && n.closest('#toast'));
 // Only a real pointer waits the note out: after a tap a phone leaves "hover" where the finger was, which would keep the note up for good.
 const canHover = () => matchMedia('(hover:hover)').matches;
-document.addEventListener('mouseover', (e) => { held.hover = canHover() && inToast(e.target); toastTimer(); });
-document.addEventListener('mouseout', (e) => { held.hover = canHover() && inToast(e.relatedTarget); toastTimer(); });
-document.addEventListener('focusin', (e) => { held.focus = inToast(e.target); toastTimer(); });
-document.addEventListener('focusout', (e) => { held.focus = inToast(e.relatedTarget); toastTimer(); });
+// The countdown starts again only when that changes, not on every move elsewhere on the page.
+document.addEventListener('mouseover', (e) => { const was = held.hover || held.focus; held.hover = canHover() && inToast(e.target); if ((held.hover || held.focus) !== was) toastTimer(); });
+document.addEventListener('mouseout', (e) => { const was = held.hover || held.focus; held.hover = canHover() && inToast(e.relatedTarget); if ((held.hover || held.focus) !== was) toastTimer(); });
+document.addEventListener('focusin', (e) => { const was = held.hover || held.focus; held.focus = inToast(e.target); if ((held.hover || held.focus) !== was) toastTimer(); });
+document.addEventListener('focusout', (e) => { const was = held.hover || held.focus; held.focus = inToast(e.relatedTarget); if ((held.hover || held.focus) !== was) toastTimer(); });
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape' || !TOAST || !inToast(e.target)) return;
   e.stopImmediatePropagation();
@@ -920,7 +921,7 @@ function eventCopyRow(c, e) {
       h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'eget-no:' + c.id, onClick: () => { EG.delete(c.id); bump(); } }, 'Not this one'));
   } else {
     action = h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'eget:' + c.id, 'data-s': busy ? 'busy' : null, 'aria-disabled': busy ? 'true' : 'false', 'aria-label': `Get this copy: ${label}`,
-      onClick: () => { if (c.caution) { EG.set(c.id, { st: 'ask' }); bump(); } else getEventCopy(e, c, false); } }, busy ? 'Getting…' : 'Get this one');
+      onClick: () => { if (busy) return; if (c.caution) { EG.set(c.id, { st: 'ask' }); bump(); } else getEventCopy(e, c, false); } }, busy ? 'Getting…' : 'Get this one');
   }
   return h('li', { key: c.id, class: 'item copy' },
     h('div', { class: 'what' },
@@ -1905,6 +1906,13 @@ async function restoreEntry(id) {
   const n = r.data.restored, left = (r.data.skipped || []).length;
   return { ok: true, text: left ? `${plural(n, 'file is', 'files are')} back. ${plural(left, 'file', 'files')} could not go back because something is already there.` : `${plural(n, 'file is', 'files are')} back.` };
 }
+// The sheet closed while its request ran, so closing it did not draw the screen under it again.
+function redrawIfLeft(tk) {
+  if (tk === P.token || P.shown || S.out || !S.stale) return;
+  S.stale = false;
+  const { path, q } = parseHash();
+  renderPath(path, q, location.hash || '#/');
+}
 async function doDelete() {
   const dl = P.del;
   if (!dl || dl.busy || dl.st !== 'ready' || !dl.pv.files.length || (dl.pv.blocked && !dl.keep)) return;
@@ -1921,18 +1929,21 @@ async function doDelete() {
     else if (code === 'delete_refused') res = { text: "Arr won't delete these: " + r.data.error.message, err: true };
     else res = { text: "Couldn't delete the files. Try again in a moment.", err: true };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  // The lists and the Undo are needed even if the sheet was left while this ran.
+  if (res.ok) {
+    forget(d.media_id); bust();
+    S.stale = true; loadFeed(); redrawIfLeft(tk);
+    const undo = async () => {
+      const m = await restoreEntry(res.id);
+      if (tk === P.token && P.shown) loadTitle(true);
+      return m;
+    };
+    showToast({ before: 'Deleted ', title: dl.noun, after: '. Undo within 7 days.' + (res.kept ? ' A download is still being shared, so some space stays used.' : '') }, undo);
+  }
   if (tk !== P.token) return;
   P.del = null;
   if (!res.ok) { P.msg.set('delete', res); say(res.text); bump(); after(() => $(`#panel [data-fk="${dl.fk}"]`)?.focus({ preventScroll: true })); return; }
-  forget(d.media_id); bust();
-  S.stale = true; loadFeed();
   say(`${dl.noun} deleted. It stays in the bin for 7 days.`);
-  const undo = async () => {
-    const m = await restoreEntry(res.id);
-    if (tk === P.token && P.shown) loadTitle(true);
-    return m;
-  };
-  showToast({ before: 'Deleted ', title: dl.noun, after: '. Undo within 7 days.' + (res.kept ? ' A download is still being shared, so some space stays used.' : '') }, undo);
   // A whole show leaves Arr unless a new copy is wanted; the page is then closed like Remove does.
   if (whole && P.kind === 'show' && !dl.keep) dismiss(); else await loadTitle(true);
 }
@@ -1982,12 +1993,11 @@ async function doRemove() {
     else if (code === 'not_managed') res = { text: 'Arr is not tracking this one.', err: true };
     else res = { text: "Couldn't remove it. Try again in a moment.", err: true };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
+  if (res.ok) { forget(d.media_id); bust(); S.stale = true; loadFeed(); redrawIfLeft(tk); } // the screen under the sheet is drawn again, without this title
   if (tk !== P.token) return;
   P.removing = false;
   if (!res.ok) { P.msg.set('remove', res); say(res.text); closeConfirm(); return; }
   P.confirm = false;
-  forget(d.media_id); bust();
-  S.stale = true; // the screen under the sheet is drawn again, without this title
   dismiss();
   say(`${d.title} removed. Anything already in Plex stays there.`);
 }
@@ -2273,6 +2283,7 @@ function movieBody() {
 
 // ---------- sign in ----------
 function showSignin(data) {
+  closeSheet(); // or it would cover the sign-in, and route() no longer runs to close it
   S.out = true; authGen++; token++; dropFeed();
   clearTimeout(pollT); clearTimeout(retryT);
   setBanner(''); S.setup = false;
@@ -2443,7 +2454,8 @@ async function turnOn() {
   const old = await reg.pushManager.getSubscription();
   if (old) await old.unsubscribe();
   const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(k.data.key) });
-  const r = await api('/v1/notifications/subscribe', { method: 'POST', body: sub.toJSON() });
+  let r;
+  try { r = await api('/v1/notifications/subscribe', { method: 'POST', body: sub.toJSON() }); } catch (e) { await sub.unsubscribe(); throw e; }
   if (!r.ok) { await sub.unsubscribe(); throw new Error('subscribe'); }
   return 'on';
 }
@@ -2784,9 +2796,15 @@ function Footer() {
       h('span', { id: 'tmdb-credit', hidden: !S.tmdb }, ' and ', h('img', { src: '/app/tmdb.svg', alt: 'TMDB', width: 85, height: 11 }), ' (Arr uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB)'),
       ', show details and posters from ', h('a', { href: 'https://www.tvmaze.com', target: '_blank', rel: 'noopener noreferrer' }, 'TVmaze'), '.'));
 }
+let signingOut = false;
 async function signOut() {
+  if (signingOut) return; // a second tap would reload on its 401 before the first finished
+  signingOut = true;
   authGen++; dropFeed();
-  try { await api('/signout', { method: 'POST' }); } catch { /* signed out anyway */ }
+  let out = false;
+  try { out = (await api('/signout', { method: 'POST' })).ok; } catch { /* signed out anyway */ }
+  // Arr forgot this device's notifications with the session, so the browser does too.
+  if (out) try { const reg = await navigator.serviceWorker.getRegistration(SW_SCOPE); await (await reg.pushManager.getSubscription()).unsubscribe(); } catch { /* none to drop */ }
   location.hash = ''; location.reload();
 }
 
@@ -2819,7 +2837,8 @@ function App() {
   if (tabAt >= 0) M.tab = tabAt;
   const inert = P.shown; // everything behind the sheet: out of reach of the keyboard and assistive tech
   return h(Fragment, null,
-    h('a', { class: 'skip', href: '#view', inert }, 'Skip to content'),
+    // The hash is the router's, so the link moves focus itself.
+    h('a', { class: 'skip', href: '#view', inert, onClick: (e) => { e.preventDefault(); $('#view').focus(); } }, 'Skip to content'),
     h('header', { class: 'top', id: 'top', inert },
       h('a', { class: 'brand', href: '#/', 'aria-label': 'Arr, home' }, h('img', { src: '/app/mascot.svg', alt: '', width: 34, height: 34 }), h('span', null, 'Arr')),
       h('nav', { id: 'tabs', 'aria-label': 'Main', hidden: S.out, style: { '--i': M.tab } },

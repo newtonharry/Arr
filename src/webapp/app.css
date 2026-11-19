@@ -204,7 +204,7 @@ html.sheet-open{overflow:hidden}
 .sea .msg,.ep .msg{margin:0 12px 10px}
 .ep .msg{margin:4px 0 0}
 .eps{list-style:none;padding:0;border-top:2px solid var(--line)}
-.ep{display:flex;align-items:center;gap:10px;padding:8px 12px}
+.ep{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:8px 12px}
 .ep+.ep{border-top:2px solid var(--line)}
 .ep .num{flex:none;width:26px;text-align:center;font-weight:800;color:var(--muted)}
 .ep .what{flex:1;min-width:0}
@@ -258,6 +258,7 @@ html.sheet-open{overflow:hidden}
 /* download options on a show or movie page */
 .opts{background:var(--card);border:2px solid var(--line);border-radius:18px;overflow:hidden}
 .opts-head{display:flex;align-items:center;gap:12px;width:100%;min-height:64px;padding:12px;background:none;border:0;text-align:left;cursor:pointer}
+.opts-head:focus-visible{outline-offset:-3px;border-radius:16px} /* inset: .opts clips anything outside */
 .opts-head .what{flex:1;min-width:0}
 .opts-head .ic{color:var(--muted);transition:transform .2s}
 .opts-head[aria-expanded=true] .ic{transform:rotate(180deg)}
@@ -334,7 +335,8 @@ h2 .link .ic{width:16px;height:16px;stroke-width:3}
 .remove{padding-top:4px}
 .link.danger{color:var(--coral-ink)}
 .btn.danger{background:var(--coral-ink);border-color:var(--coral-ink);color:var(--on-teal)}
-.confirm-back{position:absolute;inset:0;z-index:5;display:grid;place-items:center;padding:20px;background:var(--scrim)}
+.confirm-back{position:absolute;inset:0;z-index:5;display:grid;padding:20px;overflow-y:auto;overscroll-behavior:contain;background:var(--scrim)}
+.confirm-back>.confirm{margin:auto} /* centred like place-items, but a card taller than the screen scrolls from its top */
 .confirm{width:min(420px,100%);padding:20px;border:2px solid var(--line);border-radius:16px;background:var(--card);display:grid;gap:12px}
 .confirm h2{font-size:18px;text-transform:none;letter-spacing:0;color:var(--ink)}
 .confirm em{font-style:normal;font-weight:800}
