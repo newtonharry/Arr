@@ -915,7 +915,7 @@ function eventCopyRow(c, e) {
   let action;
   if (g.st === 'done') action = h('p', { class: 'hint', role: 'status' }, ic('check'), g.text);
   else if (ask) {
-    action = h('div', { class: 'confirm', role: 'group', 'aria-label': 'Check before getting this copy' },
+    action = h('div', { class: 'ecp-ask', role: 'group', 'aria-label': 'Check before getting this copy' },
       h('p', { class: 'problem' }, ic('alert'), h('span', null, `${note || 'Some of its name couldn’t be checked.'} Get it anyway?`)),
       h('button', { type: 'button', class: 'btn coral', 'data-fk': 'eget-yes:' + c.id, 'aria-label': `Get it anyway: ${label}`, onClick: () => getEventCopy(e, c, true) }, 'Get it anyway'),
       h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'eget-no:' + c.id, onClick: () => { EG.delete(c.id); bump(); } }, 'Not this one'));

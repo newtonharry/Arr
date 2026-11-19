@@ -93,6 +93,8 @@ struct Wizard {
 #[derive(Default)]
 struct Inner {
     pin: Option<(u64, String)>,
+    /// Where the user signs in for `pin`, for the page's "Open it again" after a reload.
+    signin_url: Option<String>,
     account: Option<Secret>,
     plex: Option<Connected>,
     /// Set when the last look found no Plex on this computer that Arr can use.
@@ -427,7 +429,32 @@ async fn state(State(wiz): St) -> Json<Value> {
 
 fn snapshot(wiz: &Wizard) -> Value {
     let inner = wiz.inner.lock().unwrap();
-    let plex = inner.plex.as_ref().map(|p| {
+    let connected = inner.plex.clone();
+    let waiting = inner.pin.is_some() && inner.account.is_none();
+    let mut v = json!({
+        "signed_in": inner.account.is_some(),
+        "waiting_for_signin": waiting,
+        "signin_url": if waiting { inner.signin_url.clone() } else { None },
+        "missing": inner.missing,
+        "install": inner.install,
+        "can_install": install_command(wiz).is_some(),
+        "install_command": manual_install_command(wiz),
+        "media_movies": crate::plexinstall::default_media().join("Movies"),
+        "media_tv": crate::plexinstall::default_media().join("TV Shows"),
+        "phase": inner.phase,
+        // Where to find the app once setup is done (the Done screen shows it).
+        "app": {
+            "url": format!("http://localhost:{}", wiz.opts.port),
+            "public_url": wiz.opts.public_url,
+        },
+        "reporting": {
+            "available": crate::report::available(),
+            "enabled": wiz.reporting.lock().unwrap().as_ref().is_some_and(|r| r.is_on()),
+        },
+    });
+    // Outside the lock: checking a folder on a sleeping drive can take a long time.
+    drop(inner);
+    let plex = connected.as_ref().map(|p| {
         let libs = |kind: &str| -> Vec<Value> {
             p.sections
                 .iter()
@@ -451,27 +478,8 @@ fn snapshot(wiz: &Wizard) -> Value {
             "tv": libs("show"),
         })
     });
-    json!({
-        "signed_in": inner.account.is_some(),
-        "waiting_for_signin": inner.pin.is_some() && inner.account.is_none(),
-        "plex": plex,
-        "missing": inner.missing,
-        "install": inner.install,
-        "can_install": install_command(wiz).is_some(),
-        "install_command": manual_install_command(wiz),
-        "media_movies": crate::plexinstall::default_media().join("Movies"),
-        "media_tv": crate::plexinstall::default_media().join("TV Shows"),
-        "phase": inner.phase,
-        // Where to find the app once setup is done (the Done screen shows it).
-        "app": {
-            "url": format!("http://localhost:{}", wiz.opts.port),
-            "public_url": wiz.opts.public_url,
-        },
-        "reporting": {
-            "available": crate::report::available(),
-            "enabled": wiz.reporting.lock().unwrap().as_ref().is_some_and(|r| r.is_on()),
-        },
-    })
+    v["plex"] = json!(plex);
+    v
 }
 
 /// Where this machine sees a folder Plex reports, if it can tell.
@@ -500,6 +508,7 @@ async fn signin(State(wiz): St) -> Response {
     {
         let mut inner = wiz.inner.lock().unwrap();
         inner.pin = Some((pin.id, pin.code));
+        inner.signin_url = Some(pin.url.clone());
         inner.account = None;
         inner.plex = None;
         inner.missing = None;

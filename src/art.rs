@@ -110,7 +110,7 @@ impl Art {
             }
         };
         let key = source.key();
-        if let Some(hit) = self.cached(&key) {
+        if let Some(hit) = self.cached(&key).await {
             return hit;
         }
         if permit.is_none() {
@@ -118,13 +118,13 @@ impl Art {
         }
         let _permit = permit;
         // Another request may have fetched it while this one waited.
-        if let Some(hit) = self.cached(&key) {
+        if let Some(hit) = self.cached(&key).await {
             return hit;
         }
         let url = match self.image_url(st, &source).await {
             Ok(Some(u)) => u,
             Ok(None) => {
-                self.remember(&key, None);
+                self.remember(&key, None).await;
                 return None;
             }
             Err(()) => return None,
@@ -140,33 +140,54 @@ impl Art {
         }
         let bytes = upstream::read_bytes(resp, MAX_POSTER_BYTES).await.ok()?;
         let kind = sniff(&bytes)?;
-        self.remember(&key, Some(&bytes));
+        let bytes = self.remember(&key, Some(bytes)).await?;
         Some((bytes, kind))
     }
 
+    /// [`Self::cached_in`], on a blocking thread.
+    async fn cached(&self, key: &str) -> Option<Option<Poster>> {
+        let (dir, key) = (self.dir.clone(), key.to_string());
+        tokio::task::spawn_blocking(move || Self::cached_in(&dir, &key))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// [`Self::remember_in`], on a blocking thread; gives the poster back.
+    async fn remember(&self, key: &str, poster: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let (dir, key) = (self.dir.clone(), key.to_string());
+        tokio::task::spawn_blocking(move || {
+            Self::remember_in(&dir, &key, poster.as_deref());
+            poster
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// `Some(None)` when a recent answer says there is no poster.
-    fn cached(&self, key: &str) -> Option<Option<Poster>> {
-        let file = self.dir.join(key);
+    fn cached_in(dir: &Path, key: &str) -> Option<Option<Poster>> {
+        let file = dir.join(key);
         if fresh(&file, POSTER_TTL)
             && let Ok(bytes) = fsutil::read_bounded(&file, MAX_POSTER_BYTES as u64)
             && let Some(kind) = sniff(&bytes)
         {
             return Some(Some((bytes, kind)));
         }
-        fresh(&self.dir.join(format!("{key}.none")), NONE_TTL).then_some(None)
+        fresh(&dir.join(format!("{key}.none")), NONE_TTL).then_some(None)
     }
 
     /// Keeps a poster, or a marker that there is none; trims the folder when it grows.
-    fn remember(&self, key: &str, poster: Option<&[u8]>) {
-        let marker = self.dir.join(format!("{key}.none"));
+    fn remember_in(dir: &Path, key: &str, poster: Option<&[u8]>) {
+        let marker = dir.join(format!("{key}.none"));
         let _ = match poster {
             Some(bytes) => {
                 let _ = fs::remove_file(&marker);
-                fsutil::atomic_replace_private(&self.dir.join(key), bytes)
+                fsutil::atomic_replace_private(&dir.join(key), bytes)
             }
             None => fsutil::atomic_replace_private(&marker, b""),
         };
-        let mut files: Vec<_> = fs::read_dir(&self.dir)
+        let mut files: Vec<_> = fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()

@@ -5,6 +5,7 @@ let state = null;
 // The library lists the form was last filled from.
 let filled = null;
 let linking = false;
+let signingIn = false;
 
 async function call(method, path, body) {
   const opts = { method, headers: { "x-arr-setup": "1" } };
@@ -15,7 +16,11 @@ async function call(method, path, body) {
   const resp = await fetch(path, opts);
   let data = null;
   try { data = await resp.json(); } catch (_) { /* not JSON */ }
-  if (!resp.ok) throw new Error((data && data.error) || `Something went wrong (${resp.status})`);
+  if (!resp.ok) {
+    const err = new Error((data && data.error) || `Something went wrong (${resp.status})`);
+    err.status = resp.status;
+    throw err;
+  }
   return data;
 }
 
@@ -23,7 +28,10 @@ function showError(msg) {
   const el = $("error");
   el.textContent = msg || "";
   el.hidden = !msg;
-  if (msg) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  if (msg) {
+    const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "center" });
+  }
 }
 
 function render(s) {
@@ -48,6 +56,7 @@ function render(s) {
   $("signin").hidden = s.signed_in;
   $("signed-in").hidden = !s.signed_in;
   $("signin-wait").hidden = !s.waiting_for_signin;
+  if (s.signin_url) $("signin-link").href = s.signin_url;
 
   $("step-server").hidden = !s.signed_in;
   renderServer(s);
@@ -168,6 +177,7 @@ function libraryChanged(kind) {
   const hint = $(`${kind}-hint`);
   folder.closest(".folder").hidden = !lib;
   hint.textContent = "";
+  hint.classList.remove("bad", "was-bad");
   if (lib) {
     folder.value = lib.local_path || "";
     hint.textContent = lib.local_path
@@ -218,15 +228,25 @@ async function act(button, fn) {
 }
 
 let pollId = 0;
+const LOST = "This page lost touch with Arr's setup. Check the terminal that's running it, then open the link it printed again.";
 
 // Calls step every `ms` until it returns false. Each call waits for the one before, and
-// starting another poll ends this one.
+// starting another poll ends this one. It gives up on a 401 or after a run of failures.
 function poll(step, ms) {
   const id = ++pollId;
+  let failures = 0;
   const tick = async () => {
     if (id !== pollId) return;
     let more = true;
-    try { more = await step(); } catch (_) { /* try again next time */ }
+    try {
+      more = await step();
+      failures = 0;
+    } catch (e) {
+      if (e.status === 401 || ++failures >= 5) {
+        if (id === pollId) showError(LOST);
+        return;
+      }
+    }
     if (more !== false && id === pollId) setTimeout(tick, ms);
   };
   setTimeout(tick, ms);
@@ -241,6 +261,7 @@ function startSigninPolling() {
       s = await call("POST", "/api/plex/check");
       showError("");
     } catch (e) {
+      if (e.status === 401) throw e;
       showError(e.message);
       s = await call("GET", "/api/state");
     }
@@ -259,6 +280,9 @@ function startProgressPolling() {
 
 // A new sign-in starts over, so it can be with a different account.
 async function startSignin() {
+  // A second click while this one waits would make a second sign-in and orphan the first tab.
+  if (signingIn) return;
+  signingIn = true;
   showError("");
   // Open the tab now, while the click still counts: browsers block pop-ups opened later.
   const tab = window.open("about:blank", "_blank");
@@ -273,6 +297,8 @@ async function startSignin() {
   } catch (e) {
     if (tab) tab.close();
     showError(e.message);
+  } finally {
+    signingIn = false;
   }
 }
 
@@ -385,16 +411,24 @@ async function prepareOpen() {
   const started = Date.now();
   const look = async () => {
     let up = false;
+    const stop = new AbortController();
+    const stall = setTimeout(() => stop.abort(), 5000);
     try {
-      const r = await fetch("/api/v1/health", { cache: "no-store" });
+      const r = await fetch("/api/v1/health", { cache: "no-store", signal: stop.signal });
       up = r.ok;
     } catch (_) { /* the setup page has gone and Arr isn't up yet */ }
+    clearTimeout(stall);
     if (up) {
       status.textContent = "Arr is running.";
       $("open-arr").disabled = false;
       return;
     }
-    if (Date.now() - started > 90000) status.textContent = "Arr is taking a while to start. The terminal says what it's doing.";
+    const waited = Date.now() - started;
+    if (waited > 300000) {
+      status.textContent = `Arr hasn't started after 5 minutes. The terminal says what went wrong; once it's fixed, open ${location.origin}.`;
+      return;
+    }
+    if (waited > 90000) status.textContent = "Arr is taking a while to start. The terminal says what it's doing.";
     setTimeout(look, 1000);
   };
   look();

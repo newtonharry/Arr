@@ -137,32 +137,32 @@ async fn pages_and_assets_carry_the_security_headers() {
         (
             "/app/icons/apple-touch-icon.png",
             "image/png",
-            "public, max-age=604800, immutable",
+            "public, max-age=604800",
         ),
         (
             "/app/icons/icon-192.png",
             "image/png",
-            "public, max-age=604800, immutable",
+            "public, max-age=604800",
         ),
         (
             "/app/icons/icon-512.png",
             "image/png",
-            "public, max-age=604800, immutable",
+            "public, max-age=604800",
         ),
         (
             "/app/icons/icon-maskable-512.png",
             "image/png",
-            "public, max-age=604800, immutable",
+            "public, max-age=604800",
         ),
         (
             "/app/fonts/nunito-latin.woff2",
             "font/woff2",
-            "public, max-age=604800, immutable",
+            "public, max-age=604800",
         ),
         (
             "/app/fonts/nunito-latin-ext.woff2",
             "font/woff2",
-            "public, max-age=604800, immutable",
+            "public, max-age=604800",
         ),
     ] {
         let r = site.plain(Method::GET, path).send().await.unwrap();
@@ -467,6 +467,53 @@ async fn a_link_signs_in_once_and_expires() {
         .json(site.app(Method::GET, "/app/api/v1/feed", Some(&cookie)))
         .await;
     assert_eq!(s, 401);
+}
+
+#[tokio::test]
+async fn a_stale_session_cookie_before_the_live_one_is_passed_over() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let live = site.sign_in(&e).await;
+    let both = format!("arr_session=stale; {live}");
+    let (s, v) = site
+        .json(site.app(Method::GET, "/app/api/me", Some(&both)))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    // Only the first few are looked up.
+    let many = format!("{}{live}", "arr_session=stale; ".repeat(4));
+    let (s, _) = site
+        .json(site.app(Method::GET, "/app/api/me", Some(&many)))
+        .await;
+    assert_eq!(s, 401);
+}
+
+#[tokio::test]
+async fn the_app_api_replies_say_nosniff() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    for (rb, status) in [
+        (site.plain(Method::GET, "/app/api/me"), 403),
+        (site.app(Method::GET, "/app/api/me", None), 401),
+        (site.app(Method::GET, "/app/api/me", Some(&cookie)), 200),
+        (
+            site.app(Method::GET, "/app/api/v1/feed", Some(&cookie)),
+            200,
+        ),
+        (
+            site.app(Method::GET, "/app/api/v1/nowhere", Some(&cookie)),
+            404,
+        ),
+        (
+            site.app(Method::GET, "/app/api/v1/notifications/key", Some(&cookie)),
+            200,
+        ),
+    ] {
+        let r = rb.send().await.unwrap();
+        let path = r.url().path().to_string();
+        assert_eq!(r.status(), status, "{path}");
+        assert_eq!(r.headers()["x-content-type-options"], "nosniff", "{path}");
+    }
 }
 
 #[tokio::test]

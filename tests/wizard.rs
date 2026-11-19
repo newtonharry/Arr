@@ -428,12 +428,15 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     let (_, v) = page.post("/api/plex/check", json!({})).await;
     assert_eq!(v["signed_in"], false);
     assert_eq!(v["waiting_for_signin"], true);
+    // A reloaded page can offer the same link again.
+    assert_eq!(v["signin_url"], url, "{v}");
     // Signed in, but the server lookup failed: checking again retries it.
     let (s, v) = page.post("/api/plex/check", json!({})).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
     let (_, v) = page.get("/api/state").await;
     assert_eq!(v["signed_in"], true);
     assert_eq!(v["plex"], Value::Null);
+    assert_eq!(v["signin_url"], Value::Null, "{v}");
     let (s, v) = page.post("/api/plex/check", json!({})).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["signed_in"], true);
