@@ -38,6 +38,8 @@ use tower::ServiceExt;
 
 pub const SESSION_COOKIE: &str = "arr_session";
 const SESSION_TTL: i64 = 30 * 86_400;
+/// How many `arr_session` cookies of one request are looked up.
+const MAX_SESSION_COOKIES: usize = 4;
 /// How long a link from `arr app-link` works.
 pub const LINK_TTL: i64 = 15 * 60;
 const MAX_PROXY_BODY: usize = 64 * 1024;
@@ -339,7 +341,17 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             post(notifications_subscribe).delete(notifications_unsubscribe),
         )
         .route("/app/api/v1/{*rest}", any(proxy))
+        .layer(axum::middleware::map_response(nosniff))
         .with_state(web))
+}
+
+/// Every reply says nosniff, the `/app/api` JSON included (it is built without [`secure_headers`]).
+async fn nosniff(mut r: Response) -> Response {
+    r.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    r
 }
 
 const INDEX: &str = include_str!("webapp/index.html");
@@ -451,12 +463,13 @@ fn if_none_match(req: &HeaderMap, tag: &HeaderValue) -> bool {
         })
 }
 
-/// A file that never changes (a font or an icon), cached for a week.
+/// A font or an icon, cached for a week. Not `immutable`: the address stays the same when
+/// an update changes the file.
 fn font(content_type: &'static str, body: &'static [u8]) -> Response {
     let mut r = ([(header::CONTENT_TYPE, content_type)], body).into_response();
     r.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=604800, immutable"),
+        HeaderValue::from_static("public, max-age=604800"),
     );
     secure_headers(&mut r);
     r
@@ -548,21 +561,32 @@ impl Web {
         None
     }
 
-    /// The live session of a request: `(cookie value, email)`.
+    /// The live session of a request: `(cookie value, email)`. A stale cookie may come
+    /// before the live one, so the first few are tried.
     async fn session(&self, headers: &HeaderMap) -> Option<(String, Option<String>)> {
-        let id = headers
+        let ids: Vec<String> = headers
             .get_all(header::COOKIE)
             .iter()
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(';'))
-            .find_map(|c| {
+            .filter_map(|c| {
                 c.trim()
                     .strip_prefix(SESSION_COOKIE)?
                     .strip_prefix('=')
                     .map(str::to_string)
-            })?;
-        let key = id.clone();
-        let (kind, email) = self.sessions.off(move |s| s.lookup(&key)).await??;
+            })
+            .take(MAX_SESSION_COOKIES)
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let (id, (kind, email)) = self
+            .sessions
+            .off(move |s| {
+                ids.into_iter()
+                    .find_map(|id| s.lookup(&id).map(|found| (id, found)))
+            })
+            .await??;
         if kind == "google" {
             // Only while Google sign-in exists and the address is still allowed.
             let allowed = self

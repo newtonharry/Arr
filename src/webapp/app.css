@@ -93,7 +93,7 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 .journey li:nth-of-type(3){left:66.666%;transform:translateX(-50%)}
 .journey li:nth-of-type(4){right:0;align-items:flex-end}
 .status{display:flex;align-items:center;gap:4px}.status .ic{width:15px;height:15px}
-.ideas-row{display:flex;gap:10px;overflow-x:auto;margin:0 -20px;padding:2px 20px 10px;scroll-snap-type:x proximity;scroll-padding-inline:20px;list-style:none}
+.ideas-row{display:flex;gap:10px;overflow-x:auto;margin:0 -20px;padding:6px 20px 10px;scroll-snap-type:x proximity;scroll-padding-inline:20px;list-style:none}
 .idea{flex:none;width:116px;scroll-snap-align:start;display:flex;flex-direction:column;gap:6px}
 .idea .tile{width:100%;height:auto;aspect-ratio:2/3;border-radius:12px;font-size:28px}
 .idea h3{font-size:14px;font-weight:800;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
@@ -108,7 +108,7 @@ h2 a{text-transform:none;letter-spacing:0;font-size:14px;font-weight:800}
 .signin p{color:var(--muted);max-width:30ch}
 .bar{display:flex;gap:10px;align-items:center;margin-bottom:14px}
 .seg{display:flex;gap:6px}
-.seg button,.seg a{min-height:44px;padding:0 16px;border:2px solid var(--line);background:transparent;border-radius:999px;font-weight:800;cursor:pointer}
+.seg button{min-height:44px;padding:0 16px;border:2px solid var(--line);background:transparent;border-radius:999px;font-weight:800;cursor:pointer}
 .seg button[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:var(--on-teal)}
 .filter{flex:1;min-width:0;min-height:44px;border:2px solid var(--line);border-radius:14px;background:var(--card);padding:0 14px;font-weight:600}
 .filter::placeholder{color:var(--muted);opacity:1}
@@ -217,7 +217,6 @@ html.sheet-open{overflow:hidden}
 .item.state{flex-wrap:wrap}
 .item.state .what{min-width:160px}
 .st{font-size:16px;font-weight:800;line-height:1.3}
-.item.state .act:has(.ask){flex-basis:100%}
 .sk{height:14px;border-radius:8px;background:linear-gradient(100deg,var(--line) 35%,var(--card) 50%,var(--line) 65%) 110% 0/220% 100%;animation:shim 1.1s linear infinite}
 @keyframes shim{to{background-position:-110% 0}}
 .ln{height:13px;border-radius:7px;margin:5px 0}.ln.s{height:10px}
@@ -243,7 +242,6 @@ html.sheet-open{overflow:hidden}
 .stretch:focus-visible::after{outline:3px solid var(--ring);outline-offset:3px}
 .item,.idea{position:relative}
 .item:has(.stretch){cursor:pointer}
-.idea{position:relative}
 .item .btn,.item .link,.idea .btn,.idea .link{position:relative;z-index:1}
 .item:has(.stretch:hover) h3 .stretch,.idea:has(.stretch:hover) h3 .stretch{text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:2px;text-decoration-color:var(--line)}
 @media (min-width:760px){
@@ -294,7 +292,7 @@ html.sheet-open{overflow:hidden}
 #copies:empty{display:none}
 .lv-s{white-space:nowrap}
 /* ideas: genre chips, not interested */
-.chips{display:flex;gap:8px;overflow-x:auto;margin:0 -20px 10px;padding:2px 20px 6px;scroll-padding-inline:20px}
+.chips{display:flex;gap:8px;overflow-x:auto;margin:0 -20px 10px;padding:6px 20px;scroll-padding-inline:20px}
 .chip{flex:none;min-height:44px;padding:0 16px;border:2px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);font-weight:800;font-size:14px;cursor:pointer;white-space:nowrap}
 .chip:hover{border-color:var(--teal)}
 a.chip{display:inline-flex;align-items:center;text-decoration:none}
@@ -364,7 +362,6 @@ h2 .link .ic{width:16px;height:16px;stroke-width:3}
 .upd{display:flex;flex-wrap:wrap;align-items:center;gap:0 8px;padding:6px 14px;border:2px solid var(--teal);border-radius:12px;background:var(--card);color:var(--ink);font-weight:700}
 .upd.bad{border-color:var(--coral);color:var(--coral-ink)}
 .upd .link{min-height:44px;padding:0}
-a.link{display:inline-flex;align-items:center;padding:0 6px}
 .rows>*+*{margin-top:10px}
 .field-row{display:flex;gap:10px;margin-top:10px}
 .field-row .filter{flex:1 1 120px;min-width:0}
@@ -411,5 +408,7 @@ a.link{display:inline-flex;align-items:center;padding:0 6px}
 .ecp-part{width:100%;display:grid;gap:8px}
 .ecp .part{margin:4px 0 0;font-size:13px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
 .ecp .item.copy{background:var(--bg)}
+.ecp-ask{display:flex;flex-wrap:wrap;gap:0 8px;margin-top:8px}
+.ecp-ask .problem{flex-basis:100%}
 .tag.check{color:var(--muted);font-weight:700;align-items:flex-start}
 .tag.check .ic{flex:none;margin-top:1px}

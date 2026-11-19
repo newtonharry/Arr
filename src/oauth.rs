@@ -627,6 +627,10 @@ async fn guard(State(o): Oa, req: Request, next: axum::middleware::Next) -> Resp
     };
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 

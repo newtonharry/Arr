@@ -6,11 +6,13 @@ self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 self.addEventListener('push', (e) => {
   let m = {};
   try { m = e.data ? e.data.json() : {}; } catch { /* show the plain notification */ }
+  let url = '/';
+  try { if (typeof m.url === 'string' && new URL(m.url, self.location.origin).origin === self.location.origin) url = m.url; } catch { /* not a URL */ }
   e.waitUntil(self.registration.showNotification(String(m.title || 'Arr'), {
     body: String(m.body || ''),
     icon: '/app/icons/icon-192.png',
     badge: '/app/icons/icon-192.png',
-    data: { url: typeof m.url === 'string' && m.url[0] === '/' ? m.url : '/' },
+    data: { url },
   }));
 });
 
