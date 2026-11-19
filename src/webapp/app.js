@@ -150,7 +150,7 @@ function remember(m, k, v, max) { m.delete(k); m.set(k, v); if (m.size > max) m.
 // A read that started before authentication ended (authGen) paints and stores nothing; one that
 // started before the last change (cacheGen) may still paint but stores nothing.
 let authGen = 0, cacheGen = 0, feedGen = 0;
-function bust() { cacheGen++; SC.clear(); LC.clear(); TC.clear(); driveC = null; dropFeed(); }
+function bust() { cacheGen++; SC.clear(); LC.clear(); TC.clear(); driveC = null; S.ideasAt = 0; dropFeed(); }
 // The last feed, kept in this browser for the person who saw it, so opening Arr paints at once.
 const FEED_KEY = 'arr.feed';
 function saveFeed() {
@@ -237,13 +237,13 @@ async function api(path, { method = 'GET', body, signal } = {}) {
     if (e.name !== 'AbortError') setBanner("Can't reach Arr. Trying again…");
     throw e;
   }
-  let data = null;
-  try { data = await r.json(); } catch { /* empty body */ }
+  let data = null, junk = false;
+  try { const tx = await r.text(); if (tx) try { data = JSON.parse(tx); } catch { junk = true; } } catch { /* the body didn't arrive */ }
   if (r.status === 401) { showSignin(data); throw new Error('signed out'); }
   const code = data && data.error && data.error.code;
   if (code === 'catalog_not_imported') { setSetup(true); throw new Error(code); }
-  // Only a reply that isn't Arr's own error (a proxy or tunnel failing) means Arr is out of reach.
-  if (r.status >= 500 && !code) { setBanner("Can't reach Arr. Trying again…"); throw new Error('unreachable'); }
+  // Only a reply that isn't Arr's own error (a proxy or tunnel failing, or a page that isn't JSON) means Arr is out of reach.
+  if ((r.status >= 500 && !code) || (r.ok && junk)) { setBanner("Can't reach Arr. Trying again…"); throw new Error('unreachable'); }
   setBanner('');
   return { ok: r.ok, status: r.status, data };
 }
@@ -255,11 +255,13 @@ function parseDate(s) {
 }
 const fmtDay = (d) => d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
 function chip(d, mode) {
+  if (isNaN(d)) return h('time', { class: 'date' });
   const top = mode === 'month' ? d.toLocaleDateString(undefined, { month: 'short' }) : d.toLocaleDateString(undefined, { weekday: 'short' });
-  return h('time', { class: 'date', datetime: d.toISOString().slice(0, 10) }, top, h('b', null, d.getDate()));
+  const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; // the local day shown, not the UTC one
+  return h('time', { class: 'date', datetime: ymd }, top, h('b', null, d.getDate()));
 }
 function ago(iso) {
-  const days = Math.floor((new Date().setHours(0, 0, 0, 0) - new Date(iso).setHours(0, 0, 0, 0)) / 864e5);
+  const days = Math.round((new Date().setHours(0, 0, 0, 0) - new Date(iso).setHours(0, 0, 0, 0)) / 864e5);
   return days <= 0 ? 'today' : days === 1 ? 'yesterday' : days + ' days ago';
 }
 const meta = (it) => it.detail || (it.year ? String(it.year) : '');
@@ -306,7 +308,7 @@ function toastTimer() {
   if (held.hover || held.focus) { ringAn?.pause(); return; }
   ringTo(true);
   const n = TOAST.n;
-  toastT = setTimeout(() => { if (TOAST && TOAST.n === n) closeToast(); }, 6000);
+  toastT = setTimeout(() => { if (TOAST && TOAST.n === n && !TOAST.busy) closeToast(); }, 6000); // an Undo under way replaces it when done
 }
 function toastOut() {
   const el = $('#toast');
@@ -348,7 +350,9 @@ async function undoToast(e) {
   t.busy = true; bump();
   let m = null;
   try { m = await t.undo(); } catch { /* said below */ }
-  showToast({ before: m ? (m.ok ? 'Undone. ' : '') + m.text : "Couldn't undo that. Try again in a moment.", title: '', after: '' });
+  const text = m ? (m.ok ? 'Undone. ' : '') + m.text : "Couldn't undo that. Try again in a moment.";
+  if (TOAST && TOAST !== t) return say(text); // a newer note is up: this one is only read out
+  showToast({ before: text, title: '', after: '' });
   if (byKey) after(() => $('#toast')?.focus({ preventScroll: true }));
   else { held.focus = false; toastTimer(); }
 }
@@ -370,15 +374,17 @@ document.addEventListener('keydown', (e) => {
 });
 // Undo is also on a key, so nobody has to tab to it: Z, when nothing is being typed.
 document.addEventListener('keydown', (e) => {
-  if (e.key.toLowerCase() !== 'z' || e.ctrlKey || e.metaKey || e.altKey || !TOAST || !TOAST.undo) return;
+  if (e.key.toLowerCase() !== 'z' || e.ctrlKey || e.metaKey || e.altKey || !TOAST || !TOAST.undo || askOpen()) return;
   const a = e.target;
   if (a && a.closest && a.closest('input,textarea,select,[contenteditable]')) return;
   e.preventDefault();
   undoToast();
 });
+// A question on the sheet (remove, delete) holds the page until it is answered, the toast too.
+const askOpen = () => P.shown && (P.confirm || !!P.del);
 function Toast() {
   const t = TOAST;
-  return h('div', { class: 'toast-region', 'aria-live': 'polite' }, t && h('div', { id: 'toast', class: 'toast', tabindex: '-1' },
+  return h('div', { class: 'toast-region', 'aria-live': 'polite', inert: askOpen() }, t && h('div', { id: 'toast', class: 'toast', tabindex: '-1' },
     h('span', { class: 'toast-t' }, t.before, t.title ? h('b', null, t.title) : null, t.after),
     t.undo && h('button', { type: 'button', class: 'toast-undo', 'data-s': t.busy ? 'busy' : null, 'aria-disabled': t.busy ? 'true' : 'false', 'aria-keyshortcuts': 'Z', onClick: (e) => undoToast(e) }, t.busy ? 'Undoing…' : 'Undo',
       h('svg', { class: 'ring', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, h('circle', { cx: 9, cy: 9, r: 7 })))));
@@ -492,16 +498,23 @@ async function hideIdea(x) {
   const list = (S.ideas && S.ideas.items) || [], at = list.indexOf(x);
   if (at < 0) return;
   const post = api('/v1/ideas/hide', { method: 'POST', body: { media_id: x.media_id } }).then((r) => r.ok, () => false); // asked now; the card shrinks meanwhile
-  outgoing(document.querySelector(`[data-fk="hide:${CSS.escape(x.media_id)}"]`)?.closest('li'), [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200 });
+  const li = document.querySelector(`[data-fk="hide:${CSS.escape(x.media_id)}"]`)?.closest('li');
+  const nb = (li?.nextElementSibling || li?.previousElementSibling)?.querySelector('[data-fk^="hide:"]')?.dataset.fk;
+  // The button that had the focus is gone: the next card's takes it.
+  if (li && li.contains(document.activeElement)) after(() => ((nb && document.querySelector(`[data-fk="${CSS.escape(nb)}"]`)) || $('#view'))?.focus({ preventScroll: true }));
+  outgoing(li, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.9)' }], { duration: 200 });
   S.ideas = { ...S.ideas, items: ((S.ideas && S.ideas.items) || list).filter((i) => i.media_id !== x.media_id) };
   const back = () => { S.ideas = { ...S.ideas, items: S.ideas.items.some((i) => i.media_id === x.media_id) ? S.ideas.items : [...S.ideas.items.slice(0, at), x, ...S.ideas.items.slice(at)] }; };
+  let undone = false;
   toast('Hidden', async () => {
-    back(); bump();
+    undone = true; back(); bump();
+    // After the hide has settled, or it would hide the show again behind this; sent even if the hide seemed to fail (its reply may be what was lost).
+    await post;
     try { await api('/v1/ideas/hide/' + encodeURIComponent(x.media_id), { method: 'DELETE' }); } catch { /* shown again for now; hidden again on the next load */ }
     return { ok: true, text: 'It is back in Ideas.' };
   });
   const ok = await post;
-  if (!ok) { back(); toast("Couldn't hide that. Try again in a moment."); }
+  if (!ok && !undone) { back(); toast("Couldn't hide that. Try again in a moment."); }
 }
 const notInterested = (x) => h('button', { type: 'button', class: 'link quiet', 'data-fk': 'hide:' + x.media_id, 'aria-label': `Not interested in ${x.title}`, onClick: () => hideIdea(x) }, 'Not interested');
 
@@ -622,7 +635,8 @@ function SoonRow({ it }) {
 }
 // Ideas are shows: the button opens the show page, where the person picks what to get.
 function chooseLink(x) {
-  return h('a', { class: 'btn' + (x.in_library ? ' ghost' : ''), href: titleHref(x.media_id), 'aria-label': `${x.in_library ? 'Open' : 'Choose'} ${x.title}` }, x.in_library ? 'Open' : 'Choose', ic('right'));
+  const have = owned(x);
+  return h('a', { class: 'btn' + (have ? ' ghost' : ''), href: titleHref(x.media_id), 'aria-label': `${have ? 'Open' : 'Choose'} ${x.title}` }, have ? 'Open' : 'Choose', ic('right'));
 }
 // IMDb and Rotten Tomatoes scores from Plex, and a quick verdict. Only the scores that exist show.
 const VERDICTS = {
@@ -870,9 +884,11 @@ async function loadEventCopies(e) {
   c.st = 'loading'; bump();
   const r = await sportReq(`/event/${enc(e.id)}/copies`, { ms: 25e3 });
   if (tk !== P.token || P.cp.get(e.id) !== c) return;
-  if (r && r.ok && r.data && Array.isArray(r.data.copies)) { c.st = 'ready'; c.data = r.data; } else c.st = 'error';
+  if (r && r.ok && r.data && Array.isArray(r.data.copies)) { c.st = 'ready'; c.data = r.data; c.stale = false; } else c.st = 'error';
+  if (c.st === 'ready') for (const x of c.data.copies) if ((EG.get(x.id) || {}).st === 'error') EG.delete(x.id); // a fresh list starts without the old list's errors
   bump();
-  if (c.st === 'ready' && c.open) say(c.data.copies.length ? plural(c.data.copies.length, 'copy', 'copies') + ' found.' : "Arr couldn't find a copy yet.");
+  // A "busy", "nothing to look for" or "no copy yet" note is read out by its own status line.
+  if (c.st === 'ready' && c.open && c.data.available && c.data.note !== 'busy' && c.data.copies.length) say(plural(c.data.copies.length, 'copy', 'copies') + ' found.');
 }
 function toggleEventCopies(e) {
   let c = P.cp.get(e.id);
@@ -898,11 +914,15 @@ async function getEventCopy(e, c, confirm) {
   let res;
   try {
     const r = await sportReq(`/event/${enc(e.id)}/get`, { method: 'POST', body: { id: c.id, confirm: !!confirm } });
+    const code = r && r.data && r.data.error && r.data.error.code;
     if (r && r.ok) res = { st: 'done', text: (r.data && r.data.message) || 'Arr is getting that copy now.' };
-    else if (r && r.data && r.data.error && r.data.error.code === 'confirmation_needed') res = { st: 'confirm' };
-    else res = { st: 'error', text: EGET_ERRORS[r && r.data && r.data.error && r.data.error.code] || "Couldn't start that one. Try again in a moment." };
+    else if (code === 'confirmation_needed') res = { st: 'confirm' };
+    else res = { st: 'error', text: EGET_ERRORS[code] || "Couldn't start that one. Try again in a moment." };
+    // The list is out of date: it gets a way to look again.
+    if (code === 'release_not_found' && P.cp.get(e.id)) P.cp.get(e.id).stale = true;
   } catch { res = { st: 'error', text: "Couldn't reach Arr. Try again in a moment." }; }
   EG.set(c.id, res); say(res.text || ''); bump();
+  if (res.st === 'done') { bust(); loadFeed(); } // Home's On its way has it now
 }
 function eventCopyRow(c, e) {
   const line = [c.resolution, c.source].filter(Boolean).join(' · ') || 'Unknown quality';
@@ -953,7 +973,7 @@ function eventCopiesNode(e) {
   const many = groups.length > 1;
   return h('div', { id, class: 'copies ecp' },
     ...groups.map((g) => h('div', { key: g, class: 'ecp-part' }, many ? h('h4', { class: 'part' }, byPart.get(g)[0].part_label) : null, h('ul', { class: 'list' }, byPart.get(g).map((x) => eventCopyRow(x, e))))),
-    partial, skipped);
+    partial, skipped, c.stale ? retry : null);
 }
 
 // ----- search: leagues and teams that match, each a row you can follow in place
@@ -991,11 +1011,12 @@ function teamsNode(d, L) {
   if (!all.length) return h(Section, { id: 'teams', title: 'Teams' }, h(Hint, { text: "The team list isn't available yet. Check back in a moment." }));
   const hits = q ? all.filter((t) => [t.name, t.short_name, t.abbreviation].some((n) => n && n.toLowerCase().includes(q))) : all;
   // Collapsed, the first eight and any the person has followed or just tapped; nothing jumps under a finger.
-  const shown = q || P.tall || !many ? hits : hits.filter((t, i) => i < 8 || P.touched.has(t.id) || folOn(tkey(L.slug, t.id), t.followed));
+  const few = hits.filter((t, i) => i < 8 || P.touched.has(t.id) || folOn(tkey(L.slug, t.id), t.followed));
+  const shown = q || P.tall || !many ? hits : few;
   return h(Section, { id: 'teams', title: 'Teams' },
     many ? h('input', { type: 'search', class: 'filter team-filter', placeholder: 'Find a team', 'aria-label': `Find a team in ${L.name}`, autocomplete: 'off', value: P.tf, onInput: (e) => { P.tf = e.target.value; bump(); } }) : null,
     shown.length ? h(List, null, keyed(shown, (t) => t.id, (t, key) => h(TeamRow, { key, t, L }))) : h(Hint, { text: `No team matches “${P.tf.trim()}”.` }),
-    many && !q ? h('div', { class: 'more' }, h('button', { type: 'button', class: 'link', 'aria-expanded': String(P.tall), 'data-fk': 'teams-all', onClick: () => { P.tall = !P.tall; bump(); } }, P.tall ? 'Show fewer teams' : `Show all ${all.length} teams`)) : null);
+    many && !q && few.length < hits.length ? h('div', { class: 'more' }, h('button', { type: 'button', class: 'link', 'aria-expanded': String(P.tall), 'data-fk': 'teams-all', onClick: () => { P.tall = !P.tall; bump(); } }, P.tall ? 'Show fewer teams' : `Show all ${all.length} teams`)) : null);
 }
 const LG_ROWS = 5; // the first few events: the teams are below, not a long scroll away
 function leagueBody() {
@@ -1132,8 +1153,9 @@ function loadFeed() {
 function loadIdeas() {
   if (S.ideas && Date.now() - S.ideasAt < 6e5) return Promise.resolve(S.ideas);
   return (ideasP ||= (async () => {
-    const ag = authGen;
-    try { const r = await api('/v1/ideas'); if (r.ok && ag === authGen) { S.ideas = r.data; S.ideasAt = Date.now(); } } catch { /* optional */ } finally { ideasP = null; }
+    const ag = authGen, cg = cacheGen;
+    // An "unavailable" answer, or one read before the last change, is shown but not kept: the next screen asks again.
+    try { const r = await api('/v1/ideas'); if (r.ok && ag === authGen) { S.ideas = r.data; S.ideasAt = r.data.status === 'unavailable' || cg !== cacheGen ? 0 : Date.now(); } } catch { /* optional */ } finally { ideasP = null; }
     return S.ideas;
   })());
 }
@@ -1148,6 +1170,7 @@ async function renderHome(t) {
   const ok = await feed;
   if (t !== token) return;
   if (!ok && !S.feed) return failed(t);
+  if (V.t !== 'home') paintHome(); // under a title opened by a link, loadFeed did not paint it
   await ideas;
   if (t === token && S.ideas !== had) paintHome();
 }
@@ -1226,12 +1249,13 @@ async function renderSearch(q, t) {
   const carried = V.t === 'search' ? carryPeople(V.people, q) : null;
   if (V.t === 'search') { V.busy = true; bump(); } else setView(skel('Searching…'));
   const key = q.toLowerCase(), hit = SC.get(key), ag = authGen, cg = cacheGen;
-  let view = null, pend = null, pendS = null, pdone = false, entry = null;
+  let view = null, pend = null, pendS = null, pdone = false, sdone = false, entry = null;
   // A people or sport answer that comes after the view was drawn goes into it, and into the cache
   // entry of this query, so drawing the same query again has it at once.
   const attach = () => {
     if (!(view && V === view && seq === searchSeq)) return;
     let changed = false, late = false;
+    if (view.wait && pdone && sdone) { view.wait = false; changed = true; } // "Nothing found" may show now
     if (pdone && view.people !== pend) { view.people = pend; changed = true; }
     if (pdone && pend && entry) entry.people = pend;
     if (pendS && view.sport !== pendS) { late = !view.sport && !M.fresh; view.sport = pendS; changed = true; }
@@ -1244,14 +1268,14 @@ async function renderSearch(q, t) {
   // Searched a moment ago: shown at once, with the people and the sport it found.
   if (hit && Date.now() - hit.at < SEARCH_TTL) {
     entry = hit;
-    view = { t: 'search', q, rows: hit.rows, notes: hit.notes, busy: false, loading: false, people: hit.people || carried, sport: hit.sport || null };
+    view = { t: 'search', q, rows: hit.rows, notes: hit.notes, busy: false, loading: false, people: hit.people || carried, sport: hit.sport || null, wait: !hit.people || !hit.sport };
     M.fresh = true; setView(view);
     if (!hit.people) findPeople(q, seq, ac.signal).then((p) => { pend = p; pdone = true; attach(); }); else { pend = hit.people; pdone = true; }
-    if (!hit.sport) findSport(q, ac.signal).then((s) => { pendS = s; attach(); });
+    if (!hit.sport) findSport(q, ac.signal).then((s) => { pendS = s; sdone = true; attach(); }); else sdone = true;
     return;
   }
   const pp = findPeople(q, seq, ac.signal).then((p) => { pend = p; pdone = true; attach(); });
-  findSport(q, ac.signal).then((s) => { pendS = s; attach(); }); // never waited for: it only adds a section, or nothing
+  findSport(q, ac.signal).then((s) => { pendS = s; sdone = true; attach(); }); // never waited for: it only adds a section, or nothing
   const ok = (r) => r && r.ok;
   const part = (kind) => api(`/v1/discover?kind=${kind}&q=${encodeURIComponent(q)}`, { signal: ac.signal }).then((r) => ({ ok: r.ok, data: r.data }), () => ({ ok: false }));
   const done = {}, shown = {};
@@ -1271,7 +1295,7 @@ async function renderSearch(q, t) {
     if (done.m && moviesOff) notes.push("Movie search isn't set up yet.");
     else if (done.m && !ok(done.m)) notes.push("Movie results aren't available right now.");
     if (done.s && !ok(done.s)) notes.push("Show results aren't available right now.");
-    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: carried, sport: null }; M.fresh = true; setView(view); }
+    if (view) { Object.assign(view, { rows, notes, loading: !both() }); bump(); } else { view = { t: 'search', q, rows, notes, busy: false, loading: !both(), people: carried, sport: null, wait: !pdone || !sdone }; M.fresh = true; setView(view); }
     attach();
     if (both() && ok(done.m) && ok(done.s) && cg === cacheGen && !entry) { entry = { at: Date.now(), rows, notes, people: pend, sport: pendS }; remember(SC, key, entry, 20); }
   };
@@ -1377,22 +1401,23 @@ function SearchRow({ x, label, flip }) {
       chooseLink({ media_id: x.media_id, title: x.title, in_library: (x.in_catalog && x.monitored) || !!x.library_state }));
   }
   // fresh: the result says Arr did not have it at all, so the add can be undone.
-  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : x.in_catalog && x.monitored ? 'added' : 'add', fresh: x.in_catalog === false && !x.has_file && !x.library_state };
+  const it = { id: x.media_id, title: x.title, base: x.has_file || x.library_state === 'in_plex' ? 'inplex' : (x.in_catalog && x.monitored) || x.library_state ? 'added' : 'add', fresh: x.in_catalog === false && !x.has_file && !x.library_state };
   return h('li', { class: 'item top-align', 'data-flip': fl }, h(Tile, { title: x.title, mediaId: x.media_id }),
     h('div', { class: 'what' }, h(Title, { title: x.title, id: x.media_id }), h('p', { class: 'meta' }, joinDot(x.year, label, x.role, x.upcoming && 'Not out yet')), scoreLine(x.scores), haveBadge(x, label), addMsg(it)), addBtn(it));
 }
 function SearchResults() {
-  const { q, rows, notes, busy, loading, people, sport } = V;
-  const hits = !!(sport && (sport.leagues.length || sport.teams.length));
+  const { q, rows, notes, busy, loading, people, sport, wait } = V;
+  const hits = !!(sport && (sport.leagues.length || sport.teams.length)), none = !rows.length && !hits && !people;
   // Opening or adding a result counts the search as one worth keeping.
   return h('div', { 'data-results': '', class: busy ? 'busy' : null, 'aria-busy': loading ? 'true' : null, onClick: (e) => { if (e.target.closest('a,button')) noteSearch(q); } },
     // People matches have one place, the top, whether it is one person or a row of names: rows that
     // arrive later go below and never push them out of sight.
     people && people.person ? h('div', { class: 'people-sec' }, h(PersonBlock, { person: people.person })) : people && people.names ? h(PeopleRow, { names: people.names }) : null,
-    rows.length || !hits ? h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label, flip: true })))
+    // "Nothing found" only once every search has answered (people and sport too) and none matched.
+    rows.length || (none && !loading && !wait) ? h(Section, { id: 'res', title: 'Results' }, rows.length ? h(List, null, keyed(rows, (r) => r.label + r.x.media_id, (r, key) => h(SearchRow, { key, x: r.x, label: r.label, flip: true })))
       : h(Hint, { text: `Nothing found for “${q}”. Check the spelling or try fewer words.` })) : null,
     hits ? h(SportHits, { sport }) : null,
-    loading ? h(Hint, { key: 'more', text: 'Still looking…', role: 'status' }) : null,
+    loading || (none && wait) ? h(Hint, { key: 'more', text: 'Still looking…', role: 'status' }) : null,
     notes.map((t) => h(Hint, { key: t, text: t })));
 }
 
@@ -1440,27 +1465,30 @@ function Library({ t }) {
   const [st, setSt] = useState({ items: [], total: 0, status: 'Loading…' });
   const m = useRef({ seq: 0, items: [], ft: 0 }).current;
   async function load(reset) {
+    // While the list is read again from the top, the rows on screen are the old answer: more comes after that.
+    if (!reset && m.pend) return;
     const ag = authGen, cg = cacheGen, my = ++m.seq, key = `${S.kind}|${S.sort}|${S.filter.trim()}`;
+    // The last answer for this list shows while the new one is fetched.
+    const hit = reset ? LC.get(key) : null;
     if (reset) {
-      // The last answer for this list shows while the new one is fetched.
-      const hit = LC.get(key);
-      m.items = []; m.enter = true;
+      // m.items is what is on screen, so a "Show more" after a failed read goes on from there.
+      m.items = hit ? hit.items : []; m.gen = cg; m.enter = true; m.pend = my;
       setSt(hit ? { items: hit.items, total: hit.total, status: 'Updating…' } : { items: [], total: 0, status: 'Loading…' });
     } else if (m.gen !== cacheGen) {
       // The rows on screen were read before something changed: "Show more" starts over from page one.
       m.items = [];
       setSt((s) => ({ ...s, status: 'Updating…' }));
     }
-    const qs = `limit=50&offset=${m.items.length}&sort=${S.sort}` + (S.filter.trim() ? '&q=' + encodeURIComponent(S.filter.trim()) : '');
+    const qs = `limit=50&offset=${reset ? 0 : m.items.length}&sort=${S.sort}` + (S.filter.trim() ? '&q=' + encodeURIComponent(S.filter.trim()) : '');
     try {
       const r = await api(`/v1/library/${S.kind}?${qs}`);
       if (my !== m.seq || t !== token || ag !== authGen) return;
       if (!r.ok) { setSt((s) => ({ ...s, status: "Couldn't load the library just now." })); return; }
-      m.items = m.items.concat(r.data.items || []);
+      m.items = (reset ? [] : m.items).concat(r.data.items || []);
       m.gen = cg;
       if (cg === cacheGen) remember(LC, key, { items: m.items, total: r.data.total || 0 }, 12);
       setSt({ items: m.items, total: r.data.total || 0, status: m.items.length ? '' : S.filter.trim() ? `No matches for “${S.filter.trim()}”.` : 'Nothing here yet. Add something from the search above.' });
-    } catch { if (my === m.seq && t === token && !S.out) { setSt((s) => ({ ...s, status: '' })); if (!m.items.length) failed(t); } }
+    } catch { if (my === m.seq && t === token && !S.out) { setSt((s) => ({ ...s, status: '' })); if (!m.items.length && !hit) failed(t); } } finally { if (m.pend === my) m.pend = 0; }
   }
   useEffect(() => {
     // Sport is asked about once, so the Sport choice only shows where it is switched on.
@@ -1481,7 +1509,8 @@ function Library({ t }) {
   const kinds = [['movies', 'Movies'], ['series', 'Shows']];
   if (sp || sportShown) kinds.push(['sport', 'Sport']);
   const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'What to show' },
-    kinds.map(([k, l]) => h('button', { key: k, type: 'button', 'aria-pressed': String(kind === k), onClick: () => { S.kind = k; setKind(k); if (k !== 'sport') load(true); } }, l)));
+    // A filter still waiting to apply goes with the switch; Sport drops a list read still on its way.
+    kinds.map(([k, l]) => h('button', { key: k, type: 'button', 'aria-pressed': String(kind === k), onClick: () => { clearTimeout(m.ft); S.filter = fv; S.kind = k; setKind(k); if (k !== 'sport') load(true); else { m.seq++; setSt((s) => ({ ...s, status: '' })); } } }, l)));
   if (sp) return h(Section, { id: 'lib', title: 'Library' }, h('div', null, h('div', { class: 'bar' }, seg), h(SportFollowing)));
   return h(Section, { id: 'lib', title: 'Library' }, h('div', null,
     h(Storage),
@@ -1528,7 +1557,11 @@ document.addEventListener('click', (e) => {
 
 function openTitle(t) {
   if (P.shown && P.id === t.id) return;
+  clearTimeout(debounceT); // a search still waiting to run would take the page away from under the sheet
   const first = !P.shown;
+  const o = P.opener, tr = o && o.getAttribute && titleRoute(parseHash(o.getAttribute('href') || '').path);
+  // A link last tapped for another title (this one came from a typed link or a notification) is not where it opened from.
+  if (first && !(tr && tr.id === t.id)) P.opener = null;
   const from = first ? tileOf(P.opener) : null;
   if (first) {
     P.canBack = !!bgHash; // came from a screen of the app: closing goes back to it
@@ -1538,12 +1571,12 @@ function openTitle(t) {
   }
   clearTimeout(P.pollT); clearTimeout(P.askT);
   // Until fresh data arrives: what was read last time, else the title, year and poster of the row that was tapped.
-  const hit = TC.get(t.id), o = P.opener, tr = o && o.getAttribute && titleRoute(parseHash(o.getAttribute('href') || '').path);
+  const hit = TC.get(t.id);
   const row = tr && tr.id === t.id && o.isConnected ? o.closest('li') : null;
   const peek = row && o.textContent ? { title: o.textContent, year: ((row.querySelector('.meta') || {}).textContent || '').match(/\b(?:19|20)\d\d\b/)?.[0] || '' } : null;
   if (hit) document.title = `${nameOf(hit)} · Arr`;
   // A league has no year to show; its name is on the link that was tapped, when there is one.
-  const lead = t.kind === 'league' ? (o && o.dataset && o.dataset.lg ? { title: o.dataset.lg, year: '' } : null) : peek;
+  const lead = t.kind === 'league' ? (tr && tr.id === t.id && o.dataset && o.dataset.lg ? { title: o.dataset.lg, year: '' } : null) : peek;
   Object.assign(P, { id: t.id, kind: t.kind, token: P.token + 1, data: hit || null, peek: lead, upd: !!hit, err: '', seasons: new Map(), open: new Set(), ask: '', busy: new Set(), msg: new Map(), more: false, followBusy: false, confirm: false, del: null, removing: false, opt: freshOpt(), tf: '', tall: false, upAll: false, touched: new Set(), polls: 0, cp: new Map() });
   if (W.id === t.id) Object.assign(P.opt, { open: true, copiesOpen: true, season: W.season, fetch: true }); // from Needs you
   W.id = '';
@@ -1562,8 +1595,9 @@ function closeSheet() {
   P.token++;
   P.shown = false; P.confirm = false; P.del = null;
   document.title = pageName(parseHash(bgHash).path) + ' · Arr';
+  const same = (location.hash || '#/') === bgHash; // back to the screen it covered, not on to another
   after(() => {
-    window.scrollTo(0, P.scrollY);
+    if (same) window.scrollTo(0, P.scrollY);
     const o = P.opener, fk = o && o.dataset.fk, main = $('#view');
     const back = (o && o.isConnected && o) || (fk && main.querySelector(`[data-fk="${CSS.escape(fk)}"]`)) || main;
     back.focus({ preventScroll: true });
@@ -1585,7 +1619,7 @@ document.addEventListener('keydown', (e) => {
   const panel = $('#confirm') || $('#panel'); // an open question holds the focus until it is answered
   // The toast, when there is one, is part of the loop. It comes before the sheet in the page, so it
   // is first here too and the loop runs in the order the browser would tab (not while a question is open).
-  const f = [...(panel.id === 'confirm' ? [] : document.querySelectorAll('#toast button')), ...panel.querySelectorAll('a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])')].filter((x) => !x.hidden && x.getClientRects().length);
+  const f = [...(panel.id === 'confirm' ? [] : document.querySelectorAll('#toast button')), ...panel.querySelectorAll('a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])')].filter((x) => !x.hidden && !x.matches(':disabled') && x.getClientRects().length);
   const a = document.activeElement;
   if (!f.length) { e.preventDefault(); panel.focus(); return; }
   const i = f.indexOf(a), last = f.length - 1;
@@ -1604,6 +1638,7 @@ function errText(r) {
 // Reads are numbered: a newer read, or the start of an action, makes an older answer stale.
 async function loadTitle(quiet) {
   const tk = P.token, sq = ++P.seq, ag = authGen, cg = cacheGen, stale = () => tk !== P.token || sq !== P.seq || ag !== authGen;
+  let read = false;
   // Expanded seasons reload on their own, so a failed title read can't leave one loading forever.
   const seasons = P.kind === 'show' ? Promise.all([...P.open].map((n) => loadSeason(n, tk, sq))) : null;
   try {
@@ -1613,8 +1648,12 @@ async function loadTitle(quiet) {
     try { r = await api(P.kind === 'league' ? `/v1/sport/league/${enc(P.id)}` : `/v1/${P.kind}/${enc(P.id)}`, dl ? { signal: dl.signal } : undefined); } finally { clearTimeout(dt); }
     if (stale()) return;
     P.upd = false;
-    if (!r.ok) { TC.delete(P.id); if (!P.data || r.status === 404) { P.data = null; P.err = errText(r); } await seasons; if (!stale()) bump(); return; }
-    P.data = r.data; P.err = '';
+    // Gone (404): a question about it goes too, or it would hold the page with nothing to answer.
+    if (!r.ok) { TC.delete(P.id); if (!P.data || r.status === 404) { P.data = null; P.err = errText(r); P.confirm = false; P.del = null; } await seasons; if (!stale()) { bump(); schedulePoll(); } return; }
+    P.data = r.data; P.err = ''; read = true;
+    // A collapsed season's episodes are read again when it opens; a level picked for a tracked title is saved, and this read has it.
+    if (P.kind === 'show') for (const n of [...P.seasons.keys()]) if (!P.open.has(n)) P.seasons.delete(n);
+    if (r.data.tracked && !P.opt.saving) P.opt.level = null;
     if (cg === cacheGen) remember(TC, P.id, r.data, 30);
     document.title = `${nameOf(r.data)} · Arr`;
     if (P.kind === 'league' && cg === cacheGen) settleLeague(r.data);
@@ -1628,15 +1667,21 @@ async function loadTitle(quiet) {
   if (stale()) return;
   bump();
   schedulePoll();
+  return read;
 }
+// Only the newest read of a season counts, and only while it is open: one collapsed meanwhile is read again when it opens.
+const seasonRead = new Map();
+let seasonReads = 0;
 async function loadSeason(n, tk, sq) {
-  const cur = P.seasons.get(n) || {};
+  const cur = P.seasons.get(n) || {}, id = ++seasonReads;
+  seasonRead.set(n, id);
+  const old = () => tk !== P.token || sq !== P.seq || seasonRead.get(n) !== id || !P.open.has(n);
   try {
     const r = await api(`/v1/show/${enc(P.id)}/season/${n}`);
-    if (tk !== P.token || sq !== P.seq) return;
+    if (old()) return;
     P.seasons.set(n, r.ok ? { eps: r.data.episodes } : { ...cur, loading: false, err: "Couldn't load the episodes." });
   } catch {
-    if (tk === P.token && sq === P.seq) P.seasons.set(n, { ...cur, loading: false, err: "Couldn't load the episodes." });
+    if (!old()) P.seasons.set(n, { ...cur, loading: false, err: "Couldn't load the episodes." });
   }
 }
 function schedulePoll() {
@@ -1837,19 +1882,20 @@ async function act(key, kind, scope) {
 }
 async function toggleFollow() {
   if (P.followBusy) return;
-  const want = !P.data.following, tk = P.token, fresh = P.data.removable === false;
+  // The page may be read again (or found gone) while this runs: what is needed later is kept now.
+  const d = P.data, want = !d.following, tk = P.token, fresh = d.removable === false, id = d.media_id, title = d.title;
   P.seq++; bust();
-  P.followBusy = true; P.data.following = want; P.msg.delete('follow'); bump();
+  P.followBusy = true; d.following = want; P.msg.delete('follow'); bump();
   let bad = false;
   try {
-    const r = await api('/v1/follow', { method: 'POST', body: { media_id: P.data.media_id, on: want, ...(want && pickedLevel() ? { level: pickedLevel() } : {}) } });
+    const r = await api('/v1/follow', { method: 'POST', body: { media_id: id, on: want, ...(want && pickedLevel() ? { level: pickedLevel() } : {}) } });
     bad = !r.ok;
   } catch { bad = true; }
   bust();
   if (tk !== P.token) return;
   P.followBusy = false;
   if (bad) {
-    P.data.following = !want;
+    if (P.data) P.data.following = !want;
     P.msg.set('follow', { text: "Couldn't change that. Try again in a moment.", err: true });
     say("Couldn't change that.");
     bump();
@@ -1857,8 +1903,7 @@ async function toggleFollow() {
   }
   say(want ? 'Arr will get new episodes as they air.' : 'Arr will not look for new episodes.');
   if (want) {
-    const id = P.data.media_id;
-    showToast({ before: 'Following ', title: P.data.title, after: '' }, !fresh ? null : async () => {
+    showToast({ before: 'Following ', title, after: '' }, !fresh ? null : async () => {
       const m = await removeTitle(id);
       if (m.ok && tk === P.token && P.shown) loadTitle(true);
       return m;
@@ -1882,16 +1927,16 @@ const deleteLink = (fk, text, scope, noun, label) =>
 // until the person taps Delete, and the files go to the bin, where they stay for 7 days.
 async function openDelete(fk, scope, noun) {
   const tk = P.token;
-  P.del = { fk, scope, noun, st: 'loading', pv: null, keep: false, busy: false, err: '' };
-  P.msg.delete('delete');
+  const dl = (P.del = { fk, scope, noun, st: 'loading', pv: null, keep: false, busy: false, err: '' });
+  P.msg.delete(fk);
   after(() => $('#confirm [data-fk="del-cancel"]')?.focus({ preventScroll: true }));
   let st = 'err', pv = null, err = "Couldn't look at the files. Try again in a moment.";
   try {
     const r = await api('/v1/delete/preview', { method: 'POST', body: { media_id: scope } });
     if (r.ok) { st = 'ready'; pv = r.data; err = ''; } else if (r.status === 409 && r.data && r.data.error) err = "Arr won't delete these: " + r.data.error.message;
   } catch { err = "Couldn't reach Arr. Try again in a moment."; }
-  if (tk !== P.token || !P.del || P.del.scope !== scope) return;
-  Object.assign(P.del, { st, pv, err });
+  if (tk !== P.token || P.del !== dl) return; // closed, or asked again since
+  Object.assign(dl, { st, pv, err });
   bump();
 }
 function closeDelete() {
@@ -1942,7 +1987,8 @@ async function doDelete() {
   }
   if (tk !== P.token) return;
   P.del = null;
-  if (!res.ok) { P.msg.set('delete', res); say(res.text); bump(); after(() => $(`#panel [data-fk="${dl.fk}"]`)?.focus({ preventScroll: true })); return; }
+  // A failure is shown by the control that was used (a season's or an episode's, or the title's).
+  if (!res.ok) { P.msg.set(dl.fk, res); say(res.text); bump(); after(() => $(`#panel [data-fk="${dl.fk}"]`)?.focus({ preventScroll: true })); return; }
   say(`${dl.noun} deleted. It stays in the bin for 7 days.`);
   // A whole show leaves Arr unless a new copy is wanted; the page is then closed like Remove does.
   if (whole && P.kind === 'show' && !dl.keep) dismiss(); else await loadTitle(true);
@@ -2044,15 +2090,18 @@ async function setLevel(level) {
       : { text: "Couldn't change that. Try again in a moment.", err: true };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   if (tk !== P.token) return;
-  o.saving = false;
   if (res.err) o.level = null;
   P.msg.set('opt', res); say(res.text); bump();
   P.seq++;
-  await loadTitle(true);
+  // Still saving until the page is read again, so another pick waits for this one.
+  const read = await loadTitle(true);
   if (tk !== P.token) return;
-  if (!res.err) { o.level = null; bump(); }
+  o.saving = false;
+  // A fresh read has Arr's own level, so the pick gives way to it (a failed read keeps it).
+  if (read) o.level = null;
+  bump();
   // An open list is looked up again for the level now in force.
-  if (o.copiesOpen) loadCopies();
+  if (o.copiesOpen && P.data) loadCopies();
 }
 const copyScope = () => (P.kind === 'movie' ? P.data.media_id : P.data.media_id.replace(/^series:/, 'season:') + ':' + (P.opt.season ?? defaultSeason()));
 function defaultSeason() {
@@ -2107,7 +2156,7 @@ async function pickCopy(c) {
     toastAdded(title, 'on_its_way', season ? 'Season ' + season[1] : '', was === 'none' ? undoGet(tk, id) : null);
   }
   P.msg.set('copy', res); say(res.text);
-  if (!res.err) { o.copiesOpen = false; o.copies = { st: 'idle' }; }
+  if (!res.err) { o.copiesOpen = false; o.copies = { st: 'idle' }; o.gen = (o.gen || 0) + 1; } // a lookup still on its way is for the list just closed
   bump();
   await loadTitle(true);
 }
@@ -2150,9 +2199,9 @@ function optionsPanel() {
   const sub = cur ? `Quality: ${cur.label} (${cur.resolution})` : 'Choose a copy yourself';
   const season = P.kind === 'show' && o.copiesOpen && d.seasons.length > 1
     ? h('label', { class: 'pick-season' }, h('span', null, 'Season'),
-      h('select', { 'data-fk': 'season-pick', onChange: (e) => { o.season = Number(e.target.value); o.copies = { st: 'idle' }; loadCopies(); } },
+      h('select', { 'data-fk': 'season-pick', disabled: !!o.picking, onChange: (e) => { o.season = Number(e.target.value); o.copies = { st: 'idle' }; loadCopies(); } },
         d.seasons.map((s) => h('option', { key: s.number, value: s.number, selected: s.number === (o.season ?? defaultSeason()) }, 'Season ' + s.number)))) : null;
-  const fs = lv && h('fieldset', { class: 'lv', disabled: o.saving, 'aria-busy': o.saving ? 'true' : null },
+  const fs = lv && h('fieldset', { class: 'lv', disabled: o.saving || !!o.picking, 'aria-busy': o.saving ? 'true' : null },
     h('legend', null, 'Quality'),
     h('p', { class: 'lv-note' }, P.kind === 'movie' ? 'Estimated size of this movie at each level.' : 'Estimated size of each episode at each level.'),
     h('div', { class: 'lv-row' }, d.levels.map(levelChoice)),
@@ -2220,7 +2269,7 @@ function episodeRow(e) {
         : e.state === 'upcoming' ? (e.air_date ? `Airs ${fmtDate(e.air_date)}` : 'Not aired yet')
           : e.air_date ? `Aired ${fmtDate(e.air_date)}` : '';
   return h('li', { key: e.media_id, class: 'ep' }, h('span', { class: 'num', 'aria-hidden': 'true' }, e.number),
-    h('div', { class: 'what' }, h('h4', { title }, title), fact && h('div', { class: 'meta' }, fact), msgFor(key)),
+    h('div', { class: 'what' }, h('h4', { title }, title), fact && h('div', { class: 'meta' }, fact), msgFor(key), msgFor('del:' + e.media_id)),
     (kind || e.state === 'in_plex') && h('div', { class: 'act' },
       kind && actionNode(key, kind, kind === 'get' ? 'Get' : 'Stop', `episode ${e.number}, ${title}`, e.media_id),
       e.state === 'in_plex' && deleteLink('del:' + e.media_id, 'Delete…', e.media_id, `${P.data.title}, episode ${e.number}`, `Delete the file of episode ${e.number}, ${title}`)));
@@ -2236,7 +2285,7 @@ function seasonItem(s) {
     msgFor(key),
     open && h('div', { id: 'eps-' + n },
       episodesNode(n),
-      s.in_plex > 0 && h('div', { class: 'sea-del' }, deleteLink('del:' + scope, 'Delete this season’s files…', scope, `${P.data.title}, season ${n}`, `Delete the files of season ${n}`))));
+      s.in_plex > 0 && h('div', { class: 'sea-del' }, deleteLink('del:' + scope, 'Delete this season’s files…', scope, `${P.data.title}, season ${n}`, `Delete the files of season ${n}`), msgFor('del:' + scope))));
 }
 function showBody() {
   const d = P.data, on = d.following;
@@ -2428,9 +2477,11 @@ const isStandalone = () => (window.matchMedia && matchMedia('(display-mode: stan
 const canPush = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
 const keyBytes = (b64) => Uint8Array.from(atob(b64.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
 // `navigator.serviceWorker.ready` never settles for a worker outside the page's scope, so wait on the worker itself.
+// Push needs an active worker, not the newest one, so a worker already active is enough.
 function activated(reg) {
-  const w = reg.installing || reg.waiting || reg.active;
-  if (!w || w.state === 'activated') return Promise.resolve(reg);
+  const w = reg.active || reg.installing || reg.waiting;
+  if (!w || w === reg.active) return Promise.resolve(reg);
+  if (w.state === 'redundant') return Promise.reject(new Error('worker failed'));
   return new Promise((ok, no) => w.addEventListener('statechange', () => {
     if (w.state === 'activated') ok(reg); else if (w.state === 'redundant') no(new Error('worker failed'));
   }));
@@ -2501,6 +2552,8 @@ const PRIVACY = REPO + '/blob/main/docs/PRIVACY.md';
 async function quietGet(path) {
   try {
     const r = await fetch('/app/api' + path, { credentials: 'same-origin', headers: { 'X-Arr-App': '1' } });
+    // Signed out is an answer, not Arr being away: the sign-in shows and whoever asked stops (S.out).
+    if (r.status === 401) { showSignin(await r.json().catch(() => null)); return null; }
     return r.ok ? await r.json() : null;
   } catch { return null; }
 }
@@ -2529,15 +2582,16 @@ async function loadUpdate() {
 }
 async function startUpdate() {
   if (U.phase === 'waiting' || !U.info) return;
-  U.err = '';
-  let r;
-  try { r = await api('/v1/update', { method: 'POST' }); } catch { return; }
-  if (!r.ok) { U.err = errMsg(r, 'Couldn’t start the update.'); bump(); return; }
-  U.phase = 'waiting'; U.from = U.info.current; U.prevAt = U.info.status ? U.info.status.at : null;
+  U.err = ''; U.phase = 'waiting'; bump(); // at once, so a second tap sends nothing
+  let r = null;
+  try { r = await api('/v1/update', { method: 'POST' }); } catch { /* said below, unless signed out */ }
+  if (!r || !r.ok) { U.phase = 'idle'; if (!S.out) U.err = r ? errMsg(r, 'Couldn’t start the update.') : 'Couldn’t reach Arr. Try again in a moment.'; bump(); return; }
+  U.from = U.info.current; U.prevAt = U.info.status ? U.info.status.at : null;
   const since = Date.now();
-  bump(); say('Updating. Arr will be back in a minute.');
+  say('Updating. Arr will be back in a minute.');
   const poll = async () => {
     const d = await quietGet('/v1/update');
+    if (S.out) { U.phase = 'idle'; return; }
     if (d && d.current && d.current !== U.from) {
       U.info = d; U.phase = 'done'; bump(); say(`Updated to ${d.current}.`);
       setTimeout(() => location.reload(), 1800);
@@ -2569,24 +2623,37 @@ function UpdateBar() {
 }
 
 // Settings: the few things a person may change from a phone. Every change restarts Arr.
-const G = { data: null, health: null, busy: '', msg: '', err: '', restarting: false, restartMsg: '', draft: { upload: '', port: '', key: '' } };
-async function loadSettings() {
+const G = { data: null, health: null, busy: '', msg: '', err: '', restarting: false, restartMsg: '', draft: { upload: '', port: '', key: '' }, setT: 0, healthT: 0 };
+const draftOf = (d) => ({ upload: d.upload_limit_kib == null ? '' : String(d.upload_limit_kib), port: d.torrent_port ? String(d.torrent_port) : '', key: '' });
+// Settings with nothing to show yet asks again while it is open.
+const stillWanted = (have) => !have && R.path === '/settings' && !S.out;
+// A field being edited keeps what was typed, except `saved` (the field just saved), which takes the value Arr now has.
+// Says whether fresh settings came in.
+async function loadSettings(saved) {
+  clearTimeout(G.setT);
+  let ok = false;
   try {
     const r = await api('/v1/settings/app');
-    if (!r.ok) return;
-    G.data = r.data;
-    G.draft = { upload: r.data.upload_limit_kib == null ? '' : String(r.data.upload_limit_kib), port: r.data.torrent_port ? String(r.data.torrent_port) : '', key: '' };
-    bump();
+    if (r.ok) {
+      const was = G.data ? draftOf(G.data) : null, now = draftOf(r.data);
+      for (const k of Object.keys(now)) if (!was || G.draft[k] === was[k] || k === saved) G.draft[k] = now[k];
+      G.data = r.data; ok = true;
+      bump();
+    }
   } catch { /* the banner says Arr can't be reached */ }
+  if (stillWanted(G.data)) G.setT = setTimeout(loadSettings, 5000);
+  return ok;
 }
 async function loadHealth() {
+  clearTimeout(G.healthT);
   try {
     const r = await api('/v1/system/health');
     if (r.ok) { G.health = r.data; bump(); }
   } catch { /* the banner says Arr can't be reached */ }
+  if (stillWanted(G.health)) G.healthT = setTimeout(loadHealth, 5000);
 }
 async function renderSettings() {
-  G.msg = ''; G.err = '';
+  G.msg = ''; G.err = ''; B.msg = ''; B.ask = ''; // a note or question from the last visit is over
   setView({ t: 'settings' });
   // Open at the top, where "You" and Sign out are, not where the last screen was scrolled to.
   window.scrollTo(0, 0);
@@ -2658,18 +2725,19 @@ async function applySetting(name, value) {
   if (!r.ok) { G.err = errMsg(r, 'Couldn’t change that. Try again.'); bump(); return; }
   if (!r.data.restarting) { G.msg = r.data.message; bump(); say(G.msg); return; }
   G.restarting = true; G.restartMsg = r.data.message; bump(); say('Restarting. Arr will be back in a minute.');
-  waitForRestart();
+  waitForRestart({ 'upload-limit-kib': 'upload', 'torrent-port': 'port', 'tmdb-key': 'key' }[name]);
 }
 // Arr ends itself and its service manager starts it again. Wait for it to go away and come back.
-function waitForRestart() {
+function waitForRestart(saved) {
   const t0 = Date.now();
   let down = false;
   const tick = async () => {
     const d = await quietGet('/v1/update');
+    if (S.out) { G.restarting = false; return; }
     if (!d) down = true;
-    if (d && (down || Date.now() - t0 > 25000)) {
+    // Unlocked only once the new settings are in, so nothing old can be tapped; until then it asks again.
+    if (d && (down || Date.now() - t0 > 25000) && (await Promise.all([loadSettings(saved), loadHealth()]))[0]) {
       G.restarting = false;
-      await Promise.all([loadSettings(), loadHealth()]);
       G.msg = G.restartMsg; bump(); say(G.msg);
       return;
     }
