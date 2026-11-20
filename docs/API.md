@@ -982,8 +982,9 @@ passes exactly these routes). All are in the OpenAPI document.
   nothing (`changed: false`).
 - `GET /api/v1/system/health`: `{items: [{id, label, level: ok|warn|bad, text}], problems:
   [{at, level, component, message}]}`. Problems are the last 50 warnings and errors, newest
-  first, held in memory and scrubbed. Routine warnings from the uTP library (`librqbit_utp`:
-  the kernel capping its UDP receive buffer, a peer opening several connections at once) are
+  first, held in memory and scrubbed. Routine warnings from the torrent engine's libraries (`librqbit`, `librqbit_upnp`,
+  `librqbit_utp`: a peer's piece failing its hash check, an unreadable discovery reply from a
+  device on the network, the kernel capping the UDP receive buffer) are
   left out; they still reach the log.
 
 (`/api/v1/settings` is unchanged: it is the imported settings document.)
