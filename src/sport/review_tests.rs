@@ -846,6 +846,48 @@ async fn the_gate_remembers_a_bounded_number_of_events_and_not_errors() {
     assert_eq!(tries.load(Ordering::SeqCst), 3);
 }
 
+#[tokio::test]
+async fn prune_keeps_answers_and_events_in_their_cooldown() {
+    let gate = CopiesGate::default();
+    let searches = AtomicUsize::new(0);
+    let go = |id: &'static str, complete: bool| {
+        let (gate, searches) = (&gate, &searches);
+        async move {
+            gate.serve::<_, _, ()>(id, false, || async {
+                searches.fetch_add(1, Ordering::SeqCst);
+                Ok(found(complete))
+            })
+            .await
+            .ok()
+            .unwrap()
+        }
+    };
+    // A complete answer within its ttl is kept and served.
+    gate.set_limits(Duration::ZERO, Duration::from_secs(3600), 100);
+    go("event:ufc:1", true).await;
+    gate.prune();
+    assert_eq!(gate.remembered(), 1);
+    assert!(matches!(
+        go("event:ufc:1", true).await,
+        Served::Cached { .. }
+    ));
+    // An incomplete one within the cooldown too: no search runs again.
+    gate.set_limits(Duration::from_secs(3600), Duration::ZERO, 100);
+    go("event:ufc:2", false).await;
+    gate.prune();
+    assert_eq!(gate.remembered(), 2);
+    assert!(matches!(
+        go("event:ufc:2", false).await,
+        Served::Cached { .. }
+    ));
+    assert_eq!(searches.load(Ordering::SeqCst), 2);
+    // Past both the cooldown and the ttl an answer still stays: it is what a request the
+    // limits turn away is given.
+    gate.set_limits(Duration::ZERO, Duration::ZERO, 100);
+    gate.prune();
+    assert_eq!(gate.remembered(), 2);
+}
+
 // ---------------------------------------------------------------------- the property, widened
 
 #[test]

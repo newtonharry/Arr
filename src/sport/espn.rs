@@ -812,7 +812,7 @@ struct Gate {
 
 pub struct Espn {
     base: Url,
-    http: reqwest::Client,
+    http: upstream::Http,
     min_interval: Duration,
     backoff: Duration,
     /// Held across a request: one at a time, and a caller that waited finds the answer of the
@@ -824,16 +824,9 @@ pub struct Espn {
 
 impl Espn {
     pub fn new(cfg: &SportsConfig) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(cfg.timeout)
-            .connect_timeout(cfg.timeout.min(Duration::from_secs(10)))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("Arr")
-            .build()
-            .expect("static reqwest configuration is valid");
         Espn {
             base: cfg.base_url.clone(),
-            http,
+            http: upstream::http_client(cfg.timeout),
             min_interval: cfg.min_interval,
             backoff: cfg.backoff,
             gate: tokio::sync::Mutex::new(Gate {
@@ -841,10 +834,16 @@ impl Espn {
                 failures: 0,
                 blocked_until: None,
             }),
-            months: TtlCache::new(cfg.cache, 64),
+            months: TtlCache::new(cfg.cache, 16),
             // A team list changes rarely: kept twelve times as long (an hour by default).
             teams: TtlCache::new(cfg.cache.saturating_mul(12), 64),
         }
+    }
+
+    /// Drops expired months and team lists.
+    pub fn prune(&self) {
+        self.months.prune();
+        self.teams.prune();
     }
 
     fn url(&self, path: &str, tail: &str, query: &[(&str, &str)]) -> Result<Url, UpstreamError> {
@@ -891,9 +890,15 @@ impl Espn {
             }
         }
         let result: Result<T, (UpstreamError, Option<Duration>)> = async {
-            let resp = upstream::send(self.http.get(url).header("Accept", "application/json"))
-                .await
-                .map_err(|e| (e, None))?;
+            let resp = upstream::send(
+                self.http
+                    .get(url)
+                    .header("Accept", "application/json")
+                    // Its own name, not the shared client's.
+                    .header(reqwest::header::USER_AGENT, "Arr"),
+            )
+            .await
+            .map_err(|e| (e, None))?;
             let retry =
                 upstream::retry_after(resp.headers()).filter(|_| resp.status().as_u16() == 429);
             let body = upstream::read_bytes(resp, MAX_BYTES)

@@ -339,6 +339,8 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             post(notifications_subscribe).delete(notifications_unsubscribe),
         )
         .route("/app/api/v1/{*rest}", any(proxy))
+        // Nothing here takes a larger body than the proxy forwards (a form, a subscription).
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_PROXY_BODY))
         .with_state(web))
 }
 
@@ -910,6 +912,22 @@ fn title_key(id: &str) -> Option<String> {
     })
 }
 
+/// Which of `annotate`'s cases a request is: (an add, a list read, a single read).
+fn annotated_kinds(method: &Method, path: &str) -> (bool, bool, bool) {
+    let rest = path.strip_prefix("/api/v1/").unwrap_or("");
+    let parts: Vec<&str> = rest.split('/').collect();
+    let adds = *method == Method::POST
+        && matches!(
+            parts.as_slice(),
+            ["quick-add"] | ["follow"] | ["copies", _, "get"]
+        );
+    let reads_list =
+        *method == Method::GET && matches!(parts.as_slice(), ["library", "movies" | "series"]);
+    let reads_one =
+        *method == Method::GET && matches!(parts.as_slice(), ["movie", _] | ["show", _]);
+    (adds, reads_list, reads_one)
+}
+
 /// Who added what, on the way through the proxy. A successful add made by a signed-in person
 /// is remembered by the server (the name never comes from the page), and the title reads
 /// carry `requested_by`: the first person who added the title, or null.
@@ -924,17 +942,7 @@ fn annotate(
     if !status.is_success() {
         return raw;
     }
-    let rest = path.strip_prefix("/api/v1/").unwrap_or("");
-    let parts: Vec<&str> = rest.split('/').collect();
-    let adds = *method == Method::POST
-        && matches!(
-            parts.as_slice(),
-            ["quick-add"] | ["follow"] | ["copies", _, "get"]
-        );
-    let reads_list =
-        *method == Method::GET && matches!(parts.as_slice(), ["library", "movies" | "series"]);
-    let reads_one =
-        *method == Method::GET && matches!(parts.as_slice(), ["movie", _] | ["show", _]);
+    let (adds, reads_list, reads_one) = annotated_kinds(method, path);
     if !(adds || reads_list || reads_one) {
         return raw;
     }
@@ -1016,18 +1024,28 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     };
     let Ok(resp) = w.api.clone().oneshot(inner).await;
     let (rp, rbody) = resp.into_parts();
-    let Ok(raw) = axum::body::to_bytes(rbody, MAX_PROXY_REPLY).await else {
-        return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "reply too large");
+    let (adds, reads_list, reads_one) = annotated_kinds(&parts.method, &parts_path);
+    let body = if adds || reads_list || reads_one {
+        let Ok(raw) = axum::body::to_bytes(rbody, MAX_PROXY_REPLY).await else {
+            return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "reply too large");
+        };
+        let (method, status) = (parts.method.clone(), rp.status);
+        let Some(raw) = w
+            .sessions
+            .off(move |s| annotate(s, &method, &parts_path, email.as_deref(), status, raw))
+            .await
+        else {
+            return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "API unavailable");
+        };
+        Body::from(raw)
+    } else {
+        // Passed through as it comes, not held whole in memory.
+        if axum::body::HttpBody::size_hint(&rbody).lower() > MAX_PROXY_REPLY as u64 {
+            return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "reply too large");
+        }
+        rbody
     };
-    let (method, status) = (parts.method.clone(), rp.status);
-    let Some(raw) = w
-        .sessions
-        .off(move |s| annotate(s, &method, &parts_path, email.as_deref(), status, raw))
-        .await
-    else {
-        return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "API unavailable");
-    };
-    let mut out = Response::new(Body::from(raw));
+    let mut out = Response::new(body);
     *out.status_mut() = rp.status;
     for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
         if let Some(v) = rp.headers.get(&name) {

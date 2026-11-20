@@ -419,6 +419,7 @@ pub fn spawn(st: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                     tracing::error!(error = %e, "worker pass panicked; the next pass runs as usual")
                 }
             }
+            prune_caches(&st);
             tokio::select! {
                 _ = st.worker.notify.notified() => {}
                 _ = st.worker.stop.notified() => {}
@@ -426,6 +427,22 @@ pub fn spawn(st: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// Drops the expired entries of the in-memory caches, which otherwise wait for the next insert.
+fn prune_caches(st: &AppState) {
+    if let Some(s) = &st.search {
+        s.prune();
+    }
+    if let Some(t) = &st.tvmaze {
+        t.prune();
+    }
+    if let Some(m) = &st.movies {
+        m.prune();
+    }
+    if let Some(s) = &st.sports {
+        s.prune();
+    }
 }
 
 #[derive(Debug, Default, Serialize)]

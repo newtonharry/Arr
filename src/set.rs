@@ -484,10 +484,7 @@ async fn check(
                 // address first, then a new token or sign-in). Only a real Plex counts: a
                 // wrong port or a protected proxy refuses too.
                 Err(UpstreamError::Auth { .. }) => {
-                    let http = crate::upstream::http_client(
-                        crate::plexsignin::PLEX_TIMEOUT,
-                        reqwest::redirect::Policy::none(),
-                    );
+                    let http = crate::upstream::http_client(crate::plexsignin::PLEX_TIMEOUT);
                     match crate::plexsignin::identity(&http, &url).await {
                         Ok(id) if !id.machine_identifier.is_empty() => Ok(Some(format!(
                             "Plex refused the saved sign-in there; run `arr plex-signin --config {}` or set a new token.",

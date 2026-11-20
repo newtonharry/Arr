@@ -22,8 +22,9 @@ use crate::indexer::{FeedWindow, Indexer, Release};
 use crate::prowlarr::{Category, PrivateLink, SearchOutcome, SearchRequest};
 use crate::upstream::{self, UpstreamError};
 use regex::Regex;
-use serde_json::Value;
+use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 use time::OffsetDateTime;
 
@@ -114,18 +115,244 @@ pub fn magnet(hash: &str, name: &str, trackers: &[String]) -> String {
     m.as_str().replacen("xt=urn%3Abtih%3A", "xt=urn:btih:", 1)
 }
 
-fn num(v: Option<&Value>) -> Option<i64> {
-    match v? {
-        Value::Number(n) => n.as_i64(),
-        Value::String(s) => s.trim().parse().ok(),
-        _ => None,
+/// A field of an untrusted answer as far as the parsers read it: a whole number that fits an
+/// `i64`, a string, or anything else (which never fails the answer). Reading into this instead
+/// of a `serde_json::Value` keeps only the fields that are used.
+#[derive(Debug, Default)]
+pub(crate) enum Scalar {
+    Int(i64),
+    Str(String),
+    #[default]
+    Other,
+}
+
+impl Scalar {
+    /// A number, or a string holding one.
+    pub(crate) fn num(&self) -> Option<i64> {
+        match self {
+            Scalar::Int(n) => Some(*n),
+            Scalar::Str(s) => s.trim().parse().ok(),
+            Scalar::Other => None,
+        }
+    }
+
+    /// A string, trimmed, when it is not empty.
+    pub(crate) fn text(&self) -> Option<&str> {
+        match self {
+            Scalar::Str(s) => Some(s.trim()).filter(|s| !s.is_empty()),
+            _ => None,
+        }
     }
 }
 
-fn text(v: Option<&Value>) -> Option<&str> {
-    v.and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+/// Skips the rest of an array or object a visitor does not read.
+fn skip_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
+    while seq.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+fn skip_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
+    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for Scalar {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Scalar;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Scalar, E> {
+                Ok(Scalar::Int(v))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Scalar, E> {
+                Ok(i64::try_from(v).map_or(Scalar::Other, Scalar::Int))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Scalar, E> {
+                Ok(Scalar::Str(v.to_string()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Scalar, E> {
+                Ok(Scalar::Str(v))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_unit<E>(self) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_none<E>(self) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Scalar, A::Error> {
+                skip_seq(seq).map(|_| Scalar::Other)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Scalar, A::Error> {
+                skip_map(map).map(|_| Scalar::Other)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// An object of an untrusted answer: the fields a type keeps, read by key (the last of a
+/// repeated key wins, as in a `serde_json::Value`).
+pub(crate) trait Fields: Default {
+    /// Reads the value of `key` when it is kept; `false` leaves it to be skipped.
+    fn field<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error>;
+}
+
+/// `T` read from an object; any other JSON value reads as `T::default()`, never an error.
+#[derive(Default)]
+pub(crate) struct Loose<T>(pub T);
+
+impl<'de, T: Fields> Deserialize<'de> for Loose<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Fields> Visitor<'de> for V<T> {
+            type Value = Loose<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Loose<T>, A::Error> {
+                let mut out = T::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !out.field(&key, &mut map)? {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(Loose(out))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Loose<T>, A::Error> {
+                skip_seq(seq).map(|_| Loose(T::default()))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Loose<T>, E> {
+                Ok(Loose(T::default()))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Loose<T>, E> {
+                Ok(Loose(T::default()))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Loose<T>, E> {
+                Ok(Loose(T::default()))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Loose<T>, E> {
+                Ok(Loose(T::default()))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Loose<T>, E> {
+                Ok(Loose(T::default()))
+            }
+            fn visit_unit<E>(self) -> Result<Loose<T>, E> {
+                Ok(Loose(T::default()))
+            }
+            fn visit_none<E>(self) -> Result<Loose<T>, E> {
+                Ok(Loose(T::default()))
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+/// An array of an untrusted answer; any other JSON value reads as `None`, never an error.
+pub(crate) struct LooseList<T>(pub Option<Vec<T>>);
+
+impl<T> Default for LooseList<T> {
+    fn default() -> Self {
+        LooseList(None)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for LooseList<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = LooseList<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<LooseList<T>, A::Error> {
+                let mut out = vec![];
+                while let Some(v) = seq.next_element()? {
+                    out.push(v);
+                }
+                Ok(LooseList(Some(out)))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<LooseList<T>, A::Error> {
+                skip_map(map).map(|_| LooseList(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<LooseList<T>, E> {
+                Ok(LooseList(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<LooseList<T>, E> {
+                Ok(LooseList(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<LooseList<T>, E> {
+                Ok(LooseList(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<LooseList<T>, E> {
+                Ok(LooseList(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<LooseList<T>, E> {
+                Ok(LooseList(None))
+            }
+            fn visit_unit<E>(self) -> Result<LooseList<T>, E> {
+                Ok(LooseList(None))
+            }
+            fn visit_none<E>(self) -> Result<LooseList<T>, E> {
+                Ok(LooseList(None))
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+/// Decodes an untrusted answer; serde messages can quote fragments, so only the position is
+/// reported.
+pub(crate) fn decode<'de, T: Deserialize<'de>>(body: &'de [u8]) -> Result<T, UpstreamError> {
+    serde_json::from_slice(body).map_err(|e| UpstreamError::BadResponse {
+        reason: format!(
+            "invalid JSON ({:?} error at line {} column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        ),
+    })
+}
+
+/// The fields of a result row that are read.
+#[derive(Default)]
+struct Row {
+    id: Scalar,
+    name: Scalar,
+    info_hash: Scalar,
+    category: Scalar,
+    added: Scalar,
+    size: Scalar,
+    seeders: Scalar,
+    leechers: Scalar,
+    username: Scalar,
+}
+
+impl Fields for Row {
+    fn field<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        let slot = match key {
+            "id" => &mut self.id,
+            "name" => &mut self.name,
+            "info_hash" => &mut self.info_hash,
+            "category" => &mut self.category,
+            "added" => &mut self.added,
+            "size" => &mut self.size,
+            "seeders" => &mut self.seeders,
+            "leechers" => &mut self.leechers,
+            "username" => &mut self.username,
+            _ => return Ok(false),
+        };
+        *slot = map.next_value()?;
+        Ok(true)
+    }
 }
 
 /// A parsed answer.
@@ -154,28 +381,22 @@ pub fn parse(
     let bad = |reason: &str| UpstreamError::BadResponse {
         reason: reason.into(),
     };
-    let doc: Value = serde_json::from_slice(body).map_err(|e| UpstreamError::BadResponse {
-        reason: format!(
-            "invalid JSON ({:?} error at line {} column {})",
-            e.classify(),
-            e.line(),
-            e.column()
-        ),
-    })?;
-    let rows = doc
-        .as_array()
+    let rows: Vec<Loose<Row>> = decode::<LooseList<Loose<Row>>>(body)?
+        .0
         .ok_or_else(|| bad("the answer is not a JSON array"))?;
     let mut out = Parsed::default();
-    if let [only] = rows.as_slice()
-        && num(only.get("id")) == Some(0)
+    if let [Loose(only)] = rows.as_slice()
+        && only.id.num() == Some(0)
     {
         out.confirmed_empty = true;
         return Ok(out);
     }
     out.truncated = rows.len() > MAX_ROWS;
-    for row in rows.iter().take(MAX_ROWS) {
+    for Loose(row) in rows.iter().take(MAX_ROWS) {
         out.rows += 1;
-        let added = num(row.get("added"))
+        let added = row
+            .added
+            .num()
             .filter(|t| *t > 0)
             .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())
             .map(rfc3339);
@@ -187,13 +408,17 @@ pub fn parse(
                 out.newest = Some(a.clone());
             }
         }
-        let id = num(row.get("id")).filter(|i| *i > 0);
-        let name = text(row.get("name"))
+        let id = row.id.num().filter(|i| *i > 0);
+        let name = row
+            .name
+            .text()
             .filter(|n| n.chars().count() <= 1000 && !n.chars().any(char::is_control));
-        let hash = text(row.get("info_hash"))
+        let hash = row
+            .info_hash
+            .text()
             .map(str::to_ascii_lowercase)
             .filter(|h| crate::torrent::is_info_hash(h) && h.bytes().any(|b| b != b'0'));
-        let category = num(row.get("category")).and_then(|c| u32::try_from(c).ok());
+        let category = row.category.num().and_then(|c| u32::try_from(c).ok());
         let (Some(id), Some(name), Some(hash), Some(category)) = (id, name, hash, category) else {
             out.dropped += 1;
             continue;
@@ -203,7 +428,10 @@ pub fn parse(
             continue;
         }
         if !uploaders.is_empty()
-            && !text(row.get("username")).is_some_and(|u| uploaders.iter().any(|x| x == u))
+            && !row
+                .username
+                .text()
+                .is_some_and(|u| uploaders.iter().any(|x| x == u))
         {
             out.dropped += 1;
             continue;
@@ -211,11 +439,11 @@ pub fn parse(
         out.releases.push(Release {
             guid: Some(format!("tpb:{id}")),
             title: Some(normalize_title(name)),
-            size: num(row.get("size")).filter(|s| *s > 0),
+            size: row.size.num().filter(|s| *s > 0),
             indexer_id: Some(i64::from(indexer_id)),
             indexer: Some(indexer_name.chars().take(200).collect()),
-            seeders: num(row.get("seeders")).filter(|s| *s >= 0),
-            leechers: num(row.get("leechers")).filter(|s| *s >= 0),
+            seeders: row.seeders.num().filter(|s| *s >= 0),
+            leechers: row.leechers.num().filter(|s| *s >= 0),
             protocol: Some("torrent".into()),
             publish_date: added,
             magnet_url: Some(PrivateLink::new(magnet(&hash, name, trackers))),
