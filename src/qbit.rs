@@ -248,7 +248,7 @@ struct Session {
 
 pub struct Qbit {
     cfg: QbitConfig,
-    http: reqwest::Client,
+    http: upstream::Http,
     session: Mutex<Option<Session>>,
 }
 
@@ -261,7 +261,7 @@ fn bad(reason: &str) -> UpstreamError {
 impl Qbit {
     pub fn new(cfg: QbitConfig) -> Self {
         Qbit {
-            http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
+            http: upstream::http_client(cfg.timeout),
             session: Mutex::new(None),
             cfg,
         }

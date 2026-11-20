@@ -524,7 +524,12 @@ impl Adapter {
             }
         };
         // Defence in depth: the API never echoes the token, but nothing that does leaves here.
-        let text = String::from_utf8_lossy(&raw).replace(&self.token, "[redacted]");
+        let text = String::from_utf8_lossy(&raw);
+        let text = if text.contains(self.token.as_str()) {
+            std::borrow::Cow::Owned(text.replace(&self.token, "[redacted]"))
+        } else {
+            text
+        };
         let value: Option<Value> = serde_json::from_str(&text).ok();
         if (200..300).contains(&status) {
             return value.ok_or_else(|| {
@@ -561,7 +566,7 @@ impl Adapter {
         segments: &[&str],
         query: &[(&str, String)],
         body: Option<Value>,
-    ) -> Result<(u16, Vec<u8>), CallToolResult> {
+    ) -> Result<(u16, axum::body::Bytes), CallToolResult> {
         let mut req = http
             .request(method, Self::url(base, segments, query))
             .header(AUTHORIZATION, self.auth.clone());
@@ -615,7 +620,7 @@ impl Adapter {
                 }
             }
         }
-        Ok((status, raw))
+        Ok((status, raw.into()))
     }
 
     /// One call to the API router of this process (no socket): the same middleware (auth,
@@ -630,7 +635,7 @@ impl Adapter {
         segments: &[&str],
         query: &[(&str, String)],
         body: Option<Value>,
-    ) -> Result<(u16, Vec<u8>), CallToolResult> {
+    ) -> Result<(u16, axum::body::Bytes), CallToolResult> {
         use tower::ServiceExt;
         let base = Url::parse("http://arr.internal/").expect("static URL");
         let url = Self::url(&base, segments, query);
@@ -666,7 +671,7 @@ impl Adapter {
             let raw = axum::body::to_bytes(resp.into_body(), MAX_RESPONSE_BYTES)
                 .await
                 .map_err(|_| too_large(effect))?;
-            Ok::<_, CallToolResult>((status, raw.to_vec()))
+            Ok::<_, CallToolResult>((status, raw))
         };
         match tokio::time::timeout(timeout, call).await {
             Ok(r) => r,

@@ -40,7 +40,7 @@ pub struct PlexTv {
     /// The sign-in page (app.plex.tv/auth).
     pub auth: Url,
     pub client_id: String,
-    pub http: reqwest::Client,
+    pub http: upstream::Http,
 }
 
 /// A sign-in in progress.
@@ -208,7 +208,7 @@ pub struct Identity {
     pub claimed: Option<bool>,
 }
 
-pub async fn identity(http: &reqwest::Client, base: &Url) -> Result<Identity, UpstreamError> {
+pub async fn identity(http: &upstream::Http, base: &Url) -> Result<Identity, UpstreamError> {
     let url = base.join("identity").map_err(|_| bad_address())?;
     let r = upstream::send(http.get(url).header("Accept", "application/json")).await?;
     Ok(upstream::read_json::<IdentityJson>(r, 64 * 1024)
@@ -325,7 +325,7 @@ async fn signin(opts: &Options, base_url: Url, token_file: &Path) -> Result<()> 
         base: opts.plex_tv.clone(),
         auth: opts.plex_auth.clone(),
         client_id: client_id(config.parent().context("the config has no folder")?)?,
-        http: upstream::http_client(PLEX_TIMEOUT, reqwest::redirect::Policy::none()),
+        http: upstream::http_client(PLEX_TIMEOUT),
     };
     let reach = |e: UpstreamError| anyhow::anyhow!("couldn't reach plex.tv: {}", e.describe());
     let pin = tv.new_pin().await.map_err(reach)?;

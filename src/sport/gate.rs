@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Events remembered at most.
-pub const MAX_SLOTS: usize = 256;
+pub const MAX_SLOTS: usize = 64;
 /// A search for an event is not repeated within this, whatever is asked.
 pub const COOLDOWN: Duration = Duration::from_secs(120);
 /// A complete answer is reused for this long by a plain request.
@@ -126,6 +126,29 @@ impl CopiesGate {
         let s: Slot = Arc::new(tokio::sync::Mutex::new(None));
         slots.insert(id.to_string(), s.clone());
         s
+    }
+
+    /// Forgets the events that have no answer and are past their cooldown, or were never
+    /// searched. An answer stays until its slot is needed: a request the limits turn away is
+    /// still given it. One that is in use stays.
+    pub fn prune(&self) {
+        let cooldown = Duration::from_millis(self.cooldown_ms.load(Ordering::Relaxed));
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let before = slots.len();
+        slots.retain(|_, s| {
+            if Arc::strong_count(s) > 1 {
+                return true;
+            }
+            match s.try_lock() {
+                Ok(g) => g
+                    .as_ref()
+                    .is_some_and(|e| e.searched.is_some() || e.at.elapsed() < cooldown),
+                Err(_) => true,
+            }
+        });
+        if slots.len() < before {
+            slots.shrink_to_fit();
+        }
     }
 
     /// Takes a place among the searches of the last minute, or says when to come back.

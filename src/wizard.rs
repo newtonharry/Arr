@@ -80,7 +80,7 @@ struct Wizard {
     code: String,
     session: String,
     tv: PlexTv,
-    http: reqwest::Client,
+    http: upstream::Http,
     inner: Mutex<Inner>,
     /// Held while looking for (and claiming) this computer's Plex, so two looks at once
     /// can't claim it twice.
@@ -186,7 +186,7 @@ pub async fn run(mut opts: Options) -> Result<()> {
         );
         opts.bind = IpAddr::from([127, 0, 0, 1]);
     }
-    let http = upstream::http_client(PLEX_TIMEOUT, reqwest::redirect::Policy::none());
+    let http = upstream::http_client(PLEX_TIMEOUT);
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(opts.bind, opts.port))
         .await
         .with_context(|| {

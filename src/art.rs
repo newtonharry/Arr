@@ -26,7 +26,7 @@ pub type Poster = (Vec<u8>, &'static str);
 
 pub struct Art {
     dir: PathBuf,
-    http: reqwest::Client,
+    http: upstream::Http,
     permits: Semaphore,
 }
 
@@ -73,7 +73,7 @@ impl Art {
         fsutil::ensure_private_dir(&dir)?;
         Ok(Art {
             dir,
-            http: upstream::http_client(Duration::from_secs(15), reqwest::redirect::Policy::none()),
+            http: upstream::http_client(Duration::from_secs(15)),
             permits: Semaphore::new(MAX_IN_FLIGHT),
         })
     }

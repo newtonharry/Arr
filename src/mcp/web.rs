@@ -380,6 +380,14 @@ const SHAPES: &[(&str, &str, &str)] = &[
     ("command_status", "id", r"^cmd_[0-9a-f]{24}$"),
 ];
 
+/// `SHAPES`' patterns, compiled once (in the same order).
+static SHAPE_RES: std::sync::LazyLock<Vec<Option<regex::Regex>>> = std::sync::LazyLock::new(|| {
+    SHAPES
+        .iter()
+        .map(|(_, _, p)| regex::Regex::new(p).ok())
+        .collect()
+});
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DownloadArg {
@@ -773,10 +781,10 @@ impl Adapter {
     ) -> Option<CallToolResult> {
         // What goes into a URL path (or is checked by pattern in the schema) is checked here
         // too: a client that ignores the schema cannot make a request the schema forbids.
-        for (tool, field, pattern) in SHAPES {
+        for ((tool, field, _), re) in SHAPES.iter().zip(SHAPE_RES.iter()) {
             if *tool == name
                 && let Some(v) = args.get(*field).and_then(Value::as_str)
-                && !regex::Regex::new(pattern).is_ok_and(|re| re.is_match(v))
+                && !re.as_ref().is_some_and(|re| re.is_match(v))
             {
                 return Some(invalid(&format!(
                     "{field} is not in the form this tool takes (see its schema)"

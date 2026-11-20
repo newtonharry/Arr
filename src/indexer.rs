@@ -86,7 +86,7 @@ struct Backoff {
 /// One configured native indexer.
 pub struct Indexer {
     pub cfg: IndexerConfig,
-    http: reqwest::Client,
+    http: upstream::Http,
     permits: Semaphore,
     next_slot: tokio::sync::Mutex<Option<Instant>>,
     backoff: Mutex<Option<Backoff>>,
@@ -99,7 +99,7 @@ pub struct Indexer {
 impl Indexer {
     fn new(cfg: IndexerConfig, store: Store) -> Self {
         Indexer {
-            http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
+            http: upstream::http_client(cfg.timeout),
             permits: Semaphore::new(cfg.max_concurrent),
             next_slot: tokio::sync::Mutex::new(None),
             backoff: Mutex::new(None),
@@ -107,7 +107,7 @@ impl Indexer {
                 status: "unknown",
                 ..Default::default()
             }),
-            cache: TtlCache::new(cfg.cache_ttl, 256),
+            cache: TtlCache::new(cfg.cache_ttl, 64),
             caps: Mutex::new(None),
             store,
             cfg,
@@ -282,7 +282,7 @@ impl Indexer {
         h
     }
 
-    pub(crate) fn http(&self) -> &reqwest::Client {
+    pub(crate) fn http(&self) -> &upstream::Http {
         &self.http
     }
 
@@ -418,6 +418,13 @@ impl Registry {
         }
     }
 
+    /// Drops every indexer's expired search answers.
+    pub fn prune(&self) {
+        for ix in self.indexers.values() {
+            ix.cache.prune();
+        }
+    }
+
     pub fn get(&self, id: u32) -> Option<&Arc<Indexer>> {
         self.indexers.get(&id)
     }
@@ -530,6 +537,14 @@ impl Backend {
         match self {
             Backend::Native(_) => "native",
             Backend::Prowlarr(_) => "prowlarr",
+        }
+    }
+
+    /// Drops expired search answers.
+    pub fn prune(&self) {
+        match self {
+            Backend::Native(r) => r.prune(),
+            Backend::Prowlarr(p) => p.prune(),
         }
     }
 

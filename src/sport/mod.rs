@@ -162,6 +162,12 @@ impl Sports {
         }
     }
 
+    /// Drops expired schedules and the events the copies gate no longer needs.
+    pub fn prune(&self) {
+        self.espn.prune();
+        self.copies.prune();
+    }
+
     pub(crate) fn league_lock(&self, slug: &'static str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         self.turns
             .lock()

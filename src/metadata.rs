@@ -90,6 +90,24 @@ fn clean_name(n: Option<&str>) -> Option<String> {
     (!n.is_empty() && n.chars().count() <= 120).then(|| n.to_string())
 }
 
+/// Cuts a cast list down to the entries a `cast()` reads before it has `CAST_MAX` names (all of
+/// them when it never gets that many), so a cached title does not hold the rest.
+fn trim_cast<T>(list: &mut Vec<T>, name: impl Fn(&T) -> Option<&str>) {
+    let mut seen: Vec<String> = vec![];
+    for (i, c) in list.iter().enumerate() {
+        if let Some(n) = clean_name(name(c))
+            && !seen.contains(&n)
+        {
+            seen.push(n);
+            if seen.len() == CAST_MAX {
+                list.truncate(i + 1);
+                list.shrink_to_fit();
+                return;
+            }
+        }
+    }
+}
+
 /// Genre names as a title page lists them: trimmed, no empties or repeats, at most `max`.
 pub fn clean_genres<'a>(names: impl IntoIterator<Item = &'a str>, max: usize) -> Vec<String> {
     let mut out: Vec<String> = vec![];
@@ -116,12 +134,15 @@ pub struct TvmazeImage {
     pub medium: Option<String>,
 }
 
+fn premiered_year(premiered: Option<&str>) -> Option<u16> {
+    premiered
+        .and_then(|d| d.get(..4))
+        .and_then(|y| y.parse().ok())
+}
+
 impl TvmazeShow {
     pub fn year(&self) -> Option<u16> {
-        self.premiered
-            .as_deref()
-            .and_then(|d| d.get(..4))
-            .and_then(|y| y.parse().ok())
+        premiered_year(self.premiered.as_deref())
     }
 
     /// The network or streaming service that shows it.
@@ -130,6 +151,12 @@ impl TvmazeShow {
             .into_iter()
             .flatten()
             .find_map(|n| n.name.clone().filter(|n| !n.trim().is_empty()))
+    }
+
+    fn trim_cast(&mut self) {
+        if let Some(e) = &mut self.embedded {
+            trim_cast(&mut e.cast, |c| c.person.as_ref()?.name.as_deref());
+        }
     }
 
     /// The top billed cast (TVmaze lists them in billing order).
@@ -244,8 +271,16 @@ struct ScheduleEmbedded {
 
 #[derive(Deserialize)]
 struct ScheduleShow {
-    #[serde(flatten)]
-    show: TvmazeShow,
+    /// The `TvmazeShow` fields a schedule entry uses, read without `flatten` so that serde
+    /// does not buffer every field of every show.
+    id: u32,
+    name: String,
+    #[serde(default)]
+    premiered: Option<String>,
+    #[serde(default)]
+    externals: TvmazeExternals,
+    #[serde(default)]
+    genres: Vec<String>,
     #[serde(default)]
     weight: Option<f64>,
     #[serde(default)]
@@ -312,7 +347,7 @@ const IDEAS_MAX: usize = 24;
 
 pub struct Tvmaze {
     base: Url,
-    http: reqwest::Client,
+    http: upstream::Http,
     shows: TtlCache<String, Option<TvmazeShow>>,
     episodes: TtlCache<u32, Vec<TvmazeEpisode>>,
     people: TtlCache<u32, TvmazeCredits>,
@@ -331,14 +366,21 @@ impl Tvmaze {
     pub fn new(cfg: &MetadataConfig) -> Self {
         Tvmaze {
             base: cfg.base_url.clone(),
-            http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
-            shows: TtlCache::new(METADATA_TTL, 512),
-            episodes: TtlCache::new(METADATA_TTL, 128),
-            people: TtlCache::new(METADATA_TTL, 64),
+            http: upstream::http_client(cfg.timeout),
+            shows: TtlCache::new(METADATA_TTL, 128),
+            episodes: TtlCache::new(METADATA_TTL, 32),
+            people: TtlCache::new(METADATA_TTL, 16),
             ideas: Mutex::new(None),
             budget: DECORATION_BUDGET.min(cfg.timeout / 2),
             inflight: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Drops expired cache entries (see `TtlCache::prune`).
+    pub fn prune(&self) {
+        self.shows.prune();
+        self.episodes.prune();
+        self.people.prune();
     }
 
     fn url(&self, path: &str, query: &[(&str, &str)]) -> Result<Url, UpstreamError> {
@@ -428,9 +470,9 @@ impl Tvmaze {
             for show in entries
                 .into_iter()
                 .filter_map(|e| e.embedded?.show)
-                .filter(|s| !s.show.name.trim().is_empty())
+                .filter(|s| !s.name.trim().is_empty())
             {
-                if ranked.iter().any(|(_, r)| r.id == show.show.id) {
+                if ranked.iter().any(|(_, r)| r.id == show.id) {
                     continue;
                 }
                 let network = show
@@ -441,14 +483,14 @@ impl Tvmaze {
                 ranked.push((
                     show.weight.unwrap_or(0.0),
                     WebShow {
-                        id: show.show.id,
-                        tvdb: show.show.externals.thetvdb,
-                        imdb: show.show.externals.imdb.clone(),
-                        name: show.show.name.trim().to_string(),
-                        year: show.show.year(),
+                        id: show.id,
+                        tvdb: show.externals.thetvdb,
+                        imdb: show.externals.imdb.clone(),
+                        name: show.name.trim().to_string(),
+                        year: premiered_year(show.premiered.as_deref()),
                         network,
                         summary: show.summary.as_deref().and_then(|s| plain_summary(s, 200)),
-                        genres: clean_genres(show.show.genres.iter().map(String::as_str), 4),
+                        genres: clean_genres(show.genres.iter().map(String::as_str), 4),
                         rating: show
                             .rating
                             .get("average")
@@ -539,7 +581,10 @@ impl Tvmaze {
             return Ok(hit);
         }
         let show = match self.get::<TvmazeShow>(url).await {
-            Ok(s) => Some(s),
+            Ok(mut s) => {
+                s.trim_cast();
+                Some(s)
+            }
             Err(UpstreamError::NotFound) => None,
             Err(e) => return Err(e),
         };
@@ -895,6 +940,10 @@ impl TmdbMovie {
         clean_genres(self.genres.iter().map(|g| g.name.as_str()), 6)
     }
 
+    fn trim_cast(&mut self) {
+        trim_cast(&mut self.credits.cast, |c| Some(&c.name));
+    }
+
     /// The top billed cast.
     pub fn cast(&self) -> Vec<CastName> {
         let mut out: Vec<CastName> = vec![];
@@ -1015,7 +1064,7 @@ pub fn language_name(code: &str) -> Option<&'static str> {
 
 pub struct Tmdb {
     base: Url,
-    http: reqwest::Client,
+    http: upstream::Http,
     credential: crate::config::Secret,
     movies: TtlCache<u32, Option<TmdbMovie>>,
 }
@@ -1024,10 +1073,14 @@ impl Tmdb {
     pub fn new(cfg: &MetadataConfig) -> Option<Self> {
         Some(Tmdb {
             base: cfg.base_url.clone(),
-            http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
+            http: upstream::http_client(cfg.timeout),
             credential: cfg.credential.clone()?,
-            movies: TtlCache::new(METADATA_TTL, 512),
+            movies: TtlCache::new(METADATA_TTL, 128),
         })
+    }
+
+    pub fn prune(&self) {
+        self.movies.prune();
     }
 
     /// v4 read-access tokens (JWT, `eyJ...`) go in a Bearer header; v3 keys use `api_key`
@@ -1121,7 +1174,10 @@ impl Tmdb {
             )
             .await
         {
-            Ok(m) => Some(m),
+            Ok(mut m) => {
+                m.trim_cast();
+                Some(m)
+            }
             Err(UpstreamError::NotFound) => None,
             Err(e) => return Err(e),
         };
@@ -1280,6 +1336,11 @@ impl PlexMeta {
     fn tmdb_id(&self) -> Option<u32> {
         self.guid("tmdb")?.parse().ok().filter(|id| *id > 0)
     }
+
+    /// Roles become a movie's cast (see `plex_movie`).
+    fn trim_cast(&mut self) {
+        trim_cast(&mut self.roles, |r| Some(&r.tag));
+    }
 }
 
 /// The original-language code for the first production country Plex lists. Only common
@@ -1328,7 +1389,7 @@ pub struct PlexMovies {
 struct PlexInner {
     discover: Url,
     metadata: Url,
-    http: reqwest::Client,
+    http: upstream::Http,
     token: Secret,
     client_id: String,
     /// Plex details by Plex key.
@@ -1404,16 +1465,23 @@ impl PlexMovies {
             inner: Arc::new(PlexInner {
                 discover: cfg.discover_url.clone(),
                 metadata: cfg.metadata_url.clone(),
-                http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
+                http: upstream::http_client(cfg.timeout),
                 token: cfg.token.clone(),
                 client_id,
                 metas: TtlCache::new(METADATA_TTL, 512),
                 movies: TtlCache::new(METADATA_TTL, 512),
                 shows: TtlCache::new(METADATA_TTL, 512),
                 lookups: tokio::sync::Semaphore::new(PLEX_LOOKUPS),
-                people: TtlCache::new(METADATA_TTL, 64),
+                people: TtlCache::new(METADATA_TTL, 16),
             }),
         }
+    }
+
+    pub fn prune(&self) {
+        self.inner.metas.prune();
+        self.inner.movies.prune();
+        self.inner.shows.prune();
+        self.inner.people.prune();
     }
 
     async fn get<T: DeserializeOwned>(
@@ -1471,9 +1539,12 @@ impl PlexMovies {
         if let Some(hit) = self.inner.metas.get(&key.to_string()) {
             return Ok(hit);
         }
-        let meta = self
+        let mut meta = self
             .first_meta(&format!("library/metadata/{key}"), &[])
             .await?;
+        if let Some(m) = &mut meta {
+            m.trim_cast();
+        }
         self.inner.metas.insert(key.to_string(), meta.clone());
         Ok(meta)
     }
@@ -1812,10 +1883,11 @@ impl PlexMovies {
         if !fresh && let Some(hit) = self.inner.movies.get(&id) {
             return Ok(hit);
         }
-        let Some(meta) = self.meta_by_guid(&format!("tmdb://{id}")).await? else {
+        let Some(mut meta) = self.meta_by_guid(&format!("tmdb://{id}")).await? else {
             self.inner.movies.insert(id, None);
             return Ok(None);
         };
+        meta.trim_cast();
         let key = meta.key().to_string();
         let on_sale = self.offered(&key).await?;
         let movie = Some(plex_movie(id, &meta, on_sale));
@@ -1919,6 +1991,16 @@ impl Movies {
 
     pub fn has_tmdb(&self) -> bool {
         self.tmdb.is_some()
+    }
+
+    /// Drops expired cache entries of both providers.
+    pub fn prune(&self) {
+        if let Some(p) = &self.plex {
+            p.prune();
+        }
+        if let Some(t) = &self.tmdb {
+            t.prune();
+        }
     }
 
     /// TMDB alone, for callers that must not need the network for every Plex movie.
@@ -2271,6 +2353,11 @@ mod title_extras_tests {
         }))
         .unwrap();
         let got = show.cast();
+        let mut trimmed = show.clone();
+        trimmed.trim_cast();
+        // The blank and repeated entries ahead of the sixth name stay; the rest go.
+        assert_eq!(trimmed.embedded.as_ref().unwrap().cast.len(), 8);
+        assert_eq!(trimmed.cast(), got);
         assert_eq!(got.len(), 6);
         assert_eq!(got[0].name, "Actor 1");
         assert_eq!(
@@ -2312,6 +2399,41 @@ mod title_extras_tests {
         let merged = merge(plex, bare);
         assert_eq!(merged.genre_names(), ["Comedy"]);
         assert_eq!(merged.cast()[0].name, "P");
+    }
+
+    #[test]
+    fn a_trimmed_cast_shows_the_same_first_six() {
+        let mut cast: Vec<serde_json::Value> = (1..=20)
+            .map(|i| json!({ "name": format!("Actor {i}"), "character": format!("Role {i}") }))
+            .collect();
+        cast.insert(0, json!({ "name": "", "character": "Nobody" }));
+        cast.insert(3, json!({ "name": "Actor 1", "character": "Again" }));
+        let mut tmdb: TmdbMovie = serde_json::from_value(json!({
+            "id": 1, "title": "x", "credits": { "cast": cast },
+        }))
+        .unwrap();
+        let before = tmdb.cast();
+        tmdb.trim_cast();
+        assert_eq!(tmdb.cast(), before);
+        assert_eq!(tmdb.credits.cast.len(), 8);
+        // A list that never reaches six names is left whole, blanks included, so a provider
+        // with only unusable names still counts as having a cast (see `merge`).
+        let mut few: TmdbMovie = serde_json::from_value(json!({
+            "id": 1, "title": "x", "credits": { "cast": [{ "name": "" }, { "name": "A" }] },
+        }))
+        .unwrap();
+        few.trim_cast();
+        assert_eq!(few.credits.cast.len(), 2);
+        // Plex roles become the same cast after trimming as before.
+        let roles: Vec<serde_json::Value> = (1..=12)
+            .map(|i| json!({ "tag": format!("P {i}"), "role": format!("R {i}") }))
+            .collect();
+        let mut meta: PlexMeta =
+            serde_json::from_value(json!({ "title": "x", "Role": roles })).unwrap();
+        let before = plex_movie(1, &meta, false).cast();
+        meta.trim_cast();
+        assert_eq!(meta.roles.len(), 6);
+        assert_eq!(plex_movie(1, &meta, false).cast(), before);
     }
 
     #[test]

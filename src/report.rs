@@ -64,6 +64,8 @@ fn start_to(dsn: sentry::types::Dsn, component: &str) -> Reporting {
     options.send_default_pii = false;
     options.server_name = None;
     options.attach_stacktrace = false;
+    // `scrub_event` drops them anyway: none are kept.
+    options.max_breadcrumbs = 0;
     options.dsn = Some(dsn);
     options.before_send = Some(Arc::new(|e| Some(scrub_event(e))));
     // Bound to the main hub, not this thread's as `sentry::init` does: the setup page
