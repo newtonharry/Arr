@@ -234,7 +234,7 @@ async function api(path, { method = 'GET', body, signal } = {}) {
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
-    if (e.name !== 'AbortError') setBanner("Can't reach Arr right now. Trying again…");
+    if (e.name !== 'AbortError') setBanner("Can't reach Arr. Trying again…");
     throw e;
   }
   let data = null;
@@ -243,7 +243,7 @@ async function api(path, { method = 'GET', body, signal } = {}) {
   const code = data && data.error && data.error.code;
   if (code === 'catalog_not_imported') { setSetup(true); throw new Error(code); }
   // Only a reply that isn't Arr's own error (a proxy or tunnel failing) means Arr is out of reach.
-  if (r.status >= 500 && !code) { setBanner("Can't reach Arr right now. Trying again…"); throw new Error('unreachable'); }
+  if (r.status >= 500 && !code) { setBanner("Can't reach Arr. Trying again…"); throw new Error('unreachable'); }
   setBanner('');
   return { ok: r.ok, status: r.status, data };
 }
@@ -348,7 +348,7 @@ async function undoToast(e) {
   t.busy = true; bump();
   let m = null;
   try { m = await t.undo(); } catch { /* said below */ }
-  showToast({ before: m ? (m.ok ? 'Undone. ' : '') + m.text : "Couldn't undo that just now. Try again in a moment.", title: '', after: '' });
+  showToast({ before: m ? (m.ok ? 'Undone. ' : '') + m.text : "Couldn't undo that. Try again in a moment.", title: '', after: '' });
   if (byKey) after(() => $('#toast')?.focus({ preventScroll: true }));
   else { held.focus = false; toastTimer(); }
 }
@@ -394,7 +394,7 @@ async function removeTitle(mediaId) {
   }
   const code = r.data && r.data.error && r.data.error.code;
   if (r.status === 409 && code === 'active_downloads') return { ok: false, text: "Too late to undo: it's nearly downloaded." };
-  return { ok: false, text: "Couldn't undo that just now. Try again in a moment." };
+  return { ok: false, text: "Couldn't undo that. Try again in a moment." };
 }
 
 // ---------- add / retry controls ----------
@@ -461,7 +461,7 @@ async function retryOne(it) {
     const r = it.grab_id
       ? await api(`/v1/queue/${encodeURIComponent(it.grab_id)}/retry`, { method: 'POST' })
       : await api('/v1/quick-add', { method: 'POST', body: { media_id: it.target || it.media_id } });
-    next = r.ok ? { state: 'again', msg: 'Trying again. Check back in a minute.' } : { msg: "Couldn't try again just now. Give it a moment.", err: true };
+    next = r.ok ? { state: 'again', msg: 'Trying again. Check back in a minute.' } : { msg: "Couldn't try again. Give it a moment.", err: true };
   } catch { next = { msg: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   A.set(id, next); bump(); say(next.msg);
   bust();
@@ -871,7 +871,7 @@ async function loadEventCopies(e) {
   if (tk !== P.token || P.cp.get(e.id) !== c) return;
   if (r && r.ok && r.data && Array.isArray(r.data.copies)) { c.st = 'ready'; c.data = r.data; } else c.st = 'error';
   bump();
-  if (c.st === 'ready' && c.open) say(c.data.copies.length ? plural(c.data.copies.length, 'copy', 'copies') + ' found.' : "Arr couldn't find a copy right now.");
+  if (c.st === 'ready' && c.open) say(c.data.copies.length ? plural(c.data.copies.length, 'copy', 'copies') + ' found.' : "Arr couldn't find a copy yet.");
 }
 function toggleEventCopies(e) {
   let c = P.cp.get(e.id);
@@ -899,7 +899,7 @@ async function getEventCopy(e, c, confirm) {
     const r = await sportReq(`/event/${enc(e.id)}/get`, { method: 'POST', body: { id: c.id, confirm: !!confirm } });
     if (r && r.ok) res = { st: 'done', text: (r.data && r.data.message) || 'Arr is getting that copy now.' };
     else if (r && r.data && r.data.error && r.data.error.code === 'confirmation_needed') res = { st: 'confirm' };
-    else res = { st: 'error', text: EGET_ERRORS[r && r.data && r.data.error && r.data.error.code] || "Couldn't start that one just now. Try again in a moment." };
+    else res = { st: 'error', text: EGET_ERRORS[r && r.data && r.data.error && r.data.error.code] || "Couldn't start that one. Try again in a moment." };
   } catch { res = { st: 'error', text: "Couldn't reach Arr. Try again in a moment." }; }
   EG.set(c.id, res); say(res.text || ''); bump();
 }
@@ -939,9 +939,9 @@ function eventCopiesNode(e) {
     return h('div', { id, class: 'copies ecp', 'aria-busy': 'true' }, h('span', { class: 'sr', role: 'status' }, 'Looking for copies'),
       h('ul', { class: 'list' }, [1, 2].map((i) => h('li', { key: i, class: 'item' }, h('div', { class: 'what' }, h('div', { class: 'sk', style: { width: '45%' } }), h('div', { class: 'sk', style: { width: '30%', marginTop: '8px' } }))))));
   }
-  if (c.st === 'error') return h('div', { id, class: 'copies ecp' }, h(Hint, { text: "Couldn't look for copies just now.", role: 'status' }), retry);
+  if (c.st === 'error') return h('div', { id, class: 'copies ecp' }, h(Hint, { text: "Couldn't look for copies.", role: 'status' }), retry);
   const d = c.data, n = (d.skipped || []).reduce((a, x) => a + x.count, 0);
-  if (d.note === 'busy') return h('div', { id, class: 'copies ecp' }, h(Hint, { text: 'Arr is looking up other events right now. Try again in a minute.', role: 'status' }), retry);
+  if (d.note === 'busy') return h('div', { id, class: 'copies ecp' }, h(Hint, { text: 'Arr is looking up other events. Try again in a minute.', role: 'status' }), retry);
   if (!d.available) return h('div', { id, class: 'copies ecp' }, h(Hint, { text: "There's nothing to look for yet.", role: 'status' }));
   const partial = d.searched && d.searched.complete === false ? h('p', { class: 'hint', role: 'status' }, 'Some places didn’t answer, so there may be more.') : null;
   const skipped = n ? h('p', { class: 'hint skipped' }, `Left out ${plural(n, 'copy', 'copies')}: ` + d.skipped.map((x) => `${x.count} ${x.reason}`).join(', ') + '.') : null;
@@ -1001,7 +1001,7 @@ function leagueBody() {
   const d = P.data, L = d.league, sc = d.schedule || {}, up = d.upcoming || [], earlier = (d.recent || []).slice(0, 5);
   const sp = { key: lkey(L.slug), league: L.slug, name: L.name }, on = folOn(sp.key, L.followed);
   const word = { golf: 'tournaments', mma: 'fights' }[L.sport] || 'games';
-  const note = sc.updating ? 'Updating the schedule…' : sc.problem ? (sc.updated_at ? 'Couldn’t update the schedule just now. Showing what Arr had.' : 'Couldn’t get the schedule just now. Try again in a moment.') : null;
+  const note = sc.updating ? 'Updating the schedule…' : sc.problem ? (sc.updated_at ? 'Couldn’t update the schedule. Showing what Arr had.' : 'Couldn’t get the schedule. Try again in a moment.') : null;
   const none = sc.updating || (sc.problem && !sc.updated_at) ? null : 'Nothing is scheduled right now. It may be the off season.';
   return h('div', { key: 'league', class: 'stack' },
     hero(L.name, L.sport_label, null, null),
@@ -1596,9 +1596,9 @@ document.addEventListener('keydown', (e) => {
 });
 
 function errText(r) {
-  if (P.kind === 'league') return r && r.status === 404 ? "Arr doesn't know that league." : r && r.status === 503 ? "Sport isn't switched on for this Arr." : "Couldn't load this league just now.";
-  if (P.kind === 'movie') return r && r.status === 404 ? (S.feed && S.feed.movies_enabled === false ? "Movie details need movie search, which isn't set up yet." : "Arr doesn't have details for this movie right now.") : "Couldn't load this movie just now.";
-  return r && r.status === 404 ? "Arr doesn't have an episode list for this show right now." : "Couldn't load this show just now.";
+  if (P.kind === 'league') return r && r.status === 404 ? "Arr doesn't know that league." : r && r.status === 503 ? "Sport isn't switched on for this Arr." : "Couldn't load this league.";
+  if (P.kind === 'movie') return r && r.status === 404 ? (S.feed && S.feed.movies_enabled === false ? "Movie details need movie search, which isn't set up yet." : "Arr doesn't have details for this movie right now.") : "Couldn't load this movie.";
+  return r && r.status === 404 ? "Arr doesn't have an episode list for this show right now." : "Couldn't load this show.";
 }
 // Reads are numbered: a newer read, or the start of an action, makes an older answer stale.
 async function loadTitle(quiet) {
@@ -1621,7 +1621,7 @@ async function loadTitle(quiet) {
   } catch {
     if (stale()) return;
     P.upd = false;
-    if (!P.data) P.err = "Couldn't reach Arr just now.";
+    if (!P.data) P.err = "Couldn't reach Arr.";
   }
   await seasons;
   if (stale()) return;
@@ -1820,7 +1820,7 @@ async function act(key, kind, scope) {
     const body = { media_id: scope };
     if (kind === 'get' && pickedLevel()) body.level = pickedLevel();
     const r = await api(kind === 'get' ? '/v1/quick-add' : '/v1/stop', { method: 'POST', body });
-    if (!r.ok) res = { text: "Couldn't do that just now. Try again in a moment.", err: true };
+    if (!r.ok) res = { text: "Couldn't do that. Try again in a moment.", err: true };
     else if (kind === 'get') { got = r.data; res = { text: r.data.message || 'Done.', err: r.data.outcome === 'movies_off' }; }
     else if (r.data.cancelled > 0) res = { text: 'Stopped. Arr cancelled the download and will not look for it.' };
     else if (r.data.finishing > 0) res = { text: 'Stopped looking. A download that is nearly done will still finish.' };
@@ -1884,7 +1884,7 @@ async function openDelete(fk, scope, noun) {
   P.del = { fk, scope, noun, st: 'loading', pv: null, keep: false, busy: false, err: '' };
   P.msg.delete('delete');
   after(() => $('#confirm [data-fk="del-cancel"]')?.focus({ preventScroll: true }));
-  let st = 'err', pv = null, err = "Couldn't look at the files just now. Try again in a moment.";
+  let st = 'err', pv = null, err = "Couldn't look at the files. Try again in a moment.";
   try {
     const r = await api('/v1/delete/preview', { method: 'POST', body: { media_id: scope } });
     if (r.ok) { st = 'ready'; pv = r.data; err = ''; } else if (r.status === 409 && r.data && r.data.error) err = "Arr won't delete these: " + r.data.error.message;
@@ -1900,7 +1900,7 @@ function closeDelete() {
 }
 async function restoreEntry(id) {
   const r = await api('/v1/bin/' + enc(id) + '/restore', { method: 'POST' });
-  if (!r.ok) return { ok: false, text: "Couldn't put the files back just now. Try again in a moment." };
+  if (!r.ok) return { ok: false, text: "Couldn't put the files back. Try again in a moment." };
   bust(); S.stale = true; loadFeed();
   const n = r.data.restored, left = (r.data.skipped || []).length;
   return { ok: true, text: left ? `${plural(n, 'file is', 'files are')} back. ${plural(left, 'file', 'files')} could not go back because something is already there.` : `${plural(n, 'file is', 'files are')} back.` };
@@ -1915,11 +1915,11 @@ async function doDelete() {
     const r = await api('/v1/delete', { method: 'POST', body: { media_id: scope, token: dl.pv.token, keep_wanted: dl.keep } });
     const code = r.data && r.data.error && r.data.error.code;
     if (r.ok) res = { ok: true, id: r.data.delete_id, kept: r.data.downloads_kept > 0 };
-    else if (code === 'active_downloads') res = { text: 'A download is nearly done and is being added to Plex. Try again in a minute.', err: true };
+    else if (code === 'active_downloads') res = { text: 'Arr is adding a download to Plex. Try again in a minute.', err: true };
     else if (code === 'changed') res = { text: 'Something changed in the files. Look again before deleting.', err: true };
-    else if (code === 'move_failed') res = { text: "A file couldn't be moved, so nothing was deleted.", err: true };
+    else if (code === 'move_failed') res = { text: "Arr couldn't move a file, so the files stay where they are.", err: true };
     else if (code === 'delete_refused') res = { text: "Arr won't delete these: " + r.data.error.message, err: true };
-    else res = { text: "Couldn't delete the files just now. Try again in a moment.", err: true };
+    else res = { text: "Couldn't delete the files. Try again in a moment.", err: true };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   if (tk !== P.token) return;
   P.del = null;
@@ -1945,7 +1945,7 @@ function ConfirmDelete() {
   else if (!files) parts.push(h('p', { key: 'n' }, 'Arr has no files of ', h('em', null, dl.noun), ' that it can delete.'));
   else {
     parts.push(h('p', { key: 'f' }, `${plural(files, 'file', 'files')}${fmtSize(pv.library_bytes) ? ` (${fmtSize(pv.library_bytes)})` : ''} of `, h('em', null, dl.noun), " will move to Arr's bin. They stay there for 7 days, and the space comes back then or when you empty the bin in Settings."));
-    if (pv.downloads.some((x) => x.removed)) parts.push(h('p', { key: 'd', class: 'hint' }, 'Arr also removes the finished download, so the space is really freed.'));
+    if (pv.downloads.some((x) => x.removed)) parts.push(h('p', { key: 'd', class: 'hint' }, 'Arr also removes the finished download, so it stops taking up space.'));
     if (shared.length) parts.push(h('p', { key: 's', class: 'hint' }, 'A download also holds episodes you are keeping. It stays, so some space stays used.'));
     if (pv.blocked && !dl.keep) parts.push(h('p', { key: 'b', class: 'msg', role: 'alert', 'data-err': '' }, pv.blocked));
     if (pv.unknown) parts.push(h('p', { key: 'u', class: 'hint' }, `Arr couldn't find the file for ${plural(pv.unknown, 'item', 'items')}, so ${pv.unknown === 1 ? 'it stays' : 'they stay'}.`));
@@ -1978,9 +1978,9 @@ async function doRemove() {
     const r = await api('/v1/remove', { method: 'POST', body: { media_id: d.media_id } });
     const code = r.data && r.data.error && r.data.error.code;
     if (r.ok) res = { ok: true };
-    else if (code === 'active_downloads') res = { text: 'A download is nearly done and is being added to Plex. Try again in a minute.', err: true };
+    else if (code === 'active_downloads') res = { text: 'Arr is adding a download to Plex. Try again in a minute.', err: true };
     else if (code === 'not_managed') res = { text: 'Arr is not tracking this one.', err: true };
-    else res = { text: "Couldn't remove it just now. Try again in a moment.", err: true };
+    else res = { text: "Couldn't remove it. Try again in a moment.", err: true };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   if (tk !== P.token) return;
   P.removing = false;
@@ -2031,7 +2031,7 @@ async function setLevel(level) {
   try {
     const r = await api('/v1/quality', { method: 'POST', body: { media_id: d.media_id, level } });
     res = r.ok ? { text: `Saved. Arr will look for ${LEVEL_WORDS[level].toLowerCase()} quality from now on. Nothing already in Plex changes.` }
-      : { text: "Couldn't change that just now. Try again in a moment.", err: true };
+      : { text: "Couldn't change that. Try again in a moment.", err: true };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   if (tk !== P.token) return;
   o.saving = false;
@@ -2062,7 +2062,7 @@ async function loadCopies() {
   // Only the newest lookup counts: an older answer is for a level or season no longer shown.
   if (tk !== P.token || o.gen !== gen) return;
   o.copies = c; bump();
-  if (c.st === 'ready') say(c.data.copies.length ? plural(c.data.copies.length, 'copy', 'copies') + ' found.' : "Arr couldn't find any copies right now.");
+  if (c.st === 'ready') say(c.data.copies.length ? plural(c.data.copies.length, 'copy', 'copies') + ' found.' : "Arr couldn't find any copies yet.");
 }
 function toggleCopies() {
   const o = P.opt;
@@ -2074,8 +2074,8 @@ const PICK_ERRORS = {
   blocklisted: "That copy failed before, so Arr won't try it again.",
   release_not_found: 'That list is out of date. Look again and pick one.',
   quality_changed: 'That copy no longer matches the quality you chose. Look again and pick one.',
-  not_managed: 'Arr is not getting this right now. Tap Get to start again.',
-  not_adopted: 'Arr is not getting this right now. Tap Get to start again.',
+  not_managed: 'Arr is not getting this. Tap Get to start again.',
+  not_adopted: 'Arr is not getting this. Tap Get to start again.',
 };
 async function pickCopy(c) {
   const o = P.opt;
@@ -2087,7 +2087,7 @@ async function pickCopy(c) {
   try {
     const r = await api(`/v1/copies/${enc(scope)}/get`, { method: 'POST', body: { id: c.id, ...(pickedLevel() ? { level: pickedLevel() } : {}) } });
     if (r.ok) res = { text: r.data.message || 'Arr is getting that copy now.' };
-    else res = { text: PICK_ERRORS[r.data && r.data.error && r.data.error.code] || "Couldn't start that one just now. Try again in a moment.", err: true };
+    else res = { text: PICK_ERRORS[r.data && r.data.error && r.data.error.code] || "Couldn't start that one. Try again in a moment.", err: true };
   } catch { res = { text: "Couldn't reach Arr. Try again in a moment.", err: true }; }
   bust();
   if (tk !== P.token) return;
@@ -2127,11 +2127,11 @@ function copiesNode() {
       h('ul', { class: 'list' }, [1, 2, 3].map((i) => h('li', { key: i, class: 'item' }, h('div', { class: 'what' }, h('div', { class: 'sk', style: { width: '45%' } }), h('div', { class: 'sk', style: { width: '30%', marginTop: '8px' } })), h('div', { class: 'sk', style: { width: '92px', height: '44px', borderRadius: '12px' } })))));
   }
   const retry = h('button', { type: 'button', class: 'btn ghost', 'data-fk': 'copies-retry', onClick: loadCopies }, ic('retry'), 'Try again');
-  if (c.st === 'error') return h('div', { key: 'err', class: 'copies' }, h(Hint, { text: "Couldn't look for copies just now.", role: 'status' }), retry);
+  if (c.st === 'error') return h('div', { key: 'err', class: 'copies' }, h(Hint, { text: "Couldn't look for copies.", role: 'status' }), retry);
   if (c.st !== 'ready') return null;
   const n = c.data.skipped.reduce((a, x) => a + x.count, 0);
   const skipped = n ? h('p', { class: 'hint skipped' }, `Skipped ${plural(n, 'copy', 'copies')}: ` + c.data.skipped.map((x) => `${x.count} ${x.reason}`).join(', ') + '.') : null;
-  if (!c.data.copies.length) return h('div', { key: 'none', class: 'copies' }, h(Hint, { text: "Arr couldn't find any copies right now.", role: 'status' }), skipped, retry);
+  if (!c.data.copies.length) return h('div', { key: 'none', class: 'copies' }, h(Hint, { text: "Arr couldn't find any copies yet.", role: 'status' }), skipped, retry);
   return h('div', { key: 'ready', class: 'copies' }, h('ul', { class: 'list' }, c.data.copies.map(copyRow)), skipped);
 }
 function optionsPanel() {
@@ -2146,7 +2146,7 @@ function optionsPanel() {
     h('legend', null, 'Quality'),
     h('p', { class: 'lv-note' }, P.kind === 'movie' ? 'Estimated size of this movie at each level.' : 'Estimated size of each episode at each level.'),
     h('div', { class: 'lv-row' }, d.levels.map(levelChoice)),
-    h('p', { class: 'lv-note' }, shownLevel() === 'best' ? 'Best takes 1080p when there is no 4K copy. ' : '', 'This never removes or replaces anything already in Plex. It only changes what Arr looks for next.'),
+    h('p', { class: 'lv-note' }, shownLevel() === 'best' ? 'Best takes 1080p when there is no 4K copy. ' : '', 'This changes what Arr looks for next. Arr leaves what is already in Plex alone.'),
     !d.tracked && o.level ? h('p', { class: 'lv-note' }, 'Arr will use this when you tap Get.') : null,
     msgFor('opt'));
   return h('section', { class: 'opts', 'aria-label': 'Download options' },
@@ -2603,7 +2603,7 @@ async function binAct(id, what) {
     if (what === 'restore') m = await restoreEntry(id);
     else {
       const r = await api('/v1/bin/' + enc(id), { method: 'DELETE' });
-      m = r.ok ? { ok: true, text: 'Deleted for good. The space is free.' } : { ok: false, text: "Couldn't empty that just now. Try again in a moment." };
+      m = r.ok ? { ok: true, text: 'Deleted for good. The space is free.' } : { ok: false, text: "Couldn't empty that. Try again in a moment." };
     }
   } catch { m = { ok: false, text: "Couldn't reach Arr. Try again in a moment." }; }
   B.busy = ''; B.msg = m.text; B.err = !m.ok; say(m.text);
@@ -2643,7 +2643,7 @@ async function applySetting(name, value) {
   let r;
   try { r = await api('/v1/settings/app', { method: 'POST', body: { name, value } }); } catch { G.busy = ''; G.err = 'Couldn’t reach Arr. Try again.'; bump(); return; }
   G.busy = '';
-  if (!r.ok) { G.err = errMsg(r, 'That didn’t work.'); bump(); return; }
+  if (!r.ok) { G.err = errMsg(r, 'Couldn’t change that. Try again.'); bump(); return; }
   if (!r.data.restarting) { G.msg = r.data.message; bump(); say(G.msg); return; }
   G.restarting = true; G.restartMsg = r.data.message; bump(); say('Restarting. Arr will be back in a minute.');
   waitForRestart();
