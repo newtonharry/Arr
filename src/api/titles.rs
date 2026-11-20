@@ -121,7 +121,7 @@ async fn active_progress(
 async fn load_show(st: &Arc<AppState>, key: SeriesKey) -> Result<Show, ApiError> {
     let now = OffsetDateTime::now_utc();
     let index = st.index();
-    let catalog: Option<Series> = index.series(key).cloned();
+    let mut catalog: Option<Series> = index.series(key).cloned();
     // The show as TVmaze knows it: the only source for a show outside the catalog, and the
     // summary, network and status of one inside it.
     let (target, show) = match &catalog {
@@ -165,8 +165,8 @@ async fn load_show(st: &Arc<AppState>, key: SeriesKey) -> Result<Show, ApiError>
         (None, None) => (format!("Show {key}"), None),
     };
     // Episodes: the catalog's list when it has one, else TVmaze's (nothing owned or wanted).
-    let (eps, own_flags): (Option<Vec<Episode>>, bool) = match &catalog {
-        Some(s) if s.episodes.is_some() => (s.episodes.clone(), s.monitored),
+    let (eps, own_flags): (Option<Vec<Episode>>, bool) = match &mut catalog {
+        Some(s) if s.episodes.is_some() => (s.episodes.take(), s.monitored),
         _ => {
             let listed = match (&st.tvmaze, &show) {
                 (Some(tv), Some(sh)) => {

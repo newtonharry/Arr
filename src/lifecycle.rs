@@ -43,6 +43,38 @@ pub fn supervised() -> bool {
         || std::env::var("XPC_SERVICE_NAME").is_ok_and(|v| v == "io.github.newtonharry.arr")
 }
 
+/// The runtime every Arr program runs on: a few workers (handlers are short; database and file
+/// work runs on blocking threads) and a bounded blocking pool, so a burst of requests queues
+/// instead of starting hundreds of threads.
+pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(32)
+        .enable_all()
+        .build()
+}
+
+/// Caps glibc's malloc at two arenas. By default each thread may get its own arena, and each
+/// keeps the memory its thread freed. Call first in `main`, before any thread starts.
+pub fn limit_malloc_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only changes allocator settings; it is called before other threads exist.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+}
+
+/// Gives memory freed by glibc's malloc back to the system (after the catalog index is
+/// replaced, say, whose old copy is large).
+pub fn trim_malloc() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes no pointers and is thread-safe; it only releases free memory.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// A request to end the process so the service manager starts it again.
 #[derive(Default)]
 pub struct Restart {

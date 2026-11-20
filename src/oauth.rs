@@ -206,6 +206,7 @@ impl OAuth {
         }
         let db = rusqlite::Connection::open(&path).context("open oauth.sqlite")?;
         db.busy_timeout(Duration::from_secs(5))?;
+        db.pragma_update(None, "cache_size", -256)?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS tokens (
                 hash TEXT PRIMARY KEY, kind TEXT NOT NULL, sub TEXT NOT NULL, email TEXT NOT NULL,

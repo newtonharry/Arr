@@ -16,6 +16,7 @@ use std::path::PathBuf;
 const MAX_LOG: u64 = 10 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    arr::lifecycle::limit_malloc_arenas();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     match args.first().and_then(|a| a.to_str()) {
         Some("--config") if args.len() == 2 => serve(PathBuf::from(&args[1])),
@@ -54,7 +55,7 @@ fn serve(config: PathBuf) -> Result<()> {
     // error (a changed setting from the web app ends it that way on purpose).
     arr::lifecycle::mark_supervised();
     arr::lifecycle::set_config_path(&config);
-    let result = tokio::runtime::Runtime::new()?.block_on(async {
+    let result = arr::lifecycle::runtime()?.block_on(async {
         let cfg = arr::config::load(&config)?;
         let _reporting = arr::report::start(cfg.reporting, "server");
         let result = arr::api::serve(cfg).await;

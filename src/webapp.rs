@@ -71,6 +71,7 @@ fn open_db(state_dir: &Path) -> Result<rusqlite::Connection> {
     }
     let db = rusqlite::Connection::open(&path).context("open web.sqlite")?;
     db.busy_timeout(Duration::from_secs(5))?;
+    db.pragma_update(None, "cache_size", -256)?;
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
             hash TEXT PRIMARY KEY, kind TEXT NOT NULL, email TEXT,
