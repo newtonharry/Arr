@@ -313,13 +313,13 @@ pub fn parse_sections(body: &[u8]) -> Result<Vec<Section>, UpstreamError> {
 
 pub struct Plex {
     cfg: PlexConfig,
-    http: reqwest::Client,
+    http: upstream::Http,
 }
 
 impl Plex {
     pub fn new(cfg: PlexConfig) -> Self {
         Plex {
-            http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
+            http: upstream::http_client(cfg.timeout),
             cfg,
         }
     }

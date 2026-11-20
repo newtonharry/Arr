@@ -470,6 +470,33 @@ async fn a_link_signs_in_once_and_expires() {
 }
 
 #[tokio::test]
+async fn the_app_refuses_an_oversized_body() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+    let big = format!(r#"{{"endpoint":"{}"}}"#, "x".repeat(100 * 1024));
+    let r = site
+        .app(
+            Method::POST,
+            "/app/api/v1/notifications/subscribe",
+            Some(&cookie),
+        )
+        .header("content-type", "application/json")
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 413);
+    let r = site
+        .plain(Method::POST, "/app/link")
+        .form(&[("t", "x".repeat(100 * 1024))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 413);
+}
+
+#[tokio::test]
 async fn the_proxy_only_passes_the_allow_listed_routes() {
     let e = exec().await;
     let site = serve(e.state.clone()).await;

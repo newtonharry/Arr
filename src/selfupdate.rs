@@ -154,7 +154,7 @@ pub struct Updates {
     api_url: Mutex<String>,
     cache: tokio::sync::Mutex<Option<(Instant, Option<Latest>)>>,
     last_request: Mutex<Option<(Instant, i64)>>,
-    client: reqwest::Client,
+    client: upstream::Http,
 }
 
 impl Updates {
@@ -180,7 +180,7 @@ impl Updates {
             ),
             cache: tokio::sync::Mutex::new(None),
             last_request: Mutex::new(None),
-            client: upstream::http_client(CHECK_TIMEOUT, reqwest::redirect::Policy::none()),
+            client: upstream::http_client(CHECK_TIMEOUT),
         }
     }
 
@@ -273,20 +273,16 @@ impl Updates {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let answer = async {
-            let r = self
-                .client
-                .get(url)
-                .header("Accept", "application/vnd.github+json")
-                .send()
-                .await
-                .ok()?
-                .error_for_status()
-                .ok()?;
+            let r = upstream::send(
+                self.client
+                    .get(url)
+                    .header("Accept", "application/vnd.github+json"),
+            )
+            .await
+            .ok()?;
             // A release answer is a few KB; never read more than this.
-            if r.content_length().is_some_and(|n| n > 1 << 20) {
-                return None;
-            }
-            parse_release(&r.text().await.ok()?)
+            let body = upstream::read_bytes(r, 1 << 20).await.ok()?;
+            parse_release(&String::from_utf8_lossy(&body))
         }
         .await;
         *cache = Some((Instant::now(), answer.clone()));
@@ -618,6 +614,32 @@ mod tests {
         // An unreachable GitHub is unknown, and remembered for a short while only.
         let u = install(d.path(), true, true);
         u.set_api_url("http://127.0.0.1:9/");
+        assert_eq!(u.latest().await, None);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_release_answer_without_a_length_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            // No Content-Length: the body runs until the connection closes.
+            let body = format!(
+                r#"{{"tag_name":"v0.12.1","pad":"{}"}}"#,
+                "x".repeat(2 << 20)
+            );
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+            let _ = s.write_all(head.as_bytes()).await;
+            let _ = s.write_all(body.as_bytes()).await;
+            let _ = s.shutdown().await;
+        });
+        let d = tempfile::tempdir().unwrap();
+        let u = install(d.path(), true, true);
+        u.set_api_url(&format!("http://{addr}/latest"));
         assert_eq!(u.latest().await, None);
     }
 }

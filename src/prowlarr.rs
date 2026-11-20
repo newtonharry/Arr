@@ -146,7 +146,7 @@ pub struct SearchOutcome {
 
 pub struct ProwlarrClient {
     cfg: ProwlarrConfig,
-    http: reqwest::Client,
+    http: upstream::Http,
     permits: Semaphore,
     cache: TtlCache<SearchRequest, SearchOutcome>,
 }
@@ -154,11 +154,15 @@ pub struct ProwlarrClient {
 impl ProwlarrClient {
     pub fn new(cfg: ProwlarrConfig) -> Self {
         ProwlarrClient {
-            http: upstream::http_client(cfg.timeout, reqwest::redirect::Policy::none()),
+            http: upstream::http_client(cfg.timeout),
             permits: Semaphore::new(cfg.max_concurrent),
-            cache: TtlCache::new(cfg.cache_ttl, 256),
+            cache: TtlCache::new(cfg.cache_ttl, 64),
             cfg,
         }
+    }
+
+    pub fn prune(&self) {
+        self.cache.prune();
     }
 
     /// Resolves a Prowlarr download proxy link (from `downloadUrl`, or an HTTP `magnetUrl`) to

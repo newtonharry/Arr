@@ -230,14 +230,39 @@ pub async fn read_bytes(mut resp: reqwest::Response, max: usize) -> Result<Vec<u
     Ok(body)
 }
 
-pub fn http_client(timeout: Duration, redirect: reqwest::redirect::Policy) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(timeout.min(Duration::from_secs(10)))
-        .redirect(redirect)
-        .user_agent(concat!("arr/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("static reqwest configuration is valid")
+/// A caller's handle on the one shared HTTP client (one certificate store and connection pool
+/// for the process). Every request carries the caller's own total timeout, which also bounds
+/// the connect, so a connect still gives up after at most `min(timeout, 10 s)`.
+#[derive(Clone)]
+pub struct Http {
+    client: reqwest::Client,
+    timeout: Duration,
+}
+
+impl Http {
+    pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        self.client.get(url).timeout(self.timeout)
+    }
+
+    pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        self.client.post(url).timeout(self.timeout)
+    }
+}
+
+/// A client that never follows redirects (callers that allow one follow it themselves).
+pub fn http_client(timeout: Duration) -> Http {
+    static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = SHARED
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(concat!("arr/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("static reqwest configuration is valid")
+        })
+        .clone();
+    Http { client, timeout }
 }
 
 /// Small TTL cache with a size bound (oldest entry evicted first).
@@ -284,6 +309,71 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
             map.remove(&oldest);
         }
         map.insert(k, (Instant::now(), v));
+    }
+
+    /// Drops expired entries and gives back the space they held.
+    pub fn prune(&self) {
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let before = map.len();
+        map.retain(|_, (at, _)| at.elapsed() < self.ttl);
+        if map.len() < before {
+            map.shrink_to_fit();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_drops_expired_entries_and_keeps_live_ones() {
+        let c = TtlCache::new(Duration::from_secs(60), 8);
+        c.insert(1, "live");
+        // An entry that expired while nothing was inserted (`insert` would have dropped it).
+        c.entries
+            .lock()
+            .unwrap()
+            .insert(2, (Instant::now() - Duration::from_secs(61), "expired"));
+        assert_eq!(c.len(), 2);
+        c.prune();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.get(&1), Some("live"));
+    }
+
+    #[tokio::test]
+    async fn each_handle_on_the_shared_client_keeps_its_own_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/slow", l.local_addr().unwrap());
+        // Answers every request after 400 ms.
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlate")
+                        .await;
+                });
+            }
+        });
+        let short = http_client(Duration::from_millis(100));
+        let long = http_client(Duration::from_secs(5));
+        assert_eq!(
+            send(short.get(&url)).await.err(),
+            Some(UpstreamError::Timeout)
+        );
+        let body = read_bytes(send(long.get(&url)).await.unwrap(), 64)
+            .await
+            .unwrap();
+        assert_eq!(body, b"late");
     }
 }
 

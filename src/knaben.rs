@@ -30,8 +30,9 @@
 use crate::import::rfc3339;
 use crate::indexer::{FeedWindow, Indexer, Release};
 use crate::prowlarr::{Category, PrivateLink, SearchOutcome, SearchRequest};
-use crate::tpb::{Parsed, magnet, normalize_title};
+use crate::tpb::{Fields, Loose, LooseList, Parsed, Scalar, decode, magnet, normalize_title};
 use crate::upstream::{self, UpstreamError};
+use serde::de::MapAccess;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -98,18 +99,86 @@ fn torznab_of(ids: &[u32], allowed: &[u32]) -> Vec<Category> {
     out.into_iter().map(|c| Category { id: Some(c) }).collect()
 }
 
-fn num(v: Option<&Value>) -> Option<i64> {
-    match v? {
-        Value::Number(n) => n.as_i64(),
-        Value::String(s) => s.trim().parse().ok(),
-        _ => None,
+/// The parts of an answer that are read.
+#[derive(Default)]
+struct Answer {
+    hits: LooseList<Loose<Hit>>,
+    total: Loose<Total>,
+}
+
+#[derive(Default)]
+struct Total {
+    relation: Scalar,
+    value: Scalar,
+}
+
+/// The fields of a hit that are read.
+#[derive(Default)]
+struct Hit {
+    title: Scalar,
+    hash: Scalar,
+    /// The info-hash of `magnetUrl`, kept instead of the link and its long tracker list.
+    magnet_hash: Option<String>,
+    category_id: LooseList<Scalar>,
+    date: Scalar,
+    bytes: Scalar,
+    seeders: Scalar,
+    peers: Scalar,
+    live_seeders: Scalar,
+    live_peers: Scalar,
+    last_seen: Scalar,
+}
+
+impl Fields for Answer {
+    fn field<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "hits" => self.hits = map.next_value()?,
+            "total" => self.total = map.next_value()?,
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 }
 
-fn text(v: Option<&Value>) -> Option<&str> {
-    v.and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+impl Fields for Total {
+    fn field<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "relation" => self.relation = map.next_value()?,
+            "value" => self.value = map.next_value()?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl Fields for Hit {
+    fn field<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        let slot = match key {
+            "magnetUrl" => {
+                let link: Scalar = map.next_value()?;
+                self.magnet_hash = link
+                    .text()
+                    .and_then(|m| crate::torrent::magnet_hash(m).ok());
+                return Ok(true);
+            }
+            "categoryId" => {
+                self.category_id = map.next_value()?;
+                return Ok(true);
+            }
+            "title" => &mut self.title,
+            "hash" => &mut self.hash,
+            "date" => &mut self.date,
+            "bytes" => &mut self.bytes,
+            "seeders" => &mut self.seeders,
+            "peers" => &mut self.peers,
+            "liveSeeders" => &mut self.live_seeders,
+            "livePeers" => &mut self.live_peers,
+            "lastSeen" => &mut self.last_seen,
+            _ => return Ok(false),
+        };
+        *slot = map.next_value()?;
+        Ok(true)
+    }
 }
 
 /// A Knaben timestamp: RFC 3339, or the same without an offset (read as UTC).
@@ -121,20 +190,26 @@ fn timestamp(s: &str) -> Option<OffsetDateTime> {
 
 /// The torrent's seeders and leechers: the live tracker counts when present and recent, else
 /// the stored ones. `peers` is the leecher count (see the module docs).
-fn counts(row: &Value, now: OffsetDateTime) -> (Option<i64>, Option<i64>) {
+fn hit_counts(row: &Hit, now: OffsetDateTime) -> (Option<i64>, Option<i64>) {
     let nonneg = |v: Option<i64>| v.filter(|n| *n >= 0);
-    let fresh = text(row.get("lastSeen"))
+    let fresh = row
+        .last_seen
+        .text()
         .and_then(timestamp)
         .is_some_and(|t| (now - t).whole_seconds() <= LIVE_MAX_AGE_SECS);
-    let live_seeders = nonneg(num(row.get("liveSeeders")));
+    let live_seeders = nonneg(row.live_seeders.num());
     if fresh && live_seeders.is_some() {
-        let leechers = nonneg(num(row.get("livePeers"))).or(nonneg(num(row.get("peers"))));
+        let leechers = nonneg(row.live_peers.num()).or(nonneg(row.peers.num()));
         return (live_seeders, leechers);
     }
-    (
-        nonneg(num(row.get("seeders"))),
-        nonneg(num(row.get("peers"))),
-    )
+    (nonneg(row.seeders.num()), nonneg(row.peers.num()))
+}
+
+/// `hit_counts` for a row given as JSON (the tests' form).
+#[cfg(test)]
+fn counts(row: &Value, now: OffsetDateTime) -> (Option<i64>, Option<i64>) {
+    use serde::Deserialize;
+    hit_counts(&Loose::<Hit>::deserialize(row).unwrap().0, now)
 }
 
 /// Parses an untrusted answer; keeps hits that carry one of the `allowed` Knaben category
@@ -150,30 +225,26 @@ pub fn parse(
     let bad = |reason: &str| UpstreamError::BadResponse {
         reason: reason.into(),
     };
-    let doc: Value = serde_json::from_slice(body).map_err(|e| UpstreamError::BadResponse {
-        reason: format!(
-            "invalid JSON ({:?} error at line {} column {})",
-            e.classify(),
-            e.line(),
-            e.column()
-        ),
-    })?;
+    let Loose(doc) = decode::<Loose<Answer>>(body)?;
+    let Loose(total) = doc.total;
     let hits = doc
-        .get("hits")
-        .and_then(Value::as_array)
+        .hits
+        .0
         .ok_or_else(|| bad("the answer has no hits list"))?;
     let mut out = Parsed {
         // An explicit zero total is Knaben's "no results" (an absent total is not).
         confirmed_empty: hits.is_empty()
-            && doc.pointer("/total/relation").and_then(Value::as_str) == Some("eq")
-            && num(doc.pointer("/total/value")) == Some(0),
+            && matches!(&total.relation, Scalar::Str(r) if r == "eq")
+            && total.value.num() == Some(0),
         truncated: hits.len() > MAX_ROWS,
         ..Parsed::default()
     };
     let mut by_hash: HashMap<String, usize> = HashMap::new();
-    for row in hits.iter().take(MAX_ROWS) {
+    for Loose(row) in hits.iter().take(MAX_ROWS) {
         out.rows += 1;
-        let added = text(row.get("date"))
+        let added = row
+            .date
+            .text()
             .and_then(timestamp)
             .filter(|t| t.year() > 1990)
             .map(rfc3339);
@@ -185,23 +256,23 @@ pub fn parse(
                 out.newest = Some(a.clone());
             }
         }
-        let name = text(row.get("title"))
+        let name = row
+            .title
+            .text()
             .filter(|n| n.chars().count() <= 1000 && !n.chars().any(char::is_control));
-        let hash = text(row.get("hash"))
+        let hash = row
+            .hash
+            .text()
             .map(str::to_ascii_lowercase)
-            .or_else(|| {
-                text(row.get("magnetUrl")).and_then(|m| crate::torrent::magnet_hash(m).ok())
-            })
+            .or_else(|| row.magnet_hash.clone())
             .filter(|h| crate::torrent::is_info_hash(h) && h.bytes().any(|b| b != b'0'));
         let ids: Vec<u32> = row
-            .get("categoryId")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| num(Some(v)).and_then(|n| u32::try_from(n).ok()))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .category_id
+            .0
+            .iter()
+            .flatten()
+            .filter_map(|v| v.num().and_then(|n| u32::try_from(n).ok()))
+            .collect();
         let (Some(name), Some(hash)) = (name, hash) else {
             out.dropped += 1;
             continue;
@@ -211,11 +282,11 @@ pub fn parse(
             out.dropped += 1;
             continue;
         }
-        let (seeders, leechers) = counts(row, now);
+        let (seeders, leechers) = hit_counts(row, now);
         let release = Release {
             guid: Some(format!("knaben:{hash}")),
             title: Some(normalize_title(name)),
-            size: num(row.get("bytes")).filter(|s| *s > 0),
+            size: row.bytes.num().filter(|s| *s > 0),
             indexer_id: Some(i64::from(indexer_id)),
             indexer: Some(indexer_name.chars().take(200).collect()),
             seeders,
