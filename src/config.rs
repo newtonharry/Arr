@@ -685,7 +685,8 @@ pub struct EmbeddedConfig {
     pub local_discovery: bool,
     /// Peers every torrent starts with (controlled tests and private swarms).
     pub initial_peers: Vec<SocketAddr>,
-    pub peer_limit: Option<usize>,
+    /// Peers per torrent (librqbit's own default is 128).
+    pub peer_limit: usize,
     pub upload_bps: Option<std::num::NonZeroU32>,
     pub download_bps: Option<std::num::NonZeroU32>,
     /// Torrents downloading at once; further grabs wait in the outbox.
@@ -1488,7 +1489,7 @@ pub fn parse_config(
                     .peer_limit
                     .map(|p| within("embedded.peer_limit", u64::from(p), 1, 1000))
                     .transpose()?
-                    .map(|p| p as usize),
+                    .map_or(50, |p| p as usize),
                 upload_bps: nonzero(
                     e.upload_limit_bytes_per_sec,
                     "embedded.upload_limit_bytes_per_sec",
@@ -2406,6 +2407,26 @@ mod tests {
             ));
             assert_eq!(
                 load(&cfg).unwrap().embedded.unwrap().upnp,
+                want,
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_peer_limit_defaults_to_50_and_a_configured_one_wins() {
+        let base = "[server]\napi_token_file = \"secrets/api_token\"\n[prowlarr]\nbase_url = \"http://127.0.0.1:9696\"\napi_key_file = \"secrets/prowlarr_api_key\"\n[execution]\nenabled = true\n[library]\nmovies = \"/srv/movies\"\n[migration]\nmode = \"coexistence\"\n";
+        for (extra, want) in [
+            ("", 50),
+            ("peer_limit = 8\n", 8),
+            ("peer_limit = 200\n", 200),
+        ] {
+            let (_t, cfg) = setup(&format!(
+                "{base}[embedded]\ndownload_dir = \"/srv/um-dl\"\nlisten = \"127.0.0.1:0\"\n{extra}"
+            ));
+            assert_eq!(
+                load(&cfg).unwrap().embedded.unwrap().peer_limit,
                 want,
                 "{extra:?}"
             );
