@@ -694,3 +694,164 @@ async fn season_status_includes_individual_grabs_with_either_series_namespace() 
         assert_eq!(season["downloads"][0]["target"], "episode:tvdb:372264:1:2");
     }
 }
+
+/// The list pages show each title's stored added time whether or not they sort by it, and
+/// count a series' episodes without listing them.
+#[tokio::test]
+async fn library_pages_show_added_times_and_episode_counts() {
+    let e = start_exec(ExecOptions::default()).await;
+    let added: std::collections::HashMap<String, String> = e
+        .state
+        .store
+        .with(|c| {
+            let mut q = c.prepare("SELECT id, added_at FROM media")?;
+            let rows = q
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    for kind in ["movies", "series"] {
+        for query in [
+            "",
+            "?limit=2&offset=1",
+            "?sort=title",
+            "?sort=size",
+            "?sort=added",
+        ] {
+            let (s, v, _) = e
+                .json(e.get(&format!("/api/v1/library/{kind}{query}")))
+                .await;
+            assert_eq!(s, 200, "{v}");
+            let items = v["items"].as_array().unwrap();
+            assert!(!items.is_empty(), "{kind}{query}");
+            for i in items {
+                let id = i["id"].as_str().unwrap();
+                assert!(added.contains_key(id), "{id}");
+                assert_eq!(i["added_at"], json!(added[id]), "{kind}{query}: {id}");
+            }
+        }
+    }
+    let (_, v, _) = e.json(e.get("/api/v1/library/series?limit=100")).await;
+    let index = e.state.index();
+    let mut counted = 0;
+    for i in v["items"].as_array().unwrap() {
+        let s = index
+            .catalog
+            .series
+            .iter()
+            .find(|s| i["id"] == s.id.to_string())
+            .unwrap();
+        assert!(i.get("episodes").is_none(), "{i}");
+        match &s.episodes {
+            Some(list) => {
+                counted += 1;
+                let owned = list.iter().filter(|e| e.has_file).count();
+                let queued = list.iter().filter(|e| e.queued).count();
+                assert_eq!(i["episode_samples_present"], true);
+                assert_eq!(
+                    i["episode_counts"],
+                    json!({ "known": list.len(), "owned": owned, "queued": queued })
+                );
+            }
+            None => {
+                assert_eq!(i["episode_samples_present"], false);
+                assert!(i.get("episode_counts").is_none(), "{i}");
+            }
+        }
+    }
+    assert!(counted > 0, "{v}");
+    let slow = &v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "series:tvdb:372264")
+        .unwrap()["episode_counts"];
+    assert!(slow["owned"].as_u64().unwrap() > 0, "{slow}");
+}
+
+/// Wanted shows the search schedule of the items that have one and "never searched" for the
+/// rest.
+#[tokio::test]
+async fn wanted_shows_search_schedules_where_there_are_any() {
+    let e = start_exec(ExecOptions {
+        plex: false,
+        ..Default::default()
+    })
+    .await;
+    let (s, _, text) = e
+        .json(
+            e.post("/api/v1/library")
+                .json(&json!({ "media_id": "series:tvdb:999001", "monitor": "all" })),
+        )
+        .await;
+    assert_eq!(s, 201, "{text}");
+    let wanted = || async {
+        let (_, v, _) = e
+            .json(e.get("/api/v1/wanted?media_id=series:tvdb:999001"))
+            .await;
+        v["items"].as_array().unwrap().clone()
+    };
+    let items = wanted().await;
+    assert_eq!(items.len(), 8, "{items:?}");
+    for i in &items {
+        assert_eq!(
+            (
+                &i["last_search_at"],
+                &i["next_search_at"],
+                &i["search_failures"]
+            ),
+            (&Value::Null, &Value::Null, &json!(0)),
+            "{i}"
+        );
+    }
+    let target: arr::ids::MediaId = items[3]["target"].as_str().unwrap().parse().unwrap();
+    let at = time::macros::datetime!(2026-01-02 03:04:05 UTC);
+    let next = time::macros::datetime!(2026-01-03 03:04:05 UTC);
+    e.state
+        .store
+        .with(move |c| arr::library::record_search(c, &[target], at, Some(next), true))
+        .await
+        .unwrap();
+    let items = wanted().await;
+    for i in &items {
+        let expected = if i["target"] == target.to_string() {
+            json!(["2026-01-02T03:04:05Z", "2026-01-03T03:04:05Z", 1])
+        } else {
+            json!([null, null, 0])
+        };
+        assert_eq!(
+            json!([
+                i["last_search_at"],
+                i["next_search_at"],
+                i["search_failures"]
+            ]),
+            expected,
+            "{i}"
+        );
+    }
+    // A failure count alone is a schedule too.
+    e.state
+        .store
+        .with(|c| {
+            c.execute(
+                "UPDATE episodes SET last_search_at = NULL, next_search_at = NULL, search_failures = 2 WHERE series_id = 'series:tvdb:999001'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for i in wanted().await {
+        assert_eq!(
+            json!([
+                i["last_search_at"],
+                i["next_search_at"],
+                i["search_failures"]
+            ]),
+            json!([null, null, 2]),
+            "{i}"
+        );
+    }
+}

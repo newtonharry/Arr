@@ -455,7 +455,8 @@ fn read_secret(what: &str) -> Result<String> {
 // timeout, because the MCP adapter's stdin read can't be cancelled and would otherwise keep
 // a failed `arr mcp` waiting for its client's next line.
 fn main() -> std::process::ExitCode {
-    let rt = match tokio::runtime::Runtime::new() {
+    arr::lifecycle::limit_malloc_arenas();
+    let rt = match arr::lifecycle::runtime() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("Error: couldn't start: {e}");

@@ -495,6 +495,8 @@ pub async fn scan(st: &AppState, now: OffsetDateTime, explicit: bool) -> Result<
             .await?;
         reports.push(report);
     }
+    // (so the reload can free the old index)
+    drop(index);
     st.reload_index().await?;
     Ok(reports)
 }

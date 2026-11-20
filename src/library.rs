@@ -116,7 +116,7 @@ fn queued_targets(c: &Connection) -> Result<HashSet<String>> {
 
 /// Rebuilds the in-memory index used by every route.
 pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
-    let files = file_evidence_by_target(c)?;
+    let mut files = file_evidence_by_target(c)?;
     let queued = queued_targets(c)?;
     let replaceable: HashSet<String> =
         crate::downloads::active_covers(c, time::OffsetDateTime::now_utc(), None)?
@@ -132,66 +132,6 @@ pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
         )
         .optional()?
         .unwrap_or_default();
-    let mut movies = vec![];
-    let mut series = vec![];
-    let mut stmt = c.prepare(
-        "SELECT id, kind, data, monitored, managed, origin, scanned_at, adopted_at IS NOT NULL, native_specials, metadata_hold FROM media ORDER BY id",
-    )?;
-    type Row = (
-        String,
-        String,
-        String,
-        bool,
-        bool,
-        String,
-        Option<String>,
-        bool,
-        i64,
-        Option<String>,
-    );
-    let rows: Vec<Row> = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-            ))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-    let mut episodes: HashMap<String, Vec<(Episode, Option<bool>)>> = HashMap::new();
-    let mut ep_stmt = c.prepare(
-        "SELECT series_id, season, number, title, air_date_utc, runtime, monitored, snapshot_owned FROM episodes ORDER BY series_id, season, number",
-    )?;
-    for row in ep_stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            Episode {
-                season: r.get(1)?,
-                number: r.get(2)?,
-                title: r.get(3)?,
-                air_date_utc: r.get(4)?,
-                runtime_minutes: r.get(5)?,
-                has_file: false,
-                monitored: r.get(6)?,
-                file_quality: None,
-                file: None,
-                ownership_unknown: false,
-                queued: false,
-                replaceable: false,
-            },
-            r.get::<_, Option<bool>>(7)?,
-        ))
-    })? {
-        let (sid, e, snap) = row?;
-        episodes.entry(sid).or_default().push((e, snap));
-    }
     let mut season_monitor: HashMap<(String, u16), bool> = HashMap::new();
     let mut s_stmt = c.prepare("SELECT series_id, season, monitored FROM seasons")?;
     for row in s_stmt.query_map([], |r| {
@@ -204,7 +144,27 @@ pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
         let (sid, n, m) = row?;
         season_monitor.insert((sid, n), m);
     }
-    for (id, kind, data, monitored, managed, origin, scanned, adopted, specials, hold) in rows {
+    let mut ep_stmt = c.prepare(
+        "SELECT season, number, title, air_date_utc, runtime, monitored, snapshot_owned FROM episodes WHERE series_id = ?1 ORDER BY season, number",
+    )?;
+    let mut movies = vec![];
+    let mut series = vec![];
+    let mut stmt = c.prepare(
+        "SELECT id, kind, data, monitored, managed, origin, scanned_at, adopted_at IS NOT NULL, native_specials, metadata_hold FROM media ORDER BY id",
+    )?;
+    // One row at a time: the stored JSON of the whole catalog is never held at once.
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let id: String = r.get(0)?;
+        let kind: String = r.get(1)?;
+        let data: String = r.get(2)?;
+        let monitored: bool = r.get(3)?;
+        let managed: bool = r.get(4)?;
+        let origin: String = r.get(5)?;
+        let scanned: Option<String> = r.get(6)?;
+        let adopted: bool = r.get(7)?;
+        let specials: i64 = r.get(8)?;
+        let hold: Option<String> = r.get(9)?;
         let acquisition = crate::catalog::acquisition_state(managed, &origin, adopted);
         // Effective monitoring: only what this server acquires, i.e. adopted items.
         let acquiring = managed && acquisition == "adopted";
@@ -213,7 +173,9 @@ pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
                 serde_json::from_str(&data).with_context(|| format!("media {id}"))?;
             m.monitored = monitored && acquiring;
             m.acquisition = Some(acquisition.into());
-            let ev = files.get(&id).cloned();
+            // Each target is looked up once (media and episode ids are unique), so its
+            // evidence moves into the index.
+            let ev = files.remove(&id);
             m.has_file = ev.is_some();
             m.file_quality = ev.as_ref().and_then(|e| e.quality);
             m.file = ev;
@@ -240,13 +202,33 @@ pub fn load_index(c: &Connection) -> Result<CatalogIndex> {
                     season.monitored = *m;
                 }
             }
-            let eps = episodes.remove(&id).unwrap_or_default();
+            let eps = ep_stmt
+                .query_map([&id], |r| {
+                    Ok((
+                        Episode {
+                            season: r.get(0)?,
+                            number: r.get(1)?,
+                            title: r.get(2)?,
+                            air_date_utc: r.get(3)?,
+                            runtime_minutes: r.get(4)?,
+                            has_file: false,
+                            monitored: r.get(5)?,
+                            file_quality: None,
+                            file: None,
+                            ownership_unknown: false,
+                            queued: false,
+                            replaceable: false,
+                        },
+                        r.get::<_, Option<bool>>(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             if !eps.is_empty() {
                 let list = eps
                     .into_iter()
                     .map(|(mut e, snap)| {
                         let eid = episode_id(s.id, e.season, e.number).to_string();
-                        let ev = files.get(&eid).cloned();
+                        let ev = files.remove(&eid);
                         match (&ev, scanned.is_some(), snap) {
                             (Some(_), _, _) => e.has_file = true,
                             (None, true, _) | (None, false, Some(false)) => e.has_file = false,
@@ -1250,7 +1232,7 @@ pub fn wanted(
 ) -> Result<Vec<Wanted>> {
     let mut sched: HashMap<String, (Option<String>, Option<String>, i64)> = HashMap::new();
     let mut stmt = c.prepare(
-        "SELECT id, last_search_at, next_search_at, search_failures FROM media WHERE managed = 1",
+        "SELECT id, last_search_at, next_search_at, search_failures FROM media WHERE managed = 1 AND (last_search_at IS NOT NULL OR next_search_at IS NOT NULL OR search_failures != 0)",
     )?;
     for row in stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -1258,7 +1240,8 @@ pub fn wanted(
         let (id, l, n, f) = row?;
         sched.insert(id, (l, n, f));
     }
-    let mut stmt = c.prepare("SELECT series_id, season, number, last_search_at, next_search_at, search_failures FROM episodes")?;
+    // Only rows with a schedule: a missing one reads as never searched, (None, None, 0).
+    let mut stmt = c.prepare("SELECT series_id, season, number, last_search_at, next_search_at, search_failures FROM episodes WHERE last_search_at IS NOT NULL OR next_search_at IS NOT NULL OR search_failures != 0")?;
     for row in stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -1633,9 +1616,20 @@ pub fn ownership(
     offset: usize,
 ) -> Result<(Vec<serde_json::Value>, usize)> {
     use serde_json::json;
-    let mut stmt = c.prepare(
-        "SELECT id, kind, data, monitored, managed, origin, adopted_at, monitor_new, native_specials FROM media WHERE (?1 IS NULL OR id = ?1) ORDER BY adopted_at IS NULL, adopted_at DESC, id",
+    // `catalog::acquisition_state` in SQL, so only the page is read.
+    let filter = "WHERE (?1 IS NULL OR id = ?1) AND (?2 IS NULL OR ?2 = CASE
+        WHEN managed != 0 AND (adopted_at IS NOT NULL OR origin = 'api') THEN 'adopted'
+        WHEN managed != 0 THEN 'legacy_managed'
+        WHEN adopted_at IS NOT NULL OR origin = 'api' THEN 'released'
+        ELSE 'observed' END)";
+    let total: i64 = c.query_row(
+        &format!("SELECT COUNT(*) FROM media {filter}"),
+        params![only, state],
+        |r| r.get(0),
     )?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT id, kind, data, monitored, managed, origin, adopted_at, monitor_new, native_specials FROM media {filter} ORDER BY adopted_at IS NULL, adopted_at DESC, id LIMIT ?3 OFFSET ?4"
+    ))?;
     type Row = (
         String,
         String,
@@ -1648,7 +1642,7 @@ pub fn ownership(
         i64,
     );
     let rows: Vec<Row> = stmt
-        .query_map([only], |r| {
+        .query_map(params![only, state, limit as i64, offset as i64], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -1662,19 +1656,9 @@ pub fn ownership(
             ))
         })?
         .collect::<std::result::Result<_, _>>()?;
-    let rows: Vec<(Row, &'static str)> = rows
-        .into_iter()
-        .map(|r| {
-            let s = crate::catalog::acquisition_state(r.4, &r.5, r.6.is_some());
-            (r, s)
-        })
-        .filter(|(_, s)| state.is_none_or(|want| want == *s))
-        .collect();
-    let total = rows.len();
     let mut out = vec![];
-    for ((id, kind, data, monitored, _managed, origin, adopted_at, monitor_new, specials), acq) in
-        rows.into_iter().skip(offset).take(limit)
-    {
+    for (id, kind, data, monitored, managed, origin, adopted_at, monitor_new, specials) in rows {
+        let acq = crate::catalog::acquisition_state(managed, &origin, adopted_at.is_some());
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
         let native = (origin == "snapshot").then(|| {
             json!({
@@ -1753,7 +1737,7 @@ pub fn ownership(
         }
         out.push(v);
     }
-    Ok((out, total))
+    Ok((out, total as usize))
 }
 
 #[cfg(test)]

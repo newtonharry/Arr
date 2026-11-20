@@ -469,6 +469,7 @@ impl Push {
         }
         let db = rusqlite::Connection::open(&path).context("open web.sqlite")?;
         db.busy_timeout(Duration::from_secs(5))?;
+        db.pragma_update(None, "cache_size", -256)?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS push_subs (
                 endpoint TEXT PRIMARY KEY, p256dh TEXT NOT NULL, auth TEXT NOT NULL,

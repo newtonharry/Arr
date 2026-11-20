@@ -381,17 +381,20 @@ impl AppState {
 
     /// Rebuilds the index from the managed catalog tables.
     pub async fn reload_index(&self) -> anyhow::Result<()> {
-        let _one_at_a_time = self.index_lock.lock().await;
-        let idx = self.store.with(|c| library::load_index(c)).await?;
-        let pause = {
-            let mut p = RELOAD_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
-            let at = p.iter().position(|(d, _)| *d == self.cfg.state_dir);
-            at.map(|i| p.swap_remove(i).1)
-        };
-        if let Some(ms) = pause {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        {
+            let _one_at_a_time = self.index_lock.lock().await;
+            let idx = self.store.with(|c| library::load_index(c)).await?;
+            let pause = {
+                let mut p = RELOAD_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+                let at = p.iter().position(|(d, _)| *d == self.cfg.state_dir);
+                at.map(|i| p.swap_remove(i).1)
+            };
+            if let Some(ms) = pause {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            *self.index.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(idx);
         }
-        *self.index.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(idx);
+        crate::lifecycle::trim_malloc();
         Ok(())
     }
 
@@ -1599,18 +1602,43 @@ fn library_sort(raw: Option<&str>) -> Result<Option<LibrarySort>, ApiError> {
     }
 }
 
-/// When each title was added to the catalog (RFC 3339), by media id.
-async fn added_times(st: &AppState) -> Result<std::collections::HashMap<String, String>, ApiError> {
+/// When titles were added to the catalog (RFC 3339), by media id: the ones in `ids`, or all.
+async fn added_times(
+    st: &AppState,
+    ids: Option<Vec<String>>,
+) -> Result<std::collections::HashMap<String, String>, ApiError> {
     st.store
-        .with(|c| {
-            let mut stmt = c.prepare("SELECT id, added_at FROM media")?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                .collect::<std::result::Result<_, _>>()?;
-            Ok(rows)
+        .with(move |c| {
+            let Some(ids) = ids else {
+                let mut stmt = c.prepare("SELECT id, added_at FROM media")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?;
+                return Ok(rows);
+            };
+            use rusqlite::OptionalExtension;
+            let mut stmt = c.prepare("SELECT added_at FROM media WHERE id = ?1")?;
+            let mut out = std::collections::HashMap::new();
+            for id in ids {
+                if let Some(at) = stmt.query_row([&id], |r| r.get(0)).optional()? {
+                    out.insert(id, at);
+                }
+            }
+            Ok(out)
         })
         .await
         .map_err(internal("added"))
+}
+
+/// Every title's added time when the list is sorted by it (none otherwise; see `added_times`).
+async fn added_for_sort(
+    st: &AppState,
+    sort: Option<LibrarySort>,
+) -> Result<Option<std::collections::HashMap<String, String>>, ApiError> {
+    match sort {
+        Some(LibrarySort::Added) => Ok(Some(added_times(st, None).await?)),
+        _ => Ok(None),
+    }
 }
 
 fn series_size(s: &crate::catalog::Series) -> u64 {
@@ -1710,9 +1738,14 @@ async fn library_movies(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
         .into_iter()
         .filter(|m| managed(&m.provenance.source_app))
         .collect();
-    let added = added_times(&st).await?;
-    let when = |id: &MediaId| added.get(&id.to_string()).cloned().unwrap_or_default();
-    if let Some(sort) = library_sort(q.sort.as_deref())? {
+    let sort = library_sort(q.sort.as_deref())?;
+    let all = added_for_sort(&st, sort).await?;
+    let when = |id: &MediaId| {
+        all.as_ref()
+            .and_then(|a| a.get(&id.to_string()).cloned())
+            .unwrap_or_default()
+    };
+    if let Some(sort) = sort {
         sort_library(
             &mut items,
             sort,
@@ -1721,10 +1754,13 @@ async fn library_movies(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
             |m| movie_size(m),
         );
     }
-    let views: Vec<Value> = items
-        .iter()
-        .skip(offset)
-        .take(limit)
+    let page: Vec<_> = items.iter().skip(offset).take(limit).collect();
+    let added = match all {
+        Some(all) => all,
+        None => added_times(&st, Some(page.iter().map(|m| m.id.to_string()).collect())).await?,
+    };
+    let views: Vec<Value> = page
+        .into_iter()
         .map(|m| {
             let mut v = serde_json::to_value(m).unwrap_or(Value::Null);
             if let Some(o) = v.as_object_mut() {
@@ -1753,34 +1789,45 @@ async fn library_series(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
         .into_iter()
         .filter(|s| managed(&s.provenance.source_app))
         .collect();
-    let added = added_times(&st).await?;
-    if let Some(sort) = library_sort(q.sort.as_deref())? {
+    let sort = library_sort(q.sort.as_deref())?;
+    let all = added_for_sort(&st, sort).await?;
+    if let Some(sort) = sort {
         sort_library(
             &mut items,
             sort,
             |s| s.title.as_str(),
-            |s| added.get(&s.id.to_string()).cloned().unwrap_or_default(),
+            |s| {
+                all.as_ref()
+                    .and_then(|a| a.get(&s.id.to_string()).cloned())
+                    .unwrap_or_default()
+            },
             |s| series_size(s),
         );
     }
+    let page: Vec<_> = items.iter().skip(offset).take(limit).collect();
+    let added = match all {
+        Some(all) => all,
+        None => added_times(&st, Some(page.iter().map(|s| s.id.to_string()).collect())).await?,
+    };
     let now = OffsetDateTime::now_utc();
-    let views: Vec<Value> = items
-        .iter()
-        .skip(offset)
-        .take(limit)
+    let views: Vec<Value> = page
+        .into_iter()
         .map(|s| {
-            let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
+            // The episodes are counted, not listed.
+            let mut v = serde_json::to_value(without_episodes(s)).unwrap_or(Value::Null);
             if let Some(m) = v.as_object_mut() {
                 m.insert("added_at".into(), json!(added.get(&s.id.to_string())));
                 m.insert("size_bytes".into(), json!(series_size(s)));
                 // Live per-season counts (the snapshot's statistics go stale after imports).
                 m.insert("seasons".into(), json!(season_summaries(s, now, None)));
-                let eps = m.remove("episodes");
-                let list = eps.as_ref().and_then(|e| e.as_array());
-                m.insert("episode_samples_present".into(), json!(list.is_some()));
-                if let Some(list) = list {
-                    let owned = list.iter().filter(|e| e["has_file"] == true).count();
-                    let queued = list.iter().filter(|e| e["queued"] == true).count();
+                m.remove("episodes");
+                m.insert(
+                    "episode_samples_present".into(),
+                    json!(s.episodes.is_some()),
+                );
+                if let Some(list) = &s.episodes {
+                    let owned = list.iter().filter(|e| e.has_file).count();
+                    let queued = list.iter().filter(|e| e.queued).count();
                     m.insert(
                         "episode_counts".into(),
                         json!({ "known": list.len(), "owned": owned, "queued": queued }),
@@ -1791,6 +1838,37 @@ async fn library_series(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
         })
         .collect();
     ok(json!({ "total": items.len(), "items": views, "observation": observation(&l) }))
+}
+
+/// A copy of `s` without its episode list (most of a series' size).
+fn without_episodes(s: &crate::catalog::Series) -> crate::catalog::Series {
+    crate::catalog::Series {
+        id: s.id,
+        tvdb_id: s.tvdb_id,
+        tvmaze_id: s.tvmaze_id,
+        tmdb_id: s.tmdb_id,
+        imdb_id: s.imdb_id.clone(),
+        title: s.title.clone(),
+        alternate_titles: s.alternate_titles.clone(),
+        year: s.year,
+        series_type: s.series_type.clone(),
+        scene_numbering: s.scene_numbering,
+        runtime_minutes: s.runtime_minutes,
+        original_language: s.original_language.clone(),
+        status: s.status.clone(),
+        monitored: s.monitored,
+        quality_profile: s.quality_profile.clone(),
+        root_folder: s.root_folder.clone(),
+        seasons: s.seasons.clone(),
+        episodes: None,
+        identity_conflict: s.identity_conflict,
+        provenance: s.provenance.clone(),
+        folder: s.folder.clone(),
+        monitor_new_items: s.monitor_new_items.clone(),
+        acquisition: s.acquisition.clone(),
+        native_specials_monitored: s.native_specials_monitored,
+        metadata_hold: s.metadata_hold.clone(),
+    }
 }
 
 #[derive(Deserialize, Default)]

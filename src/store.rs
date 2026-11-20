@@ -382,6 +382,8 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Page cache in KiB (SQLite's default is 2 MB per connection).
+        conn.pragma_update(None, "cache_size", -1024)?;
         conn.execute_batch(SCHEMA)?;
         let version: Option<String> = conn
             .query_row(
