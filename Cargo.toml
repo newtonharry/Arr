@@ -21,6 +21,8 @@ getrandom = "0.4"
 hex = "0.4"
 libc = "0.2"
 librqbit = { version = "=9.0.1", default-features = false, features = ["rust-tls"] }
+# The uTP options type librqbit takes is not re-exported; librqbit already builds this crate.
+librqbit-utp = "=0.7.0"
 regex = "1.13"
 ring = "0.17"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "multipart", "form", "gzip"] }

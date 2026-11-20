@@ -45,6 +45,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -66,6 +67,8 @@ pub struct Embedded {
     verifying: Arc<Mutex<HashSet<String>>>,
     /// Running full piece checks, drained before the engine lock is released.
     checks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Full piece checks reading at once; the others wait, bound and still `checking`.
+    check_slots: Arc<tokio::sync::Semaphore>,
     /// Tests hold this to keep spawned piece checks from running until they release it.
     #[cfg(test)]
     check_gate: Arc<tokio::sync::RwLock<()>>,
@@ -287,11 +290,11 @@ fn verify_selected(root: &Path, layout: &Layout, selected: &[bool]) -> Result<()
         }
     }
     let mut open: Option<(usize, std::fs::File)> = None;
-    let mut buf: Vec<u8> = Vec::with_capacity(piece as usize);
+    let mut hasher = Sha1::new();
+    let mut buf = vec![0u8; 256 * 1024];
     for (index, _) in needed.iter().enumerate().filter(|(_, n)| **n) {
         let start = index as u64 * piece;
         let end = (start + piece).min(total);
-        buf.clear();
         let mut pos = start;
         let mut f = spans.partition_point(|s| s.1 <= start);
         while pos < end {
@@ -300,10 +303,10 @@ fn verify_selected(root: &Path, layout: &Layout, selected: &[bool]) -> Result<()
                 f += 1;
                 continue;
             }
-            let take = (end.min(fe) - pos) as usize;
+            let take = end.min(fe) - pos;
             let (rel, _, padding) = &layout.files[f];
-            if *padding {
-                buf.resize(buf.len() + take, 0);
+            let mut file = if *padding {
+                None
             } else {
                 if open.as_ref().is_none_or(|(i, _)| *i != f) {
                     let file = std::fs::File::open(root.join(rel))
@@ -313,17 +316,26 @@ fn verify_selected(root: &Path, layout: &Layout, selected: &[bool]) -> Result<()
                 let file = &mut open.as_mut().expect("opened").1;
                 file.seek(SeekFrom::Start(pos - fs))
                     .map_err(|e| format!("{}: {}", rel.display(), e.kind()))?;
-                let at = buf.len();
-                buf.resize(at + take, 0);
-                file.read_exact(&mut buf[at..])
-                    .map_err(|e| format!("{}: {}", rel.display(), e.kind()))?;
+                Some(file)
+            };
+            let mut left = take;
+            while left > 0 {
+                let want = (buf.len() as u64).min(left) as usize;
+                match file.as_mut() {
+                    Some(file) => file
+                        .read_exact(&mut buf[..want])
+                        .map_err(|e| format!("{}: {}", rel.display(), e.kind()))?,
+                    None => buf[..want].fill(0),
+                }
+                hasher.update(&buf[..want]);
+                left -= want as u64;
             }
-            pos += take as u64;
+            pos += take;
             if pos >= fe {
                 f += 1;
             }
         }
-        let digest = Sha1::digest(&buf);
+        let digest = hasher.finalize_reset();
         if digest.as_slice() != &layout.pieces[index * 20..index * 20 + 20] {
             return Err(format!("piece {index} does not match its hash"));
         }
@@ -592,6 +604,21 @@ async fn finish_check(store: &Store, hash: &str, token: &str, result: Result<(),
         .unwrap_or(false)
 }
 
+/// Whether `token` is still the record's check, so its result would be recorded.
+async fn check_is_current(store: &Store, hash: &str, token: &str) -> bool {
+    let (h, t) = (hash.to_string(), token.to_string());
+    store
+        .with(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM embedded_torrents WHERE info_hash = ?1 AND verify_token = ?2 AND removed_at IS NULL)",
+                params![h, t],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })
+        .await
+        .unwrap_or(false)
+}
+
 /// The effective limit: `>= 0` own, `-2` the configured global one, `-1` none.
 fn effective<T: Copy + PartialOrd + Default>(own: T, global: Option<T>, minus_two: T) -> Option<T> {
     if own >= T::default() {
@@ -613,6 +640,7 @@ impl Embedded {
             seen: Mutex::new(HashMap::new()),
             verifying: Arc::new(Mutex::new(HashSet::new())),
             checks: Mutex::new(vec![]),
+            check_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(test)]
             check_gate: Arc::default(),
             lock: Mutex::new(None),
@@ -658,7 +686,7 @@ impl Embedded {
                 bootstrap_addrs: None,
                 port: None,
                 persistence: Some(DhtPersistenceConfig {
-                    dump_interval: None,
+                    dump_interval: Some(std::time::Duration::from_secs(30 * 60)),
                     config_filename: Some(c.session_dir.join("dht.json")),
                 }),
             });
@@ -674,13 +702,22 @@ impl Embedded {
                     listen_addr: plan.addr,
                     enable_upnp_port_forwarding: c.upnp,
                     ipv4_only: !plan.dual_stack,
+                    // librqbit-utp's defaults allow 128 streams of 1 MiB each way.
+                    utp_opts: Some(librqbit_utp::SocketOpts {
+                        vsock_rx_bufsize_bytes: NonZeroUsize::new(256 * 1024),
+                        vsock_tx_bufsize_bytes_max: NonZeroUsize::new(256 * 1024),
+                        max_live_vsocks: NonZeroUsize::new(64),
+                        ..Default::default()
+                    }),
+                    max_pending_incoming_handshake_checks: 64,
                     ..Default::default()
                 }),
                 ratelimits: LimitsConfig {
                     upload_bps: c.upload_bps,
                     download_bps: c.download_bps,
                 },
-                peer_limit: c.peer_limit,
+                peer_limit: Some(c.peer_limit),
+                concurrent_init_limit: Some(1),
                 disable_local_service_discovery: !c.local_discovery,
                 ipv4_only: !plan.dual_stack,
                 ..Default::default()
@@ -903,6 +940,8 @@ impl Embedded {
         let Some(session) = self.session.get() else {
             return;
         };
+        // Checks still waiting for a slot give up; only the ones already reading are waited for.
+        self.check_slots.close();
         {
             let _ops = self.ops.lock().await;
             let handles: Vec<(String, Arc<ManagedTorrent>)> = session.with_torrents(|it| {
@@ -1034,8 +1073,8 @@ impl Embedded {
     pub async fn add(&self, req: &AddRequest) -> Result<bool, UpstreamError> {
         let session = self.start().await?;
         let peers = (!self.cfg.initial_peers.is_empty()).then(|| self.cfg.initial_peers.clone());
-        let bytes: Vec<u8> = match &req.payload {
-            Payload::Torrent(b) => b.clone(),
+        let bytes = match &req.payload {
+            Payload::Torrent(b) => b.clone().into(),
             Payload::Magnet(m) => {
                 if crate::torrent::magnet_hash(m).is_err() {
                     return Err(invalid("malformed magnet link"));
@@ -1091,7 +1130,7 @@ impl Embedded {
                         )));
                     }
                     Ok(Err(e)) => return Err(engine_failure("fetching magnet metadata", &e)),
-                    Ok(Ok(AddTorrentResponse::ListOnly(l))) => l.torrent_bytes.to_vec(),
+                    Ok(Ok(AddTorrentResponse::ListOnly(l))) => l.torrent_bytes,
                     // Already managed by hash: reconciliation decides whether it is ours.
                     Ok(Ok(_)) => return Ok(true),
                 }
@@ -1480,10 +1519,6 @@ impl Embedded {
     /// runs, so a check never binds itself later to a different lifecycle; the spawned task
     /// only reads the pieces and records its result if its token is still the record's.
     async fn verify_later(&self, hash: &str, h: &ManagedTorrent, output_folder: &str) {
-        let Ok(layout) = h.with_metadata(|m| Layout::of(&m.info)) else {
-            return;
-        };
-        let layout = layout.with_selection(h.only_files().as_deref());
         if self
             .verifying
             .lock()
@@ -1492,6 +1527,10 @@ impl Embedded {
         {
             return;
         }
+        let Ok(layout) = h.with_metadata(|m| Layout::of(&m.info)) else {
+            return;
+        };
+        let layout = layout.with_selection(h.only_files().as_deref());
         let Some(token) = bind_check(&self.store, hash).await else {
             return;
         };
@@ -1499,21 +1538,28 @@ impl Embedded {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(hash.to_string());
-        let (store, set, hash, root) = (
+        let (store, set, hash, root, slots) = (
             self.store.clone(),
             self.verifying.clone(),
             hash.to_string(),
             PathBuf::from(output_folder),
+            self.check_slots.clone(),
         );
         #[cfg(test)]
         let gate = self.check_gate.clone();
         let handle = tokio::spawn(async move {
             #[cfg(test)]
             let _gate = gate.read().await;
-            let result = tokio::task::spawn_blocking(move || verify_pieces(&root, &layout))
-                .await
-                .unwrap_or_else(|_| Err("the check did not finish".into()));
-            finish_check(&store, &hash, &token, result).await;
+            // Closed at shutdown: a check still waiting then records nothing, and the next
+            // start checks again. One whose token went stale while it waited reads nothing.
+            if let Ok(_slot) = slots.acquire_owned().await
+                && check_is_current(&store, &hash, &token).await
+            {
+                let result = tokio::task::spawn_blocking(move || verify_pieces(&root, &layout))
+                    .await
+                    .unwrap_or_else(|_| Err("the check did not finish".into()));
+                finish_check(&store, &hash, &token, result).await;
+            }
             set.lock().unwrap_or_else(|e| e.into_inner()).remove(&hash);
         });
         let mut checks = self.checks.lock().unwrap_or_else(|e| e.into_inner());
@@ -1725,7 +1771,12 @@ impl Embedded {
         session
             .pause(&h)
             .await
-            .map_err(|e| engine_failure("pausing", &e))
+            .map_err(|e| engine_failure("pausing", &e))?;
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&hash.to_ascii_lowercase());
+        Ok(())
     }
 
     pub async fn resume(&self, hash: &str) -> Result<(), UpstreamError> {
@@ -1887,6 +1938,83 @@ mod tests {
     }
 
     #[test]
+    fn the_piece_check_of_a_selection_reads_only_the_pieces_of_selected_files() {
+        use sha1::{Digest, Sha1};
+        // Pieces larger than the read buffer; a selected file ending mid-piece before padding,
+        // and a selected file sharing its first piece with an unselected neighbour.
+        let piece = 300_000u64;
+        let a: Vec<u8> = (0..450_000u32).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..700_000u32).map(|i| (i % 239) as u8).collect();
+        let c: Vec<u8> = (0..250_000u32).map(|i| (i % 233) as u8).collect();
+        let data: Vec<u8> = [&a[..], &[0; 150_000], &b, &c].concat();
+        let pieces: Vec<u8> = data
+            .chunks(piece as usize)
+            .flat_map(|p| Sha1::digest(p).to_vec())
+            .collect();
+        let l = Layout {
+            piece_length: piece,
+            pieces,
+            files: vec![
+                ("a.mkv".into(), 450_000, false),
+                (".pad/150000".into(), 150_000, true),
+                ("b.mkv".into(), 700_000, false),
+                ("c.mkv".into(), 250_000, false),
+            ],
+            selected: Some(vec![true, false, false, true]),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |name: &str, bytes: &[u8]| std::fs::write(root.join(name), bytes).unwrap();
+        // The unselected file holds only the edge of the piece it shares with c.
+        let mut edge = vec![0u8; b.len()];
+        edge[600_000..].copy_from_slice(&b[600_000..]);
+        write("a.mkv", &a);
+        write("b.mkv", &edge);
+        write("c.mkv", &c);
+        verify_pieces(root, &l).unwrap();
+        // A corrupt byte where a selected file ends mid-piece, before the padding.
+        let mut bad = a.clone();
+        bad[449_999] ^= 1;
+        write("a.mkv", &bad);
+        assert_eq!(
+            verify_pieces(root, &l).unwrap_err(),
+            "piece 1 does not match its hash"
+        );
+        write("a.mkv", &a);
+        // A corrupt byte in the shared edge, and one in the selected file's last piece.
+        let mut bad = edge.clone();
+        bad[650_000] ^= 1;
+        write("b.mkv", &bad);
+        assert_eq!(
+            verify_pieces(root, &l).unwrap_err(),
+            "piece 4 does not match its hash"
+        );
+        write("b.mkv", &edge);
+        let mut bad = c.clone();
+        bad[249_999] ^= 1;
+        write("c.mkv", &bad);
+        assert_eq!(
+            verify_pieces(root, &l).unwrap_err(),
+            "piece 5 does not match its hash"
+        );
+        write("c.mkv", &c);
+        // Bytes of pieces no selected file overlaps are not read.
+        let mut other = edge.clone();
+        other[10] ^= 1;
+        write("b.mkv", &other);
+        verify_pieces(root, &l).unwrap();
+        // A selected file of the wrong length, and a missing neighbour sharing a needed piece.
+        write("c.mkv", &c[1..]);
+        assert!(verify_pieces(root, &l).unwrap_err().contains("bytes"));
+        write("c.mkv", &c);
+        std::fs::remove_file(root.join("b.mkv")).unwrap();
+        assert!(verify_pieces(root, &l).is_err());
+        // A neighbour shorter than the shared edge.
+        write("b.mkv", &edge[..640_000]);
+        assert!(verify_pieces(root, &l).unwrap_err().contains("b.mkv"));
+    }
+
+    #[test]
     fn readings_add_only_what_one_live_state_counted() {
         let t0 = Instant::now();
         let s = |uploaded, fetched, finished, ms| Sample {
@@ -2001,7 +2129,7 @@ mod tests {
             dht: false,
             local_discovery: false,
             initial_peers: vec![],
-            peer_limit: None,
+            peer_limit: 50,
             upload_bps: None,
             download_bps: None,
             max_active_downloads: 3,

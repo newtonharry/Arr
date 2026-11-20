@@ -1422,7 +1422,9 @@ async fn a_note_that_says_how_a_game_went_reaches_neither_the_store_nor_an_answe
         let (s, _, text) = e.json(e.get(path)).await;
         assert_eq!(s, 200, "{path}");
         assert!(
-            !text.contains("penalties") && !text.contains("win 4-3") && !text.contains("2-0"),
+            !text.contains("penalties")
+                && !text.contains("win 4-3")
+                && !text.contains("beat Chelsea"),
             "{path}: {text}"
         );
     }

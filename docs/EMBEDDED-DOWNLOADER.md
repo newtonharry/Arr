@@ -32,7 +32,7 @@ trackers = true                      # default true: announce to the torrent's t
 dht = false                          # default false: mainline DHT (state in STATE/embedded/dht.json)
 local_discovery = false              # default false: LSD multicast
 initial_peers = []                   # default none: explicit peers for every torrent (controlled swarms)
-# peer_limit = 50                    # per torrent, 1..1000
+# peer_limit = 50                    # default 50: peers per torrent, 1..1000
 # upload_limit_bytes_per_sec = 1048576     # session-wide, positive; omit for none
 # download_limit_bytes_per_sec = 4194304   # session-wide, positive; omit for none
 max_active_downloads = 3             # 1..100; further grabs wait in the outbox, no attempt counted
@@ -168,6 +168,7 @@ sample against its fast-resume bitfield (librqbit 9.0.1). So this app checks eve
 from the files on disk, streaming, before a completed torrent is reported complete:
 - every file must be a regular file of exactly its length, reached without symlinks;
 - until that check passes, the torrent is reported `checking`, so nothing is imported;
+- at most two of these checks run at once; others wait their turn, still `checking`;
 - a mismatch is reported as an error.
 
 **When it runs again.**
@@ -337,7 +338,8 @@ download-directory binding, persisted state, symlinks, admission) are stated in 
   60 s lease renewed every 30 s, and searches for a gateway every 60 s. It maps nothing
   else (never the Arr web port, and not the uTP/UDP port) and reports no result.
 - **Trackers:** on by default.
-- **Transport:** TCP and uTP on the same port number. When `listen` is `0.0.0.0` the
+- **Transport:** TCP and uTP on the same port number. uTP is bounded to 64 connections
+  with 256 KiB of buffer each way per connection. When `listen` is `0.0.0.0` the
   engine binds `[::]` with the same port, which accepts IPv4 and IPv6 (DHT and trackers
   then give IPv6 peers too); a host without IPv6 stays on IPv4. Any other `listen` address
   is used exactly as written, so `127.0.0.1` stays IPv4 on loopback.
