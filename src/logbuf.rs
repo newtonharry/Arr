@@ -36,11 +36,14 @@ fn now() -> i64 {
 }
 
 /// Libraries whose warnings are routine and not something the owner can act on, so they are
-/// kept out of the list (they still reach the log). The uTP library warns on every start that
-/// the kernel caps its UDP receive buffer (it asks for room for 128 full windows, far above
-/// Linux's default `rmem_max`), and when a peer opens several connections at once. Its errors
-/// are still listed.
-const QUIET_WARNINGS: [&str; 1] = ["librqbit_utp"];
+/// kept out of the list (they still reach the log). Their errors are still listed.
+/// - The torrent engine warns whenever a peer sends a piece that fails its hash check; it
+///   drops the peer and fetches the piece again.
+/// - The port mapper warns for every device on the network whose discovery reply it can't
+///   read, on each pass.
+/// - The uTP library warns on every start that the kernel caps its UDP receive buffer, and
+///   when a peer opens several connections at once.
+const QUIET_WARNINGS: [&str; 3] = ["librqbit", "librqbit_upnp", "librqbit_utp"];
 
 /// Stores one event, scrubbed. `target` is the module that logged it.
 pub fn record(at: i64, level: &Level, target: &str, text: &str) {
@@ -236,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_utp_warnings_are_left_out_but_its_errors_are_not() {
+    fn routine_engine_warnings_are_left_out_but_errors_are_not() {
         let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
         clear();
         record(
@@ -250,6 +253,18 @@ mod tests {
             &Level::WARN,
             "librqbit_utp",
             "too many concurrent connectins",
+        );
+        record(
+            2,
+            &Level::WARN,
+            "librqbit_upnp",
+            "failed to parse SSDP response",
+        );
+        record(
+            2,
+            &Level::WARN,
+            "librqbit::torrent_state::live",
+            "checksum for piece=110 did not validate",
         );
         record(3, &Level::ERROR, "librqbit_utp::socket", "socket failed");
         record(4, &Level::WARN, "librqbit_utpx", "another library");
