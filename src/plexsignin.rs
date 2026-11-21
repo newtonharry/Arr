@@ -29,7 +29,8 @@ pub fn client_id(state_dir: &Path) -> Result<String> {
     fsutil::ensure_private_dir(&secrets)?;
     let file = secrets.join("plex_client_id");
     if !file.exists() {
-        fsutil::write_new_private_file(&file, fsutil::random_hex(16)?.as_bytes())?;
+        // Through a temporary file, so a failed write can't leave it empty.
+        fsutil::atomic_replace_private(&file, fsutil::random_hex(16)?.as_bytes())?;
     }
     fsutil::read_secret_file(&file)
 }

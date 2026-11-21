@@ -524,27 +524,30 @@ fn inspect(bytes: &[u8]) -> Result<Inspected, String> {
 /// The download directory and every ancestor that exists must be real directories, so that
 /// confinement below it means what it says.
 fn real_directories(path: &Path) -> Result<(), UpstreamError> {
+    download_dir_problem(path).map_or(Ok(()), |p| Err(unavailable(p)))
+}
+
+/// Why the engine would refuse `path` as its download directory at start (a symbolic link,
+/// or a file, in it), if it would. The setup page checks this before recording the folder.
+pub fn download_dir_problem(path: &Path) -> Option<String> {
     let mut p = PathBuf::new();
     for c in path.components() {
         p.push(c);
         match std::fs::symlink_metadata(&p) {
             Ok(m) if m.file_type().is_symlink() => {
-                return Err(unavailable(format_args!(
+                return Some(format!(
                     "{} is a symbolic link; embedded.download_dir must be a real path without symlinks",
                     p.display()
-                )));
+                ));
             }
             Ok(m) if !m.is_dir() => {
-                return Err(unavailable(format_args!(
-                    "{} is not a directory",
-                    p.display()
-                )));
+                return Some(format!("{} is not a directory", p.display()));
             }
             Ok(_) => {}
             Err(_) => break,
         }
     }
-    Ok(())
+    None
 }
 
 /// Takes the exclusive engine lock of a state's session directory (non-blocking).
