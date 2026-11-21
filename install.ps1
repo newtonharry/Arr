@@ -1514,7 +1514,7 @@ function Undo-Run {
 	# Each goes back as it was, or goes if this run made it.
 	foreach ($f in 'active-import.json', 'default-indexers', 'ngrok.yml') {
 		if (Test-Path (Join-Path $snap $f)) { Copy-Item (Join-Path $snap $f) (Join-Path $stateDir $f) -Force }
-		else { Remove-Item (Join-Path $stateDir $f) -Force -ErrorAction SilentlyContinue }
+		elseif (Test-Path (Join-Path $stateDir $f)) { Remove-Item (Join-Path $stateDir $f) -Force }
 	}
 	$secrets = Join-Path $stateDir 'secrets'
 	$saved = Join-Path $snap 'secrets'
@@ -1541,14 +1541,22 @@ function Restore-Arr {
 	$restart = $script:ArrStopped -and [bool](Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)
 	if ($restart) { try { Stop-Arr $script:ArrBackground } catch {} }
 	# Put back what this run changed before Arr ran well with it.
+	$putBack = $true
 	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) {
 		Write-Host $script:UndoMessage
-		try { Undo-Run } catch { Write-Host "couldn't put them all back: $($_.Exception.Message)" -ForegroundColor Red }
+		try { Undo-Run } catch {
+			$putBack = $false
+			Write-Host "couldn't put them all back: $($_.Exception.Message)" -ForegroundColor Red
+		}
 	}
-	if ($restart) {
-		$script:ArrStopped = $false
+	if ($restart -and -not $putBack) {
+		# Half of the old install and half of the new one: starting that could do harm.
+		Write-Host 'Arr was not started again, because not everything could be put back. Run the install line again.' -ForegroundColor Red
+	} elseif ($restart) {
 		Write-Host 'Starting Arr again.'
 		try { Start-ScheduledTask -TaskName 'Arr' -ErrorAction Stop } catch {}
+		# Cleared only once the start was asked for: cut short before this, finally asks again.
+		$script:ArrStopped = $false
 	}
 	$script:Restored = $true
 }
