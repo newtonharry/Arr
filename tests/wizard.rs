@@ -42,6 +42,9 @@ struct World {
     import_fails: bool,
     /// Plex fails to list this section's items only.
     failing_section: Option<String>,
+    /// Made (a folder with a file in it) the next time a section's items are listed, so the
+    /// setup can't save its config.toml there afterwards.
+    block_with_folder: Option<std::path::PathBuf>,
     /// What the movie section (1) holds.
     movie_items: Vec<Value>,
     /// Libraries added through the API: (type, location, language).
@@ -233,9 +236,13 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
                  AxPath(id): AxPath<String>,
                  Query(q): Query<HashMap<String, String>>| async move {
                 {
-                    let w = m.lock().unwrap();
+                    let mut w = m.lock().unwrap();
                     if w.import_fails || w.failing_section.as_ref() == Some(&id) {
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    if let Some(dir) = w.block_with_folder.take() {
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(dir.join("in-the-way"), b"x").unwrap();
                     }
                 }
                 record(&m, "all", &h);
@@ -960,6 +967,20 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
     }
     let movies = tmp.path().join("media/Movies");
     let tv = tmp.path().join("media/TV Shows");
+    // A symbolic link is refused as Finish refuses it, before Plex is asked for anything.
+    let real = tmp.path().join("real-movies");
+    std::fs::create_dir(&real).unwrap();
+    let link = tmp.path().join("movies-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (s, v) = page
+        .post("/api/plex/libraries", json!({ "movies": link, "tv": tv }))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("symbolic link"),
+        "{v}"
+    );
+    assert!(world.lock().unwrap().created.is_empty());
     // A bad folder is refused before Plex is asked for anything, so a retry can't duplicate.
     let (s, v) = page
         .post(
@@ -1133,6 +1154,120 @@ async fn a_failed_setup_can_be_retried_with_other_libraries() {
     assert!(!config.contains("movie_section"), "{config}");
     // Set up: nothing may clear its catalog any more.
     assert!(!state_dir.join("setup-unfinished").exists());
+}
+
+/// A state folder, two libraries with a movie in one, and a page connected to the mock.
+async fn one_movie(
+    tmp: &Path,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Mock,
+    tokio::process::Child,
+    Page,
+) {
+    let movies = tmp.join("media/movies");
+    let tv = tmp.join("media/tv");
+    std::fs::create_dir_all(movies.join("Film (2000)")).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    let file = movies.join("Film (2000)/Film (2000).mkv");
+    std::fs::write(&file, b"x").unwrap();
+    let state_dir = tmp.join("state");
+    let (mock, world) = start_mock(&movies, &tv).await;
+    {
+        let mut w = world.lock().unwrap();
+        w.resources_calls = 1; // no plex.tv hiccup in this test
+        w.movie_items = vec![json!({
+            "ratingKey": "101", "type": "movie", "title": "Film", "year": 2000,
+            "Guid": [{ "id": "tmdb://603" }],
+            "Media": [{ "Part": [{ "file": file, "size": 1 }] }],
+        })];
+    }
+    let (child, page) = connected_page(&state_dir, mock).await;
+    (state_dir, movies, tv, world, child, page)
+}
+
+/// Finish with these libraries; returns the phase it ends in.
+async fn apply_and_wait(page: &Page, movies: Option<&Path>, tv: &Path, downloads: &Path) -> Value {
+    let (s, v) = page
+        .post(
+            "/api/apply",
+            json!({
+                "movies": movies.map(|m| json!({ "id": "1:0", "folder": m })),
+                "tv": { "id": "2:0", "folder": tv },
+                "downloads": downloads,
+                "auto_update": false,
+            }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    finished(page).await
+}
+
+#[tokio::test]
+async fn a_setup_stopped_before_saving_its_config_can_still_be_retried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, movies, tv, world, _child, page) = one_movie(tmp.path()).await;
+    let downloads = tmp.path().join("media/arr-downloads");
+    // Everything works, the movie is imported, but config.toml can't be saved.
+    world.lock().unwrap().block_with_folder = Some(state_dir.join("config.toml"));
+    let last = apply_and_wait(&page, Some(&movies), &tv, &downloads).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    assert!(
+        last["message"].as_str().unwrap().contains("config.toml"),
+        "{last}"
+    );
+    // Arr isn't set up, so the marker stays: a retry with TV only clears the movie.
+    assert!(state_dir.join("setup-unfinished").exists());
+    std::fs::remove_file(state_dir.join("config.toml/in-the-way")).unwrap();
+    std::fs::remove_dir(state_dir.join("config.toml")).unwrap();
+    let last = apply_and_wait(&page, None, &tv, &downloads).await;
+    assert_eq!(last["state"], "done", "{last}");
+    let config = std::fs::read_to_string(state_dir.join("config.toml")).unwrap();
+    assert!(!config.contains("movie_section"), "{config}");
+    assert!(!state_dir.join("setup-unfinished").exists());
+}
+
+#[tokio::test]
+async fn a_setup_finished_by_hand_with_another_config_is_never_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, movies, tv, world, _child, page) = one_movie(tmp.path()).await;
+    let downloads = tmp.path().join("media/arr-downloads");
+    // The movies import, then the TV import fails.
+    world.lock().unwrap().failing_section = Some("2".into());
+    let last = apply_and_wait(&page, Some(&movies), &tv, &downloads).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    let marker = state_dir.join("setup-unfinished");
+    assert!(marker.exists());
+    let failed = std::fs::read_to_string(state_dir.join("config.toml.failed")).unwrap();
+    let setup = |config: &Path| {
+        let out = std::process::Command::new(BIN)
+            .args(["setup", "--config"])
+            .arg(config)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // The page's own config (as its own `arr setup` runs it) leaves the marker.
+    let own = state_dir.join("config.toml.new");
+    arr::fsutil::write_new_private_file(&own, failed.as_bytes()).unwrap();
+    let err = setup(&own);
+    assert!(marker.exists(), "{err}");
+    std::fs::remove_file(&own).unwrap();
+    // A config kept elsewhere for this state folder now owns it: the marker goes.
+    let elsewhere = tmp.path().join("elsewhere.toml");
+    let theirs = failed.replace("dir = \".\"", &format!("dir = \"{}\"", state_dir.display()));
+    assert_ne!(theirs, failed);
+    arr::fsutil::write_new_private_file(&elsewhere, theirs.as_bytes()).unwrap();
+    let err = setup(&elsewhere);
+    assert!(!marker.exists(), "{err}");
+    // So a retry with other libraries clears nothing, and is refused.
+    world.lock().unwrap().failing_section = None;
+    let last = apply_and_wait(&page, None, &tv, &downloads).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    assert!(state_dir.join("state.sqlite").exists());
+    assert!(!state_dir.join("config.toml").exists());
 }
 
 #[tokio::test]

@@ -338,6 +338,9 @@ async fn setup_cmd(
         config::Secrets::Defer,
     )?;
     let state_dir = cfg.state_dir.clone();
+    if !dry_run {
+        wizard::release_unfinished(&config_path, &state_dir)?;
+    }
     let active = import::load_active(&state_dir)?;
     // Refuse before anything is opened or changed (the state database is not touched).
     if active
@@ -520,6 +523,7 @@ async fn run() -> Result<std::process::ExitCode> {
             batch,
         } => {
             let cfg = config::load(&config)?;
+            wizard::release_unfinished(&config, &cfg.state_dir)?;
             let state = api::AppState::new(cfg)?;
             use arr::settings::MediaKind::{Movie, Series};
             let kinds: Vec<arr::settings::MediaKind> = match media.as_deref() {
@@ -597,6 +601,7 @@ async fn run() -> Result<std::process::ExitCode> {
         }
         Command::Check { config } => {
             let cfg = config::load(&config)?;
+            wizard::release_unfinished(&config, &cfg.state_dir)?;
             let ffprobe = match &cfg.library {
                 Some(l) => Some(arr::probe::preflight(&l.ffprobe).await),
                 None => None,
@@ -648,6 +653,7 @@ async fn run() -> Result<std::process::ExitCode> {
         Command::Serve { config } => {
             arr::lifecycle::set_config_path(&config);
             let cfg = config::load(&config)?;
+            wizard::release_unfinished(&config, &cfg.state_dir)?;
             let _reporting = arr::report::start(cfg.reporting, "server");
             let result = api::serve(cfg).await;
             if let Err(e) = &result {

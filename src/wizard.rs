@@ -173,6 +173,9 @@ pub async fn run(mut opts: Options) -> Result<()> {
     // state folder.
     let _lock = lock_state(&opts.state_dir)?;
     if config.exists() {
+        // A marker a setup left beside its config.toml (stopped after saving it) proves
+        // nothing any more; it never did anything beside a config.toml.
+        let _ = drop_unfinished(&opts.state_dir);
         // Not "remove it": Arr's catalog still points at the old folders.
         bail!(
             "{} already exists; Arr is set up (to start over, run the uninstaller and choose to delete Arr's data first)",
@@ -282,6 +285,9 @@ pub async fn run(mut opts: Options) -> Result<()> {
                 } => {}
                 _ = stop_signal() => {}
             }
+            // At once, not after the open requests have finished: the setup task stops its
+            // program now, and no new setup starts.
+            done.stop.send_replace(true);
         })
         .await;
     // Stopped mid-setup (Ctrl+C, say): the setup task stops its program and waits for it to
@@ -1054,9 +1060,7 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
             continue;
         }
         // Every folder is checked before Plex is asked for anything.
-        let checked = check_folder(&folder, true)
-            .and_then(|()| outside_state(Path::new(&folder), &wiz.opts.state_dir));
-        if let Err(m) = checked {
+        if let Err(m) = check_library(&folder, &wiz.opts.state_dir, true) {
             return problem(StatusCode::BAD_REQUEST, &format!("{folder}: {m}"));
         }
         todo.push((folder, kind, name, agent, scanner));
@@ -1308,7 +1312,7 @@ async fn folder(State(wiz): St, Json(q): Json<FolderQuery>) -> Json<Value> {
     let checked = if q.create {
         check_downloads(path, &wiz.opts.state_dir)
     } else {
-        check_library(path, &wiz.opts.state_dir)
+        check_library(path, &wiz.opts.state_dir, false)
     };
     Json(match checked {
         Ok(()) => json!({ "ok": true }),
@@ -1380,9 +1384,10 @@ fn check_downloads(raw: &str, state_dir: &Path) -> Result<(), String> {
 }
 
 /// A library folder: a folder Arr can use that is not a symbolic link (the Plex import
-/// refuses one) and is neither inside nor around Arr's state folder.
-fn check_library(raw: &str, state_dir: &Path) -> Result<(), String> {
-    check_folder(raw, false)?;
+/// refuses one) and is neither inside nor around Arr's state folder. With `create` (a new
+/// Plex library), a folder that doesn't exist yet is fine.
+fn check_library(raw: &str, state_dir: &Path, create: bool) -> Result<(), String> {
+    check_folder(raw, create)?;
     let p = Path::new(trim_sep(raw));
     if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
         let real = std::fs::canonicalize(p)
@@ -1497,7 +1502,7 @@ async fn apply(State(wiz): St, Json(mut c): Json<Choices>) -> Response {
             .find(|s| s.key == key && s.kind == kind)
             .and_then(|s| s.locations.get(idx))
             .ok_or("pick a library from the list")?;
-        check_library(&ch.folder, &wiz.opts.state_dir)
+        check_library(&ch.folder, &wiz.opts.state_dir, false)
             .map_err(|m| format!("{}: {m}", ch.folder))?;
         Ok(Some(Library {
             section: key,
@@ -1524,6 +1529,13 @@ async fn apply(State(wiz): St, Json(mut c): Json<Choices>) -> Response {
         crate::config::Secrets::Defer,
     ) {
         return refuse(&format!("{e:#}"));
+    }
+    // Held until the task's handle is stored, so a task that fails at once can't be replaced
+    // by a retry whose handle this one then overwrites; and checked under it, so a setup
+    // never starts after the wizard has begun to stop (which raises `stop`, then takes it).
+    let mut slot = wiz.setup.lock().unwrap();
+    if *wiz.stop.borrow() {
+        return problem(StatusCode::SERVICE_UNAVAILABLE, "the setup page is closing");
     }
     set_phase(&wiz, "Saving your settings", "");
     editing.0 = None;
@@ -1552,7 +1564,8 @@ async fn apply(State(wiz): St, Json(mut c): Json<Choices>) -> Response {
             });
         }
     });
-    *wiz.setup.lock().unwrap() = Some(task);
+    *slot = Some(task);
+    drop(slot);
     Json(snapshot(&wiz)).into_response()
 }
 
@@ -1638,20 +1651,51 @@ async fn finish_setup(
     // This config already has Knaben: note that it was offered, so taking it out sticks
     // (`arr set default-indexers` never adds it back).
     fsutil::atomic_replace_private(&dir.join(crate::set::INDEXER_MARKER), b"knaben\n")?;
-    // Before config.toml: once Arr is set up, nothing may clear its catalog.
-    match std::fs::remove_file(dir.join(UNFINISHED)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(e).with_context(|| format!("can't remove {UNFINISHED}"));
-        }
-        _ => fsutil::fsync_dir(dir)?,
-    }
+    // Saving config.toml is what makes Arr set up; the marker goes only after it, so a stop
+    // in between leaves the marker beside a config.toml (where it permits nothing, and goes
+    // the next time Arr or this page starts), never a catalog with neither.
     std::fs::rename(&config, dir.join("config.toml")).context("can't save config.toml")?;
-    fsutil::fsync_dir(dir)
+    fsutil::fsync_dir(dir)?;
+    // Arr is set up now: a marker that can't go is harmless, and goes next time.
+    let _ = drop_unfinished(dir);
+    Ok(())
 }
 
 /// In the state folder while a setup from this page that started without a catalog is
-/// unfinished; holds that setup's config.
+/// unfinished; holds that setup's config. Only `clear_unfinished` reads it, and never
+/// beside a config.toml.
 const UNFINISHED: &str = "setup-unfinished";
+
+/// Removes the marker (`UNFINISHED`), if it is there.
+fn drop_unfinished(dir: &Path) -> Result<()> {
+    match std::fs::remove_file(dir.join(UNFINISHED)) {
+        Ok(()) => fsutil::fsync_dir(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(e).with_context(|| format!("can't remove {}", dir.join(UNFINISHED).display()))
+        }
+    }
+}
+
+/// For the commands that write a state folder's catalog or import store (`arr setup`,
+/// `bootstrap`, `check`, `serve`), before they open it: run with any config but this page's
+/// own `<state>/config.toml.new`, that config now owns the state folder, so the marker an
+/// unfinished setup from this page left (`UNFINISHED`) goes and nothing there is cleared.
+pub fn release_unfinished(config: &Path, state_dir: &Path) -> Result<()> {
+    let folder = match config.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let own = config.file_name() == Some(std::ffi::OsStr::new("config.toml.new"))
+        && matches!(
+            (std::fs::canonicalize(folder), std::fs::canonicalize(state_dir)),
+            (Ok(a), Ok(b)) if a == b
+        );
+    if own {
+        return Ok(());
+    }
+    drop_unfinished(state_dir)
+}
 
 /// The catalog's files and the import store's pointer: what a setup leaves at the top of
 /// the state folder.
@@ -1693,7 +1737,21 @@ fn clear_unfinished(dir: &Path, config: &str) -> Result<()> {
     if libraries(&started).is_some() && libraries(&started) == libraries(config) {
         return Ok(());
     }
-    // All checked before anything goes.
+    // All checked before anything goes: each catalog file missing, a file, or a symbolic link
+    // (which goes, not what it points to).
+    for name in CATALOG_FILES {
+        let f = dir.join(name);
+        match std::fs::symlink_metadata(&f) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(m) if m.is_file() || m.file_type().is_symlink() => {}
+            Ok(_) => bail!(
+                "{} isn't a file, so the earlier setup can't be cleared; move it out of {} and try again",
+                f.display(),
+                dir.display()
+            ),
+            Err(e) => return Err(e).with_context(|| format!("can't read {}", f.display())),
+        }
+    }
     let (files, dirs) = setup_imports(dir)?;
     let gone = |r: std::io::Result<()>, path: &Path| match r {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -2353,11 +2411,63 @@ mod tests {
         clear_unfinished(dir, &config("/c")).unwrap();
         assert!(!left());
         assert!(!dir.join("active-import.json").exists() && !dir.join("imports").exists());
-        // Never with a config.toml.
+        // Never with a config.toml, even beside a marker naming other libraries (a setup
+        // stopped after saving config.toml, before removing the marker).
         leftovers();
+        std::fs::write(dir.join(UNFINISHED), config("/a")).unwrap();
         std::fs::write(dir.join("config.toml"), config("/a")).unwrap();
         assert!(clear_unfinished(dir, &config("/d")).is_err());
-        assert!(left());
+        assert!(left() && dir.join("imports/imp-1/catalog.json").exists());
+    }
+
+    #[test]
+    fn a_side_file_that_isnt_a_file_stops_the_clear_before_anything_goes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("state.sqlite"), b"catalog").unwrap();
+        std::fs::write(dir.join("active-import.json"), b"{}").unwrap();
+        std::fs::create_dir(dir.join("state.sqlite-wal")).unwrap();
+        std::fs::write(dir.join(UNFINISHED), "[library]\nmovies = \"/a\"\n").unwrap();
+        let err = clear_unfinished(dir, "[library]\nmovies = \"/b\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("state.sqlite-wal"), "{err:#}");
+        assert!(dir.join("state.sqlite").exists() && dir.join("active-import.json").exists());
+        assert!(dir.join("state.sqlite-wal").is_dir());
+        // A symbolic link there goes as a link; what it points to stays.
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(dir.join("state.sqlite-wal")).unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("wal");
+            std::fs::write(&target, b"x").unwrap();
+            std::os::unix::fs::symlink(&target, dir.join("state.sqlite-wal")).unwrap();
+            clear_unfinished(dir, "[library]\nmovies = \"/b\"\n").unwrap();
+            assert!(!dir.join("state.sqlite").exists());
+            assert!(std::fs::symlink_metadata(dir.join("state.sqlite-wal")).is_err());
+            assert!(target.exists());
+        }
+    }
+
+    #[test]
+    fn another_config_takes_over_the_state_folder_and_this_pages_own_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let marker = state.join(UNFINISHED);
+        std::fs::write(&marker, b"x").unwrap();
+        release_unfinished(&state.join("config.toml.new"), &state).unwrap();
+        // The same folder by another spelling is still this page's own.
+        release_unfinished(&state.join("../state/config.toml.new"), &state).unwrap();
+        assert!(marker.exists());
+        // A config.toml.new elsewhere is someone else's.
+        release_unfinished(&tmp.path().join("config.toml.new"), &state).unwrap();
+        assert!(!marker.exists());
+        for config in [state.join("config.toml"), tmp.path().join("elsewhere.toml")] {
+            std::fs::write(&marker, b"x").unwrap();
+            release_unfinished(&config, &state).unwrap();
+            assert!(!marker.exists(), "{}", config.display());
+        }
+        // Nothing to remove is fine.
+        release_unfinished(&state.join("config.toml"), &state).unwrap();
     }
 
     #[cfg(unix)]
@@ -2371,12 +2481,18 @@ mod tests {
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&media, &link).unwrap();
         let s = |p: &Path| p.to_str().unwrap().to_string();
-        assert!(check_library(&s(&media), &state).is_ok());
-        assert!(check_library(&s(&state.join("imports/movies")), &state).is_err());
-        assert!(check_library(&s(tmp.path()), &state).is_err());
-        let err = check_library(&s(&link), &state).unwrap_err();
-        assert!(err.contains("symbolic link"), "{err}");
-        assert!(check_library(&format!("{}/", s(&link)), &state).is_err());
+        for create in [false, true] {
+            assert!(check_library(&s(&media), &state, create).is_ok());
+            assert!(check_library(&s(&state.join("imports/movies")), &state, create).is_err());
+            assert!(check_library(&s(tmp.path()), &state, create).is_err());
+            let err = check_library(&s(&link), &state, create).unwrap_err();
+            assert!(err.contains("symbolic link"), "{err}");
+            assert!(check_library(&format!("{}/", s(&link)), &state, create).is_err());
+        }
+        // A new Plex library's folder may not exist yet; a picked library's must.
+        let new = tmp.path().join("new/movies");
+        assert!(check_library(&s(&new), &state, true).is_ok());
+        assert!(check_library(&s(&new), &state, false).is_err());
     }
 
     #[cfg(unix)]
