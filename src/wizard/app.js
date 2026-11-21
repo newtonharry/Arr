@@ -154,7 +154,7 @@ function renderServer(s) {
   if (s.plex || !s.signed_in) return;
   $("switch-account").hidden = s.missing !== "not_linked";
   const [before, label, href, after] = MISSING[s.missing] ||
-    ["Arr couldn't check your Plex account just now. Check this computer's internet connection, then look again.", "", "", ""];
+    ["Arr couldn't check your Plex account. Check this computer's internet connection, then look again.", "", "", ""];
   const parts = [before];
   if (label) {
     const a = document.createElement("a");

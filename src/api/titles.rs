@@ -830,7 +830,7 @@ pub(super) async fn remove_title(st: &Arc<AppState>, media_id: &str, cancel: boo
     if finishing > 0 {
         return Err(ApiError::conflict(
             ErrorCode::ActiveDownloads,
-            "A download is nearly done and is being added to Plex. Try again in a minute.",
+            "Arr is adding a download to Plex. Try again in a minute.",
         ));
     }
     let resp = super::library_remove(State(st.clone()), Ok(Path(id.to_string()))).await?;
