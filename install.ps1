@@ -1551,7 +1551,8 @@ function Restore-Arr {
 	}
 	if ($restart -and -not $putBack) {
 		# Half of the old install and half of the new one: starting that could do harm.
-		Write-Host 'Arr was not started again, because not everything could be put back. Run the install line again.' -ForegroundColor Red
+		Write-Host 'Arr was not started again, because not everything could be put back.' -ForegroundColor Red
+		if ($script:Snapshot) { Write-Host "The settings from before are kept in $($script:Snapshot). Fix what stopped them going back (the error above) before running the install line again: a new run replaces that copy." -ForegroundColor Red }
 	} elseif ($restart) {
 		Write-Host 'Starting Arr again.'
 		try { Start-ScheduledTask -TaskName 'Arr' -ErrorAction Stop } catch {}
