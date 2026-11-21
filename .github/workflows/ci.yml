@@ -428,7 +428,8 @@ jobs:
       # the (empty) libraries, and a re-run keeps it. Before that: the config lookup and other pure
       # helpers; with nobody to answer and no Plex, a first install stops before installing anything
       # and names ARR_PLEX_URL, also with input redirected and no ARR_YES (instead of opening a setup
-      # page nobody can answer); and a busy port stops a first install, naming ARR_PORT.
+      # page nobody can answer); so do an address holding the token, a token Plex refuses and library
+      # folders that aren't there (each named); and a busy port stops a first install, naming ARR_PORT.
       - name: Setup in PowerShell (first install without questions)
         shell: powershell
         run: |
@@ -449,6 +450,11 @@ jobs:
           if ((Get-PlexUrl 'http://localhost:32400//') -ne 'http://localhost:32400/') { Fail 'Get-PlexUrl with slashes' }
           if ((Trim-Folder '"D:\Media\Movies\"') -ne 'D:\Media\Movies') { Fail 'Trim-Folder with quotes' }
           if ((Trim-Folder 'D:\') -ne 'D:\') { Fail 'Trim-Folder on a drive' }
+          foreach ($bad in 'http://127.0.0.1:32400/web?X-Plex-Token=t', 'http://me:pw@127.0.0.1:32400', 'http://127.0.0.1:32400/#x') {
+            $threw = $false
+            try { $null = Get-PlexUrl $bad } catch { $threw = $true }
+            if (-not $threw) { Fail "Get-PlexUrl took $bad" }
+          }
 
           Start-Process python -ArgumentList '-m', 'http.server', '8994', '--bind', '127.0.0.1', '--directory', 'dist'
           $media = "$env:RUNNER_TEMP\arr terminal media"
@@ -460,7 +466,7 @@ jobs:
           $bin = "$env:RUNNER_TEMP\arr terminal bin"
           $env:ARR_DOWNLOAD_BASE = 'http://127.0.0.1:8994'
           $env:ARR_BIN_DIR = $bin; $env:ARR_STATE_DIR = $state
-          $env:ARR_AUTO_UPDATE = '0'; $env:ARR_INSTALL_STRICT = '1'
+          $env:ARR_INSTALL_STRICT = '1' # ARR_AUTO_UPDATE stays unset: updates must default to off
 
           # Nobody to answer and no Plex: nothing is installed, and the error names the variable.
           $env:ARR_YES = '1'; $env:ARR_PORT = '8791'; $env:ARR_PLEX_URL = 'http://127.0.0.1:32496'
@@ -470,8 +476,12 @@ jobs:
           if ($msg -notmatch 'ARR_PLEX_URL') { Fail 'a first install with ARR_YES and no Plex did not name ARR_PLEX_URL' }
           if (Test-Path "$bin\arr.exe") { Fail 'it installed Arr before stopping' }
 
-          # The same with input redirected and no ARR_YES: no setup page that nobody can answer.
+          # The same with input redirected, no ARR_YES and no setup values (which would choose the
+          # setup here by themselves): no setup page that nobody can answer. (No Plex runs on
+          # 32400 here: an earlier step removed it.)
           $env:ARR_YES = $null
+          foreach ($v in 'ARR_PLEX_URL', 'ARR_PLEX_TOKEN', 'ARR_MOVIES', 'ARR_TV', 'ARR_MOVIE_SECTION', 'ARR_TV_SECTION',
+              'ARR_DOWNLOADS', 'ARR_SEARCH_ONLY', 'ARR_TERMINAL', 'ARR_BROWSER') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
           $empty = "$env:RUNNER_TEMP\empty.txt"
           Set-Content $empty ''
           $p = Start-Process powershell.exe -PassThru -NoNewWindow -RedirectStandardInput $empty `
@@ -484,8 +494,35 @@ jobs:
           if ($said -match 'in your web browser') { Fail 'a redirected first install went to the setup page' }
           if (Test-Path "$bin\arr.exe") { Fail 'the redirected first install installed Arr' }
 
+          # An address copied from Plex Web, with the token in it: refused before anything is
+          # installed or asked of Plex, and the token isn't shown.
+          $env:ARR_YES = '1'; $env:ARR_PLEX_URL = 'http://127.0.0.1:32497/web/index.html?X-Plex-Token=ci-plex-token'
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "address with a query said: $msg"
+          if ($msg -notmatch 'ARR_PLEX_URL' -or $msg -notmatch 'only Plex') { Fail 'an address with a query was not refused' }
+          if ("$msg".Contains('ci-plex-token')) { Fail 'the token in the address was shown' }
+          if (Test-Path $plexLog) { Fail 'Plex was asked something before the address was refused' }
+          if (Test-Path "$bin\arr.exe") { Fail 'it installed Arr before refusing the address' }
+
+          # A token Plex refuses: found before anything is installed, naming ARR_PLEX_TOKEN.
+          $env:ARR_PLEX_URL = 'http://127.0.0.1:32497'; $env:ARR_PLEX_TOKEN = 'not-the-token'
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "refused token said: $msg"
+          if ($msg -notmatch 'ARR_PLEX_TOKEN') { Fail 'a token Plex refuses was not named' }
+          if ((Test-Path "$bin\arr.exe") -or (Test-Path $state)) { Fail 'it installed Arr before finding the token refused' }
+
+          # Library folders that aren't on this computer: both named at once, before anything is installed.
+          $env:ARR_PLEX_TOKEN = 'ci-plex-token'; $env:ARR_MOVIES = "$media\No Movies"; $env:ARR_TV = "$media\No TV"
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "missing folders said: $msg"
+          if ($msg -notmatch 'ARR_MOVIES' -or $msg -notmatch 'ARR_TV ') { Fail 'the missing library folders were not both named' }
+          if ((Test-Path "$bin\arr.exe") -or (Test-Path $state)) { Fail 'it installed Arr before finding the folders missing' }
+          Remove-Item Env:ARR_MOVIES, Env:ARR_TV
+
           # A busy port: refused before anything is installed, naming ARR_PORT.
-          $env:ARR_YES = '1'; $env:ARR_PLEX_URL = 'http://127.0.0.1:32497'; $env:ARR_PLEX_TOKEN = 'ci-plex-token'
           $busy = New-Object Net.Sockets.TcpListener -ArgumentList ([Net.IPAddress]::Loopback), 8792
           $busy.Start()
           $env:ARR_PORT = '8792'

@@ -46,7 +46,7 @@
 # and these answer the questions here (giving any of them means the setup here); they apply
 # to a first setup only:
 #
-#   ARR_PLEX_URL         Plex's address (default http://127.0.0.1:32400)
+#   ARR_PLEX_URL         Plex's address, nothing more (default http://127.0.0.1:32400)
 #   ARR_PLEX_TOKEN       your Plex token (default: read from Plex's settings on this computer)
 #   ARR_MOVIES, ARR_TV   the movie and TV library folders on this computer (default: the
 #                        folders Plex names, when they are on this computer)
@@ -107,6 +107,7 @@ function Install-Arr {
 	$script:Swapped = @()
 	$script:Snapshot = $null
 	$script:Healthy = $false # once Arr runs well again, nothing is undone
+	$script:UndoMessage = 'Putting back the previous version and settings.' # said when it is
 	$script:BootFailure = $null # why Arr couldn't be set to start at boot in this run
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -205,14 +206,20 @@ function Install-Arr {
 	if (-not $firstSetup -and $env:ARR_NO_SETUP -ne '1' -and $firstOnly) {
 		Write-Warning "$($firstOnly -join ', ') apply only to a first setup; Arr keeps its config, so they are ignored"
 	}
-	# With nobody to answer, what the setup here can't do without is checked now, before anything changes.
+	# Only Plex's address: one copied from Plex Web can hold the Plex token (X-Plex-Token=...),
+	# which must not be printed, or sent anywhere but to Plex.
+	if ($firstSetup -and $setupMode -eq 'terminal' -and "$env:ARR_PLEX_URL".Trim()) {
+		try { $null = Get-PlexUrl } catch { throw "ARR_PLEX_URL: $($_.Exception.Message); nothing was changed" }
+	}
+	# With nobody to answer, everything the setup here needs from Plex and this computer (Plex,
+	# a token Plex accepts, its libraries and their folders) is found now, before anything
+	# changes, and the setup uses these answers.
+	$plexFound = $null
 	if ($firstSetup -and $setupMode -eq 'terminal' -and -not (Interactive)) {
-		$missing = @()
-		$plexUrl = Get-PlexUrl
-		if (-not (Test-Plex $plexUrl)) { $missing += "ARR_PLEX_URL (Plex didn't answer at $plexUrl)" }
-		if (-not "$env:ARR_PLEX_TOKEN".Trim() -and -not (Find-PlexToken)) { $missing += 'ARR_PLEX_TOKEN (Plex''s settings on this computer have none)' }
-		if ($missing) {
-			throw "setting up Arr with nobody to answer questions needs: $($missing -join '; '). Set them and run this again, or run this at a PowerShell prompt without ARR_YES to answer the questions or use the setup page; nothing was changed"
+		Step 'Finding Plex'
+		$plexFound = Find-PlexSetup
+		if ($plexFound.Problems) {
+			throw "setting up Arr with nobody to answer questions needs: $($plexFound.Problems -join '; '). Set them and run this again, or run this at a PowerShell prompt without ARR_YES to answer the questions or use the setup page; nothing was changed"
 		}
 	}
 	if ($StateDir -ne (Join-Path $env:LOCALAPPDATA 'Arr') -and -not $env:ARR_STATE_DIR) { Say "Found Arr installed in $StateDir" }
@@ -490,22 +497,60 @@ function Install-Arr {
 		if (-not $n) { $n = Install-Ngrok $BinDir }
 		return $m.Matches[0].Groups[1].Value, $n
 	}
-	# A configured tunnel runs as its own log-on task next to Arr, without a window.
+	# A configured tunnel runs as its own log-on task next to Arr, without a window. Registering
+	# it leaves a running tunnel alone; Restart-Tunnel starts it on the new task.
 	function Register-Tunnel {
+		# A tunnel task already set to start at boot stays as it is (re-registering it takes an administrator).
+		if (-not $PublicUrl -or (Test-S4U 'Arr tunnel')) { return }
+		$tunnelArgs = "--hidden `"$ngrok`" http 127.0.0.1:$Port `"--url=$PublicUrl`" --config `"$NgrokYml`" `"--log=$TunnelLog`" --log-level=warn"
+		Register-ScheduledTask -TaskName 'Arr tunnel' -Description 'Public HTTPS address for Arr, ngrok (installed by install.ps1)' -Force `
+			-Action (New-ScheduledTaskAction -Execute $Background -Argument $tunnelArgs) `
+			-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
+	}
+	# Once Arr runs well: the tunnel starts again on its task, or goes when remote access isn't
+	# set up any more.
+	function Restart-Tunnel {
 		if ($PublicUrl) {
+			Step "Starting the tunnel for $PublicUrl"
 			Stop-Tunnel $NgrokYml
-			# A tunnel task already set to start at boot stays as it is (re-registering it takes an administrator).
-			if (-not (Test-S4U 'Arr tunnel')) {
-				$tunnelArgs = "--hidden `"$ngrok`" http 127.0.0.1:$Port `"--url=$PublicUrl`" --config `"$NgrokYml`" `"--log=$TunnelLog`" --log-level=warn"
-				Register-ScheduledTask -TaskName 'Arr tunnel' -Description 'Public HTTPS address for Arr, ngrok (installed by install.ps1)' -Force `
-					-Action (New-ScheduledTaskAction -Execute $Background -Argument $tunnelArgs) `
-					-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
-			}
+			$null = Start-ArrTask 'Arr tunnel'
 		} elseif (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) {
 			Step 'Removing the tunnel (remote access isn''t set up any more)'
 			Stop-Tunnel $NgrokYml
 			Unregister-ScheduledTask -TaskName 'Arr tunnel' -Confirm:$false
 		}
+	}
+	# Turns automatic updates on or off, as $AutoUpdate says. Returns $true when that worked.
+	# Turning them on stops the run if it fails; turning them off says why it couldn't instead.
+	function Set-Updater {
+		if ($AutoUpdate -eq '1') {
+			Step 'Turning on automatic updates'
+			Write-Updater $Updater $Repo $Target $BinDir $StateDir $Port
+			# A task already set to run at boot stays as it is: it runs the same script.
+			if (-not (Test-S4U 'Arr update')) {
+				$at = (Get-Date).Date.AddHours(4).AddMinutes((Get-Random -Maximum 60))
+				$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+				$taskArgs = "--hidden `"$ps`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Updater`""
+				Register-ScheduledTask -TaskName 'Arr update' -Description 'Installs new Arr releases (installed by install.ps1)' -Force `
+					-Action (New-ScheduledTaskAction -Execute $Background -Argument $taskArgs) `
+					-Trigger (New-ScheduledTaskTrigger -Daily -At $at) `
+					-Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew) `
+					-Principal $principal | Out-Null
+			}
+			Say 'Arr checks for a new release once a day and installs it. Turn this off with $env:ARR_AUTO_UPDATE = "0" and running this again.'
+			return $true
+		}
+		$task = Get-ScheduledTask -TaskName 'Arr update' -ErrorAction SilentlyContinue
+		if (-not $task -and -not (Test-Path $Updater)) { return $true }
+		Step 'Turning off automatic updates'
+		try {
+			if ($task) { Unregister-ScheduledTask -TaskName 'Arr update' -Confirm:$false -ErrorAction Stop }
+			if (Test-Path $Updater) { Remove-Item $Updater -Force -ErrorAction Stop }
+		} catch {
+			Write-Warning "automatic updates couldn't be turned off ($($_.Exception.Message)); run this again to retry"
+			return $false
+		}
+		return $true
 	}
 	# Switches Arr's tasks to the kind chosen, while Arr is stopped. Returns $true when they were
 	# just switched to start at boot; why that wasn't possible goes in $script:BootFailure.
@@ -525,8 +570,9 @@ function Install-Arr {
 			Say 'so media on a network drive mapped to a letter (Z:) is not reachable until you log in: use a local drive.'
 			$why = Set-TaskMode $user $true
 			if ($why) {
-				# Nothing to undo if Windows never let the step run: the tasks start at log-on.
+				# Nothing to undo: the step changes all the tasks or none (Set-TaskMode).
 				if ($why -like 'Start at boot needs an administrator account*') { Write-Warning $why }
+				elseif (Test-S4U 'Arr') { Write-Warning "Arr's new tasks start when you log in, not at boot: $why" }
 				else { Write-Warning "Arr still starts when you log in, not at boot: $why" }
 				$script:BootFailure = $why
 				return $false
@@ -553,36 +599,24 @@ function Install-Arr {
 	function Start-ArrAndWait {
 		$boot = Test-S4U 'Arr'
 		$started = if ($boot) { Start-ArrTask 'Arr' } else { Start-ScheduledTask -TaskName 'Arr'; $true }
-		$script:ArrStopped = $false
 		$wait = if (-not $started) { 150 } elseif ($boot) { 60 } else { 30 }
-		return (Wait-Healthy $api '' $wait)
+		$ok = Wait-Healthy $api '' $wait
+		# Until Arr answers, the end of this run (finally, at the bottom) still stops it and
+		# starts Arr on what was there before.
+		if ($ok) { $script:ArrStopped = $false }
+		return $ok
 	}
 
-	# Everything that can fail without Arr running comes first: ngrok, the updater, the tunnel task.
+	# ngrok, if remote access needs it, comes before Arr is stopped. A first install also adds
+	# its tasks now, so the one administrator step below switches them all (there is no
+	# previous install to go back to); a re-run adds and changes them once the new Arr runs
+	# well, so a failed upgrade leaves them, and a running tunnel, as they were.
 	$PublicUrl, $ngrok = Find-Tunnel
-	if ($AutoUpdate -eq '1') {
-		Step 'Turning on automatic updates'
-		Write-Updater $Updater $Repo $Target $BinDir $StateDir $Port
-		# A task already set to run at boot stays as it is: it runs the same script.
-		if (-not (Test-S4U 'Arr update')) {
-			$at = (Get-Date).Date.AddHours(4).AddMinutes((Get-Random -Maximum 60))
-			$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-			$taskArgs = "--hidden `"$ps`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Updater`""
-			Register-ScheduledTask -TaskName 'Arr update' -Description 'Installs new Arr releases (installed by install.ps1)' -Force `
-				-Action (New-ScheduledTaskAction -Execute $Background -Argument $taskArgs) `
-				-Trigger (New-ScheduledTaskTrigger -Daily -At $at) `
-				-Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew) `
-				-Principal $principal | Out-Null
-		}
-		Say 'Arr checks for a new release once a day and installs it. Turn this off with $env:ARR_AUTO_UPDATE = "0" and running this again.'
-	} elseif ((Test-Path $Updater) -or $updateTask) {
-		Step 'Turning off automatic updates'
-		Unregister-ScheduledTask -TaskName 'Arr update' -Confirm:$false -ErrorAction SilentlyContinue
-		Remove-Item $Updater -Force -ErrorAction SilentlyContinue
+	$updaterOk = $false
+	if ($firstInstall) {
+		Register-Tunnel
+		$updaterOk = Set-Updater
 	}
-	# The setup page's answer has been acted on.
-	Remove-Item $choices -Force -ErrorAction SilentlyContinue
-	Register-Tunnel
 
 	Step 'Starting Arr'
 	# Only now is Arr stopped.
@@ -613,15 +647,28 @@ function Install-Arr {
 		throw "$what, $back; see $log"
 	}
 	$script:Healthy = $true
+	$script:Swapped = @() # the previous programs stay as .previous, but aren't put back any more
 	if ($script:Snapshot) { Remove-Item -Recurse -Force $script:Snapshot -ErrorAction SilentlyContinue; $script:Snapshot = $null }
-	if ($PublicUrl) {
-		Step "Starting the tunnel for $PublicUrl"
-		$null = Start-ArrTask 'Arr tunnel'
+	if (-not $firstInstall) {
+		# A task added now, next to an Arr that starts at boot, is switched to match.
+		$added = ($PublicUrl -and -not (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue)) -or
+			($AutoUpdate -eq '1' -and -not (Get-ScheduledTask -TaskName 'Arr update' -ErrorAction SilentlyContinue))
+		Register-Tunnel
+		$updaterOk = Set-Updater
+		if ($added -and $wantBoot -and (Test-S4U 'Arr')) { $null = Switch-ArrTasks }
 	}
+	# The setup page's answer has been acted on.
+	if ($updaterOk) { Remove-Item $choices -Force -ErrorAction SilentlyContinue }
+	Restart-Tunnel
 
 	# A first install offers remote access now that Arr runs. Saying yes changes Arr's config,
-	# so Arr restarts once, after it is set up.
+	# so Arr restarts once, after it is set up. Until Arr runs well with it, the settings that
+	# work are kept aside: if Arr doesn't start (or this run is interrupted), they go back and
+	# Arr starts again without remote access.
 	if ($offerRemote -and (Ask-Remote)) {
+		Save-Settings $StateDir
+		$script:Healthy = $false
+		$script:UndoMessage = 'Remote access was not set up: putting back the settings from before it.'
 		$remoteOk = $true
 		try { Set-RemoteAccess }
 		catch {
@@ -629,13 +676,27 @@ function Install-Arr {
 			Write-Warning "remote access wasn't set up: $($_.Exception.Message). Arr runs without it; to try again, run the install line again after `$env:ARR_REMOTE = '1'."
 		}
 		if ($remoteOk) {
-			$PublicUrl, $ngrok = Find-Tunnel
-			Register-Tunnel
 			Step 'Restarting Arr with remote access'
 			Stop-Arr $Background
-			$null = Switch-ArrTasks
-			if (-not (Start-ArrAndWait)) { throw "Arr didn't start again after adding remote access; see $log" }
-			if ($PublicUrl) { $null = Start-ArrTask 'Arr tunnel' }
+			if (-not (Start-ArrAndWait)) {
+				$remoteOk = $false
+				Stop-Arr $Background
+				Undo-Run
+				if (-not (Start-ArrAndWait)) {
+					throw "Arr didn't start with remote access, so remote access was not set up and the settings from before are back, but Arr didn't start with them either; see $log"
+				}
+				Write-Warning "Arr didn't start with remote access (see $log), so remote access was not set up and the settings from before are back; Arr is running without it. To try again, run the install line again after `$env:ARR_REMOTE = '1'."
+			}
+		}
+		if (-not $remoteOk) { Undo-Run } # also the secrets Set-RemoteAccess wrote
+		$script:Healthy = $true
+		if ($script:Snapshot) { Remove-Item -Recurse -Force $script:Snapshot -ErrorAction SilentlyContinue; $script:Snapshot = $null }
+		if ($remoteOk) {
+			$PublicUrl, $ngrok = Find-Tunnel
+			$added = -not (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue)
+			Register-Tunnel
+			if ($PublicUrl -and $added -and $wantBoot -and (Test-S4U 'Arr')) { $null = Switch-ArrTasks }
+			Restart-Tunnel
 		}
 	}
 
@@ -860,51 +921,16 @@ function Set-TerminalSetup {
 	Step 'Setting up Arr here in PowerShell'
 	if (Test-Path "$Config.failed") { Say "(The last setup attempt failed; what it chose is kept in $Config.failed. This setup starts from the beginning.)" }
 
-	Step 'Finding Plex'
-	$plexUrl = Get-PlexUrl
-	if (-not (Test-Plex $plexUrl) -and (Interactive)) {
-		$plexUrl = Get-PlexUrl (Ask "Plex didn't answer at $plexUrl. Plex server address?" $plexUrl)
+	# Found before anything changed when nobody can answer; else found (and asked) now.
+	$found = $plexFound
+	if (-not $found) {
+		Step 'Finding Plex'
+		$found = Find-PlexSetup
 	}
-	if (-not (Test-Plex $plexUrl)) { throw "can't reach Plex at $plexUrl. Start Plex Media Server, or set ARR_PLEX_URL to its address, then run this again; nothing was set up" }
-	Say "Plex is at $plexUrl"
-	$token = "$env:ARR_PLEX_TOKEN".Trim()
-	if (-not $token) {
-		$token = Find-PlexToken
-		if ($token) { Say 'Read the Plex token from Plex''s settings on this computer' }
-	}
-	if (-not $token -and (Interactive)) {
-		Say 'Arr needs your Plex token. In Plex Web, open any movie, choose ... > Get Info > View XML,'
-		Say 'and copy the value after X-Plex-Token= in the address bar. What you type or paste is not shown.'
-		$token = Read-Secret 'Plex token'
-	}
-	if (-not $token) { throw 'Arr needs your Plex token (set ARR_PLEX_TOKEN); nothing was set up' }
-	$locations = @(Get-PlexLocations $plexUrl $token)
-
-	# The first movie and TV library, or the ones asked for, and their first folder.
-	$problems = @()
-	$libs = @{}
-	foreach ($kind in @(@('movie', 'ARR_MOVIE_SECTION', 'ARR_MOVIES', 'Movies'), @('show', 'ARR_TV_SECTION', 'ARR_TV', 'TV'))) {
-		$section = [Environment]::GetEnvironmentVariable($kind[1])
-		$found = @($locations | Where-Object { $_.Type -eq $kind[0] -and (-not $section -or $_.Section -eq [int]$section) })
-		if (-not $found) {
-			if ($section) { $problems += "$($kind[1]) (Plex has no $($kind[3]) library number $section)" }
-			continue
-		}
-		$lib = $found[0]
-		$plexPath = Trim-Folder $lib.Path
-		$folder = Trim-Folder ([Environment]::GetEnvironmentVariable($kind[2]))
-		if (-not $folder) {
-			$here = if (Test-Path -LiteralPath $plexPath -PathType Container) { $plexPath } else { '' }
-			$folder = Trim-Folder (Ask "$($kind[3]) folder on this computer (Plex sees $plexPath)" $here)
-		}
-		if (-not $folder) { $problems += "$($kind[2]) (the $($kind[3]) folder on this computer; Plex sees $plexPath, which isn't on this computer)"; continue }
-		$folder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($folder)
-		if (-not (Test-Path -LiteralPath $folder -PathType Container)) { $problems += "$($kind[2]) ($folder isn't a folder on this computer)"; continue }
-		$libs[$kind[0]] = @{ Section = $lib.Section; PlexPath = $plexPath; Folder = $folder }
-		Say "$($kind[3]): $folder (Plex library $($lib.Section))"
-	}
-	if (-not $problems -and -not $libs.Count) { throw 'Plex has no movie or TV library yet. Add one in Plex (or use the setup page, which can make them), then run this again; nothing was set up' }
-	if ($problems) { throw "Arr's setup needs: $($problems -join '; '). Set them and run this again; nothing was set up" }
+	if ($found.Problems) { throw "Arr's setup needs: $($found.Problems -join '; '). Set them and run this again; nothing was set up" }
+	$plexUrl = $found.Url
+	$token = $found.Token
+	$libs = $found.Libs
 
 	# Downloads go next to the library by default, so imports can move files instead of copying.
 	$first = if ($libs['movie']) { $libs['movie'].Folder } else { $libs['show'].Folder }
@@ -1011,12 +1037,73 @@ max_active_downloads = 3
 	Move-Item $new $Config
 }
 
+# Finds Plex, its token, and its first movie and TV library (or the ones ARR_MOVIE_SECTION and
+# ARR_TV_SECTION name) with their folders on this computer, from the ARR_PLEX_* and library
+# variables, else from what Plex and this computer say, asking for what is missing while
+# someone is at the prompt. Returns Url, Token, Libs (movie and show: Section, PlexPath,
+# Folder) and Problems: each variable still needed, with why, all of them. Uses Install-Arr's
+# helpers (Say, Ask, Interactive).
+function Find-PlexSetup {
+	$problems = @()
+	$plexUrl = Get-PlexUrl
+	$reachable = Test-Plex $plexUrl
+	if (-not $reachable -and (Interactive)) {
+		try { $plexUrl = Get-PlexUrl (Ask "Plex didn't answer at $plexUrl. Plex server address?" $plexUrl) }
+		catch { throw "$($_.Exception.Message); nothing was set up" }
+		$reachable = Test-Plex $plexUrl
+	}
+	if ($reachable) { Say "Plex is at $plexUrl" }
+	else { $problems += "ARR_PLEX_URL (Plex didn't answer at $plexUrl; start Plex Media Server, or set its address)" }
+	$token = "$env:ARR_PLEX_TOKEN".Trim()
+	if (-not $token) {
+		$token = Find-PlexToken
+		if ($token) { Say 'Read the Plex token from Plex''s settings on this computer' }
+	}
+	if (-not $token -and $reachable -and (Interactive)) {
+		Say 'Arr needs your Plex token. In Plex Web, open any movie, choose ... > Get Info > View XML,'
+		Say 'and copy the value after X-Plex-Token= in the address bar. What you type or paste is not shown.'
+		$token = Read-Secret 'Plex token'
+	}
+	if (-not $token) { $problems += 'ARR_PLEX_TOKEN (your Plex token; Plex''s settings on this computer have none)' }
+	$libs = @{}
+	if ($problems) { return @{ Url = $plexUrl; Token = $token; Libs = $libs; Problems = $problems } }
+	try { $locations = @(Get-PlexLocations $plexUrl $token) }
+	catch { return @{ Url = $plexUrl; Token = $token; Libs = $libs; Problems = @($_.Exception.Message) } }
+
+	# The first movie and TV library, or the ones asked for, and their first folder.
+	foreach ($kind in @(@('movie', 'ARR_MOVIE_SECTION', 'ARR_MOVIES', 'Movies'), @('show', 'ARR_TV_SECTION', 'ARR_TV', 'TV'))) {
+		$section = [Environment]::GetEnvironmentVariable($kind[1])
+		$found = @($locations | Where-Object { $_.Type -eq $kind[0] -and (-not $section -or $_.Section -eq [int]$section) })
+		if (-not $found) {
+			if ($section) { $problems += "$($kind[1]) (Plex has no $($kind[3]) library number $section)" }
+			continue
+		}
+		$lib = $found[0]
+		$plexPath = Trim-Folder $lib.Path
+		$folder = Trim-Folder ([Environment]::GetEnvironmentVariable($kind[2]))
+		if (-not $folder) {
+			$here = if (Test-Path -LiteralPath $plexPath -PathType Container) { $plexPath } else { '' }
+			$folder = Trim-Folder (Ask "$($kind[3]) folder on this computer (Plex sees $plexPath)" $here)
+		}
+		if (-not $folder) { $problems += "$($kind[2]) (the $($kind[3]) folder on this computer; Plex sees $plexPath, which isn't on this computer)"; continue }
+		$folder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($folder)
+		if (-not (Test-Path -LiteralPath $folder -PathType Container)) { $problems += "$($kind[2]) ($folder isn't a folder on this computer)"; continue }
+		$libs[$kind[0]] = @{ Section = $lib.Section; PlexPath = $plexPath; Folder = $folder }
+		Say "$($kind[3]): $folder (Plex library $($lib.Section))"
+	}
+	if (-not $problems -and -not $libs.Count) { $problems += 'a movie or TV library in Plex (Plex has none yet: add one in Plex, or use the setup page, which can make them)' }
+	return @{ Url = $plexUrl; Token = $token; Libs = $libs; Problems = $problems }
+}
+
 # Plex's address, http://127.0.0.1:32400/ unless ARR_PLEX_URL (or $url) says otherwise, with
-# http:// added if it has no scheme and a / at the end, as the setup page writes it.
+# http:// added if it has no scheme and a / at the end, as the setup page writes it. Only the
+# address: one with a user name, a ?query or a #fragment is refused before it is shown or used
+# (an address copied from Plex Web can hold the Plex token).
 function Get-PlexUrl($url) {
 	if (-not $url) { $url = $env:ARR_PLEX_URL }
 	if (-not "$url".Trim()) { $url = 'http://127.0.0.1:32400' }
 	$u = "$url".Trim()
+	if ($u -match '[@?#]') { throw 'give only Plex''s address, like http://127.0.0.1:32400, without a user name, ?query or #fragment (an address copied from Plex Web can hold your Plex token)' }
 	if ($u -notmatch '^https?://') { $u = "http://$u" }
 	return $u.TrimEnd('/') + '/'
 }
@@ -1036,16 +1123,30 @@ function Find-PlexToken {
 
 # Plex's libraries, one entry per folder: Type (movie, show, ...), Section (its number) and Path
 # (the folder as Plex sees it). Read as UTF-8 JSON (Windows PowerShell would otherwise guess
-# another encoding, and mangle folder names with accents).
+# another encoding, and mangle folder names with accents). The token goes to this address
+# only: a redirect is refused, not followed. A failure throws, naming the variable to check.
 function Get-PlexLocations($url, $token) {
+	$r = $null
 	try {
-		$r = Invoke-WebRequest -UseBasicParsing "${url}library/sections" -Headers @{ 'X-Plex-Token' = $token; Accept = 'application/json' } -TimeoutSec 15
+		# Windows PowerShell 5.1 reports a redirect it may not follow as an error (made
+		# terminating here), PowerShell 7 as a failed status: both land in catch.
+		$r = Invoke-WebRequest -UseBasicParsing "${url}library/sections" -Headers @{ 'X-Plex-Token' = $token; Accept = 'application/json' } `
+			-TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
 	} catch {
-		throw "Plex at $url didn't accept the token, or didn't answer ($($_.Exception.Message)); check ARR_PLEX_TOKEN; nothing was set up"
+		$code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+		if (($code -ge 300 -and $code -lt 400) -or "$($_.Exception.Message)" -match 'redirect') {
+			throw "ARR_PLEX_URL (Plex at $url sent the request on to another address; give Plex's own address)"
+		}
+		throw "ARR_PLEX_TOKEN (Plex at $url didn't accept it, or didn't answer: $($_.Exception.Message))"
 	}
+	if ([int]$r.StatusCode -ge 300) { throw "ARR_PLEX_URL (Plex at $url sent the request on to another address; give Plex's own address)" }
 	$doc = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()) | ConvertFrom-Json
-	foreach ($d in @($doc.MediaContainer.Directory | Where-Object { $_ })) {
+	# A library without folders, or a Plex without libraries, has no such entries at all.
+	$dirs = @()
+	if ($doc.MediaContainer.PSObject.Properties['Directory']) { $dirs = @($doc.MediaContainer.Directory | Where-Object { $_ }) }
+	foreach ($d in $dirs) {
 		if ("$($d.key)" -notmatch '^\d{1,9}$') { continue }
+		if (-not $d.PSObject.Properties['Location']) { continue }
 		foreach ($l in @($d.Location | Where-Object { $_ -and $_.path })) {
 			[pscustomobject]@{ Type = "$($d.type)"; Section = [int]"$($d.key)"; Path = "$($l.path)" }
 		}
@@ -1231,7 +1332,8 @@ function Set-TaskMode($user, [bool]$boot) {
 		if (-not $t) { continue }
 		$a = $t.Actions | Select-Object -First 1
 		$at = if ($n -eq 'Arr update') { [string]($t.Triggers | Select-Object -First 1).StartBoundary } else { '' }
-		$specs += "@{ Name = $(Quote-Ps $n); Description = $(Quote-Ps $t.Description); Exe = $(Quote-Ps $a.Execute); Args = $(Quote-Ps $a.Arguments); At = $(Quote-Ps $at) }"
+		$was = if ("$($t.Principal.LogonType)" -eq 'S4U') { '$true' } else { '$false' }
+		$specs += "@{ Name = $(Quote-Ps $n); Description = $(Quote-Ps $t.Description); Exe = $(Quote-Ps $a.Execute); Args = $(Quote-Ps $a.Arguments); At = $(Quote-Ps $at); Boot = $was }"
 	}
 	if (-not $specs) { return 'there are no Arr tasks' }
 	$body = @'
@@ -1240,8 +1342,6 @@ $boot = __BOOT__
 $tasks = @(__TASKS__)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -MultipleInstances IgnoreNew
 $updateSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
-$logon = if ($boot) { 'S4U' } else { 'Interactive' }
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType $logon -RunLevel Limited
 $sid = (New-Object Security.Principal.NTAccount($user)).Translate([Security.Principal.SecurityIdentifier]).Value
 # Windows registers a task that runs without a logon (S4U) for another account only with that
 # account's password. If this PowerShell is a different administrator's (a standard user
@@ -1249,37 +1349,55 @@ $sid = (New-Object Security.Principal.NTAccount($user)).Translate([Security.Prin
 if ($boot -and [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne $sid) {
 	throw 'Start at boot needs an administrator account; Arr will start when you log in.'
 }
-foreach ($t in $tasks) {
+# Registers task $t to start at boot ($atBoot) or at log-on. Returns a note when, at boot, its
+# user couldn't be let to start and stop it.
+function Register-ArrTask($t, $atBoot) {
 	if ($t.At) { $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]$t.At); $set = $updateSettings }
 	else {
 		$trigger = @(New-ScheduledTaskTrigger -AtLogOn -User $user)
-		if ($boot) { $trigger += New-ScheduledTaskTrigger -AtStartup }
+		if ($atBoot) { $trigger += New-ScheduledTaskTrigger -AtStartup }
 		$set = $settings
 	}
+	$logon = if ($atBoot) { 'S4U' } else { 'Interactive' }
+	$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType $logon -RunLevel Limited
 	Register-ScheduledTask -TaskName $t.Name -Description $t.Description -Force `
 		-Action (New-ScheduledTaskAction -Execute $t.Exe -Argument $t.Args) -Trigger $trigger -Settings $set -Principal $principal | Out-Null
-	if ($boot) {
+	if (-not $atBoot) { return '' }
+	# Best effort: letting the user start and stop the task is what makes restarts need no
+	# administrator, but without it Arr still starts at boot (a restart then ends Arr's
+	# process and Windows starts the task again within a minute). Windows may write the entry
+	# back in another spelling, so what is checked is the parsed entry, and a failure is
+	# reported (with Windows' own message), not thrown.
+	$err = ''
+	$granted = $false
+	try {
 		$svc = New-Object -ComObject Schedule.Service
 		$svc.Connect()
 		$rt = $svc.GetFolder('\').GetTask($t.Name)
-		# Best effort: letting the user start and stop the task is what makes restarts need no
-		# administrator, but without it Arr still starts at boot (a restart then ends Arr's
-		# process and Windows starts the task again within a minute). Windows may write the entry
-		# back in another spelling, so what is checked is the parsed entry, and a failure is
-		# reported (with Windows' own message), not thrown.
-		$err = ''
-		$granted = $false
-		try {
-			$rt = $svc.GetFolder('\').GetTask($t.Name)
-			$rt.SetSecurityDescriptor($rt.GetSecurityDescriptor(4) + "(A;;FA;;;$sid)", 0)
-			$acl = (New-Object Security.AccessControl.RawSecurityDescriptor($rt.GetSecurityDescriptor(4))).DiscretionaryAcl
-			foreach ($ace in $acl) {
-				if ($ace.SecurityIdentifier.Value -eq $sid -and "$($ace.AceType)" -eq 'AccessAllowed' -and ($ace.AccessMask -band 0x20) -ne 0) { $granted = $true }
-			}
-			if (-not $granted) { $err = 'the entry is not in the security descriptor Windows returns: ' + $rt.GetSecurityDescriptor(4) }
-		} catch { $err = $_.Exception.Message }
-		if (-not $granted) { $note += " could not let $user start and stop the task $($t.Name) ($(($err -replace '\s+', ' ')))." }
+		$rt.SetSecurityDescriptor($rt.GetSecurityDescriptor(4) + "(A;;FA;;;$sid)", 0)
+		$acl = (New-Object Security.AccessControl.RawSecurityDescriptor($rt.GetSecurityDescriptor(4))).DiscretionaryAcl
+		foreach ($ace in $acl) {
+			if ($ace.SecurityIdentifier.Value -eq $sid -and "$($ace.AceType)" -eq 'AccessAllowed' -and ($ace.AccessMask -band 0x20) -ne 0) { $granted = $true }
+		}
+		if (-not $granted) { $err = 'the entry is not in the security descriptor Windows returns: ' + $rt.GetSecurityDescriptor(4) }
+	} catch { $err = $_.Exception.Message }
+	if ($granted) { return '' }
+	return " could not let $user start and stop the task $($t.Name) ($(($err -replace '\s+', ' ')))."
+}
+# All or none: if one task can't be switched, those already switched go back to how they were,
+# so Arr's tasks are never left half at boot and half at log-on.
+$done = @()
+try {
+	foreach ($t in $tasks) {
+		$done += $t
+		$note += Register-ArrTask $t $boot
 	}
+} catch {
+	$why = $_.Exception.Message
+	$left = @()
+	foreach ($t in $done) { try { $null = Register-ArrTask $t $t.Boot } catch { $left += $t.Name } }
+	if ($left) { throw "$why; putting back $($left -join ', ') as before failed too, so Arr's tasks may not all start the same way" }
+	throw "$why (Arr's tasks are as they were)"
 }
 '@
 	$body = $body.Replace('__USER__', (Quote-Ps $user)).Replace('__BOOT__', $(if ($boot) { '$true' } else { '$false' })).Replace('__TASKS__', ($specs -join ",`n"))
@@ -1289,6 +1407,7 @@ foreach ($t in $tasks) {
 # Stops the running Arr (the log-on task and its program), to restart it on the new version.
 function Stop-Arr($background) {
 	$script:ArrStopped = $true
+	$script:ArrBackground = $background # for the end of the run (finally) to stop it again
 	if (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue) {
 		Stop-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue
 	}
@@ -1633,7 +1752,7 @@ try {
 	# Arr isn't running well on what this run changed: put the previous programs and settings
 	# back first, so Arr starts on them again (or, still running, keeps them next time).
 	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) {
-		Write-Host 'Putting back the previous version and settings.'
+		Write-Host $script:UndoMessage
 		try { Undo-Run } catch { Write-Host "couldn't put them all back: $($_.Exception.Message)" -ForegroundColor Red }
 	}
 	# Told to Arr's developer only if this install's config says so (docs/PRIVACY.md).
@@ -1646,12 +1765,18 @@ try {
 	}
 	if ($env:ARR_INSTALL_STRICT -eq '1') { throw $failure } # tests want a failing exit code
 } finally {
-	# Ctrl-C at a prompt skips catch: put back what this run changed all the same.
-	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) { try { Undo-Run } catch {} }
-	# Arr was stopped to restart it (on the new version, or with new settings) and this run
-	# ended before it started again: start it again. Every start clears ArrStopped, so an Arr
-	# this run already started is left alone.
-	if ($script:ArrStopped -and (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)) {
+	# Arr was stopped to restart it (on the new version, or with new settings) and hasn't
+	# answered its health check since: it didn't start, or this run ended first (Ctrl-C skips
+	# catch). Stop whatever this run started, so that Arr can start again on what is put back
+	# below. Only a passed health check clears ArrStopped, so an Arr running well is left alone.
+	$restart = $script:ArrStopped -and [bool](Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)
+	if ($restart) { try { Stop-Arr $script:ArrBackground } catch {} }
+	# Put back what this run changed before Arr ran well with it.
+	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) {
+		Write-Host $script:UndoMessage
+		try { Undo-Run } catch {}
+	}
+	if ($restart) {
 		$script:ArrStopped = $false
 		Write-Host 'Starting Arr again.'
 		try { Start-ScheduledTask -TaskName 'Arr' -ErrorAction Stop } catch {}
