@@ -26,7 +26,8 @@ The script takes a few minutes. It:
 1. downloads the Arr binary for your system and checks its SHA-256 (no compiler needed);
 2. installs FFmpeg if `ffprobe` is missing (it asks first; on a Mac without Homebrew it offers
    to install Homebrew first, which asks for your password);
-3. opens a setup page in your web browser. You sign in to Plex there, and Arr finds your
+3. asks "Set up Arr in your web browser, or here in the terminal?" (press Enter for the
+   browser), then opens a setup page in your web browser. You sign in to Plex there, and Arr finds your
    Plex on this computer, your movie and TV libraries and their folders (Arr moves files
    into Plex's folders, so it runs on the same computer as Plex). You confirm the folders,
    choose where downloads go and whether Arr installs its own updates, then click
@@ -41,17 +42,25 @@ The script takes a few minutes. It:
 4. imports your Plex library, so Arr knows what you own. It downloads nothing at this step;
 5. starts Arr as a service (systemd on Linux, launchd on macOS), and can start it when the
    computer starts rather than when you log in (see
-   [Starting when the computer starts](#starting-when-the-computer-starts));
+   [Starting when the computer starts](#starting-when-the-computer-starts)). On Linux, after
+   the setup page, Arr starts first, so the page's **Open Arr** works straight away, and the
+   last questions follow in the terminal. On a Mac the last questions come first, then Arr
+   starts;
 6. offers to set up remote access, so you can open the web app on your phone away from home
    and, if you like, use Arr from ChatGPT (see below; you can say no and do it later).
 
-If you're connected to the machine over SSH, the script prints a link to open on the computer
-you're typing on. The link includes a secret code, so nobody else on your network can use
-the page. To answer the questions in the terminal instead, add `--terminal`:
+If you're connected to the machine over SSH, it asks the same question, and the browser setup
+prints a link to open on the computer you're typing on. The link includes a secret code, so
+nobody else on your network can use the page. To skip the question, add `--browser` for the
+setup page or `--terminal` to answer the questions in the terminal:
 `curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --terminal`.
+Setup options such as `--plex-token` or `--movies` mean the terminal setup, and the script
+says so; `--tmdb-key` works with either.
 
-Arr saves its setup only when setup has fully worked. If it stops halfway, nothing is kept:
-run the install command again to start over.
+Arr starts using its setup only when setup has fully worked. If it stops halfway, run the
+install command again to start setup again (the settings of an attempt that failed are kept
+as `config.toml.failed`, for reference). If the script says the port is in use, something
+else on the computer has Arr's port (8787): run it again with `--port` and another number.
 
 Arr runs on macOS and on Linux with glibc 2.35 or newer (Debian 12, Ubuntu 22.04, Raspberry
 Pi OS 12 and later), on x86_64 and ARM64. Plex can run natively or in Docker; when the script
@@ -128,10 +137,10 @@ keeps running. Run the current installer again to start at boot.
 
 ### Updates
 
-The installer asks whether Arr should keep itself up to date (on Windows the answer defaults to
-no, as the setup page's box does; with nobody to ask, a new install stays without updates and a
-re-run keeps them as they are). Say yes and Arr checks for a new
-release once a day, at a random time overnight. When one appears, it downloads it, checks
+The installer asks whether Arr should keep itself up to date (the setup page has a box for it;
+the question defaults to no, a new install with nobody to ask stays without updates, and a
+re-run keeps automatic updates that are on). Say yes and Arr checks for a new release once a
+day, at a random time overnight. When one appears, it downloads it, checks
 its SHA-256, swaps the binary and restarts. If the new version doesn't start within 30
 seconds, it puts the old one back. It only installs release builds from this repository, and
 it never runs a script fetched from the internet.
@@ -186,8 +195,8 @@ Windows, set `ARR_TMDB_KEY`, `ARR_UPLOAD_LIMIT_KIB`, `ARR_TORRENT_PORT`, `ARR_ER
 
 On Windows, `ARR_SEARCH_ONLY=1` turns downloading off too.
 
-`--port`, `--movies`, `--tv`, `--downloads`, `--movie-section`, `--tv-section` and `--terminal`
-(on Windows `ARR_PORT`, `ARR_PLEX_URL`, `ARR_PLEX_TOKEN`, `ARR_MOVIES`, `ARR_TV`,
+`--port`, `--movies`, `--tv`, `--downloads`, `--movie-section`, `--tv-section`, `--browser` and
+`--terminal` (on Windows `ARR_PORT`, `ARR_PLEX_URL`, `ARR_PLEX_TOKEN`, `ARR_MOVIES`, `ARR_TV`,
 `ARR_DOWNLOADS`, `ARR_MOVIE_SECTION`, `ARR_TV_SECTION`, `ARR_TERMINAL` and `ARR_BROWSER`)
 apply only to the first setup, as do the remote access values once remote access is set up. A
 re-run with a different value stops with an `error:` line (at a terminal it warns and carries

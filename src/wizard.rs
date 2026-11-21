@@ -86,6 +86,10 @@ struct Wizard {
     /// can't claim it twice.
     lookup: tokio::sync::Mutex<()>,
     finished: Notify,
+    /// The setup task, once Finish has started one.
+    setup: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set when the wizard is stopping: the setup task stops the program it is running.
+    stop: tokio::sync::watch::Sender<bool>,
     /// Error reports, from the moment the user ticks the box (docs/PRIVACY.md).
     reporting: Mutex<Option<crate::report::Reporting>>,
 }
@@ -162,7 +166,21 @@ type St = State<Arc<Wizard>>;
 /// Runs the wizard until setup finishes (Ok) or is abandoned (Err).
 pub async fn run(mut opts: Options) -> Result<()> {
     let config = opts.state_dir.join("config.toml");
+    if std::fs::symlink_metadata(&opts.state_dir).is_err() {
+        fsutil::ensure_private_dir(&opts.state_dir)?;
+    }
+    // Held until the wizard exits, from before the config check, so two can't set up one
+    // state folder.
+    let Some(_lock) = lock_state(&opts.state_dir)? else {
+        bail!(
+            "another Arr setup is already running for {}; finish or close it first",
+            opts.state_dir.display()
+        );
+    };
     if config.exists() {
+        // A marker a setup left beside its config.toml (stopped after saving it) proves
+        // nothing any more; it never did anything beside a config.toml.
+        let _ = drop_unfinished(&opts.state_dir);
         // Not "remove it": Arr's catalog still points at the old folders.
         bail!(
             "{} already exists; Arr is set up (to start over, run the uninstaller and choose to delete Arr's data first)",
@@ -176,6 +194,19 @@ pub async fn run(mut opts: Options) -> Result<()> {
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .filter(|u| u.starts_with("https://") && !u.contains(char::is_whitespace));
     fsutil::ensure_private_dir(&opts.state_dir)?;
+    // A first run (no config.toml): a token file an interrupted write left empty would fail
+    // every try, so it goes and is made again. Only an empty file in a real, private secrets
+    // folder; plex_token is always replaced whole anyway.
+    let secrets = opts.state_dir.join("secrets");
+    fsutil::ensure_private_dir(&secrets)?;
+    for name in ["plex_client_id", "api_token", "mcp_token"] {
+        let f = secrets.join(name);
+        let empty = std::fs::symlink_metadata(&f).is_ok_and(|m| m.file_type().is_file())
+            && std::fs::read(&f).is_ok_and(|b| b.trim_ascii().is_empty());
+        if empty {
+            std::fs::remove_file(&f).with_context(|| format!("can't remove {}", f.display()))?;
+        }
+    }
     let client_id = plexsignin::client_id(&opts.state_dir)?;
     if !opts.bind.is_loopback() && !private_lan(opts.bind) {
         // The page would be open to the internet, protected only by its link.
@@ -189,10 +220,17 @@ pub async fn run(mut opts: Options) -> Result<()> {
     let http = upstream::http_client(PLEX_TIMEOUT);
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(opts.bind, opts.port))
         .await
-        .with_context(|| {
-            format!(
-                "can't listen on {}:{} (is Arr already running?)",
-                opts.bind, opts.port
+        .map_err(|e| {
+            // The installer's own setting, which is how a person chooses the port.
+            let choose = if cfg!(windows) {
+                "set $env:ARR_PORT = '8790' (or another number), then run the install line again"
+            } else {
+                "run the installer again with --port 8790 (or another number)"
+            };
+            anyhow::anyhow!(
+                "can't use port {port} on {} ({e}). Another program may be using it. To use another port, {choose}.",
+                opts.bind,
+                port = opts.port
             )
         })?;
     let wiz = Arc::new(Wizard {
@@ -208,6 +246,8 @@ pub async fn run(mut opts: Options) -> Result<()> {
         inner: Mutex::new(Inner::default()),
         lookup: tokio::sync::Mutex::new(()),
         finished: Notify::new(),
+        setup: Mutex::new(None),
+        stop: tokio::sync::watch::Sender::new(false),
         reporting: Mutex::new(
             opts.error_reports
                 .then(|| crate::report::start(true, "setup")),
@@ -244,7 +284,7 @@ pub async fn run(mut opts: Options) -> Result<()> {
     }
     println!("Waiting for setup to finish (press Ctrl+C to cancel)...");
     let done = wiz.clone();
-    axum::serve(listener, router(wiz.clone()))
+    let served = axum::serve(listener, router(wiz.clone()))
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = done.finished.notified() => {}
@@ -255,14 +295,72 @@ pub async fn run(mut opts: Options) -> Result<()> {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 } => {}
-                _ = tokio::signal::ctrl_c() => {}
+                _ = stop_signal() => {}
             }
+            // At once, not after the open requests have finished: the setup task stops its
+            // program now, and no new setup starts.
+            raise_stop(&done);
         })
-        .await?;
+        .await;
+    // Stopped mid-setup (Ctrl+C, say): the setup task stops its program and waits for it to
+    // exit, and only then does the state folder's lock go.
+    raise_stop(&wiz);
+    let task = wiz.setup.lock().unwrap().take();
+    if let Some(task) = task {
+        let _ = task.await;
+    }
+    served?;
     match wiz.inner.lock().unwrap().phase.clone() {
         Phase::Done => Ok(()),
         _ => bail!("setup wasn't finished"),
     }
+}
+
+/// Raises `stop` under the lock `apply` admits a setup under, so no setup starts after it.
+fn raise_stop(wiz: &Wizard) {
+    let _slot = wiz.setup.lock().unwrap();
+    wiz.stop.send_replace(true);
+}
+
+/// Takes the state folder's `setup.lock`, which a wizard holds for its whole run; None when
+/// another process holds it.
+fn lock_state(dir: &Path) -> Result<Option<std::fs::File>> {
+    let path = dir.join("setup.lock");
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let f = o
+        .open(&path)
+        .with_context(|| format!("can't open {}", path.display()))?;
+    match f.try_lock() {
+        Ok(()) => Ok(Some(f)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("can't lock {}", path.display()))
+        }
+    }
+}
+
+/// Ctrl+C, and on Unix a plain kill (SIGTERM) or the terminal closing (SIGHUP): the wizard
+/// stops the same way for each, so the programs it runs are stopped too.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let (Ok(mut term), Ok(mut hup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+                _ = hup.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn working(wiz: &Wizard) -> bool {
@@ -449,6 +547,8 @@ fn snapshot(wiz: &Wizard) -> Value {
             "name": p.name,
             "movies": libs("movie"),
             "tv": libs("show"),
+            // Plex in Docker: the page can't create libraries there.
+            "docker": !p.mounts.is_empty(),
         })
     });
     json!({
@@ -459,6 +559,8 @@ fn snapshot(wiz: &Wizard) -> Value {
         "install": inner.install,
         "can_install": install_command(wiz).is_some(),
         "install_command": manual_install_command(wiz),
+        // The page words installing Plex, and remote access, for this computer's system.
+        "platform": std::env::consts::OS,
         "media_movies": crate::plexinstall::default_media().join("Movies"),
         "media_tv": crate::plexinstall::default_media().join("TV Shows"),
         "phase": inner.phase,
@@ -683,7 +785,7 @@ async fn find_local(wiz: &Wizard, servers: &[Server]) -> Result<(), Missing> {
             continue;
         };
         let mounts = if wiz.opts.docker {
-            docker_mounts().await
+            docker_mounts(port).await
         } else {
             vec![]
         };
@@ -805,7 +907,7 @@ async fn install_plex(State(wiz): St) -> Response {
             return problem(StatusCode::CONFLICT, "Plex is already being installed");
         }
         inner.install = Install::Running {
-            step: "Waiting for your password".into(),
+            step: first_install_step(std::env::consts::OS).into(),
         };
     }
     let w = wiz.clone();
@@ -815,8 +917,10 @@ async fn install_plex(State(wiz): St) -> Response {
             Ok(()) => Install::Done,
             Err(e) => {
                 let message = format!("{e:#}");
-                // Closing the password dialog is a choice, not a failure.
-                if message != NO_PASSWORD {
+                // Closing the password dialog is a choice, and pkexec refusing to ask (no
+                // password dialog, or not authorized) isn't a fault in Arr: neither is
+                // reported, as before.
+                if message != NO_PASSWORD && !message.starts_with(NO_AGENT) {
                     crate::report::error("plex-install", &crate::report::reportable(&e));
                 }
                 Install::Failed { message }
@@ -826,11 +930,21 @@ async fn install_plex(State(wiz): St) -> Response {
     Json(snapshot(&wiz)).into_response()
 }
 
+/// Shown until the installer reports its own steps. Only Linux asks for a password first:
+/// Windows asks for permission after the download, and macOS doesn't ask.
+fn first_install_step(os: &str) -> &'static str {
+    match os {
+        "windows" | "macos" => "Starting the Plex installer",
+        _ => "Waiting for your password",
+    }
+}
+
 fn set_install_step(wiz: &Wizard, step: &str) {
     wiz.inner.lock().unwrap().install = Install::Running { step: step.into() };
 }
 
 const NO_PASSWORD: &str = "Plex wasn't installed, because the password wasn't entered. Click Install Plex for me to try again.";
+const NO_AGENT: &str = "Plex wasn't installed, because Arr couldn't ask for your password.";
 
 async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -873,9 +987,18 @@ async fn run_install(wiz: &Wizard, cmd: Vec<String>) -> Result<()> {
         .and_then(Result::ok)
         .unwrap_or_default();
     if !status.success() {
-        // pkexec: 126 when the password dialog is closed, 127 when it isn't authorized.
+        // pkexec: 126 when the password dialog is closed; 127 when it can't ask (no polkit
+        // agent), isn't authorized, or fails otherwise.
         return Err(match status.code() {
-            Some(126 | 127) if cmd[0].ends_with("pkexec") => anyhow::anyhow!(NO_PASSWORD),
+            Some(126) if cmd[0].ends_with("pkexec") => anyhow::anyhow!(NO_PASSWORD),
+            Some(127) if cmd[0].ends_with("pkexec") => {
+                anyhow::anyhow!(match manual_install_command(wiz) {
+                    Some(c) => format!(
+                        "{NO_AGENT} Run this in a terminal instead, then click Look again: {c}"
+                    ),
+                    None => NO_AGENT.to_string(),
+                })
+            }
             // Its output is shown on the page but not reported: it can name anything.
             _ => anyhow::Error::new(crate::report::Private(tail(&errors)))
                 .context("Plex couldn't be installed"),
@@ -942,7 +1065,7 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
     ];
     if wanted
         .iter()
-        .all(|w| w.0.as_deref().is_none_or(|f| f.trim().is_empty()))
+        .all(|w| w.0.as_deref().is_none_or(|f| unquote(f).is_empty()))
     {
         return problem(
             StatusCode::BAD_REQUEST,
@@ -957,7 +1080,7 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
     let mut todo = vec![];
     for (folder, kind, name, agent, scanner) in wanted {
         let Some(folder) = folder
-            .map(|f| trim_sep(f.trim()).to_string())
+            .map(|f| trim_sep(unquote(&f)).to_string())
             .filter(|f| !f.is_empty())
         else {
             continue;
@@ -966,23 +1089,28 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
             continue;
         }
         // Every folder is checked before Plex is asked for anything.
-        if let Err(m) = check_folder(&folder, true) {
+        if let Err(m) = check_library(&folder, &wiz.opts.state_dir, true) {
             return problem(StatusCode::BAD_REQUEST, &format!("{folder}: {m}"));
         }
         todo.push((folder, kind, name, agent, scanner));
     }
     for (folder, kind, name, agent, scanner) in todo {
-        if let Err(e) = std::fs::create_dir_all(&folder) {
+        if let Err(e) = make_library_dir(Path::new(&folder)) {
             return problem(
                 StatusCode::BAD_REQUEST,
                 &format!("{folder}: can't create it: {}", e.kind()),
             );
         }
-        if !plex_can_read(Path::new(&folder)) {
-            warnings.push(format!(
-                "Plex may not be able to see {folder}: it runs as its own user, and folders inside your home folder are usually private. {} works.",
-                crate::plexinstall::default_media().display()
-            ));
+        if let Some(private) = plex_blocker(Path::new(&folder)) {
+            let media = crate::plexinstall::default_media();
+            let mut w = format!(
+                "Plex may not be able to see {folder}: it runs as its own user, and other users can't open {}.",
+                private.display()
+            );
+            if !Path::new(&folder).starts_with(&media) {
+                w.push_str(&format!(" {} works.", media.display()));
+            }
+            warnings.push(w);
         }
         let Ok(mut url) = plex.base_url.join("library/sections") else {
             return problem(StatusCode::INTERNAL_SERVER_ERROR, "bad Plex address");
@@ -1022,8 +1150,33 @@ async fn create_libraries(State(wiz): St, Json(n): Json<NewLibraries>) -> Respon
     Json(v).into_response()
 }
 
-/// Whether a user other than the owner can open `dir` (Plex runs as its own user on Linux).
-fn plex_can_read(dir: &Path) -> bool {
+/// Creates a new library folder (and missing parents) that Plex's own user can read: mode
+/// 755 on Unix whatever the umask (the shell installer's is 077). Folders that already
+/// exist are left as they are. One folder at a time from the top, each opened up as soon
+/// as it is made, so a umask without the owner's search bit can't lock it out of the next.
+fn make_library_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = PathBuf::new();
+        for c in dir.components() {
+            p.push(c);
+            match std::fs::create_dir(&p) {
+                // Only a folder this call made: one that appeared meanwhile is someone else's.
+                Ok(()) => std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?,
+                Err(_) if p.is_dir() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// The folder that keeps users other than the owner out of `dir` (Plex runs as its own
+/// user on Linux), if any.
+fn plex_blocker(dir: &Path) -> Option<PathBuf> {
     // Only Linux runs Plex as its own user; on Windows and macOS it runs as you.
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -1034,20 +1187,24 @@ fn plex_can_read(dir: &Path) -> bool {
                 .unwrap_or(0)
         };
         if mode(dir) & 0o005 != 0o005 {
-            return false;
+            return Some(dir.to_path_buf());
         }
-        dir.ancestors().skip(1).all(|a| mode(a) & 0o001 != 0)
+        dir.ancestors()
+            .skip(1)
+            .find(|a| mode(a) & 0o001 == 0)
+            .map(Path::to_path_buf)
     }
     #[cfg(any(not(unix), target_os = "macos"))]
     {
         let _ = dir;
-        true
+        None
     }
 }
 
-/// The mounts of a running Plex container, as (container path, host path), longest
-/// container path first so `/media/movies` wins over `/media`.
-async fn docker_mounts() -> Vec<(String, String)> {
+/// The mounts of the running Plex container that answered on `port`, as (container path,
+/// host path), longest container path first so `/media/movies` wins over `/media`. Empty
+/// when no container is that Plex (a Plex tool such as a metadata manager doesn't count).
+async fn docker_mounts(port: u16) -> Vec<(String, String)> {
     async fn out(args: &[&str]) -> Option<String> {
         let o = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1066,18 +1223,32 @@ async fn docker_mounts() -> Vec<(String, String)> {
     let Some(ps) = out(&["ps", "--format", "{{.Names}}\t{{.Image}}"]).await else {
         return vec![];
     };
-    let Some(name) = ps.lines().find_map(|l| {
-        let low = l.to_ascii_lowercase();
-        let skip = ["tautulli", "overseerr", "seerr"]
-            .iter()
-            .any(|s| low.contains(s));
-        (low.contains("plex") && !skip).then(|| l.split('\t').next().unwrap_or("").to_string())
-    }) else {
-        return vec![];
-    };
-    if name.is_empty() || name.starts_with('-') {
-        return vec![];
+    let names: Vec<String> = ps
+        .lines()
+        .filter(|l| {
+            let low = l.to_ascii_lowercase();
+            let skip = ["tautulli", "overseerr", "seerr"]
+                .iter()
+                .any(|s| low.contains(s));
+            low.contains("plex") && !skip
+        })
+        .map(|l| l.split('\t').next().unwrap_or("").to_string())
+        .filter(|n| !n.is_empty() && !n.starts_with('-'))
+        .collect();
+    for name in names {
+        if let Some(json) = out(&["inspect", "-f", "{{json .}}", &name]).await
+            && let Some(mounts) = plex_container_mounts(&json, port)
+        {
+            return mounts;
+        }
     }
+    vec![]
+}
+
+/// The mounts in a container's `docker inspect`, if it is the Plex answering on `port`:
+/// that TCP port is published to it on 127.0.0.1, or it shares the host's network and
+/// serves that port.
+fn plex_container_mounts(inspect: &str, port: u16) -> Option<Vec<(String, String)>> {
     #[derive(Deserialize)]
     struct Mount {
         #[serde(rename = "Source")]
@@ -1085,11 +1256,62 @@ async fn docker_mounts() -> Vec<(String, String)> {
         #[serde(rename = "Destination")]
         destination: String,
     }
-    let Some(json) = out(&["inspect", "-f", "{{json .Mounts}}", &name]).await else {
-        return vec![];
-    };
-    let mut mounts: Vec<(String, String)> = serde_json::from_str::<Vec<Mount>>(json.trim())
-        .unwrap_or_default()
+    #[derive(Deserialize)]
+    struct Binding {
+        #[serde(rename = "HostIp", default)]
+        host_ip: String,
+        #[serde(rename = "HostPort", default)]
+        host_port: String,
+    }
+    #[derive(Deserialize, Default)]
+    struct HostConfig {
+        #[serde(rename = "NetworkMode", default)]
+        network_mode: String,
+    }
+    #[derive(Deserialize, Default)]
+    struct Network {
+        #[serde(rename = "Ports", default)]
+        ports: Option<std::collections::HashMap<String, Option<Vec<Binding>>>>,
+    }
+    #[derive(Deserialize, Default)]
+    struct Config {
+        #[serde(rename = "ExposedPorts", default)]
+        exposed: Option<std::collections::HashMap<String, Value>>,
+    }
+    #[derive(Deserialize)]
+    struct Inspect {
+        #[serde(rename = "Mounts", default)]
+        mounts: Vec<Mount>,
+        #[serde(rename = "HostConfig", default)]
+        host: HostConfig,
+        #[serde(rename = "NetworkSettings", default)]
+        network: Network,
+        #[serde(rename = "Config", default)]
+        config: Config,
+    }
+    let i: Inspect = serde_json::from_str(inspect.trim()).ok()?;
+    let port = port.to_string();
+    let published = i
+        .network
+        .ports
+        .iter()
+        .flatten()
+        // Over TCP and on 127.0.0.1, as Arr connected to it: not a UDP port, or a TCP one
+        // only on another address.
+        .filter(|(p, _)| p.ends_with("/tcp"))
+        .flat_map(|(_, b)| b.iter().flatten())
+        .any(|b| b.host_port == port && ["", "0.0.0.0", "127.0.0.1"].contains(&&*b.host_ip));
+    let host_network = i.host.network_mode == "host"
+        && i.config
+            .exposed
+            .iter()
+            .flatten()
+            .any(|(p, _)| *p == format!("{port}/tcp"));
+    if !published && !host_network {
+        return None;
+    }
+    let mut mounts: Vec<(String, String)> = i
+        .mounts
         .into_iter()
         .filter(|m| m.destination.starts_with('/') && m.source.starts_with('/'))
         .map(|m| {
@@ -1100,7 +1322,7 @@ async fn docker_mounts() -> Vec<(String, String)> {
         })
         .collect();
     mounts.sort_by_key(|(d, _)| std::cmp::Reverse(d.len()));
-    mounts
+    Some(mounts)
 }
 
 // ------------------------------------------------------------------ folders
@@ -1112,15 +1334,34 @@ struct FolderQuery {
     create: bool,
 }
 
-async fn folder(Json(q): Json<FolderQuery>) -> Json<Value> {
-    Json(match check_folder(&q.path, q.create) {
+async fn folder(State(wiz): St, Json(q): Json<FolderQuery>) -> Json<Value> {
+    let path = unquote(&q.path);
+    // Only the download folder is checked with `create` (library folders must exist), so
+    // each gets its own folder's rules too.
+    let checked = if q.create {
+        check_downloads(path, &wiz.opts.state_dir)
+    } else {
+        check_library(path, &wiz.opts.state_dir, false)
+    };
+    Json(match checked {
         Ok(()) => json!({ "ok": true }),
         Err(msg) => json!({ "ok": false, "message": msg }),
     })
 }
 
-/// A folder Arr can use: absolute, a real directory, and writable by this user (the one
-/// Arr will run as). With `create`, a missing folder is fine: setup creates it.
+/// A folder as typed or pasted: without surrounding spaces or one pair of surrounding
+/// quotes (Windows Explorer's "Copy as path" gives `"D:\Media\Movies"`).
+fn unquote(raw: &str) -> &str {
+    let t = raw.trim();
+    ['"', '\'']
+        .iter()
+        .find_map(|q| t.strip_prefix(*q)?.strip_suffix(*q))
+        .map_or(t, str::trim)
+}
+
+/// A folder Arr can use: absolute (without '.' or '..', as the config requires), a real
+/// directory, and writable by this user (the one Arr will run as). With `create`, a missing
+/// folder is fine: setup creates it.
 fn check_folder(raw: &str, create: bool) -> Result<(), String> {
     let p = Path::new(raw);
     if raw.is_empty() || !p.is_absolute() || raw.chars().any(|c| c.is_control()) {
@@ -1129,6 +1370,14 @@ fn check_folder(raw: &str, create: bool) -> Result<(), String> {
         } else {
             "enter a full path, starting with /".into()
         });
+    }
+    if p.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err("enter the folder's path without '.' or '..' in it".into());
     }
     if !p.exists() {
         if create {
@@ -1149,6 +1398,49 @@ fn check_folder(raw: &str, create: bool) -> Result<(), String> {
         return Err("that's a file, not a folder".into());
     }
     writable(p).map_err(|_| "Arr can't save files here; check the folder's permissions".into())
+}
+
+/// The download folder: a folder Arr can use (it may not exist yet), without a symbolic
+/// link in it (the download engine refuses one when Arr starts), and neither inside nor
+/// around Arr's state folder.
+fn check_downloads(raw: &str, state_dir: &Path) -> Result<(), String> {
+    check_folder(raw, true)?;
+    let p = Path::new(raw);
+    if let Some(problem) = crate::embedded::download_dir_problem(p) {
+        return Err(problem);
+    }
+    outside_state(p, state_dir)
+}
+
+/// A library folder: a folder Arr can use that is not a symbolic link (the Plex import
+/// refuses one) and is neither inside nor around Arr's state folder. With `create` (a new
+/// Plex library), a folder that doesn't exist yet is fine.
+fn check_library(raw: &str, state_dir: &Path, create: bool) -> Result<(), String> {
+    check_folder(raw, create)?;
+    let p = Path::new(trim_sep(raw));
+    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+        let real = std::fs::canonicalize(p)
+            .map(|r| format!(" ({})", r.display()))
+            .unwrap_or_default();
+        return Err(format!(
+            "this is a symbolic link, and Arr's import of your Plex library needs the real folder; enter the folder it points to{real}"
+        ));
+    }
+    outside_state(p, state_dir)
+}
+
+/// Refuses a folder inside or around Arr's state folder, which holds Arr's own files.
+fn outside_state(p: &Path, state_dir: &Path) -> Result<(), String> {
+    let around = p.starts_with(state_dir)
+        || state_dir.starts_with(p)
+        || crate::paths::overlap(p, state_dir)?;
+    if around {
+        return Err(format!(
+            "this folder is inside or around Arr's own folder ({}); choose another",
+            state_dir.display()
+        ));
+    }
+    Ok(())
 }
 
 /// A folder without the separator at its end (`/srv/media/` -> `/srv/media`), but never
@@ -1202,7 +1494,11 @@ struct Library {
     folder: String,
 }
 
-async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
+async fn apply(State(wiz): St, Json(mut c): Json<Choices>) -> Response {
+    c.downloads = unquote(&c.downloads).to_string();
+    for ch in [&mut c.movies, &mut c.tv].into_iter().flatten() {
+        ch.folder = unquote(&ch.folder).to_string();
+    }
     // Checked and claimed in one go, so two tabs can't both start setup.
     let plex = {
         let mut inner = wiz.inner.lock().unwrap();
@@ -1235,7 +1531,8 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
             .find(|s| s.key == key && s.kind == kind)
             .and_then(|s| s.locations.get(idx))
             .ok_or("pick a library from the list")?;
-        check_folder(&ch.folder, false).map_err(|m| format!("{}: {m}", ch.folder))?;
+        check_library(&ch.folder, &wiz.opts.state_dir, false)
+            .map_err(|m| format!("{}: {m}", ch.folder))?;
         Ok(Some(Library {
             section: key,
             plex_path: trim_sep(loc).to_string(),
@@ -1249,19 +1546,40 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
     if movies.is_none() && tv.is_none() {
         return refuse("choose a movie or TV library");
     }
-    if let Err(m) = check_folder(&c.downloads, true) {
+    if let Err(m) = check_downloads(&c.downloads, &wiz.opts.state_dir) {
         return refuse(&format!("download folder: {m}"));
+    }
+    // The config's own rules (folders that overlap, ...), before anything is written.
+    let text = render_config(&wiz.opts, &plex, movies.as_ref(), tv.as_ref(), &c);
+    if let Err(e) = crate::config::parse_config(
+        &text,
+        &wiz.opts.state_dir,
+        "the setup",
+        crate::config::Secrets::Defer,
+    ) {
+        return refuse(&format!("{e:#}"));
+    }
+    // Held until the task's handle is stored, so a task that fails at once can't be replaced
+    // by a retry whose handle this one then overwrites; and `stop` is checked under it, so a
+    // setup never starts after the wizard has begun to stop (`raise_stop` raises it under it).
+    let mut slot = wiz.setup.lock().unwrap();
+    if *wiz.stop.borrow() {
+        return problem(StatusCode::SERVICE_UNAVAILABLE, "the setup page is closing");
     }
     set_phase(&wiz, "Saving your settings", "");
     editing.0 = None;
     let w = wiz.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let result = finish_setup(&w, &plex, movies, tv, &c).await;
+        let stopping = *w.stop.borrow();
         let mut inner = w.inner.lock().unwrap();
         inner.phase = match result {
             Ok(()) => Phase::Done,
             Err(e) => {
-                crate::report::error("setup", &crate::report::reportable(&e));
+                // Stopped by the person, not a fault.
+                if !stopping {
+                    crate::report::error("setup", &crate::report::reportable(&e));
+                }
                 Phase::Failed {
                     message: format!("{e:#}"),
                 }
@@ -1275,6 +1593,8 @@ async fn apply(State(wiz): St, Json(c): Json<Choices>) -> Response {
             });
         }
     });
+    *slot = Some(task);
+    drop(slot);
     Json(snapshot(&wiz)).into_response()
 }
 
@@ -1303,23 +1623,36 @@ async fn finish_setup(
     tv: Option<Library>,
     c: &Choices,
 ) -> Result<()> {
+    // Before anything is written: the wizard may have begun to stop since `apply` checked.
+    if *wiz.stop.borrow() {
+        bail!("setup was stopped");
+    }
     let dir = &wiz.opts.state_dir;
     let secrets = dir.join("secrets");
-    let api_token = secrets.join("api_token");
-    if !api_token.exists() {
-        fsutil::write_new_private_file(&api_token, fsutil::random_hex(32)?.as_bytes())?;
-    }
-    let mcp_token = secrets.join("mcp_token");
-    if !mcp_token.exists() {
-        fsutil::write_new_private_file(&mcp_token, fsutil::random_hex(32)?.as_bytes())?;
+    // New tokens through a temporary file, so a failed write can't leave one empty.
+    for name in ["api_token", "mcp_token"] {
+        let token = secrets.join(name);
+        if !token.exists() {
+            fsutil::atomic_replace_private(&token, fsutil::random_hex(32)?.as_bytes())?;
+        }
     }
     fsutil::atomic_replace_private(&secrets.join("plex_token"), plex.token.expose().as_bytes())?;
     std::fs::create_dir_all(&c.downloads)
         .with_context(|| format!("can't create {}", c.downloads))?;
+    // Again now that it exists, before a config names it.
+    if let Some(problem) = crate::embedded::download_dir_problem(Path::new(&c.downloads)) {
+        bail!("download folder: {problem}");
+    }
+    let text = render_config(&wiz.opts, plex, movies.as_ref(), tv.as_ref(), c);
+    clear_unfinished(dir, &text)?;
+    // The proof that this setup made what it puts in the catalog, so a retry may clear it:
+    // written only when the folder has no catalog or import yet, removed once setup worked.
+    if !has_catalog(dir) {
+        fsutil::atomic_replace_private(&dir.join(UNFINISHED), text.as_bytes())?;
+    }
     // Under another name until everything has worked: the installers take config.toml to
     // mean "Arr is set up".
     let config = dir.join("config.toml.new");
-    let text = render_config(&wiz.opts, plex, movies.as_ref(), tv.as_ref(), c);
     fsutil::atomic_replace_private(&config, text.as_bytes())?;
 
     let result = async {
@@ -1351,28 +1684,243 @@ async fn finish_setup(
     // This config already has Knaben: note that it was offered, so taking it out sticks
     // (`arr set default-indexers` never adds it back).
     fsutil::atomic_replace_private(&dir.join(crate::set::INDEXER_MARKER), b"knaben\n")?;
+    // Saving config.toml is what makes Arr set up; the marker goes only after it, so a stop
+    // in between leaves the marker beside a config.toml (where it permits nothing, and goes
+    // the next time Arr or this page starts), never a catalog with neither.
     std::fs::rename(&config, dir.join("config.toml")).context("can't save config.toml")?;
+    fsutil::fsync_dir(dir)?;
+    // Arr is set up now: a marker that can't go is harmless, and goes next time.
+    let _ = drop_unfinished(dir);
+    Ok(())
+}
+
+/// In the state folder while a setup from this page that started without a catalog is
+/// unfinished; holds that setup's config. Only `clear_unfinished` reads it, and never
+/// beside a config.toml.
+const UNFINISHED: &str = "setup-unfinished";
+
+/// Removes the marker (`UNFINISHED`), if it is there.
+fn drop_unfinished(dir: &Path) -> Result<()> {
+    match std::fs::remove_file(dir.join(UNFINISHED)) {
+        Ok(()) => fsutil::fsync_dir(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(e).with_context(|| format!("can't remove {}", dir.join(UNFINISHED).display()))
+        }
+    }
+}
+
+/// Set (to 1) by this page on the `arr` commands it runs for its own setup, and by nothing
+/// else: only those leave its marker (`UNFINISHED`) in place.
+const SETUP_PAGE_ENV: &str = "ARR_SETUP_PAGE";
+
+/// For the commands that write a state folder's catalog or import store (`arr setup`,
+/// `bootstrap`, `check`, `serve`), just before they open it: run by anything but this page,
+/// that command now owns the state folder, so the marker an unfinished setup from this page
+/// left (`UNFINISHED`) goes and a retry from the page clears nothing. Under the page's
+/// `setup.lock`, so it can't go while a page may be clearing; no marker, no lock.
+pub fn release_unfinished(state_dir: &Path) -> Result<()> {
+    if std::env::var_os(SETUP_PAGE_ENV).is_some_and(|v| v == "1") {
+        return Ok(());
+    }
+    let marker = state_dir.join(UNFINISHED);
+    if matches!(std::fs::symlink_metadata(&marker), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    // Beside a config.toml it permits nothing (and no page clears there): tidying only.
+    if state_dir.join("config.toml").exists() {
+        let _ = drop_unfinished(state_dir);
+        return Ok(());
+    }
+    let Some(_lock) = lock_state(state_dir)? else {
+        bail!(
+            "an Arr setup page is running for {}; finish or close the setup page first",
+            state_dir.display()
+        );
+    };
+    drop_unfinished(state_dir)
+}
+
+/// The catalog's files and the import store's pointer: what a setup leaves at the top of
+/// the state folder.
+const CATALOG_FILES: [&str; 5] = [
+    "state.sqlite",
+    "state.sqlite-wal",
+    "state.sqlite-shm",
+    "state.sqlite-journal",
+    crate::import::ACTIVE_POINTER,
+];
+
+/// Whether the state folder has any catalog or import state.
+fn has_catalog(dir: &Path) -> bool {
+    CATALOG_FILES
+        .iter()
+        .chain(&["imports"])
+        .any(|n| std::fs::symlink_metadata(dir.join(n)).is_ok())
+}
+
+/// Clears what an unfinished earlier setup from this page put in the state folder (the
+/// catalog and import cursor in state.sqlite, and the setup they came from) when `config`
+/// has other libraries; `arr setup` would otherwise refuse to drop the folders of titles
+/// already imported. With the same libraries it stays, so the import resumes where it
+/// stopped. Only without config.toml, and only with the marker (`UNFINISHED`) that setup
+/// wrote when it started in a folder without a catalog: a config.toml.new or .failed alone
+/// proves nothing (the catalog may be an install's whose config lives elsewhere).
+fn clear_unfinished(dir: &Path, config: &str) -> Result<()> {
+    if dir.join("config.toml").exists() {
+        bail!("{} already exists", dir.join("config.toml").display());
+    }
+    let Ok(started) = std::fs::read_to_string(dir.join(UNFINISHED)) else {
+        return Ok(());
+    };
+    let libraries = |text: &str| {
+        toml::from_str::<toml::Table>(text)
+            .ok()
+            .map(|t| (t.get("library").cloned(), t.get("plex").cloned()))
+    };
+    if libraries(&started).is_some() && libraries(&started) == libraries(config) {
+        return Ok(());
+    }
+    // All checked before anything goes: each catalog file missing, a file, or a symbolic link
+    // (which goes, not what it points to) to anything but a folder (never a catalog file, and
+    // on Windows not removable as a file).
+    for name in CATALOG_FILES {
+        let f = dir.join(name);
+        match std::fs::symlink_metadata(&f) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(m)
+                if m.is_file()
+                    || (m.file_type().is_symlink()
+                        && !std::fs::metadata(&f).is_ok_and(|t| t.is_dir())) => {}
+            Ok(_) => bail!(
+                "{} isn't a file, so the earlier setup can't be cleared; move it out of {} and try again",
+                f.display(),
+                dir.display()
+            ),
+            Err(e) => return Err(e).with_context(|| format!("can't read {}", f.display())),
+        }
+    }
+    let (files, dirs) = setup_imports(dir)?;
+    let gone = |r: std::io::Result<()>, path: &Path| match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("can't clear {} from the earlier setup", path.display()))
+        }
+        _ => Ok(()),
+    };
+    for name in CATALOG_FILES {
+        let f = dir.join(name);
+        gone(std::fs::remove_file(&f), &f)?;
+    }
+    for f in &files {
+        gone(std::fs::remove_file(f), f)?;
+    }
+    // Each only if empty, so nothing that isn't an import's goes.
+    for d in &dirs {
+        gone(std::fs::remove_dir(d), d)?;
+    }
     fsutil::fsync_dir(dir)
+}
+
+/// The import store as `arr setup` and `arr bootstrap` write it: `imports/imp-*/` (and a
+/// `.tmp-imp-*/` an interrupted write leaves), each holding only an import's own files.
+/// Returns those files, then the folders, innermost first. Anything else in it, or a
+/// symbolic link, fails, so nothing else is ever cleared.
+fn setup_imports(dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    const PARTS: [&str; 6] = [
+        "manifest.json",
+        "settings.json",
+        "catalog.json",
+        "migration-report.json",
+        "migration-report.md",
+        crate::setup::SOURCE_FILE,
+    ];
+    let imports = dir.join("imports");
+    let (mut files, mut dirs) = (vec![], vec![]);
+    match std::fs::symlink_metadata(&imports) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((files, dirs)),
+        Err(e) => return Err(e).with_context(|| format!("can't read {}", imports.display())),
+        Ok(_) => {}
+    }
+    let foreign = |p: &Path| {
+        anyhow::anyhow!(
+            "{} isn't part of an earlier setup, so that setup can't be cleared; move it out of {} and try again",
+            p.display(),
+            dir.display()
+        )
+    };
+    let list = |d: &Path| -> Result<Vec<std::fs::DirEntry>> {
+        // Not followed: a link to a folder isn't a folder here.
+        if !std::fs::symlink_metadata(d).is_ok_and(|m| m.is_dir()) {
+            return Err(foreign(d));
+        }
+        std::fs::read_dir(d)
+            .and_then(Iterator::collect)
+            .with_context(|| format!("can't read {}", d.display()))
+    };
+    for e in list(&imports)? {
+        let name = e.file_name();
+        let name = name.to_str().unwrap_or_default();
+        let import = e.path();
+        if !(name.starts_with("imp-") || name.starts_with(".tmp-imp-")) {
+            return Err(foreign(&import));
+        }
+        for f in list(&import)? {
+            let part = f.file_name();
+            let owned = PARTS.contains(&part.to_str().unwrap_or_default())
+                && f.file_type().is_ok_and(|t| t.is_file());
+            if !owned {
+                return Err(foreign(&f.path()));
+            }
+            files.push(f.path());
+        }
+        dirs.push(import);
+    }
+    dirs.push(imports);
+    Ok((files, dirs))
 }
 
 /// Runs `arr <args> <config>` and fails with the end of its error output.
 async fn arr(wiz: &Wizard, args: &[&str], config: &Path) -> Result<()> {
-    let out = Command::new(&wiz.opts.arr)
+    let mut child = Command::new(&wiz.opts.arr)
         .args(args)
         .arg(config)
+        .env(SETUP_PAGE_ENV, "1")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await
+        .spawn()
         .with_context(|| format!("can't run {}", wiz.opts.arr.display()))?;
-    if out.status.success() {
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let errors = tokio::spawn(async move {
+        let mut buf = vec![];
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut buf).await;
+        buf
+    });
+    let status = wait_or_stop(wiz, &mut child).await?;
+    if status.success() {
         return Ok(());
     }
+    let errors = errors.await.unwrap_or_default();
     // Its output is shown on the page but not reported: it can name anything.
-    Err(
-        anyhow::Error::new(crate::report::Private(tail(&out.stderr)))
-            .context(format!("arr {} failed", args[0])),
-    )
+    Err(anyhow::Error::new(crate::report::Private(tail(&errors)))
+        .context(format!("arr {} failed", args[0])))
+}
+
+/// Waits for `child` to exit; when the wizard is stopping, stops it and waits for that.
+async fn wait_or_stop(
+    wiz: &Wizard,
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus> {
+    let mut stop = wiz.stop.subscribe();
+    tokio::select! {
+        status = child.wait() => Ok(status?),
+        _ = async { drop(stop.wait_for(|s| *s).await) } => {
+            let _ = child.kill().await;
+            bail!("setup was stopped")
+        }
+    }
 }
 
 fn tail(bytes: &[u8]) -> String {
@@ -1392,6 +1940,7 @@ async fn bootstrap(wiz: &Wizard, config: &Path, media: &str) -> Result<()> {
     let mut child = Command::new(&wiz.opts.arr)
         .args(["bootstrap", "--media", media, "--config"])
         .arg(config)
+        .env(SETUP_PAGE_ENV, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1407,16 +1956,25 @@ async fn bootstrap(wiz: &Wizard, config: &Path, media: &str) -> Result<()> {
     });
     let mut lines = BufReader::new(stderr).lines();
     let mut last = vec![];
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(p) = progress(&line) {
-            set_phase(wiz, "Learning what you already own", &p);
-        }
-        last.push(line);
-        if last.len() > 20 {
-            last.remove(0);
+    let mut stop = wiz.stop.subscribe();
+    tokio::select! {
+        _ = async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(p) = progress(&line) {
+                    set_phase(wiz, "Learning what you already own", &p);
+                }
+                last.push(line);
+                if last.len() > 20 {
+                    last.remove(0);
+                }
+            }
+        } => {}
+        _ = async { drop(stop.wait_for(|s| *s).await) } => {
+            let _ = child.kill().await;
+            bail!("setup was stopped");
         }
     }
-    let status = child.wait().await?;
+    let status = wait_or_stop(wiz, &mut child).await?;
     let stdout = collect.await.unwrap_or_default();
     // The import's own words (log lines, titles) are shown on the page but not reported.
     let private = |m: String| anyhow::Error::new(crate::report::Private(m));
@@ -1748,6 +2306,13 @@ mod tests {
     }
 
     #[test]
+    fn only_linux_waits_for_a_password_before_installing_plex() {
+        assert_eq!(first_install_step("linux"), "Waiting for your password");
+        assert_eq!(first_install_step("windows"), "Starting the Plex installer");
+        assert_eq!(first_install_step("macos"), "Starting the Plex installer");
+    }
+
+    #[test]
     fn folders_must_be_absolute_and_writable() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().to_str().unwrap();
@@ -1758,5 +2323,270 @@ mod tests {
         let file = dir.path().join("f");
         std::fs::write(&file, b"x").unwrap();
         assert!(check_folder(file.to_str().unwrap(), false).is_err());
+        // The config refuses '..' in a folder, so the page does too.
+        assert!(check_folder(&format!("{d}/missing/../x"), true).is_err());
+    }
+
+    #[test]
+    fn pasted_paths_lose_one_pair_of_quotes() {
+        assert_eq!(unquote("\"D:\\Media\\Movies\""), "D:\\Media\\Movies");
+        assert_eq!(unquote(" '/srv/media/TV Shows' "), "/srv/media/TV Shows");
+        assert_eq!(unquote("/srv/media"), "/srv/media");
+        assert_eq!(unquote("\"\"/x\"\""), "\"/x\"");
+        assert_eq!(unquote("\"/x'"), "\"/x'");
+        assert_eq!(unquote("\""), "\"");
+    }
+
+    #[test]
+    fn the_download_folder_is_checked_as_the_engine_and_config_check_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        crate::fsutil::ensure_private_dir(&state).unwrap();
+        let s = |p: &Path| p.to_str().unwrap().to_string();
+        assert!(check_downloads(&s(&tmp.path().join("downloads")), &state).is_ok());
+        assert!(check_downloads(&s(&state.join("downloads")), &state).is_err());
+        assert!(check_downloads(&s(tmp.path()), &state).is_err());
+        #[cfg(unix)]
+        {
+            let real = tmp.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let err = check_downloads(&s(&link), &state).unwrap_err();
+            assert!(err.contains("symbolic link"), "{err}");
+            // A link above a folder that doesn't exist yet counts too.
+            assert!(check_downloads(&s(&link.join("new")), &state).is_err());
+            // The same folder by its own path is fine.
+            assert!(check_downloads(&s(&real), &state).is_ok());
+        }
+    }
+
+    #[test]
+    fn only_the_plex_that_answered_lends_its_mounts() {
+        let mounts = r#""Mounts": [{"Source": "/srv/media", "Destination": "/data"}]"#;
+        let published = format!(
+            r#"{{{mounts}, "HostConfig": {{"NetworkMode": "bridge"}},
+                "NetworkSettings": {{"Ports": {{"32400/tcp": [{{"HostIp": "0.0.0.0", "HostPort": "32400"}}]}}}},
+                "Config": {{"ExposedPorts": {{"32400/tcp": {{}}}}}}}}"#
+        );
+        let want = Some(vec![("/data".to_string(), "/srv/media".to_string())]);
+        assert_eq!(plex_container_mounts(&published, 32400), want);
+        assert_eq!(plex_container_mounts(&published, 32401), None);
+        // Plex on the host's network serves its port without publishing it.
+        let host = format!(
+            r#"{{{mounts}, "HostConfig": {{"NetworkMode": "host"}},
+                "NetworkSettings": {{"Ports": {{}}}}, "Config": {{"ExposedPorts": {{"32400/tcp": {{}}}}}}}}"#
+        );
+        assert_eq!(plex_container_mounts(&host, 32400), want);
+        // A Plex tool (a metadata manager, say) with "plex" in its name serves no Plex port.
+        let tool = format!(
+            r#"{{{mounts}, "HostConfig": {{"NetworkMode": "host"}},
+                "NetworkSettings": {{"Ports": null}}, "Config": {{"ExposedPorts": null}}}}"#
+        );
+        assert_eq!(plex_container_mounts(&tool, 32400), None);
+        let unpublished = format!(
+            r#"{{{mounts}, "HostConfig": {{"NetworkMode": "bridge"}},
+                "NetworkSettings": {{"Ports": {{"32400/tcp": null}}}}, "Config": {{}}}}"#
+        );
+        assert_eq!(plex_container_mounts(&unpublished, 32400), None);
+        // Arr asked 127.0.0.1 over TCP: a UDP port, or a TCP one only on another address,
+        // isn't that Plex.
+        let bound = |key: &str, ip: &str| {
+            format!(
+                r#"{{{mounts}, "HostConfig": {{"NetworkMode": "bridge"}},
+                    "NetworkSettings": {{"Ports": {{"{key}": [{{"HostIp": "{ip}", "HostPort": "32400"}}]}}}}}}"#
+            )
+        };
+        assert_eq!(
+            plex_container_mounts(&bound("32400/udp", "0.0.0.0"), 32400),
+            None
+        );
+        assert_eq!(
+            plex_container_mounts(&bound("32400/tcp", "::1"), 32400),
+            None
+        );
+        assert_eq!(
+            plex_container_mounts(&bound("32400/tcp", "::"), 32400),
+            None
+        );
+        for ip in ["", "0.0.0.0", "127.0.0.1"] {
+            assert_eq!(
+                plex_container_mounts(&bound("32400/tcp", ip), 32400),
+                want,
+                "{ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfinished_setup_is_cleared_only_for_other_libraries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let leftovers = || {
+            std::fs::write(dir.join("state.sqlite"), b"catalog").unwrap();
+            std::fs::write(dir.join("active-import.json"), b"{}").unwrap();
+            std::fs::create_dir_all(dir.join("imports/imp-1")).unwrap();
+            std::fs::write(dir.join("imports/imp-1/catalog.json"), b"{}").unwrap();
+            std::fs::create_dir_all(dir.join("imports/.tmp-imp-2-ab")).unwrap();
+        };
+        let left = || dir.join("state.sqlite").exists();
+        let config =
+            |movies: &str| format!("[library]\nmovies = \"{movies}\"\n[plex]\nmovie_section = 1\n");
+        leftovers();
+        // No marker from a setup that started without a catalog: whatever is there isn't the
+        // page's to clear, even beside a config.toml.failed or .new from this page.
+        clear_unfinished(dir, &config("/a")).unwrap();
+        assert!(left());
+        std::fs::write(dir.join("config.toml.failed"), config("/b")).unwrap();
+        std::fs::write(dir.join("config.toml.new"), config("/b")).unwrap();
+        clear_unfinished(dir, &config("/a")).unwrap();
+        assert!(left());
+        // The same libraries as the marker's resume, whatever the .failed file says.
+        std::fs::write(dir.join(UNFINISHED), config("/a")).unwrap();
+        clear_unfinished(dir, &config("/a")).unwrap();
+        assert!(left());
+        // Something in the import store that isn't an import's: nothing at all is cleared.
+        std::fs::write(dir.join("imports/imp-1/Film (2000).mkv"), b"x").unwrap();
+        assert!(clear_unfinished(dir, &config("/c")).is_err());
+        assert!(left() && dir.join("imports/imp-1/catalog.json").exists());
+        std::fs::remove_file(dir.join("imports/imp-1/Film (2000).mkv")).unwrap();
+        std::fs::create_dir(dir.join("imports/movies")).unwrap();
+        assert!(clear_unfinished(dir, &config("/c")).is_err());
+        assert!(left());
+        std::fs::remove_dir(dir.join("imports/movies")).unwrap();
+        #[cfg(unix)]
+        {
+            // A link in it, even named as an import, isn't followed or cleared.
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::fs::write(elsewhere.path().join("catalog.json"), b"{}").unwrap();
+            let link = dir.join("imports/imp-3");
+            std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
+            assert!(clear_unfinished(dir, &config("/c")).is_err());
+            assert!(left() && elsewhere.path().join("catalog.json").exists());
+            std::fs::remove_file(&link).unwrap();
+        }
+        // Other libraries start clean.
+        clear_unfinished(dir, &config("/c")).unwrap();
+        assert!(!left());
+        assert!(!dir.join("active-import.json").exists() && !dir.join("imports").exists());
+        // Never with a config.toml, even beside a marker naming other libraries (a setup
+        // stopped after saving config.toml, before removing the marker).
+        leftovers();
+        std::fs::write(dir.join(UNFINISHED), config("/a")).unwrap();
+        std::fs::write(dir.join("config.toml"), config("/a")).unwrap();
+        assert!(clear_unfinished(dir, &config("/d")).is_err());
+        assert!(left() && dir.join("imports/imp-1/catalog.json").exists());
+    }
+
+    #[test]
+    fn a_side_file_that_isnt_a_file_stops_the_clear_before_anything_goes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("state.sqlite"), b"catalog").unwrap();
+        std::fs::write(dir.join("active-import.json"), b"{}").unwrap();
+        std::fs::create_dir(dir.join("state.sqlite-wal")).unwrap();
+        std::fs::write(dir.join(UNFINISHED), "[library]\nmovies = \"/a\"\n").unwrap();
+        let err = clear_unfinished(dir, "[library]\nmovies = \"/b\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("state.sqlite-wal"), "{err:#}");
+        assert!(dir.join("state.sqlite").exists() && dir.join("active-import.json").exists());
+        assert!(dir.join("state.sqlite-wal").is_dir());
+        // A symbolic link there goes as a link; what it points to stays. But not a link to a
+        // folder: that stops the clear too.
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(dir.join("state.sqlite-wal")).unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(elsewhere.path(), dir.join("state.sqlite-wal")).unwrap();
+            let err = clear_unfinished(dir, "[library]\nmovies = \"/b\"\n").unwrap_err();
+            assert!(format!("{err:#}").contains("state.sqlite-wal"), "{err:#}");
+            assert!(dir.join("state.sqlite").exists() && dir.join("active-import.json").exists());
+            assert!(elsewhere.path().is_dir());
+            std::fs::remove_file(dir.join("state.sqlite-wal")).unwrap();
+            let target = elsewhere.path().join("wal");
+            std::fs::write(&target, b"x").unwrap();
+            std::os::unix::fs::symlink(&target, dir.join("state.sqlite-wal")).unwrap();
+            clear_unfinished(dir, "[library]\nmovies = \"/b\"\n").unwrap();
+            assert!(!dir.join("state.sqlite").exists());
+            assert!(std::fs::symlink_metadata(dir.join("state.sqlite-wal")).is_err());
+            assert!(target.exists());
+        }
+    }
+
+    #[test]
+    fn another_command_takes_over_the_state_folder_unless_a_page_holds_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        // No marker: no lock, no file.
+        release_unfinished(&state).unwrap();
+        assert!(!state.join("setup.lock").exists());
+        // A marker while a page holds the folder: refused, and nothing changes.
+        let marker = state.join(UNFINISHED);
+        std::fs::write(&marker, b"x").unwrap();
+        std::fs::write(state.join("state.sqlite"), b"catalog").unwrap();
+        let page = lock_state(&state).unwrap().unwrap();
+        let err = release_unfinished(&state).unwrap_err();
+        assert!(format!("{err:#}").contains("setup page"), "{err:#}");
+        assert!(marker.exists() && state.join("state.sqlite").exists());
+        // Once it has closed, the marker goes.
+        drop(page);
+        release_unfinished(&state).unwrap();
+        assert!(!marker.exists());
+        // A marker that can't go: an error without config.toml (a page's retry would still
+        // trust it), ignored beside one (it permits nothing there).
+        std::fs::create_dir_all(marker.join("stuck")).unwrap();
+        assert!(release_unfinished(&state).is_err());
+        std::fs::write(state.join("config.toml"), b"").unwrap();
+        release_unfinished(&state).unwrap();
+        assert!(marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_library_folder_is_a_real_folder_outside_arrs_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let media = tmp.path().join("media");
+        std::fs::create_dir_all(state.join("imports/movies")).unwrap();
+        std::fs::create_dir(&media).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&media, &link).unwrap();
+        let s = |p: &Path| p.to_str().unwrap().to_string();
+        for create in [false, true] {
+            assert!(check_library(&s(&media), &state, create).is_ok());
+            assert!(check_library(&s(&state.join("imports/movies")), &state, create).is_err());
+            assert!(check_library(&s(tmp.path()), &state, create).is_err());
+            let err = check_library(&s(&link), &state, create).unwrap_err();
+            assert!(err.contains("symbolic link"), "{err}");
+            assert!(check_library(&format!("{}/", s(&link)), &state, create).is_err());
+        }
+        // A new Plex library's folder may not exist yet; a picked library's must.
+        let new = tmp.path().join("new/movies");
+        assert!(check_library(&s(&new), &state, true).is_ok());
+        assert!(check_library(&s(&new), &state, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn library_folders_are_made_one_at_a_time_and_opened_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let before = mode(tmp.path());
+        let dir = tmp.path().join("a/b/c");
+        make_library_dir(&dir).unwrap();
+        for d in [tmp.path().join("a"), tmp.path().join("a/b"), dir.clone()] {
+            assert_eq!(mode(&d), 0o755, "{}", d.display());
+        }
+        // Folders that were there already are left as they are.
+        assert_eq!(mode(tmp.path()), before);
+        std::fs::set_permissions(tmp.path().join("a"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        make_library_dir(&tmp.path().join("a/d")).unwrap();
+        assert_eq!(mode(&tmp.path().join("a")), 0o700);
+        // A file in the way fails.
+        std::fs::write(tmp.path().join("f"), b"x").unwrap();
+        assert!(make_library_dir(&tmp.path().join("f")).is_err());
+        assert!(make_library_dir(&tmp.path().join("f/g")).is_err());
     }
 }

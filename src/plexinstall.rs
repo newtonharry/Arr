@@ -247,8 +247,9 @@ async fn install_windows() -> Result<()> {
         );
     }
     step("Starting Plex");
+    let probe = local_probe()?;
     for _ in 0..10 {
-        let up = http.get("http://127.0.0.1:32400/identity").send().await;
+        let up = probe.get("http://127.0.0.1:32400/identity").send().await;
         if up.is_ok_and(|r| r.status().is_success()) {
             return Ok(());
         }
@@ -383,8 +384,9 @@ async fn install_macos() -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    let probe = local_probe()?;
     for _ in 0..60 {
-        let up = http.get("http://127.0.0.1:32400/identity").send().await;
+        let up = probe.get("http://127.0.0.1:32400/identity").send().await;
         if up.is_ok_and(|r| r.status().is_success()) {
             return Ok(());
         }
@@ -393,6 +395,15 @@ async fn install_macos() -> Result<()> {
     bail!(
         "Plex is installed but didn't start; open Plex Media Server from Applications, then click Look again"
     )
+}
+
+/// A client for asking the Plex on this computer whether it is up: it answers at once or
+/// not at all, so a probe never waits as long as a download may.
+#[cfg(any(windows, target_os = "macos"))]
+fn local_probe() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?)
 }
 
 fn write_public(path: &Path, bytes: &[u8]) -> Result<()> {

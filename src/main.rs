@@ -338,6 +338,9 @@ async fn setup_cmd(
         config::Secrets::Defer,
     )?;
     let state_dir = cfg.state_dir.clone();
+    if !dry_run {
+        wizard::release_unfinished(&state_dir)?;
+    }
     let active = import::load_active(&state_dir)?;
     // Refuse before anything is opened or changed (the state database is not touched).
     if active
@@ -520,6 +523,7 @@ async fn run() -> Result<std::process::ExitCode> {
             batch,
         } => {
             let cfg = config::load(&config)?;
+            wizard::release_unfinished(&cfg.state_dir)?;
             let state = api::AppState::new(cfg)?;
             use arr::settings::MediaKind::{Movie, Series};
             let kinds: Vec<arr::settings::MediaKind> = match media.as_deref() {
@@ -606,6 +610,7 @@ async fn run() -> Result<std::process::ExitCode> {
             {
                 anyhow::bail!("media validation preflight failed: {e}");
             }
+            wizard::release_unfinished(&cfg.state_dir)?;
             let state = api::AppState::new(cfg)?;
             state.store.ping().await?;
             let index = state.index();

@@ -4116,6 +4116,7 @@ pub async fn serve(cfg: RuntimeConfig) -> anyhow::Result<()> {
         tracing::info!(ffprobe = %l.ffprobe.display(), %version, "media probe available");
     }
     let listen = cfg.listen;
+    crate::wizard::release_unfinished(&cfg.state_dir)?;
     let state = Arc::new(AppState::new(cfg)?);
     // The API socket first: an occupied API port stops startup before any transfer starts.
     let listener = tokio::net::TcpListener::bind(listen).await?;
