@@ -1156,14 +1156,14 @@ async fn a_failed_setup_can_be_retried_with_other_libraries() {
     assert!(!state_dir.join("setup-unfinished").exists());
 }
 
-/// A state folder, two libraries with a movie in one, and a page connected to the mock.
+/// A state folder, two libraries with a movie in one, the mock, and a page connected to it.
 async fn one_movie(
     tmp: &Path,
 ) -> (
     std::path::PathBuf,
     std::path::PathBuf,
     std::path::PathBuf,
-    Mock,
+    (SocketAddr, Mock),
     tokio::process::Child,
     Page,
 ) {
@@ -1185,7 +1185,7 @@ async fn one_movie(
         })];
     }
     let (child, page) = connected_page(&state_dir, mock).await;
-    (state_dir, movies, tv, world, child, page)
+    (state_dir, movies, tv, (mock, world), child, page)
 }
 
 /// Finish with these libraries; returns the phase it ends in.
@@ -1208,7 +1208,7 @@ async fn apply_and_wait(page: &Page, movies: Option<&Path>, tv: &Path, downloads
 #[tokio::test]
 async fn a_setup_stopped_before_saving_its_config_can_still_be_retried() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state_dir, movies, tv, world, _child, page) = one_movie(tmp.path()).await;
+    let (state_dir, movies, tv, (_, world), _child, page) = one_movie(tmp.path()).await;
     let downloads = tmp.path().join("media/arr-downloads");
     // Everything works, the movie is imported, but config.toml can't be saved.
     world.lock().unwrap().block_with_folder = Some(state_dir.join("config.toml"));
@@ -1232,7 +1232,7 @@ async fn a_setup_stopped_before_saving_its_config_can_still_be_retried() {
 #[tokio::test]
 async fn a_setup_finished_by_hand_with_another_config_is_never_cleared() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state_dir, movies, tv, world, _child, page) = one_movie(tmp.path()).await;
+    let (state_dir, movies, tv, (mock, world), mut child, page) = one_movie(tmp.path()).await;
     let downloads = tmp.path().join("media/arr-downloads");
     // The movies import, then the TV import fails.
     world.lock().unwrap().failing_section = Some("2".into());
@@ -1240,30 +1240,49 @@ async fn a_setup_finished_by_hand_with_another_config_is_never_cleared() {
     assert_eq!(last["state"], "failed", "{last}");
     let marker = state_dir.join("setup-unfinished");
     assert!(marker.exists());
+    let catalog = std::fs::read(state_dir.join("state.sqlite")).unwrap();
     let failed = std::fs::read_to_string(state_dir.join("config.toml.failed")).unwrap();
-    let setup = |config: &Path| {
-        let out = std::process::Command::new(BIN)
-            .args(["setup", "--config"])
-            .arg(config)
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stderr).into_owned()
+    // `arr setup`, as the page runs it (with ARR_SETUP_PAGE=1) or by hand.
+    let setup = |config: &Path, from_page: bool| {
+        let mut cmd = std::process::Command::new(BIN);
+        cmd.args(["setup", "--config"]).arg(config);
+        if from_page {
+            cmd.env("ARR_SETUP_PAGE", "1");
+        } else {
+            cmd.env_remove("ARR_SETUP_PAGE");
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
-    // The page's own config (as its own `arr setup` runs it) leaves the marker.
-    let own = state_dir.join("config.toml.new");
-    arr::fsutil::write_new_private_file(&own, failed.as_bytes()).unwrap();
-    let err = setup(&own);
-    assert!(marker.exists(), "{err}");
-    std::fs::remove_file(&own).unwrap();
-    // A config kept elsewhere for this state folder now owns it: the marker goes.
     let elsewhere = tmp.path().join("elsewhere.toml");
     let theirs = failed.replace("dir = \".\"", &format!("dir = \"{}\"", state_dir.display()));
     assert_ne!(theirs, failed);
     arr::fsutil::write_new_private_file(&elsewhere, theirs.as_bytes()).unwrap();
-    let err = setup(&elsewhere);
+    // While the page is open, a command run by hand can't take the folder (the page may be
+    // clearing it), and changes nothing.
+    let (ok, err) = setup(&elsewhere, false);
+    assert!(!ok && err.contains("setup page"), "{err}");
+    assert!(marker.exists());
+    assert_eq!(
+        std::fs::read(state_dir.join("state.sqlite")).unwrap(),
+        catalog
+    );
+    // The page's own commands leave the marker.
+    let own = state_dir.join("config.toml.new");
+    arr::fsutil::write_new_private_file(&own, failed.as_bytes()).unwrap();
+    let (_, err) = setup(&own, true);
+    assert!(marker.exists(), "{err}");
+    // Once the page is closed, even its own config run by hand owns the folder: the marker goes.
+    child.kill().await.unwrap();
+    let (_, err) = setup(&own, false);
     assert!(!marker.exists(), "{err}");
-    // So a retry with other libraries clears nothing, and is refused.
+    std::fs::remove_file(&own).unwrap();
+    // So a retry from a new page with other libraries clears nothing, and is refused.
     world.lock().unwrap().failing_section = None;
+    let (_child, page) = connected_page(&state_dir, mock).await;
     let last = apply_and_wait(&page, None, &tv, &downloads).await;
     assert_eq!(last["state"], "failed", "{last}");
     assert!(state_dir.join("state.sqlite").exists());

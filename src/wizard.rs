@@ -171,7 +171,12 @@ pub async fn run(mut opts: Options) -> Result<()> {
     }
     // Held until the wizard exits, from before the config check, so two can't set up one
     // state folder.
-    let _lock = lock_state(&opts.state_dir)?;
+    let Some(_lock) = lock_state(&opts.state_dir)? else {
+        bail!(
+            "another Arr setup is already running for {}; finish or close it first",
+            opts.state_dir.display()
+        );
+    };
     if config.exists() {
         // A marker a setup left beside its config.toml (stopped after saving it) proves
         // nothing any more; it never did anything beside a config.toml.
@@ -287,12 +292,12 @@ pub async fn run(mut opts: Options) -> Result<()> {
             }
             // At once, not after the open requests have finished: the setup task stops its
             // program now, and no new setup starts.
-            done.stop.send_replace(true);
+            raise_stop(&done);
         })
         .await;
     // Stopped mid-setup (Ctrl+C, say): the setup task stops its program and waits for it to
     // exit, and only then does the state folder's lock go.
-    wiz.stop.send_replace(true);
+    raise_stop(&wiz);
     let task = wiz.setup.lock().unwrap().take();
     if let Some(task) = task {
         let _ = task.await;
@@ -304,8 +309,15 @@ pub async fn run(mut opts: Options) -> Result<()> {
     }
 }
 
-/// Takes the state folder for this wizard alone (`setup.lock`, released when it exits).
-fn lock_state(dir: &Path) -> Result<std::fs::File> {
+/// Raises `stop` under the lock `apply` admits a setup under, so no setup starts after it.
+fn raise_stop(wiz: &Wizard) {
+    let _slot = wiz.setup.lock().unwrap();
+    wiz.stop.send_replace(true);
+}
+
+/// Takes the state folder's `setup.lock`, which a wizard holds for its whole run; None when
+/// another process holds it.
+fn lock_state(dir: &Path) -> Result<Option<std::fs::File>> {
     let path = dir.join("setup.lock");
     let mut o = std::fs::OpenOptions::new();
     o.create(true).truncate(false).write(true);
@@ -315,11 +327,8 @@ fn lock_state(dir: &Path) -> Result<std::fs::File> {
         .open(&path)
         .with_context(|| format!("can't open {}", path.display()))?;
     match f.try_lock() {
-        Ok(()) => Ok(f),
-        Err(std::fs::TryLockError::WouldBlock) => bail!(
-            "another Arr setup is already running for {}; finish or close it first",
-            dir.display()
-        ),
+        Ok(()) => Ok(Some(f)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => {
             Err(e).with_context(|| format!("can't lock {}", path.display()))
         }
@@ -1531,8 +1540,8 @@ async fn apply(State(wiz): St, Json(mut c): Json<Choices>) -> Response {
         return refuse(&format!("{e:#}"));
     }
     // Held until the task's handle is stored, so a task that fails at once can't be replaced
-    // by a retry whose handle this one then overwrites; and checked under it, so a setup
-    // never starts after the wizard has begun to stop (which raises `stop`, then takes it).
+    // by a retry whose handle this one then overwrites; and `stop` is checked under it, so a
+    // setup never starts after the wizard has begun to stop (`raise_stop` raises it under it).
     let mut slot = wiz.setup.lock().unwrap();
     if *wiz.stop.borrow() {
         return problem(StatusCode::SERVICE_UNAVAILABLE, "the setup page is closing");
@@ -1594,6 +1603,10 @@ async fn finish_setup(
     tv: Option<Library>,
     c: &Choices,
 ) -> Result<()> {
+    // Before anything is written: the wizard may have begun to stop since `apply` checked.
+    if *wiz.stop.borrow() {
+        bail!("setup was stopped");
+    }
     let dir = &wiz.opts.state_dir;
     let secrets = dir.join("secrets");
     // New tokens through a temporary file, so a failed write can't leave one empty.
@@ -1677,23 +1690,35 @@ fn drop_unfinished(dir: &Path) -> Result<()> {
     }
 }
 
+/// Set (to 1) by this page on the `arr` commands it runs for its own setup, and by nothing
+/// else: only those leave its marker (`UNFINISHED`) in place.
+const SETUP_PAGE_ENV: &str = "ARR_SETUP_PAGE";
+
 /// For the commands that write a state folder's catalog or import store (`arr setup`,
-/// `bootstrap`, `check`, `serve`), before they open it: run with any config but this page's
-/// own `<state>/config.toml.new`, that config now owns the state folder, so the marker an
-/// unfinished setup from this page left (`UNFINISHED`) goes and nothing there is cleared.
-pub fn release_unfinished(config: &Path, state_dir: &Path) -> Result<()> {
-    let folder = match config.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let own = config.file_name() == Some(std::ffi::OsStr::new("config.toml.new"))
-        && matches!(
-            (std::fs::canonicalize(folder), std::fs::canonicalize(state_dir)),
-            (Ok(a), Ok(b)) if a == b
-        );
-    if own {
+/// `bootstrap`, `check`, `serve`), just before they open it: run by anything but this page,
+/// that command now owns the state folder, so the marker an unfinished setup from this page
+/// left (`UNFINISHED`) goes and a retry from the page clears nothing. Under the page's
+/// `setup.lock`, so it can't go while a page may be clearing; no marker, no lock.
+pub fn release_unfinished(state_dir: &Path) -> Result<()> {
+    if std::env::var_os(SETUP_PAGE_ENV).is_some_and(|v| v == "1") {
         return Ok(());
     }
+    let marker = state_dir.join(UNFINISHED);
+    if matches!(std::fs::symlink_metadata(&marker), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    // Beside a config.toml it permits nothing (and no page clears there): tidying only.
+    if state_dir.join("config.toml").exists() {
+        let _ = drop_unfinished(state_dir);
+        return Ok(());
+    }
+    let Some(_lock) = lock_state(state_dir)? else {
+        bail!(
+            "an Arr setup page is running for {}; finish or close the setup page first",
+            state_dir.display()
+        );
+    };
     drop_unfinished(state_dir)
 }
 
@@ -1738,12 +1763,16 @@ fn clear_unfinished(dir: &Path, config: &str) -> Result<()> {
         return Ok(());
     }
     // All checked before anything goes: each catalog file missing, a file, or a symbolic link
-    // (which goes, not what it points to).
+    // (which goes, not what it points to) to anything but a folder (never a catalog file, and
+    // on Windows not removable as a file).
     for name in CATALOG_FILES {
         let f = dir.join(name);
         match std::fs::symlink_metadata(&f) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(m) if m.is_file() || m.file_type().is_symlink() => {}
+            Ok(m)
+                if m.is_file()
+                    || (m.file_type().is_symlink()
+                        && !std::fs::metadata(&f).is_ok_and(|t| t.is_dir())) => {}
             Ok(_) => bail!(
                 "{} isn't a file, so the earlier setup can't be cleared; move it out of {} and try again",
                 f.display(),
@@ -1836,6 +1865,7 @@ async fn arr(wiz: &Wizard, args: &[&str], config: &Path) -> Result<()> {
     let mut child = Command::new(&wiz.opts.arr)
         .args(args)
         .arg(config)
+        .env(SETUP_PAGE_ENV, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1890,6 +1920,7 @@ async fn bootstrap(wiz: &Wizard, config: &Path, media: &str) -> Result<()> {
     let mut child = Command::new(&wiz.opts.arr)
         .args(["bootstrap", "--media", media, "--config"])
         .arg(config)
+        .env(SETUP_PAGE_ENV, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2432,11 +2463,18 @@ mod tests {
         assert!(format!("{err:#}").contains("state.sqlite-wal"), "{err:#}");
         assert!(dir.join("state.sqlite").exists() && dir.join("active-import.json").exists());
         assert!(dir.join("state.sqlite-wal").is_dir());
-        // A symbolic link there goes as a link; what it points to stays.
+        // A symbolic link there goes as a link; what it points to stays. But not a link to a
+        // folder: that stops the clear too.
         #[cfg(unix)]
         {
             std::fs::remove_dir(dir.join("state.sqlite-wal")).unwrap();
             let elsewhere = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(elsewhere.path(), dir.join("state.sqlite-wal")).unwrap();
+            let err = clear_unfinished(dir, "[library]\nmovies = \"/b\"\n").unwrap_err();
+            assert!(format!("{err:#}").contains("state.sqlite-wal"), "{err:#}");
+            assert!(dir.join("state.sqlite").exists() && dir.join("active-import.json").exists());
+            assert!(elsewhere.path().is_dir());
+            std::fs::remove_file(dir.join("state.sqlite-wal")).unwrap();
             let target = elsewhere.path().join("wal");
             std::fs::write(&target, b"x").unwrap();
             std::os::unix::fs::symlink(&target, dir.join("state.sqlite-wal")).unwrap();
@@ -2448,26 +2486,32 @@ mod tests {
     }
 
     #[test]
-    fn another_config_takes_over_the_state_folder_and_this_pages_own_does_not() {
+    fn another_command_takes_over_the_state_folder_unless_a_page_holds_it() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
         std::fs::create_dir(&state).unwrap();
+        // No marker: no lock, no file.
+        release_unfinished(&state).unwrap();
+        assert!(!state.join("setup.lock").exists());
+        // A marker while a page holds the folder: refused, and nothing changes.
         let marker = state.join(UNFINISHED);
         std::fs::write(&marker, b"x").unwrap();
-        release_unfinished(&state.join("config.toml.new"), &state).unwrap();
-        // The same folder by another spelling is still this page's own.
-        release_unfinished(&state.join("../state/config.toml.new"), &state).unwrap();
-        assert!(marker.exists());
-        // A config.toml.new elsewhere is someone else's.
-        release_unfinished(&tmp.path().join("config.toml.new"), &state).unwrap();
+        std::fs::write(state.join("state.sqlite"), b"catalog").unwrap();
+        let page = lock_state(&state).unwrap().unwrap();
+        let err = release_unfinished(&state).unwrap_err();
+        assert!(format!("{err:#}").contains("setup page"), "{err:#}");
+        assert!(marker.exists() && state.join("state.sqlite").exists());
+        // Once it has closed, the marker goes.
+        drop(page);
+        release_unfinished(&state).unwrap();
         assert!(!marker.exists());
-        for config in [state.join("config.toml"), tmp.path().join("elsewhere.toml")] {
-            std::fs::write(&marker, b"x").unwrap();
-            release_unfinished(&config, &state).unwrap();
-            assert!(!marker.exists(), "{}", config.display());
-        }
-        // Nothing to remove is fine.
-        release_unfinished(&state.join("config.toml"), &state).unwrap();
+        // A marker that can't go: an error without config.toml (a page's retry would still
+        // trust it), ignored beside one (it permits nothing there).
+        std::fs::create_dir_all(marker.join("stuck")).unwrap();
+        assert!(release_unfinished(&state).is_err());
+        std::fs::write(state.join("config.toml"), b"").unwrap();
+        release_unfinished(&state).unwrap();
+        assert!(marker.exists());
     }
 
     #[cfg(unix)]
