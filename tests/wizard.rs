@@ -1000,13 +1000,16 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
         }
     }
     // ...but the temp folder above them is private, so the page warns that Plex may not
-    // see them, naming that folder.
-    let warning = v["warnings"][0].as_str().unwrap();
-    assert!(
-        warning.contains("Plex may not be able to see")
-            && warning.contains(&format!("can't open {}.", tmp.path().display())),
-        "{v}"
-    );
+    // see them, naming that folder (not on macOS, where Plex runs as you).
+    #[cfg(not(target_os = "macos"))]
+    {
+        let warning = v["warnings"][0].as_str().unwrap();
+        assert!(
+            warning.contains("Plex may not be able to see")
+                && warning.contains(&format!("can't open {}.", tmp.path().display())),
+            "{v}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1128,6 +1131,56 @@ async fn a_failed_setup_can_be_retried_with_other_libraries() {
     assert_eq!(last["state"], "done", "{last}");
     let config = std::fs::read_to_string(state_dir.join("config.toml")).unwrap();
     assert!(!config.contains("movie_section"), "{config}");
+    // Set up: nothing may clear its catalog any more.
+    assert!(!state_dir.join("setup-unfinished").exists());
+}
+
+#[tokio::test]
+async fn a_catalog_this_page_did_not_start_is_never_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("media/movies");
+    let tv = tmp.path().join("media/tv");
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    // A state folder that already holds a catalog and an import (an install whose config
+    // lives elsewhere), and a config.toml.failed from an earlier try naming other libraries.
+    let state_dir = tmp.path().join("state");
+    arr::fsutil::ensure_private_dir(&state_dir.join("imports/imp-1")).unwrap();
+    let theirs: [(&str, &[u8]); 3] = [
+        ("state.sqlite", b"someone else's catalog"),
+        ("active-import.json", b"{}"),
+        ("imports/imp-1/catalog.json", b"{}"),
+    ];
+    for (f, bytes) in theirs {
+        arr::fsutil::write_new_private_file(&state_dir.join(f), bytes).unwrap();
+    }
+    std::fs::write(
+        state_dir.join("config.toml.failed"),
+        "[library]\nmovies = \"/elsewhere\"\n[plex]\nmovie_section = 9\n",
+    )
+    .unwrap();
+    let (mock, world) = start_mock(&movies, &tv).await;
+    world.lock().unwrap().resources_calls = 1; // no plex.tv hiccup in this test
+    let (_child, page) = connected_page(&state_dir, mock).await;
+    let (s, v) = page
+        .post(
+            "/api/apply",
+            json!({
+                "movies": { "id": "1:0", "folder": movies },
+                "tv": { "id": "2:0", "folder": tv },
+                "downloads": tmp.path().join("media/arr-downloads"),
+                "auto_update": false,
+            }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // `arr setup` refuses what it finds; the wizard deletes none of it.
+    let last = finished(&page).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    for (f, bytes) in theirs {
+        assert_eq!(std::fs::read(state_dir.join(f)).unwrap(), bytes, "{f}");
+    }
+    assert!(!state_dir.join("setup-unfinished").exists());
 }
 
 #[tokio::test]
@@ -1218,6 +1271,52 @@ async fn bad_folders_are_refused_before_anything_is_written() {
             assert!(!state_dir.join(f).exists(), "{downloads}: {f} was written");
         }
     }
+
+    // Library folders: not inside Arr's own folder (where clearing an unfinished setup could
+    // reach them), and not a symbolic link (the Plex import refuses one after setup has
+    // written its state).
+    let inside = state_dir.join("imports/movies");
+    std::fs::create_dir_all(&inside).unwrap();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut bad_libraries = vec![(inside.clone(), "inside or around Arr's own folder")];
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("movies-link");
+        std::os::unix::fs::symlink(&movies, &link).unwrap();
+        bad_libraries.push((link, "symbolic link"));
+    }
+    for (library, why) in &bad_libraries {
+        let (_, v) = page.post("/api/folder", json!({ "path": library })).await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["message"].as_str().unwrap().contains(why), "{v}");
+        let (status, v) = page
+            .post(
+                "/api/apply",
+                json!({
+                    "movies": { "id": "1:0", "folder": library },
+                    "tv": { "id": "2:0", "folder": tv },
+                    "downloads": tmp.path().join("media/arr-downloads"),
+                    "auto_update": false,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}: {v}",
+            library.display()
+        );
+        assert!(v["error"].as_str().unwrap().contains(why), "{v}");
+        for f in ["secrets/api_token", "config.toml.new", "config.toml"] {
+            assert!(
+                !state_dir.join(f).exists(),
+                "{}: {f} was written",
+                library.display()
+            );
+        }
+    }
+    std::fs::remove_dir(&inside).unwrap();
+    std::fs::remove_dir(state_dir.join("imports")).unwrap();
 
     // Paths pasted in quotes (Windows Explorer's "Copy as path") work, and are saved
     // without them.

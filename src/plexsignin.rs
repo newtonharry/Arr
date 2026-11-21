@@ -29,8 +29,19 @@ pub fn client_id(state_dir: &Path) -> Result<String> {
     fsutil::ensure_private_dir(&secrets)?;
     let file = secrets.join("plex_client_id");
     if !file.exists() {
-        // Through a temporary file, so a failed write can't leave it empty.
-        fsutil::atomic_replace_private(&file, fsutil::random_hex(16)?.as_bytes())?;
+        // Written whole to a temporary file, then linked into place only if no id is there
+        // yet: a failed write can't leave it empty, and when two start at once both use the
+        // id that got there first.
+        let tmp = secrets.join(format!(".plex_client_id.tmp-{}", fsutil::random_hex(6)?));
+        fsutil::write_new_private_file(&tmp, fsutil::random_hex(16)?.as_bytes())?;
+        let linked = std::fs::hard_link(&tmp, &file);
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(e).with_context(|| format!("cannot create {}", file.display()));
+            }
+            _ => fsutil::fsync_dir(&secrets)?,
+        }
     }
     fsutil::read_secret_file(&file)
 }
