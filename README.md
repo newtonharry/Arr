@@ -44,7 +44,8 @@ The script takes a few minutes. It:
    computer starts rather than when you log in (see
    [Starting when the computer starts](#starting-when-the-computer-starts)). After the setup
    page, Arr starts first, so the page's **Open Arr** works straight away, and the last
-   questions follow in the terminal;
+   questions follow in the terminal. On a Mac, "start at boot?" comes just before Arr starts,
+   so Arr starts once, the way it will stay;
 6. offers to set up remote access, so you can open the web app on your phone away from home
    and, if you like, use Arr from ChatGPT (see below; you can say no and do it later).
 

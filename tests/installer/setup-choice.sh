@@ -6,11 +6,14 @@
 #   - ARR_AUTO_UPDATE, ARR_ERROR_REPORTS and ARR_BROWSER take only 1 or 0;
 #   - at a terminal with no setup options, "web browser or terminal?" is asked, and Enter means
 #     the setup page; a TMDB key doesn't change that, and is added after the page;
-#   - it is asked over SSH too, and the page then listens on the SSH address;
+#   - it is asked over SSH too, and the page then listens on the SSH address (only a private or
+#     loopback one is checked for a busy port, as the page uses 127.0.0.1 otherwise);
 #   - it isn't asked with --yes, with --terminal, with setup options (which say so) or with
 #     --browser;
 #   - "Open Arr" is promised only for a page on a loopback address;
-#   - --auto-update on a re-run replaces the page's answer kept for the updater step;
+#   - an automatic updates option removes the page's answer kept for the updater step (after
+#     the page, and at the start of a re-run), without following a link planted there; an
+#     answer left from an earlier attempt is removed before a first setup;
 #   - after the page Arr starts before the remaining questions, the state folder is private
 #     even if it existed with mode 755, the page doesn't inherit a private umask, unit files
 #     are mode 644, and the page's automatic updates answer is used and then removed;
@@ -18,8 +21,8 @@
 #     page, naming --port (on 127.0.0.1 and on the page's IPv6 address); a page that fails
 #     doesn't claim that nothing was saved.
 #
-# No case can reach a real Plex: cases that get to the terminal setup give a closed Plex
-# address, and curl refuses Plex's port 32400.
+# No case can reach a real Plex: curl refuses Plex's port 32400. --yes and --terminal try it
+# (refused); every other case that gets to the terminal setup gives a closed Plex address.
 #
 # Usage: sh tests/installer/setup-choice.sh      (from the repository root)
 set -eu
@@ -107,9 +110,10 @@ EOF
 printf '#!/bin/sh\nexit 0\n' >"$FAKE_DIR/bin/docker"
 printf '#!/bin/sh\necho "ffprobe version stand-in"\n' >"$FAKE_DIR/bin/ffprobe"
 printf '#!/bin/sh\necho "xdg-open $*" >>"$FAKE_DIR/calls.log"\n' >"$FAKE_DIR/bin/xdg-open"
-# This test must never reach a real Plex (one may run on this computer): every case that gets
-# to the terminal setup gives a Plex address on a closed port, and as a second guard curl
-# refuses Plex's port (as "couldn't connect"), so Plex's token file is never read either.
+# This test must never reach a real Plex (one may run on this computer): curl refuses Plex's
+# port (as "couldn't connect"), so Plex's token file is never read either. --yes and --terminal
+# try that port (with no setup option, so it's the flag that chooses the terminal setup); every
+# other case that gets to the terminal setup gives a Plex address on a closed port.
 REAL_CURL=$(command -v curl) || fail "no curl"
 export REAL_CURL
 cat >"$FAKE_DIR/bin/curl" <<'EOF'
@@ -139,6 +143,13 @@ at_terminal() { python3 "$repo/tests/installer/fakepty.py" sh "$repo/install.sh"
 unattended() { sh "$repo/install.sh" "$@" >"$out" 2>&1 </dev/null; }
 asked() { grep -qF "$question" "$out"; }
 wizard_ran() { grep -q '^arr wizard ' "$FAKE_DIR/arr.log"; }
+# The case just run tried Plex's own address, which curl refused: only its /identity, and
+# nothing else of Plex's, then the log is cleared for the check at the end.
+plex_refused() {
+	[ -s "$FAKE_DIR/plex.log" ] || { cat "$out"; fail "$1 didn't try Plex's address"; }
+	! grep -qv ':32400/identity' "$FAKE_DIR/plex.log" || { cat "$FAKE_DIR/plex.log"; fail "$1 asked Plex for more than /identity"; }
+	: >"$FAKE_DIR/plex.log"
+}
 # Line number of the first line of $out containing $1 (0 if none).
 line_of() { grep -nF -- "$1" "$out" | head -n1 | cut -d: -f1 | grep . || echo 0; }
 
@@ -189,6 +200,12 @@ asked || { cat "$out"; fail "the question wasn't asked over SSH"; }
 grep -q "^arr wizard --state-dir $state --bind ::1 --port $port " "$FAKE_DIR/arr.log" || { cat "$FAKE_DIR/arr.log"; fail "the page didn't listen on the SSH address"; }
 grep -qF "Arr is running: the setup page's \"Open Arr\" button works now." "$out" || { cat "$out"; fail "the button isn't promised on a loopback page"; }
 
+echo "== over SSH to a public address: the page uses 127.0.0.1 instead, so only that is checked"
+fresh
+(export SSH_CONNECTION="2001:db8::2 50000 2001:db8::1 22" && FAKE_AUTO_UPDATE=0 at_terminal --port "$port" --no-at-boot) || { cat "$out"; fail "the install over SSH to a public address failed"; }
+grep -q "^arr wizard --state-dir $state --bind 2001:db8::1 --port $port " "$FAKE_DIR/arr.log" || { cat "$FAKE_DIR/arr.log"; fail "the page wasn't given the SSH address"; }
+grep -qF "Arr is running: the setup page's \"Open Arr\" button works now." "$out" || { cat "$out"; fail "the button isn't promised though the page falls back to 127.0.0.1"; }
+
 echo "== no screen: the page listens on the network address, and its button isn't promised"
 fresh
 (unset DISPLAY && FAKE_AUTO_UPDATE=0 at_terminal --port "$port" --no-at-boot) || { cat "$out"; fail "the install without a screen failed"; }
@@ -200,19 +217,24 @@ else
 	! grep -q '"Open Arr" button works now' "$out" || { cat "$out"; fail "the button was promised on a page that hides it"; }
 fi
 
-echo "== --yes: not asked, terminal setup"
+echo "== --yes: not asked, terminal setup; a page answer left from an earlier attempt goes first"
 fresh
-unattended --yes --plex-url "$noplex" --port "$port" || true
+mkdir -p "$state"
+echo auto_update=1 >"$state/setup-choices"
+unattended --yes --port "$port" || true
 ! asked || { cat "$out"; fail "--yes asked"; }
 ! wizard_ran || fail "--yes ran the setup page"
 grep -q '^==> Finding Plex' "$out" || { cat "$out"; fail "--yes didn't run the terminal setup"; }
+plex_refused --yes
+[ ! -e "$state/setup-choices" ] || fail "an earlier attempt's setup-choices was left for this setup"
 
 echo "== --terminal: not asked, terminal setup"
 fresh
-at_terminal --terminal --plex-url "$noplex" --port "$port" || true
+at_terminal --terminal --port "$port" || true
 ! asked || { cat "$out"; fail "--terminal asked"; }
 ! wizard_ran || fail "--terminal ran the setup page"
 grep -q '^==> Finding Plex' "$out" || { cat "$out"; fail "--terminal didn't run the terminal setup"; }
+plex_refused --terminal
 
 echo "== setup options: not asked, terminal setup, and it says why"
 fresh
@@ -231,10 +253,21 @@ grep -qF "  \"$HOME/.local/bin/arr\" serve --config \"$state/config.toml\"" "$ou
 # With no service the run ends before the automatic updates step, so the page's answer waits for it.
 [ -e "$state/setup-choices" ] || fail "setup-choices was removed before the updater step used it"
 
-echo "== a re-run with --auto-update that stops before the updater step: a later run gets that choice"
+echo "== a re-run with --auto-update: the page's older answer goes, and a link there isn't followed"
 # --no-service ends this run too before the updater step, like one that was interrupted there.
 unattended --yes --auto-update --no-service --port "$port" || { cat "$out"; fail "the re-run failed"; }
-[ "$(cat "$state/setup-choices")" = auto_update=1 ] || fail "setup-choices still holds the page's older answer: $(cat "$state/setup-choices")"
+[ ! -e "$state/setup-choices" ] || fail "setup-choices still holds the page's older answer: $(cat "$state/setup-choices")"
+echo keep >"$w/target"
+ln -s "$w/target" "$state/setup-choices"
+unattended --yes --no-auto-update --no-service --port "$port" || { cat "$out"; fail "the re-run with a link failed"; }
+[ ! -e "$state/setup-choices" ] && [ ! -L "$state/setup-choices" ] || fail "the link in place of setup-choices was left"
+[ "$(cat "$w/target")" = keep ] || fail "the file a link pointed to was written"
+
+echo "== --no-auto-update with the setup page: the page's answer is removed straight away"
+fresh
+FAKE_AUTO_UPDATE=1 unattended --browser --yes --no-service --no-auto-update --port "$port" || { cat "$out"; fail "--browser --no-auto-update failed"; }
+wizard_ran || fail "the setup page didn't run"
+[ ! -e "$state/setup-choices" ] || fail "the page's answer was kept though --no-auto-update was given"
 
 echo "== a page that fails: no claim that nothing was saved"
 fresh

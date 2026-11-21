@@ -9,7 +9,6 @@
 #     new binary by ending the user's own process (the stand-in refuses `launchctl kickstart` of
 #     a system daemon without root, as launchd does);
 #   - --no-at-boot unattended can't remove the daemons, and says so;
-#   - a fresh switch whose daemon never answers goes back to the login item, which runs Arr;
 #   - the daily updater: its restart and its rollback (the "new release" reports the old version,
 #     so the health check fails and the updater must put the old binary back), with Arr never
 #     left stopped;
@@ -97,8 +96,6 @@ start_job() { # domain plist
 	[ ! -e "$L/job.$key" ] || { echo "$key already loaded" >&2; exit 1; }
 	: >"$L/job.$key"
 	case "$key" in *.io.github.newtonharry.arr) ;; *) return 0 ;; esac
-	# With $L/daemon-fail present, Arr's launch daemon is loaded but Arr never comes up.
-	[ "$1" != system ] || [ ! -e "$L/daemon-fail" ] || return 0
 	bin=$(strings_of "$2" | sed -n 2p) cfg=$(strings_of "$2" | sed -n 5p)
 	# Its own session, like a job of launchd's: it outlives the terminal that loaded it.
 	# With $L/slow present, Arr is the stand-in in $L/slow.d: same command line, but on SIGTERM it
@@ -235,18 +232,6 @@ grep -q "couldn't set up start at boot" "$w/out" || fail "no explanation for the
 [ ! -e "$daemons/$label.plist" ] || fail "a daemon was left behind"
 retry 30 healthy || fail "Arr was left stopped by the refused sudo"
 [ -f "$agents/$label.plist" ] || fail "the login item is gone"
-
-echo "== a start-at-boot service that never answers: back to the login item, which runs Arr"
-: >"$calls"
-: >"$w/fake/state/daemon-fail"
-install_sh --yes --no-auto-update --at-boot >"$w/out" 2>&1 || { rm -f "$w/fake/state/daemon-fail"; cat "$w/out"; fail "the rollback to the login item failed the run"; }
-rm -f "$w/fake/state/daemon-fail"
-grep -q "Arr didn't start as a start-at-boot service, so that was undone: Arr starts when you log in, as before" "$w/out" || { cat "$w/out"; fail "the rollback isn't explained"; }
-grep -q 'root=1 launchctl bootstrap system' "$calls" || { cat "$calls"; fail "the daemon was never tried"; }
-[ ! -e "$daemons/$label.plist" ] || fail "the daemon that never answered was left"
-[ ! -e "$w/fake/state/job.system.$label" ] || fail "the daemon that never answered is still loaded"
-[ -f "$agents/$label.plist" ] || fail "the login item is gone"
-retry 30 healthy || fail "Arr was left stopped"
 
 echo "== a terminal: the question defaults to yes; --no-at-boot is honoured"
 : >"$calls"
