@@ -42,6 +42,9 @@ jobs:
           sh tests/installer/macos-boot.sh target/release/arr
           sh tests/installer/linger.sh target/release/arr
           sh tests/installer/update-now.sh target/release/arr
+      # How the first setup is chosen (web page or terminal) and run, with a stand-in arr.
+      - name: Installer, first setup choice (with stand-ins)
+        run: sh tests/installer/setup-choice.sh
       # Auto-update rolls back to the previous binary when the new one is not healthy, so the
       # latest published release must still start on what this build (its install.sh, its setup
       # page, its API) wrote, and back.
