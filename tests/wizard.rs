@@ -40,6 +40,13 @@ struct World {
     added_library: Option<String>,
     /// Plex fails to list a library's items, so the import fails.
     import_fails: bool,
+    /// Plex fails to list this section's items only.
+    failing_section: Option<String>,
+    /// Made (a folder with a file in it) the next time a section's items are listed, so the
+    /// setup can't save its config.toml there afterwards.
+    block_with_folder: Option<std::path::PathBuf>,
+    /// What the movie section (1) holds.
+    movie_items: Vec<Value>,
     /// Libraries added through the API: (type, location, language).
     created: Vec<(String, String, String)>,
     /// The token each request carried, by path.
@@ -224,15 +231,31 @@ async fn start_mock(movies: &Path, tv: &Path) -> (SocketAddr, Mock) {
         )
         .route(
             "/library/sections/{id}/all",
-            get(|State(m): State<Mock>, h: HeaderMap| async move {
-                if m.lock().unwrap().import_fails {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            get(|State(m): State<Mock>,
+                 h: HeaderMap,
+                 AxPath(id): AxPath<String>,
+                 Query(q): Query<HashMap<String, String>>| async move {
+                {
+                    let mut w = m.lock().unwrap();
+                    if w.import_fails || w.failing_section.as_ref() == Some(&id) {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    if let Some(dir) = w.block_with_folder.take() {
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(dir.join("in-the-way"), b"x").unwrap();
+                    }
                 }
                 record(&m, "all", &h);
                 if h.get("x-plex-token").and_then(|v| v.to_str().ok()) != Some(SERVER_TOKEN) {
                     return StatusCode::UNAUTHORIZED.into_response();
                 }
-                axum::Json(json!({ "MediaContainer": { "size": 0, "totalSize": 0, "offset": 0, "Metadata": [] } }))
+                let first = q.get("X-Plex-Container-Start").is_none_or(|s| s == "0");
+                let items = match id.as_str() {
+                    "1" if first => m.lock().unwrap().movie_items.clone(),
+                    _ => vec![],
+                };
+                let n = items.len();
+                axum::Json(json!({ "MediaContainer": { "size": n, "totalSize": n, "offset": 0, "Metadata": items } }))
                     .into_response()
             }),
         )
@@ -310,8 +333,31 @@ async fn start_wizard(
     mock: SocketAddr,
     extra: &[String],
 ) -> (tokio::process::Child, String, u16) {
+    spawn_wizard(state_dir, mock, extra, None).await
+}
+
+/// The same, with this file-creation mask (Unix) instead of the test's.
+async fn spawn_wizard(
+    state_dir: &Path,
+    mock: SocketAddr,
+    extra: &[String],
+    umask: Option<u32>,
+) -> (tokio::process::Child, String, u16) {
     let port = free_port();
-    let mut child = tokio::process::Command::new(BIN)
+    let mut cmd = tokio::process::Command::new(BIN);
+    #[cfg(unix)]
+    if let Some(mask) = umask {
+        // SAFETY: umask is async-signal-safe and only sets the child's mask.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::umask(mask as libc::mode_t);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = umask;
+    let mut child = cmd
         .args(["wizard", "--no-docker", "--port", &port.to_string()])
         .arg("--state-dir")
         .arg(state_dir)
@@ -875,7 +921,9 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
         // The installer's --error-reports: the box starts ticked.
         "--error-reports".into(),
     ];
-    let (_child, link, port) = start_wizard(&tmp.path().join("state"), mock, &extra).await;
+    // The shell installer runs the wizard with a private umask.
+    let (_child, link, port) =
+        spawn_wizard(&tmp.path().join("state"), mock, &extra, Some(0o077)).await;
     let page = open_page(&link, port).await;
     let (_, v) = page.get("/api/state").await;
     assert_eq!(v["reporting"]["enabled"], true, "{v}");
@@ -919,6 +967,20 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
     }
     let movies = tmp.path().join("media/Movies");
     let tv = tmp.path().join("media/TV Shows");
+    // A symbolic link is refused as Finish refuses it, before Plex is asked for anything.
+    let real = tmp.path().join("real-movies");
+    std::fs::create_dir(&real).unwrap();
+    let link = tmp.path().join("movies-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (s, v) = page
+        .post("/api/plex/libraries", json!({ "movies": link, "tv": tv }))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("symbolic link"),
+        "{v}"
+    );
+    assert!(world.lock().unwrap().created.is_empty());
     // A bad folder is refused before Plex is asked for anything, so a retry can't duplicate.
     let (s, v) = page
         .post(
@@ -950,14 +1012,25 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
             ("show".into(), tv.to_str().unwrap().into(), "en-AU".into()),
         ]
     );
-    // The temp folder is private, so the page warns that Plex may not see it.
-    assert!(
-        v["warnings"][0]
-            .as_str()
-            .unwrap()
-            .contains("Plex may not be able to see"),
-        "{v}"
-    );
+    // The new folders are readable by Plex's own user whatever the umask...
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for d in [&movies, &tv, &movies.parent().unwrap().to_path_buf()] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "{} is {mode:o}", d.display());
+        }
+    }
+    // ...but the temp folder above them is private, so the page warns that Plex may not
+    // see them, naming that folder (not on macOS, where Plex runs as you).
+    #[cfg(not(target_os = "macos"))]
+    {
+        let warning = v["warnings"][0].as_str().unwrap();
+        assert!(
+            warning.contains("Plex may not be able to see")
+                && warning.contains(&format!("can't open {}.", tmp.path().display())),
+            "{v}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -993,4 +1066,471 @@ fn an_upload_limit_the_config_cant_hold_is_refused() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("4194304"));
+}
+
+/// Opens the page, signs in and connects to the mock's Plex.
+async fn connected_page(state_dir: &Path, mock: SocketAddr) -> (tokio::process::Child, Page) {
+    let (child, link, port) = start_wizard(state_dir, mock, &[]).await;
+    let page = open_page(&link, port).await;
+    page.post("/api/plex/signin", json!({})).await;
+    page.post("/api/plex/check", json!({})).await;
+    let (s, v) = page.post("/api/plex/check", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["plex"]["name"], "Living Room", "{v}");
+    (child, page)
+}
+
+/// Waits for setup to stop working; returns its last phase.
+async fn finished(page: &Page) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..120 {
+        let (_, v) = page.get("/api/state").await;
+        last = v["phase"].clone();
+        if last["state"] != "working" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    last
+}
+
+#[tokio::test]
+async fn a_failed_setup_can_be_retried_with_other_libraries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("media/movies");
+    let tv = tmp.path().join("media/tv");
+    std::fs::create_dir_all(movies.join("Film (2000)")).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    let file = movies.join("Film (2000)/Film (2000).mkv");
+    std::fs::write(&file, b"x").unwrap();
+    let state_dir = tmp.path().join("state");
+    let (mock, world) = start_mock(&movies, &tv).await;
+    {
+        let mut w = world.lock().unwrap();
+        w.resources_calls = 1; // no plex.tv hiccup in this test
+        w.movie_items = vec![json!({
+            "ratingKey": "101", "type": "movie", "title": "Film", "year": 2000,
+            "Guid": [{ "id": "tmdb://603" }],
+            "Media": [{ "Part": [{ "file": file, "size": 1 }] }],
+        })];
+        // The movies import, then the TV import fails: the catalog now has a movie.
+        w.failing_section = Some("2".into());
+    }
+    let (_child, page) = connected_page(&state_dir, mock).await;
+    let downloads = tmp.path().join("media/arr-downloads");
+    let (s, v) = page
+        .post(
+            "/api/apply",
+            json!({
+                "movies": { "id": "1:0", "folder": movies },
+                "tv": { "id": "2:0", "folder": tv },
+                "downloads": downloads,
+                "auto_update": false,
+            }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let last = finished(&page).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    assert!(!state_dir.join("config.toml").exists());
+
+    // Tried again with TV only: the movie the failed run imported doesn't hold it back.
+    world.lock().unwrap().failing_section = None;
+    let (s, v) = page
+        .post(
+            "/api/apply",
+            json!({
+                "movies": null,
+                "tv": { "id": "2:0", "folder": tv },
+                "downloads": downloads,
+                "auto_update": false,
+            }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let last = finished(&page).await;
+    assert_eq!(last["state"], "done", "{last}");
+    let config = std::fs::read_to_string(state_dir.join("config.toml")).unwrap();
+    assert!(!config.contains("movie_section"), "{config}");
+    // Set up: nothing may clear its catalog any more.
+    assert!(!state_dir.join("setup-unfinished").exists());
+}
+
+/// A state folder, two libraries with a movie in one, the mock, and a page connected to it.
+async fn one_movie(
+    tmp: &Path,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    (SocketAddr, Mock),
+    tokio::process::Child,
+    Page,
+) {
+    let movies = tmp.join("media/movies");
+    let tv = tmp.join("media/tv");
+    std::fs::create_dir_all(movies.join("Film (2000)")).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    let file = movies.join("Film (2000)/Film (2000).mkv");
+    std::fs::write(&file, b"x").unwrap();
+    let state_dir = tmp.join("state");
+    let (mock, world) = start_mock(&movies, &tv).await;
+    {
+        let mut w = world.lock().unwrap();
+        w.resources_calls = 1; // no plex.tv hiccup in this test
+        w.movie_items = vec![json!({
+            "ratingKey": "101", "type": "movie", "title": "Film", "year": 2000,
+            "Guid": [{ "id": "tmdb://603" }],
+            "Media": [{ "Part": [{ "file": file, "size": 1 }] }],
+        })];
+    }
+    let (child, page) = connected_page(&state_dir, mock).await;
+    (state_dir, movies, tv, (mock, world), child, page)
+}
+
+/// Finish with these libraries; returns the phase it ends in.
+async fn apply_and_wait(page: &Page, movies: Option<&Path>, tv: &Path, downloads: &Path) -> Value {
+    let (s, v) = page
+        .post(
+            "/api/apply",
+            json!({
+                "movies": movies.map(|m| json!({ "id": "1:0", "folder": m })),
+                "tv": { "id": "2:0", "folder": tv },
+                "downloads": downloads,
+                "auto_update": false,
+            }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    finished(page).await
+}
+
+#[tokio::test]
+async fn a_setup_stopped_before_saving_its_config_can_still_be_retried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, movies, tv, (_, world), _child, page) = one_movie(tmp.path()).await;
+    let downloads = tmp.path().join("media/arr-downloads");
+    // Everything works, the movie is imported, but config.toml can't be saved.
+    world.lock().unwrap().block_with_folder = Some(state_dir.join("config.toml"));
+    let last = apply_and_wait(&page, Some(&movies), &tv, &downloads).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    assert!(
+        last["message"].as_str().unwrap().contains("config.toml"),
+        "{last}"
+    );
+    // Arr isn't set up, so the marker stays: a retry with TV only clears the movie.
+    assert!(state_dir.join("setup-unfinished").exists());
+    std::fs::remove_file(state_dir.join("config.toml/in-the-way")).unwrap();
+    std::fs::remove_dir(state_dir.join("config.toml")).unwrap();
+    let last = apply_and_wait(&page, None, &tv, &downloads).await;
+    assert_eq!(last["state"], "done", "{last}");
+    let config = std::fs::read_to_string(state_dir.join("config.toml")).unwrap();
+    assert!(!config.contains("movie_section"), "{config}");
+    assert!(!state_dir.join("setup-unfinished").exists());
+}
+
+#[tokio::test]
+async fn a_setup_finished_by_hand_with_another_config_is_never_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, movies, tv, (mock, world), mut child, page) = one_movie(tmp.path()).await;
+    let downloads = tmp.path().join("media/arr-downloads");
+    // The movies import, then the TV import fails.
+    world.lock().unwrap().failing_section = Some("2".into());
+    let last = apply_and_wait(&page, Some(&movies), &tv, &downloads).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    let marker = state_dir.join("setup-unfinished");
+    assert!(marker.exists());
+    let catalog = std::fs::read(state_dir.join("state.sqlite")).unwrap();
+    let failed = std::fs::read_to_string(state_dir.join("config.toml.failed")).unwrap();
+    // `arr setup`, as the page runs it (with ARR_SETUP_PAGE=1) or by hand.
+    let setup = |config: &Path, from_page: bool| {
+        let mut cmd = std::process::Command::new(BIN);
+        cmd.args(["setup", "--config"]).arg(config);
+        if from_page {
+            cmd.env("ARR_SETUP_PAGE", "1");
+        } else {
+            cmd.env_remove("ARR_SETUP_PAGE");
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let elsewhere = tmp.path().join("elsewhere.toml");
+    let theirs = failed.replace("dir = \".\"", &format!("dir = '{}'", state_dir.display()));
+    assert_ne!(theirs, failed);
+    arr::fsutil::write_new_private_file(&elsewhere, theirs.as_bytes()).unwrap();
+    // While the page is open, a command run by hand can't take the folder (the page may be
+    // clearing it), and changes nothing.
+    let (ok, err) = setup(&elsewhere, false);
+    assert!(!ok && err.contains("setup page"), "{err}");
+    assert!(marker.exists());
+    assert_eq!(
+        std::fs::read(state_dir.join("state.sqlite")).unwrap(),
+        catalog
+    );
+    // The page's own commands leave the marker.
+    let own = state_dir.join("config.toml.new");
+    arr::fsutil::write_new_private_file(&own, failed.as_bytes()).unwrap();
+    let (_, err) = setup(&own, true);
+    assert!(marker.exists(), "{err}");
+    // Once the page is closed, even its own config run by hand owns the folder: the marker goes.
+    child.kill().await.unwrap();
+    let (_, err) = setup(&own, false);
+    assert!(!marker.exists(), "{err}");
+    std::fs::remove_file(&own).unwrap();
+    // So a retry from a new page with other libraries clears nothing, and is refused.
+    world.lock().unwrap().failing_section = None;
+    let (_child, page) = connected_page(&state_dir, mock).await;
+    let last = apply_and_wait(&page, None, &tv, &downloads).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    assert!(state_dir.join("state.sqlite").exists());
+    assert!(!state_dir.join("config.toml").exists());
+}
+
+#[tokio::test]
+async fn a_catalog_this_page_did_not_start_is_never_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("media/movies");
+    let tv = tmp.path().join("media/tv");
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    // A state folder that already holds a catalog and an import (an install whose config
+    // lives elsewhere), and a config.toml.failed from an earlier try naming other libraries.
+    let state_dir = tmp.path().join("state");
+    arr::fsutil::ensure_private_dir(&state_dir.join("imports/imp-1")).unwrap();
+    let theirs: [(&str, &[u8]); 3] = [
+        ("state.sqlite", b"someone else's catalog"),
+        ("active-import.json", b"{}"),
+        ("imports/imp-1/catalog.json", b"{}"),
+    ];
+    for (f, bytes) in theirs {
+        arr::fsutil::write_new_private_file(&state_dir.join(f), bytes).unwrap();
+    }
+    std::fs::write(
+        state_dir.join("config.toml.failed"),
+        "[library]\nmovies = \"/elsewhere\"\n[plex]\nmovie_section = 9\n",
+    )
+    .unwrap();
+    let (mock, world) = start_mock(&movies, &tv).await;
+    world.lock().unwrap().resources_calls = 1; // no plex.tv hiccup in this test
+    let (_child, page) = connected_page(&state_dir, mock).await;
+    let (s, v) = page
+        .post(
+            "/api/apply",
+            json!({
+                "movies": { "id": "1:0", "folder": movies },
+                "tv": { "id": "2:0", "folder": tv },
+                "downloads": tmp.path().join("media/arr-downloads"),
+                "auto_update": false,
+            }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // `arr setup` refuses what it finds; the wizard deletes none of it.
+    let last = finished(&page).await;
+    assert_eq!(last["state"], "failed", "{last}");
+    for (f, bytes) in theirs {
+        assert_eq!(std::fs::read(state_dir.join(f)).unwrap(), bytes, "{f}");
+    }
+    assert!(!state_dir.join("setup-unfinished").exists());
+}
+
+#[tokio::test]
+async fn bad_folders_are_refused_before_anything_is_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("media/movies");
+    let tv = tmp.path().join("media/tv");
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::create_dir_all(&tv).unwrap();
+    let state_dir = tmp.path().join("state");
+    let (mock, world) = start_mock(&movies, &tv).await;
+    world.lock().unwrap().resources_calls = 1; // no plex.tv hiccup in this test
+    let (_child, page) = connected_page(&state_dir, mock).await;
+    let s = |p: &Path| p.to_str().unwrap().to_string();
+
+    // Folder checks: a pasted path in quotes is fine; '..', and a download folder in Arr's
+    // own folder, are not.
+    let (_, v) = page
+        .post(
+            "/api/folder",
+            json!({ "path": format!("\"{}\"", s(&movies)) }),
+        )
+        .await;
+    assert_eq!(v["ok"], true, "{v}");
+    let (_, v) = page
+        .post(
+            "/api/folder",
+            json!({ "path": format!("{}/../movies", s(&tv)) }),
+        )
+        .await;
+    assert_eq!(v["ok"], false, "{v}");
+    let (_, v) = page
+        .post(
+            "/api/folder",
+            json!({ "path": state_dir.join("downloads"), "create": true }),
+        )
+        .await;
+    assert_eq!(v["ok"], false, "{v}");
+
+    let choices = |downloads: String| {
+        json!({
+            "movies": { "id": "1:0", "folder": movies },
+            "tv": { "id": "2:0", "folder": tv },
+            "downloads": downloads,
+            "auto_update": false,
+        })
+    };
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut refused = vec![
+        // Inside a library.
+        s(&movies.join("arr-downloads")),
+        // Around a library.
+        s(&tmp.path().join("media")),
+        // Inside Arr's own folder.
+        s(&state_dir.join("downloads")),
+        // With '..' in it.
+        format!("{}/../arr-downloads", s(&tv)),
+    ];
+    #[cfg(unix)]
+    {
+        // A symbolic link: Arr's download engine would refuse it when it starts.
+        let real = tmp.path().join("real-downloads");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("downloads-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (_, v) = page
+            .post("/api/folder", json!({ "path": link, "create": true }))
+            .await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("symbolic link"),
+            "{v}"
+        );
+        refused.push(s(&link));
+        refused.push(s(&link.join("arr")));
+    }
+    for downloads in refused {
+        let (status, v) = page.post("/api/apply", choices(downloads.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{downloads}: {v}");
+        let (_, v) = page.get("/api/state").await;
+        assert_eq!(v["phase"]["state"], "editing", "{downloads}: {v}");
+        for f in [
+            "secrets/api_token",
+            "config.toml.new",
+            "config.toml.failed",
+            "config.toml",
+        ] {
+            assert!(!state_dir.join(f).exists(), "{downloads}: {f} was written");
+        }
+    }
+
+    // Library folders: not inside Arr's own folder (where clearing an unfinished setup could
+    // reach them), and not a symbolic link (the Plex import refuses one after setup has
+    // written its state).
+    let inside = state_dir.join("imports/movies");
+    std::fs::create_dir_all(&inside).unwrap();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut bad_libraries = vec![(inside.clone(), "inside or around Arr's own folder")];
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("movies-link");
+        std::os::unix::fs::symlink(&movies, &link).unwrap();
+        bad_libraries.push((link, "symbolic link"));
+    }
+    for (library, why) in &bad_libraries {
+        let (_, v) = page.post("/api/folder", json!({ "path": library })).await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["message"].as_str().unwrap().contains(why), "{v}");
+        let (status, v) = page
+            .post(
+                "/api/apply",
+                json!({
+                    "movies": { "id": "1:0", "folder": library },
+                    "tv": { "id": "2:0", "folder": tv },
+                    "downloads": tmp.path().join("media/arr-downloads"),
+                    "auto_update": false,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}: {v}",
+            library.display()
+        );
+        assert!(v["error"].as_str().unwrap().contains(why), "{v}");
+        for f in ["secrets/api_token", "config.toml.new", "config.toml"] {
+            assert!(
+                !state_dir.join(f).exists(),
+                "{}: {f} was written",
+                library.display()
+            );
+        }
+    }
+    std::fs::remove_dir(&inside).unwrap();
+    std::fs::remove_dir(state_dir.join("imports")).unwrap();
+
+    // Paths pasted in quotes (Windows Explorer's "Copy as path") work, and are saved
+    // without them.
+    let downloads = tmp.path().join("media/arr-downloads");
+    let (status, v) = page
+        .post(
+            "/api/apply",
+            json!({
+                "movies": { "id": "1:0", "folder": format!("\"{}\"", s(&movies)) },
+                "tv": { "id": "2:0", "folder": format!("'{}'", s(&tv)) },
+                "downloads": format!("\"{}\"", s(&downloads)),
+                "auto_update": false,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let last = finished(&page).await;
+    assert_eq!(last["state"], "done", "{last}");
+    let parsed: toml::Table =
+        toml::from_str(&std::fs::read_to_string(state_dir.join("config.toml")).unwrap()).unwrap();
+    assert_eq!(parsed["library"]["movies"].as_str(), movies.to_str());
+    assert_eq!(parsed["library"]["tv"].as_str(), tv.to_str());
+    assert_eq!(
+        parsed["embedded"]["download_dir"].as_str(),
+        downloads.to_str()
+    );
+    assert!(downloads.is_dir());
+}
+
+#[tokio::test]
+async fn one_state_folder_has_one_setup_and_an_empty_token_file_is_made_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    // A failed write left these empty.
+    arr::fsutil::ensure_private_dir(&state_dir.join("secrets")).unwrap();
+    for f in ["plex_client_id", "api_token"] {
+        arr::fsutil::write_new_private_file(&state_dir.join("secrets").join(f), b"").unwrap();
+    }
+    let (mock, _world) = start_mock(tmp.path(), tmp.path()).await;
+    let (_child, _link, _port) = start_wizard(&state_dir, mock, &[]).await;
+    let id = std::fs::read_to_string(state_dir.join("secrets/plex_client_id")).unwrap();
+    assert_eq!(id.len(), 32, "{id:?}");
+    assert!(!state_dir.join("secrets/api_token").exists());
+
+    // A second wizard for the same folder (on another port) is refused.
+    let second = tokio::process::Command::new(BIN)
+        .args(["wizard", "--no-docker", "--port"])
+        .arg(free_port().to_string())
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .arg("--ffprobe")
+        .arg(ffprobe())
+        .arg(format!("--plex-tv-url=http://{mock}/"))
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(20), second)
+        .await
+        .expect("a second wizard started on the same state folder")
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already running"), "{err}");
 }
