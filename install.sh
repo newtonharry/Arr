@@ -962,7 +962,9 @@ browser_setup() {
 	fi
 	case "$bind" in "" | *%*) bind=$(lan_ip) ;; esac
 	[ -n "$bind" ] || bind=127.0.0.1
-	case "$bind" in 127.0.0.1 | *:*) ;; *) port_free "$bind" ;; esac
+	[ "$bind" = 127.0.0.1 ] || port_free "$bind"
+	# The page shows its "Open Arr" button only on a loopback address.
+	PAGE_BIND=$bind
 	# The page refuses a state folder others can read, as Arr does: an existing one is made
 	# private too. Only the folder: the page's own files set their modes themselves.
 	(umask 077 && mkdir -p "$STATE_DIR")
@@ -991,10 +993,15 @@ browser_setup() {
 
 # The setup page's answer about automatic updates (an option given wins). The file stays
 # until the automatic updates step has acted on it, so a run that stops before then doesn't
-# lose the answer.
+# lose the answer. An option given replaces the answer in the file, so a run that stops
+# before then and is run again without it keeps that choice, not the page's older one.
 setup_choices() {
-	if [ -z "$AUTO_UPDATE" ] && [ -f "$STATE_DIR/setup-choices" ]; then
+	[ -f "$STATE_DIR/setup-choices" ] || return 0
+	if [ -z "$AUTO_UPDATE" ]; then
 		AUTO_UPDATE=$(sed -n 's/^auto_update=\([01]\)$/\1/p' "$STATE_DIR/setup-choices")
+	else
+		printf 'auto_update=%s\n' "$AUTO_UPDATE" >"$STATE_DIR/setup-choices" 2>/dev/null ||
+			rm -f "$STATE_DIR/setup-choices"
 	fi
 }
 
@@ -1003,7 +1010,9 @@ setup_choices() {
 # this again would fail the same way.
 port_free() {
 	rc=0
-	curl -s --noproxy '*' --max-time 3 -o /dev/null "http://$1:$PORT/" 2>/dev/null || rc=$?
+	# An IPv6 address goes in brackets; -g so curl doesn't read them as a URL pattern.
+	case "$1" in *:*) h="[$1]" ;; *) h=$1 ;; esac
+	curl -s -g --noproxy '*' --max-time 3 -o /dev/null "http://$h:$PORT/" 2>/dev/null || rc=$?
 	[ "$rc" != 7 ] || return 0
 	alt=$((PORT + 1)); [ "$alt" -le 65535 ] || alt=8788
 	die "port $PORT on this computer is already in use (by another program, or an Arr installed somewhere else); run this again with --port and a free port, for example --port $alt"
@@ -1125,7 +1134,7 @@ else
 	port_free 127.0.0.1
 	# The web page, unless the answer is already known: --browser or --terminal, nobody to ask
 	# (--yes, no terminal), or setup options on the command line, which mean the terminal setup.
-	# Over SSH the page opens on the computer you're typing on, as it always has.
+	# Over SSH it's asked too; the page then opens on the computer you're typing on.
 	opts=$(setup_opts)
 	if [ "$BROWSER" = 1 ]; then
 		HOW=browser
@@ -1134,8 +1143,6 @@ else
 	elif [ -n "$opts" ]; then
 		HOW=terminal
 		say "Setting Arr up here in the terminal, because setup options were given ($opts)."
-	elif [ -n "${SSH_CONNECTION:-}" ]; then
-		HOW=browser
 	else
 		HOW=""
 		while [ -z "$HOW" ]; do
@@ -1428,7 +1435,24 @@ boot_restart() {
 launchd_restart() { agent_stop "$L_ARR"; launchctl load "$LA_DIR/$L_ARR.plist"; }
 # How Arr starts on a Mac (BOOT_NOW), asked at a terminal when nothing says. A first setup on
 # the web page starts Arr as a login item first (BOOT_CHOSEN set), and asks this after.
-BOOT_CHOSEN=""
+BOOT_CHOSEN="" BOOT_SWITCHED=0
+# The start-at-boot service this run just put in place of the login item doesn't answer: it
+# goes, and the login item that ran Arr comes back (mac_service kept its plists for this).
+boot_rollback() {
+	BOOT_SWITCHED=0
+	if mac_sudo && { el_start; el_remove "$L_ARR"; el_remove "$L_TUN"; elevate >/dev/null 2>&1; }; then
+		CUR_BOOT=0 BOOT_NOW=0
+		RESTART=launchd_restart
+		for l in "$L_ARR" "$L_TUN"; do
+			[ ! -f "$LA_DIR/$l.plist" ] || launchctl load "$LA_DIR/$l.plist" 2>/dev/null || true
+		done
+		say "Warning: Arr didn't start as a start-at-boot service, so that was undone: Arr starts when you log in, as before. See: $logs"
+	else
+		# Two copies would fight over the port: the daemon stays, the login item goes.
+		agent_remove "$L_ARR"; agent_remove "$L_TUN"
+		die "Arr didn't start as a start-at-boot service, and removing it needs an administrator; see: $logs"
+	fi
+}
 boot_choice() {
 	BOOT_CHOSEN=1
 	if [ -n "$AT_BOOT" ]; then BOOT_NOW=$AT_BOOT
@@ -1472,7 +1496,10 @@ mac_service() {
 				if [ -n "$PUBLIC_URL" ]; then el_add "$L_TUN" "$tun_d"; elif [ -f "$D_TUN" ]; then el_remove "$L_TUN"; fi
 				if elevate; then ok=1; fi
 			fi
-			if [ "$ok" = 1 ]; then ELEVATED=1; CUR_BOOT=1
+			if [ "$ok" = 1 ]; then
+				# Switched from a login item just now: its plists stay until the daemon answers.
+				[ "$CUR_BOOT" = 1 ] || BOOT_SWITCHED=1
+				ELEVATED=1; CUR_BOOT=1
 			elif [ "$CUR_BOOT" = 1 ]; then
 				say "Warning: couldn't update Arr's start-at-boot services; they stay as they were."
 			else
@@ -1490,8 +1517,9 @@ mac_service() {
 	fi
 
 	if [ "$BOOT_NOW" = 1 ]; then
-		# The daemons are Arr's now: two copies would fight over the port.
-		agent_remove "$L_ARR"
+		# The daemons are Arr's now: two copies would fight over the port. (A login item just
+		# replaced is stopped already; start_arr removes it once the daemon answers.)
+		[ "$BOOT_SWITCHED" = 1 ] || agent_remove "$L_ARR"
 		RESTART=boot_restart
 		# A daemon just started already runs the new binary; otherwise end Arr so launchd starts it again.
 		[ "$ELEVATED" = 1 ] || boot_restart
@@ -1499,7 +1527,7 @@ mac_service() {
 			say "Note: the tunnel starts when you log in; to start it at boot, run this again at a terminal (it needs an administrator)."
 			mac_tunnel_plist 0 >"$tmp/tun.a.plist"
 			agent_load "$L_TUN" "$tmp/tun.a.plist"
-		elif [ -n "$PUBLIC_URL" ]; then agent_remove "$L_TUN"
+		elif [ -n "$PUBLIC_URL" ]; then [ "$BOOT_SWITCHED" = 1 ] || agent_remove "$L_TUN"
 		else
 			agent_remove "$L_TUN"
 			[ ! -f "$D_TUN" ] || say "Warning: Arr's tunnel service ($D_TUN) is still installed; run this again at a terminal to remove it."
@@ -1616,8 +1644,20 @@ if [ "$started" != 1 ]; then
 	exit 0
 fi
 
+up=1
+healthy || up=0
+# A Mac just switched to starting at boot: a daemon that doesn't answer gives way to the login
+# item that did, and that login item goes only once the daemon answers.
+if [ "$up" = 0 ] && [ "$BOOT_SWITCHED" = 1 ]; then
+	boot_rollback
+	if healthy; then up=1; fi
+elif [ "$BOOT_SWITCHED" = 1 ]; then
+	BOOT_SWITCHED=0
+	agent_remove "$L_ARR"
+	[ ! -f "$D_TUN" ] || agent_remove "$L_TUN"
+fi
 # A new version that doesn't answer is swapped back for the one that did.
-if ! healthy; then
+if [ "$up" = 0 ]; then
 	if [ "$UNDO_BIN" = 1 ]; then
 		undo_bin
 		if healthy; then die "the new version of Arr didn't start, so the previous one is running again; see: $logs"; fi
@@ -1643,7 +1683,10 @@ if [ "${HOW:-}" = browser ] && service_starts; then
 	# On a Mac it starts as a login item first; starting at boot is asked below.
 	[ "$os" != Darwin ] || [ "$CUR_BOOT" = 1 ] || { BOOT_NOW=0; BOOT_CHOSEN=1; }
 	start_arr "Starting Arr"
-	say "Arr is running: the setup page's \"Open Arr\" button works now."
+	case "${PAGE_BIND:-}" in
+	127.0.0.1 | ::1) say "Arr is running: the setup page's \"Open Arr\" button works now." ;;
+	*) say "Arr is running." ;;
+	esac
 	again=0
 	remote_step
 	[ -z "$PUBLIC_URL" ] || again=1

@@ -48,10 +48,10 @@ The script takes a few minutes. It:
 6. offers to set up remote access, so you can open the web app on your phone away from home
    and, if you like, use Arr from ChatGPT (see below; you can say no and do it later).
 
-If you're connected to the machine over SSH, the script doesn't ask: it prints a link to open
-on the computer you're typing on. The link includes a secret code, so nobody else on your
-network can use the page. To skip the question, add `--browser` for the setup page or
-`--terminal` to answer the questions in the terminal:
+If you're connected to the machine over SSH, it asks the same question, and the browser setup
+prints a link to open on the computer you're typing on. The link includes a secret code, so
+nobody else on your network can use the page. To skip the question, add `--browser` for the
+setup page or `--terminal` to answer the questions in the terminal:
 `curl -fsSL https://raw.githubusercontent.com/newtonharry/Arr/main/install.sh | sh -s -- --terminal`.
 Setup options such as `--plex-token` or `--movies` mean the terminal setup, and the script
 says so; `--tmdb-key` works with either.

@@ -6,13 +6,20 @@
 #   - ARR_AUTO_UPDATE, ARR_ERROR_REPORTS and ARR_BROWSER take only 1 or 0;
 #   - at a terminal with no setup options, "web browser or terminal?" is asked, and Enter means
 #     the setup page; a TMDB key doesn't change that, and is added after the page;
+#   - it is asked over SSH too, and the page then listens on the SSH address;
 #   - it isn't asked with --yes, with --terminal, with setup options (which say so) or with
 #     --browser;
+#   - "Open Arr" is promised only for a page on a loopback address;
+#   - --auto-update on a re-run replaces the page's answer kept for the updater step;
 #   - after the page Arr starts before the remaining questions, the state folder is private
 #     even if it existed with mode 755, the page doesn't inherit a private umask, unit files
 #     are mode 644, and the page's automatic updates answer is used and then removed;
 #   - --no-service says how to start Arr right after the page; a busy port stops before the
-#     page, naming --port; a page that fails doesn't claim that nothing was saved.
+#     page, naming --port (on 127.0.0.1 and on the page's IPv6 address); a page that fails
+#     doesn't claim that nothing was saved.
+#
+# No case can reach a real Plex: cases that get to the terminal setup give a closed Plex
+# address, and curl refuses Plex's port 32400.
 #
 # Usage: sh tests/installer/setup-choice.sh      (from the repository root)
 set -eu
@@ -100,8 +107,19 @@ EOF
 printf '#!/bin/sh\nexit 0\n' >"$FAKE_DIR/bin/docker"
 printf '#!/bin/sh\necho "ffprobe version stand-in"\n' >"$FAKE_DIR/bin/ffprobe"
 printf '#!/bin/sh\necho "xdg-open $*" >>"$FAKE_DIR/calls.log"\n' >"$FAKE_DIR/bin/xdg-open"
+# This test must never reach a real Plex (one may run on this computer): every case that gets
+# to the terminal setup gives a Plex address on a closed port, and as a second guard curl
+# refuses Plex's port (as "couldn't connect"), so Plex's token file is never read either.
+REAL_CURL=$(command -v curl) || fail "no curl"
+export REAL_CURL
+cat >"$FAKE_DIR/bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in *:32400*) echo "curl $*" >>"$FAKE_DIR/plex.log"; exit 7 ;; esac
+exec "$REAL_CURL" "$@"
+EOF
 chmod +x "$FAKE_DIR/bin"/*
 export PATH="$FAKE_DIR/bin:$PATH"
+noplex="http://127.0.0.1:$(freeport)"
 
 question='Set up Arr in your web browser, or here in the terminal?'
 n=0
@@ -164,24 +182,41 @@ grep -q "^arr set --config $state/config.toml tmdb-key$" "$FAKE_DIR/arr.log" || 
 [ "$(cat "$FAKE_DIR/tmdb.stdin")" = "$key" ] || fail "the TMDB key didn't reach arr on its standard input"
 grep -q 'sudo' "$FAKE_DIR/calls.log" && fail "sudo was called"
 
+echo "== over SSH: asked too; the page listens on the SSH address, where its button works"
+fresh
+(export SSH_CONNECTION="::1 50000 ::1 22" && FAKE_AUTO_UPDATE=0 at_terminal --port "$port" --no-at-boot) || { cat "$out"; fail "the install over SSH failed"; }
+asked || { cat "$out"; fail "the question wasn't asked over SSH"; }
+grep -q "^arr wizard --state-dir $state --bind ::1 --port $port " "$FAKE_DIR/arr.log" || { cat "$FAKE_DIR/arr.log"; fail "the page didn't listen on the SSH address"; }
+grep -qF "Arr is running: the setup page's \"Open Arr\" button works now." "$out" || { cat "$out"; fail "the button isn't promised on a loopback page"; }
+
+echo "== no screen: the page listens on the network address, and its button isn't promised"
+fresh
+(unset DISPLAY && FAKE_AUTO_UPDATE=0 at_terminal --port "$port" --no-at-boot) || { cat "$out"; fail "the install without a screen failed"; }
+bind=$(sed -n 's/^arr wizard .* --bind \([^ ]*\) .*/\1/p' "$FAKE_DIR/arr.log")
+if [ "$bind" = 127.0.0.1 ]; then
+	echo "(skipped: this computer has no network address)"
+else
+	tr -d '\r' <"$out" | grep -qx 'Arr is running.' || { cat "$out"; fail "no plain 'Arr is running.' for a page on $bind"; }
+	! grep -q '"Open Arr" button works now' "$out" || { cat "$out"; fail "the button was promised on a page that hides it"; }
+fi
+
 echo "== --yes: not asked, terminal setup"
 fresh
-unattended --yes --port "$port" || true
+unattended --yes --plex-url "$noplex" --port "$port" || true
 ! asked || { cat "$out"; fail "--yes asked"; }
 ! wizard_ran || fail "--yes ran the setup page"
 grep -q '^==> Finding Plex' "$out" || { cat "$out"; fail "--yes didn't run the terminal setup"; }
 
 echo "== --terminal: not asked, terminal setup"
 fresh
-at_terminal --terminal --port "$port" || true
+at_terminal --terminal --plex-url "$noplex" --port "$port" || true
 ! asked || { cat "$out"; fail "--terminal asked"; }
 ! wizard_ran || fail "--terminal ran the setup page"
 grep -q '^==> Finding Plex' "$out" || { cat "$out"; fail "--terminal didn't run the terminal setup"; }
 
 echo "== setup options: not asked, terminal setup, and it says why"
 fresh
-closed=$(freeport)
-at_terminal --movies "$w/nowhere" --plex-url "http://127.0.0.1:$closed" --port "$port" || true
+at_terminal --movies "$w/nowhere" --plex-url "$noplex" --port "$port" || true
 ! asked || { cat "$out"; fail "setup options asked"; }
 ! wizard_ran || fail "setup options ran the setup page"
 grep -qF 'Setting Arr up here in the terminal, because setup options were given (--plex-url, --movies).' "$out" || { cat "$out"; fail "no reason given for the terminal setup"; }
@@ -195,6 +230,11 @@ grep -q 'No background service will be installed, so Arr doesn' "$out" || { cat 
 grep -qF "  \"$HOME/.local/bin/arr\" serve --config \"$state/config.toml\"" "$out" || { cat "$out"; fail "the start command isn't shown"; }
 # With no service the run ends before the automatic updates step, so the page's answer waits for it.
 [ -e "$state/setup-choices" ] || fail "setup-choices was removed before the updater step used it"
+
+echo "== a re-run with --auto-update that stops before the updater step: a later run gets that choice"
+# --no-service ends this run too before the updater step, like one that was interrupted there.
+unattended --yes --auto-update --no-service --port "$port" || { cat "$out"; fail "the re-run failed"; }
+[ "$(cat "$state/setup-choices")" = auto_update=1 ] || fail "setup-choices still holds the page's older answer: $(cat "$state/setup-choices")"
 
 echo "== a page that fails: no claim that nothing was saved"
 fresh
@@ -214,4 +254,16 @@ grep -q "port $port on this computer is already in use.*--port" "$out" || { cat 
 ! asked || fail "asked how to set up with a busy port"
 kill "$busy"; busy=""
 
+echo "== a busy port on the page's IPv6 address: stops before the page, naming --port"
+fresh
+python3 -m http.server "$port" --bind ::1 --directory "$w" >/dev/null 2>&1 &
+busy=$!
+i=0
+until curl -g -fsS -o /dev/null "http://[::1]:$port/" 2>/dev/null; do i=$((i + 1)); [ "$i" -lt 30 ] || fail "the IPv6 busy-port stand-in didn't start"; sleep 0.2; done
+if (export SSH_CONNECTION="::1 50000 ::1 22" && at_terminal --port "$port"); then cat "$out"; fail "a busy IPv6 port passed"; fi
+grep -q "port $port on this computer is already in use.*--port" "$out" || { cat "$out"; fail "the busy IPv6 port isn't explained"; }
+! wizard_ran || fail "the page ran on a busy IPv6 port"
+kill "$busy"; busy=""
+
+[ ! -s "$FAKE_DIR/plex.log" ] || { cat "$FAKE_DIR/plex.log"; fail "a case tried Plex's own address"; }
 echo "setup choice: all checks passed"
