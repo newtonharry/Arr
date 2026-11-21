@@ -109,6 +109,7 @@ function Install-Arr {
 	$script:Healthy = $false # once Arr runs well again, nothing is undone
 	$script:UndoMessage = 'Putting back the previous version and settings.' # said when it is
 	$script:BootFailure = $null # why Arr couldn't be set to start at boot in this run
+	$script:Restored = $false # set by Restore-Arr, which the end of the run calls once
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 	$Repo = 'newtonharry/Arr'
@@ -211,9 +212,16 @@ function Install-Arr {
 	if ($firstSetup -and $setupMode -eq 'terminal' -and "$env:ARR_PLEX_URL".Trim()) {
 		try { $null = Get-PlexUrl } catch { throw "ARR_PLEX_URL: $($_.Exception.Message); nothing was changed" }
 	}
+	if ($StateDir -ne (Join-Path $env:LOCALAPPDATA 'Arr') -and -not $env:ARR_STATE_DIR) { Say "Found Arr installed in $StateDir" }
+	Assert-OwnTask
+	# A first setup needs Arr's port free: the setup page uses it, then Arr.
+	if ($env:ARR_NO_SETUP -ne '1' -and -not (Test-Path $Config) -and (Test-PortBusy $Port)) {
+		$who = if (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue) { ', maybe by the Arr already running from the "Arr" task (Stop-ScheduledTask Arr stops it)' } else { ' by another program' }
+		throw "port $Port on this computer is already in use$who. Choose another port for Arr, for example `$env:ARR_PORT = '8788', then run this again; nothing was changed"
+	}
 	# With nobody to answer, everything the setup here needs from Plex and this computer (Plex,
 	# a token Plex accepts, its libraries and their folders) is found now, before anything
-	# changes, and the setup uses these answers.
+	# changes (after the port check above), and the setup uses these answers.
 	$plexFound = $null
 	if ($firstSetup -and $setupMode -eq 'terminal' -and -not (Interactive)) {
 		Step 'Finding Plex'
@@ -221,13 +229,6 @@ function Install-Arr {
 		if ($plexFound.Problems) {
 			throw "setting up Arr with nobody to answer questions needs: $($plexFound.Problems -join '; '). Set them and run this again, or run this at a PowerShell prompt without ARR_YES to answer the questions or use the setup page; nothing was changed"
 		}
-	}
-	if ($StateDir -ne (Join-Path $env:LOCALAPPDATA 'Arr') -and -not $env:ARR_STATE_DIR) { Say "Found Arr installed in $StateDir" }
-	Assert-OwnTask
-	# A first setup needs Arr's port free: the setup page uses it, then Arr.
-	if ($env:ARR_NO_SETUP -ne '1' -and -not (Test-Path $Config) -and (Test-PortBusy $Port)) {
-		$who = if (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue) { ', maybe by the Arr already running from the "Arr" task (Stop-ScheduledTask Arr stops it)' } else { ' by another program' }
-		throw "port $Port on this computer is already in use$who. Choose another port for Arr, for example `$env:ARR_PORT = '8788', then run this again; nothing was changed"
 	}
 	# A re-run keeps Arr's port from its config.
 	if (Test-Path $Config) {
@@ -543,11 +544,18 @@ function Install-Arr {
 		$task = Get-ScheduledTask -TaskName 'Arr update' -ErrorAction SilentlyContinue
 		if (-not $task -and -not (Test-Path $Updater)) { return $true }
 		Step 'Turning off automatic updates'
-		try {
-			if ($task) { Unregister-ScheduledTask -TaskName 'Arr update' -Confirm:$false -ErrorAction Stop }
-			if (Test-Path $Updater) { Remove-Item $Updater -Force -ErrorAction Stop }
-		} catch {
-			Write-Warning "automatic updates couldn't be turned off ($($_.Exception.Message)); run this again to retry"
+		# Each is tried even if the other fails: without its script, the task updates nothing.
+		$left = @()
+		if ($task) {
+			try { Unregister-ScheduledTask -TaskName 'Arr update' -Confirm:$false -ErrorAction Stop }
+			catch { $left += "the ""Arr update"" task ($($_.Exception.Message))" }
+		}
+		if (Test-Path $Updater) {
+			try { Remove-Item $Updater -Force -ErrorAction Stop }
+			catch { $left += "$Updater ($($_.Exception.Message))" }
+		}
+		if ($left) {
+			Write-Warning "automatic updates couldn't be turned off completely: couldn't remove $($left -join ' or '); run this again to retry"
 			return $false
 		}
 		return $true
@@ -1363,6 +1371,10 @@ function Register-ArrTask($t, $atBoot) {
 	Register-ScheduledTask -TaskName $t.Name -Description $t.Description -Force `
 		-Action (New-ScheduledTaskAction -Execute $t.Exe -Argument $t.Args) -Trigger $trigger -Settings $set -Principal $principal | Out-Null
 	if (-not $atBoot) { return '' }
+	return Grant-ArrTask $t.Name
+}
+# Lets $user start and stop the task $name. Returns '' when that worked, else a note why not.
+function Grant-ArrTask($name) {
 	# Best effort: letting the user start and stop the task is what makes restarts need no
 	# administrator, but without it Arr still starts at boot (a restart then ends Arr's
 	# process and Windows starts the task again within a minute). Windows may write the entry
@@ -1373,7 +1385,7 @@ function Register-ArrTask($t, $atBoot) {
 	try {
 		$svc = New-Object -ComObject Schedule.Service
 		$svc.Connect()
-		$rt = $svc.GetFolder('\').GetTask($t.Name)
+		$rt = $svc.GetFolder('\').GetTask($name)
 		$rt.SetSecurityDescriptor($rt.GetSecurityDescriptor(4) + "(A;;FA;;;$sid)", 0)
 		$acl = (New-Object Security.AccessControl.RawSecurityDescriptor($rt.GetSecurityDescriptor(4))).DiscretionaryAcl
 		foreach ($ace in $acl) {
@@ -1382,22 +1394,35 @@ function Register-ArrTask($t, $atBoot) {
 		if (-not $granted) { $err = 'the entry is not in the security descriptor Windows returns: ' + $rt.GetSecurityDescriptor(4) }
 	} catch { $err = $_.Exception.Message }
 	if ($granted) { return '' }
-	return " could not let $user start and stop the task $($t.Name) ($(($err -replace '\s+', ' ')))."
+	return " could not let $user start and stop the task $name ($(($err -replace '\s+', ' ')))."
 }
 # All or none: if one task can't be switched, those already switched go back to how they were,
-# so Arr's tasks are never left half at boot and half at log-on.
+# so Arr's tasks are never left half at boot and half at log-on. Each task's whole definition
+# is kept first (here, with this step's rights), so going back keeps every setting it had (a
+# disabled update task stays disabled), not only those this step sets.
+foreach ($t in $tasks) {
+	try { $t.Xml = Export-ScheduledTask -TaskName $t.Name -TaskPath '\' }
+	catch { throw "couldn't read the task $($t.Name) before switching it ($($_.Exception.Message)); Arr's tasks are as they were" }
+}
 $done = @()
 try {
 	foreach ($t in $tasks) {
-		$done += $t
 		$note += Register-ArrTask $t $boot
+		$done += $t # only once it is switched: a task that failed is as it was
 	}
 } catch {
 	$why = $_.Exception.Message
 	$left = @()
-	foreach ($t in $done) { try { $null = Register-ArrTask $t $t.Boot } catch { $left += $t.Name } }
+	$notes = ''
+	foreach ($t in $done) {
+		try {
+			$null = Register-ScheduledTask -TaskName $t.Name -TaskPath '\' -Xml $t.Xml -Force
+			# Who may start and stop a task isn't in its definition: given again where it was.
+			if ($t.Boot) { $notes += Grant-ArrTask $t.Name }
+		} catch { $left += $t.Name }
+	}
 	if ($left) { throw "$why; putting back $($left -join ', ') as before failed too, so Arr's tasks may not all start the same way" }
-	throw "$why (Arr's tasks are as they were)"
+	throw "$why (Arr's tasks are as they were)$notes"
 }
 '@
 	$body = $body.Replace('__USER__', (Quote-Ps $user)).Replace('__BOOT__', $(if ($boot) { '$true' } else { '$false' })).Replace('__TASKS__', ($specs -join ",`n"))
@@ -1465,8 +1490,9 @@ function Save-Settings($stateDir) {
 	if (Test-Path $snap) { Remove-Item -Recurse -Force $snap }
 	New-Item -ItemType Directory $snap | Out-Null
 	Copy-Item (Join-Path $stateDir 'config.toml') $snap
-	# The managed settings pointer and the "Knaben was offered" note change with the config.
-	foreach ($f in 'active-import.json', 'default-indexers') {
+	# The managed settings pointer, the "Knaben was offered" note and ngrok's config (remote
+	# access writes its authtoken there) change with the config.
+	foreach ($f in 'active-import.json', 'default-indexers', 'ngrok.yml') {
 		if (Test-Path (Join-Path $stateDir $f)) { Copy-Item (Join-Path $stateDir $f) $snap }
 	}
 	$secrets = Join-Path $stateDir 'secrets'
@@ -1485,7 +1511,8 @@ function Undo-Run {
 	if (-not $snap) { return }
 	$stateDir = Split-Path $snap
 	Copy-Item (Join-Path $snap 'config.toml') (Join-Path $stateDir 'config.toml') -Force
-	foreach ($f in 'active-import.json', 'default-indexers') {
+	# Each goes back as it was, or goes if this run made it.
+	foreach ($f in 'active-import.json', 'default-indexers', 'ngrok.yml') {
 		if (Test-Path (Join-Path $snap $f)) { Copy-Item (Join-Path $snap $f) (Join-Path $stateDir $f) -Force }
 		else { Remove-Item (Join-Path $stateDir $f) -Force -ErrorAction SilentlyContinue }
 	}
@@ -1499,6 +1526,31 @@ function Undo-Run {
 	}
 	Remove-Item -Recurse -Force $snap
 	$script:Snapshot = $null
+}
+
+# At the end of a run that didn't finish well (an error, or Ctrl-C, which skips catch): Arr
+# back on what was there before. Once per run, whichever way it ends; a run that finished
+# well has nothing to do here. (Marked done at its end: if Ctrl-C cuts it short in catch,
+# finally runs it again; each step is harmless twice.)
+function Restore-Arr {
+	if ($script:Restored) { return }
+	# Arr was stopped to restart it (on the new version, or with new settings) and hasn't
+	# answered its health check since: it didn't start, or this run ended first. Stop whatever
+	# this run started, so that Arr starts again on what is put back below. Only a passed
+	# health check clears ArrStopped, so an Arr running well is left alone.
+	$restart = $script:ArrStopped -and [bool](Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)
+	if ($restart) { try { Stop-Arr $script:ArrBackground } catch {} }
+	# Put back what this run changed before Arr ran well with it.
+	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) {
+		Write-Host $script:UndoMessage
+		try { Undo-Run } catch { Write-Host "couldn't put them all back: $($_.Exception.Message)" -ForegroundColor Red }
+	}
+	if ($restart) {
+		$script:ArrStopped = $false
+		Write-Host 'Starting Arr again.'
+		try { Start-ScheduledTask -TaskName 'Arr' -ErrorAction Stop } catch {}
+	}
+	$script:Restored = $true
 }
 
 # Puts back the programs Replace-File -Keep kept, for each name in $names.
@@ -1749,12 +1801,8 @@ try {
 } catch {
 	$failure = $_
 	Write-Host "error: $($failure.Exception.Message)" -ForegroundColor Red
-	# Arr isn't running well on what this run changed: put the previous programs and settings
-	# back first, so Arr starts on them again (or, still running, keeps them next time).
-	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) {
-		Write-Host $script:UndoMessage
-		try { Undo-Run } catch { Write-Host "couldn't put them all back: $($_.Exception.Message)" -ForegroundColor Red }
-	}
+	# Arr back on what was there before first, then the report (by the arr.exe put back).
+	Restore-Arr
 	# Told to Arr's developer only if this install's config says so (docs/PRIVACY.md).
 	try { $bin, $state = Get-ArrDirs } catch { $bin, $state = 'none', 'none' }
 	if ((Test-Path (Join-Path $bin 'arr.exe')) -and (Test-Path (Join-Path $state 'config.toml'))) {
@@ -1765,20 +1813,7 @@ try {
 	}
 	if ($env:ARR_INSTALL_STRICT -eq '1') { throw $failure } # tests want a failing exit code
 } finally {
-	# Arr was stopped to restart it (on the new version, or with new settings) and hasn't
-	# answered its health check since: it didn't start, or this run ended first (Ctrl-C skips
-	# catch). Stop whatever this run started, so that Arr can start again on what is put back
-	# below. Only a passed health check clears ArrStopped, so an Arr running well is left alone.
-	$restart = $script:ArrStopped -and [bool](Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)
-	if ($restart) { try { Stop-Arr $script:ArrBackground } catch {} }
-	# Put back what this run changed before Arr ran well with it.
-	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) {
-		Write-Host $script:UndoMessage
-		try { Undo-Run } catch {}
-	}
-	if ($restart) {
-		$script:ArrStopped = $false
-		Write-Host 'Starting Arr again.'
-		try { Start-ScheduledTask -TaskName 'Arr' -ErrorAction Stop } catch {}
-	}
+	# Ctrl-C skips catch: the same, here (it does nothing a second time, or after a run that
+	# finished well).
+	Restore-Arr
 }

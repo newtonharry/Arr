@@ -522,20 +522,22 @@ jobs:
           if ((Test-Path "$bin\arr.exe") -or (Test-Path $state)) { Fail 'it installed Arr before finding the folders missing' }
           Remove-Item Env:ARR_MOVIES, Env:ARR_TV
 
-          # A busy port: refused before anything is installed, naming ARR_PORT.
+          # A busy port, with no Plex either: refused before anything is installed, naming the
+          # port and ARR_PORT, before anything is said about Plex.
           $busy = New-Object Net.Sockets.TcpListener -ArgumentList ([Net.IPAddress]::Loopback), 8792
           $busy.Start()
-          $env:ARR_PORT = '8792'
+          $env:ARR_PORT = '8792'; $env:ARR_PLEX_URL = 'http://127.0.0.1:32496'
           $msg = $null
           try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
           $busy.Stop()
           "busy port said: $msg"
-          if ($msg -notmatch 'ARR_PORT' -or $msg -notmatch '8792') { Fail 'a busy port was not refused naming ARR_PORT' }
+          if ($msg -notmatch 'ARR_PORT' -or $msg -notmatch 'port 8792') { Fail 'a busy port was not refused naming the port and ARR_PORT' }
+          if ($msg -match 'ARR_PLEX_URL') { Fail 'a busy port with no Plex was reported as a Plex problem' }
           if (Test-Path "$bin\arr.exe") { Fail 'it installed Arr before refusing the busy port' }
 
           # The first install: every answer from the variables or found (the folders Plex names,
           # the download folder next to the movies).
-          $env:ARR_PORT = '8791'
+          $env:ARR_PORT = '8791'; $env:ARR_PLEX_URL = 'http://127.0.0.1:32497'
           Get-Content install.ps1 -Raw | Invoke-Expression
           $config = Get-Content "$state\config.toml" -Raw
           'config.toml:'; $config
