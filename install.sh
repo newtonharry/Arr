@@ -1461,17 +1461,12 @@ boot_restart() {
 }
 # Once unloaded, a login item can't be kickstarted: a rollback loads it again instead.
 launchd_restart() { agent_stop "$L_ARR"; launchctl load "$LA_DIR/$L_ARR.plist"; }
-# BOOT_CHOSEN: how Arr starts (BOOT_NOW) is decided once a run. A first setup on the web page
-# comes back here to add the tunnel when remote access is set up after Arr started.
-BOOT_CHOSEN=""
 mac_service() {
 	ELEVATED=0
-	if [ -n "$BOOT_CHOSEN" ]; then :
-	elif [ -n "$AT_BOOT" ]; then BOOT_NOW=$AT_BOOT
+	if [ -n "$AT_BOOT" ]; then BOOT_NOW=$AT_BOOT
 	elif [ "$CUR_BOOT" = 1 ]; then BOOT_NOW=1
 	elif interactive && confirm "Start Arr when this computer starts, even before anyone logs in? It needs your admin password once." y; then BOOT_NOW=1
 	else BOOT_NOW=0; fi
-	BOOT_CHOSEN=1
 	if [ "$AT_BOOT" = 1 ] || interactive; then ELEV_OK=1; fi
 	D_ARR="$LD_DIR/$L_ARR.plist" D_TUN="$LD_DIR/$L_TUN.plist"
 
@@ -1671,9 +1666,9 @@ healthy() {
 	done
 }
 
-if [ "${HOW:-}" = browser ] && service_starts; then
+if [ "${HOW:-}" = browser ] && service_starts && [ "$os" != Darwin ]; then
 	# The setup page is waiting for Arr ("Open Arr"): start it now, and ask the rest after.
-	# (On a Mac, starting at boot is asked first, so Arr starts once, as it will stay.)
+	# (Not on a Mac: its services are installed once, after every question, as they will stay.)
 	start_arr "Starting Arr"
 	case "${PAGE_BIND:-}" in
 	127.0.0.1 | ::1) say "Arr is running: the setup page's \"Open Arr\" button works now." ;;
@@ -1682,7 +1677,7 @@ if [ "${HOW:-}" = browser ] && service_starts; then
 	remote_step
 	[ -z "$PUBLIC_URL" ] || start_arr "Restarting Arr with these settings"
 else
-	if [ "${HOW:-}" = browser ]; then
+	if [ "${HOW:-}" = browser ] && ! service_starts; then
 		# Nothing starts Arr in the background, so the setup page waits until you do.
 		say ""
 		say "No background service will be installed, so Arr doesn't start by itself; the setup page"

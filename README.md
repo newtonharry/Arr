@@ -42,10 +42,10 @@ The script takes a few minutes. It:
 4. imports your Plex library, so Arr knows what you own. It downloads nothing at this step;
 5. starts Arr as a service (systemd on Linux, launchd on macOS), and can start it when the
    computer starts rather than when you log in (see
-   [Starting when the computer starts](#starting-when-the-computer-starts)). After the setup
-   page, Arr starts first, so the page's **Open Arr** works straight away, and the last
-   questions follow in the terminal. On a Mac, "start at boot?" comes just before Arr starts,
-   so Arr starts once, the way it will stay;
+   [Starting when the computer starts](#starting-when-the-computer-starts)). On Linux, after
+   the setup page, Arr starts first, so the page's **Open Arr** works straight away, and the
+   last questions follow in the terminal. On a Mac the last questions come first, then Arr
+   starts;
 6. offers to set up remote access, so you can open the web app on your phone away from home
    and, if you like, use Arr from ChatGPT (see below; you can say no and do it later).
 
