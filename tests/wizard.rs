@@ -1258,7 +1258,7 @@ async fn a_setup_finished_by_hand_with_another_config_is_never_cleared() {
         )
     };
     let elsewhere = tmp.path().join("elsewhere.toml");
-    let theirs = failed.replace("dir = \".\"", &format!("dir = \"{}\"", state_dir.display()));
+    let theirs = failed.replace("dir = \".\"", &format!("dir = '{}'", state_dir.display()));
     assert_ne!(theirs, failed);
     arr::fsutil::write_new_private_file(&elsewhere, theirs.as_bytes()).unwrap();
     // While the page is open, a command run by hand can't take the folder (the page may be
