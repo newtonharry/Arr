@@ -1,5 +1,6 @@
 # Arr installer for Windows: downloads a prebuilt Arr, then sets it up next to your Plex
-# server in your web browser. Open PowerShell (Start menu > type "PowerShell") and paste:
+# server, in your web browser or here in PowerShell (it asks which). Open PowerShell (Start
+# menu > type "PowerShell") and paste:
 #
 #   irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex
 #
@@ -16,7 +17,8 @@
 #   ARR_AUTO_UPDATE      1 to install new versions automatically, 0 to turn that off. Asked at a
 #                        PowerShell prompt if not given (default no); without a prompt it stays
 #                        off on a new install, and a re-run keeps it as it is.
-#   ARR_ERROR_REPORTS    1 to send error reports, 0 not to (docs/PRIVACY.md)
+#   ARR_ERROR_REPORTS    1 to send error reports, 0 not to (docs/PRIVACY.md); asked in the setup
+#                        here in PowerShell if not given (the setup page has a box)
 #   ARR_TMDB_KEY         an optional backup TMDB key (movies come from Plex), checked before
 #                        anything changes
 #   ARR_UPLOAD_LIMIT_KIB upload limit for downloads in KiB/s (0 = no limit)
@@ -28,9 +30,32 @@
 #                        installed, else %LOCALAPPDATA%\Arr)
 #   ARR_BIN_DIR          where arr.exe goes (default: where it is, else %LOCALAPPDATA%\Programs\Arr)
 #   ARR_NO_SETUP         1 to install the program only
-#   ARR_YES              1 to never ask (FFmpeg is installed without asking); first setup
-#                        needs the setup page, so it needs someone at the browser and is
-#                        refused with ARR_YES or without a PowerShell prompt to type in
+#   ARR_YES              1 to never ask (FFmpeg is installed without asking). A first setup
+#                        then runs the setup here with the values below and what it finds
+#                        (Plex on this computer, its token and its library folders), and stops
+#                        before changing anything, naming the variables to set, when it can't.
+#                        So does a first setup without a PowerShell prompt to type in.
+#
+# A first setup asks whether to use the setup page in your web browser (press Enter) or to
+# answer questions here in PowerShell. These skip that question:
+#
+#   ARR_BROWSER          1 for the setup page (even with ARR_YES: someone must be at this
+#                        computer's browser)
+#   ARR_TERMINAL         1 for the questions here
+#
+# and these answer the questions here (giving any of them means the setup here); they apply
+# to a first setup only:
+#
+#   ARR_PLEX_URL         Plex's address (default http://127.0.0.1:32400)
+#   ARR_PLEX_TOKEN       your Plex token (default: read from Plex's settings on this computer)
+#   ARR_MOVIES, ARR_TV   the movie and TV library folders on this computer (default: the
+#                        folders Plex names, when they are on this computer)
+#   ARR_MOVIE_SECTION    Plex's movie and TV library numbers (default: the first of each)
+#   ARR_TV_SECTION
+#   ARR_DOWNLOADS        where downloads go before they move into the library (default: an
+#                        arr-downloads folder next to the movie folder, else the TV folder)
+#   ARR_SEARCH_ONLY      1 to not let Arr download anything (arr set ... downloading on turns
+#                        it on later)
 #
 # Running this again keeps your settings and updates Arr; the options above that you give
 # are applied, the rest are kept.
@@ -98,7 +123,9 @@ function Install-Arr {
 	$BinDir, $StateDir = Get-ArrDirs
 	# A given option is checked before anything changes, so it either applies or stops here.
 	foreach ($o in @(@('ARR_PORT', 1, 65535), @('ARR_TORRENT_PORT', 1, 65535), @('ARR_UPLOAD_LIMIT_KIB', 0, 4194303),
-			@('ARR_ERROR_REPORTS', 0, 1), @('ARR_AUTO_UPDATE', 0, 1), @('ARR_AT_BOOT', 0, 1))) {
+			@('ARR_ERROR_REPORTS', 0, 1), @('ARR_AUTO_UPDATE', 0, 1), @('ARR_AT_BOOT', 0, 1),
+			@('ARR_TERMINAL', 0, 1), @('ARR_BROWSER', 0, 1), @('ARR_SEARCH_ONLY', 0, 1),
+			@('ARR_MOVIE_SECTION', 1, 9999999), @('ARR_TV_SECTION', 1, 9999999))) {
 		$v = [Environment]::GetEnvironmentVariable($o[0])
 		if ($v -and -not ($v -match '^\d{1,7}$' -and [int]$v -ge $o[1] -and [int]$v -le $o[2])) {
 			$what = if ($o[2] -eq 1) { '0 or 1' } else { "a number from $($o[1]) to $($o[2])" }
@@ -128,6 +155,14 @@ function Install-Arr {
 		if (-not $a) { $a = $default }
 		return $a -match '^[Yy]'
 	}
+	# A typed answer, or $default when Enter is pressed or nobody is at the prompt.
+	function Ask($question, $default) {
+		if (-not (Interactive)) { return $default }
+		$hint = if ($default) { " [$default]" } else { '' }
+		$a = "$(Read-Host "$question$hint")".Trim()
+		if ($a) { return $a }
+		return $default
+	}
 
 	# Runs arr with any piped text on its stdin; returns its output, stderr too, as text, and
 	# $LASTEXITCODE says how it went. (Windows PowerShell turns a native program's stderr
@@ -148,10 +183,37 @@ function Install-Arr {
 	if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
 		Say 'This PC has an ARM processor; Arr runs through Windows 11''s x64 emulation.'
 	}
-	# The setup page needs a person, and so does a question asked here: ARR_YES, or input that
-	# isn't a PowerShell prompt, means nobody can answer it.
-	if (-not (Interactive) -and $env:ARR_NO_SETUP -ne '1' -and -not (Test-Path $Config)) {
-		throw 'Windows setup needs the setup page in a browser; run this in PowerShell without ARR_YES'
+	# How a first setup goes: the setup page ('browser'), questions here ('terminal'), or ask
+	# which. Setup values given mean the setup here. With nobody to answer (ARR_YES, or input
+	# that isn't a PowerShell prompt) the setup page can't be answered either, unless
+	# ARR_BROWSER=1 says someone is at the browser: the setup here runs on what's given and found.
+	$setupValues = @(@('ARR_PLEX_URL', 'ARR_PLEX_TOKEN', 'ARR_MOVIES', 'ARR_TV', 'ARR_MOVIE_SECTION', 'ARR_TV_SECTION', 'ARR_DOWNLOADS') |
+		Where-Object { [Environment]::GetEnvironmentVariable($_) })
+	if ($env:ARR_SEARCH_ONLY -eq '1') { $setupValues += 'ARR_SEARCH_ONLY' }
+	if ($env:ARR_TERMINAL -eq '1' -and $env:ARR_BROWSER -eq '1') { throw 'ARR_TERMINAL and ARR_BROWSER are both 1; set only one; nothing was changed' }
+	$setupMode = 'ask'
+	if ($env:ARR_TERMINAL -eq '1') { $setupMode = 'terminal' }
+	elseif ($env:ARR_BROWSER -eq '1') { $setupMode = 'browser' }
+	elseif ($setupValues) { $setupMode = 'terminal' }
+	elseif (-not (Interactive)) { $setupMode = 'terminal' }
+	$firstSetup = $env:ARR_NO_SETUP -ne '1' -and -not (Test-Path $Config)
+	if ($firstSetup -and $setupMode -eq 'browser' -and $setupValues) {
+		Write-Warning "the setup page asks for these itself, so $($setupValues -join ', ') are ignored"
+	}
+	# On a re-run only ARR_SEARCH_ONLY=1 does something: it turns downloading off.
+	$firstOnly = @(@($setupValues | Where-Object { $_ -ne 'ARR_SEARCH_ONLY' }) + @('ARR_TERMINAL', 'ARR_BROWSER' | Where-Object { [Environment]::GetEnvironmentVariable($_) }))
+	if (-not $firstSetup -and $env:ARR_NO_SETUP -ne '1' -and $firstOnly) {
+		Write-Warning "$($firstOnly -join ', ') apply only to a first setup; Arr keeps its config, so they are ignored"
+	}
+	# With nobody to answer, what the setup here can't do without is checked now, before anything changes.
+	if ($firstSetup -and $setupMode -eq 'terminal' -and -not (Interactive)) {
+		$missing = @()
+		$plexUrl = Get-PlexUrl
+		if (-not (Test-Plex $plexUrl)) { $missing += "ARR_PLEX_URL (Plex didn't answer at $plexUrl)" }
+		if (-not "$env:ARR_PLEX_TOKEN".Trim() -and -not (Find-PlexToken)) { $missing += 'ARR_PLEX_TOKEN (Plex''s settings on this computer have none)' }
+		if ($missing) {
+			throw "setting up Arr with nobody to answer questions needs: $($missing -join '; '). Set them and run this again, or run this at a PowerShell prompt without ARR_YES to answer the questions or use the setup page; nothing was changed"
+		}
 	}
 	if ($StateDir -ne (Join-Path $env:LOCALAPPDATA 'Arr') -and -not $env:ARR_STATE_DIR) { Say "Found Arr installed in $StateDir" }
 	Assert-OwnTask
@@ -290,6 +352,7 @@ function Install-Arr {
 		# If this run fails before Arr runs well again, the config and secrets go back as they are now.
 		Save-Settings $StateDir
 		if ($tmdbKey) { $tmdbKey.Trim() | Set-Arr tmdb-key }
+		if ($env:ARR_SEARCH_ONLY -eq '1') { Set-Arr downloading off }
 		if ($env:ARR_UPLOAD_LIMIT_KIB) { Set-Arr upload-limit-kib $UploadLimit }
 		if ($env:ARR_TORRENT_PORT) { Set-Arr torrent-port $TorrentPort }
 		if ($env:ARR_ERROR_REPORTS) { Set-Arr error-reports $(if ($env:ARR_ERROR_REPORTS -eq '1') { 'on' } else { 'off' }) }
@@ -324,17 +387,28 @@ function Install-Arr {
 			$why = $tmdbKey.Trim() | Run-Arr tmdb-key --check
 			if ($LASTEXITCODE -ne 0) { throw "TMDB didn't accept ARR_TMDB_KEY: $(($why -join ' ') -replace '^Error: ', '') (see docs/TMDB.md); nothing was set up" }
 		}
-		Step 'Setting up Arr in your web browser'
-		if (Test-Path "$Config.failed") { Say "(The last setup attempt failed; what it chose is kept in $Config.failed. This setup starts from the beginning.)" }
-		$reports = @(if ($env:ARR_ERROR_REPORTS -eq '1') { '--error-reports' })
-		# Remote access given up front: the page can show its address (it's set up after this).
-		$wizardDomain = ($env:ARR_NGROK_DOMAIN -replace '^https?://', '' -replace '/.*$', '').ToLowerInvariant()
-		$publicArgs = @(if ($wizardDomain -match '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { '--public-url'; "https://$wizardDomain" })
-		& $Arr wizard --state-dir $StateDir --port $Port --torrent-port $TorrentPort `
-			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open @reports @publicArgs
-		if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Config)) {
-			$kept = if (Test-Path "$Config.failed") { " What the failed attempt chose is kept in $Config.failed." } else { '' }
-			throw "setup wasn't finished, so Arr isn't set up yet.$kept Run this again to go through setup again."
+		if ($setupMode -eq 'ask') {
+			Say ''
+			Say 'Arr can be set up on a page in your web browser, or here by answering a few questions.'
+			Say 'Press Enter for the web browser, or type P and press Enter to stay here in PowerShell.'
+			$a = Read-Host 'Set up Arr in your web browser, or here in PowerShell? [B/p]'
+			$setupMode = if ("$a".Trim() -match '^[PpTt]') { 'terminal' } else { 'browser' }
+		}
+		if ($setupMode -eq 'terminal') {
+			Set-TerminalSetup
+		} else {
+			Step 'Setting up Arr in your web browser'
+			if (Test-Path "$Config.failed") { Say "(The last setup attempt failed; what it chose is kept in $Config.failed. This setup starts from the beginning.)" }
+			$reports = @(if ($env:ARR_ERROR_REPORTS -eq '1') { '--error-reports' })
+			# Remote access given up front: the page can show its address (it's set up after this).
+			$wizardDomain = ($env:ARR_NGROK_DOMAIN -replace '^https?://', '' -replace '/.*$', '').ToLowerInvariant()
+			$publicArgs = @(if ($wizardDomain -match '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { '--public-url'; "https://$wizardDomain" })
+			& $Arr wizard --state-dir $StateDir --port $Port --torrent-port $TorrentPort `
+				--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open @reports @publicArgs
+			if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Config)) {
+				$kept = if (Test-Path "$Config.failed") { " What the failed attempt chose is kept in $Config.failed." } else { '' }
+				throw "setup wasn't finished, so Arr isn't set up yet.$kept Run this again to go through setup again."
+			}
 		}
 		if ($tmdbKey) {
 			try { $tmdbKey.Trim() | Set-Arr tmdb-key }
@@ -712,11 +786,7 @@ function Set-RemoteAccess {
 	New-Item -ItemType Directory -Force $secrets | Out-Null
 	Write-Private (Join-Path $secrets 'google_client_secret') $secret
 	$mcpToken = Join-Path $secrets 'mcp_token'
-	if (-not (Test-Path $mcpToken)) {
-		$bytes = New-Object byte[] 32
-		[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-		Write-Private $mcpToken (-join ($bytes | ForEach-Object { $_.ToString('x2') }))
-	}
+	if (-not (Test-Path $mcpToken)) { Write-Private $mcpToken (New-Token) }
 
 	# /mcp must accept the ngrok host; then add the sign-in section. Restored if Arr rejects it.
 	$before = [IO.File]::ReadAllText($Config)
@@ -758,17 +828,247 @@ function Set-RemoteAccess {
 function Read-Value($label, $value, $envName, [switch]$Secret) {
 	if ($value) { return $value.Trim() }
 	if (-not (Interactive)) { throw "remote access needs `$env:$envName (see docs/REMOTE.md)" }
-	if ($Secret) {
-		$s = Read-Host "  $label" -AsSecureString
-		$p = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
-		try { $value = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($p) }
-		finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) }
-	} else {
-		$value = Read-Host "  $label"
-	}
+	if ($Secret) { $value = Read-Secret "  $label" }
+	else { $value = Read-Host "  $label" }
 	if (-not $value.Trim()) { throw "$label is needed for remote access" }
 	return $value.Trim()
 }
+
+# Reads a secret at the prompt without showing it.
+function Read-Secret($label) {
+	$s = Read-Host $label -AsSecureString
+	$p = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
+	try { return "$([Runtime.InteropServices.Marshal]::PtrToStringBSTR($p))".Trim() }
+	finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) }
+}
+
+# 32 random bytes as hex, for a new token.
+function New-Token {
+	$bytes = New-Object byte[] 32
+	[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+	return (-join ($bytes | ForEach-Object { $_.ToString('x2') }))
+}
+
+# Setup here in PowerShell instead of the setup page, as install.sh's terminal setup does it:
+# finds Plex, its token and its libraries, asks for the folders on this computer and the
+# download folder, then writes the config the setup page writes for the same answers and
+# checks it with arr setup and arr check (the Plex import follows once Arr runs). Uses
+# Install-Arr's variables. Left out from install.sh: mapping a Docker Plex's folders back to
+# this computer's (Plex on Windows is a program here, so the folders it names are this
+# computer's) and sudo or file owners (Arr runs as you).
+function Set-TerminalSetup {
+	Step 'Setting up Arr here in PowerShell'
+	if (Test-Path "$Config.failed") { Say "(The last setup attempt failed; what it chose is kept in $Config.failed. This setup starts from the beginning.)" }
+
+	Step 'Finding Plex'
+	$plexUrl = Get-PlexUrl
+	if (-not (Test-Plex $plexUrl) -and (Interactive)) {
+		$plexUrl = Get-PlexUrl (Ask "Plex didn't answer at $plexUrl. Plex server address?" $plexUrl)
+	}
+	if (-not (Test-Plex $plexUrl)) { throw "can't reach Plex at $plexUrl. Start Plex Media Server, or set ARR_PLEX_URL to its address, then run this again; nothing was set up" }
+	Say "Plex is at $plexUrl"
+	$token = "$env:ARR_PLEX_TOKEN".Trim()
+	if (-not $token) {
+		$token = Find-PlexToken
+		if ($token) { Say 'Read the Plex token from Plex''s settings on this computer' }
+	}
+	if (-not $token -and (Interactive)) {
+		Say 'Arr needs your Plex token. In Plex Web, open any movie, choose ... > Get Info > View XML,'
+		Say 'and copy the value after X-Plex-Token= in the address bar. What you type or paste is not shown.'
+		$token = Read-Secret 'Plex token'
+	}
+	if (-not $token) { throw 'Arr needs your Plex token (set ARR_PLEX_TOKEN); nothing was set up' }
+	$locations = @(Get-PlexLocations $plexUrl $token)
+
+	# The first movie and TV library, or the ones asked for, and their first folder.
+	$problems = @()
+	$libs = @{}
+	foreach ($kind in @(@('movie', 'ARR_MOVIE_SECTION', 'ARR_MOVIES', 'Movies'), @('show', 'ARR_TV_SECTION', 'ARR_TV', 'TV'))) {
+		$section = [Environment]::GetEnvironmentVariable($kind[1])
+		$found = @($locations | Where-Object { $_.Type -eq $kind[0] -and (-not $section -or $_.Section -eq [int]$section) })
+		if (-not $found) {
+			if ($section) { $problems += "$($kind[1]) (Plex has no $($kind[3]) library number $section)" }
+			continue
+		}
+		$lib = $found[0]
+		$plexPath = Trim-Folder $lib.Path
+		$folder = Trim-Folder ([Environment]::GetEnvironmentVariable($kind[2]))
+		if (-not $folder) {
+			$here = if (Test-Path -LiteralPath $plexPath -PathType Container) { $plexPath } else { '' }
+			$folder = Trim-Folder (Ask "$($kind[3]) folder on this computer (Plex sees $plexPath)" $here)
+		}
+		if (-not $folder) { $problems += "$($kind[2]) (the $($kind[3]) folder on this computer; Plex sees $plexPath, which isn't on this computer)"; continue }
+		$folder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($folder)
+		if (-not (Test-Path -LiteralPath $folder -PathType Container)) { $problems += "$($kind[2]) ($folder isn't a folder on this computer)"; continue }
+		$libs[$kind[0]] = @{ Section = $lib.Section; PlexPath = $plexPath; Folder = $folder }
+		Say "$($kind[3]): $folder (Plex library $($lib.Section))"
+	}
+	if (-not $problems -and -not $libs.Count) { throw 'Plex has no movie or TV library yet. Add one in Plex (or use the setup page, which can make them), then run this again; nothing was set up' }
+	if ($problems) { throw "Arr's setup needs: $($problems -join '; '). Set them and run this again; nothing was set up" }
+
+	# Downloads go next to the library by default, so imports can move files instead of copying.
+	$first = if ($libs['movie']) { $libs['movie'].Folder } else { $libs['show'].Folder }
+	$parent = Split-Path -Parent $first
+	$suggested = Join-Path $(if ($parent) { $parent } else { $first }) 'arr-downloads'
+	$downloads = Trim-Folder $env:ARR_DOWNLOADS
+	if (-not $downloads) { $downloads = Trim-Folder (Ask 'Download folder' $suggested) }
+	$downloads = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($downloads)
+	try { New-Item -ItemType Directory -Force $downloads | Out-Null }
+	catch { throw "can't make the download folder $downloads ($($_.Exception.Message)); set ARR_DOWNLOADS to another folder; nothing was set up" }
+	foreach ($d in @($libs.Values | ForEach-Object { $_.Folder }) + $downloads) {
+		if (-not (Test-Writable $d)) { throw "Arr can't save files in $d; check the folder's permissions or choose another, then run this again; nothing was set up" }
+	}
+	Say "Downloads: $downloads"
+
+	$downloadingOn = $env:ARR_SEARCH_ONLY -ne '1'
+	if ($downloadingOn -and -not (Confirm 'Let Arr download and import what you ask for?' 'y')) { $downloadingOn = $false }
+	$reporting = $env:ARR_ERROR_REPORTS -eq '1'
+	if (-not $env:ARR_ERROR_REPORTS) {
+		$reporting = Confirm 'Send error reports to help fix Arr? Names, folders, addresses and passwords are removed first, and nothing about your library is sent (docs/PRIVACY.md)' 'n'
+	}
+
+	Step "Writing $Config"
+	$secrets = Join-Path $StateDir 'secrets'
+	New-Item -ItemType Directory -Force $secrets | Out-Null
+	# A failed attempt's tokens are kept, as the setup page keeps them.
+	foreach ($name in 'api_token', 'mcp_token') {
+		if (-not (Test-Path (Join-Path $secrets $name))) { Write-Private (Join-Path $secrets $name) (New-Token) }
+	}
+	Write-Private (Join-Path $secrets 'plex_token') $token
+	$exec = if ($downloadingOn) { 'true' } else { 'false' }
+	$text = @"
+# Arr configuration, written by install.ps1. Secrets live in secrets/ (only you can open them).
+# More options: https://github.com/$Repo/blob/main/config/standalone.example.toml
+
+[server]
+listen = $(Toml-String "127.0.0.1:$Port")
+api_token_file = "secrets/api_token"
+
+[state]
+dir = "."
+
+[[indexer]]
+id = 1
+name = "The Pirate Bay"
+kind = "thepiratebay"
+base_url = "https://apibay.org/"
+recent_feed = true
+
+[[indexer]]
+id = 2
+name = "Knaben"
+kind = "knaben"
+base_url = "https://api.knaben.org/"
+
+[tvmaze]
+enabled = true
+
+[tmdb]
+enabled = false
+
+[execution]
+enabled = $exec
+download_cleanup = true
+
+# Still written so this config also works with the previous release (auto-update rollback),
+# which requires it when downloading is on. "coexistence" is the only mode.
+[migration]
+mode = "coexistence"
+
+[embedded]
+download_dir = $(Toml-String $downloads)
+listen = $(Toml-String "0.0.0.0:$TorrentPort")
+trackers = true
+dht = true
+max_active_downloads = 3
+"@
+	$text += "`n"
+	if ($UploadLimit -gt 0) { $text += "upload_limit_bytes_per_sec = $([long]$UploadLimit * 1024)`n" }
+	$text += "`n[library]`nffprobe = $(Toml-String $ffprobe)`n"
+	if ($libs['movie']) { $text += "movies = $(Toml-String $libs['movie'].Folder)`n" }
+	if ($libs['show']) { $text += "tv = $(Toml-String $libs['show'].Folder)`n" }
+	$text += "`n[plex]`nbase_url = $(Toml-String $plexUrl)`ntoken_file = `"secrets/plex_token`"`n"
+	if ($libs['movie']) { $text += "movie_section = $($libs['movie'].Section)`nmovies_path = $(Toml-String $libs['movie'].PlexPath)`n" }
+	if ($libs['show']) { $text += "tv_section = $($libs['show'].Section)`ntv_path = $(Toml-String $libs['show'].PlexPath)`n" }
+	$text += "`n# MCP for AI assistants on this machine (Claude Desktop, Claude Code, ...); see docs/MCP.md.`n[mcp]`nenabled = true`ntoken_file = `"secrets/mcp_token`"`n"
+	if ($reporting) { $text += "`n# Error reports with names, paths, addresses and tokens removed; see docs/PRIVACY.md.`n[reporting]`nenabled = true`n" }
+	# Under another name until it has passed its checks: config.toml means "Arr is set up".
+	$new = "$Config.new"
+	Write-Private $new ($text -replace "`r`n", "`n")
+	foreach ($cmd in 'setup', 'check') {
+		$out = Run-Arr $cmd --config $new
+		if ($LASTEXITCODE -ne 0) {
+			$out | ForEach-Object { Say $_ }
+			Remove-Item "$Config.failed" -Force -ErrorAction SilentlyContinue
+			Move-Item $new "$Config.failed"
+			throw "arr $cmd didn't accept the new config (see above), so Arr isn't set up yet. It is kept as $Config.failed; run this again to go through setup again."
+		}
+	}
+	Say 'Config checked'
+	# This config already has Knaben: note that it was offered, so taking it out sticks
+	# (arr set default-indexers never adds it back).
+	Write-Private (Join-Path $StateDir 'default-indexers') "knaben`n"
+	Move-Item $new $Config
+}
+
+# Plex's address, http://127.0.0.1:32400/ unless ARR_PLEX_URL (or $url) says otherwise, with
+# http:// added if it has no scheme and a / at the end, as the setup page writes it.
+function Get-PlexUrl($url) {
+	if (-not $url) { $url = $env:ARR_PLEX_URL }
+	if (-not "$url".Trim()) { $url = 'http://127.0.0.1:32400' }
+	$u = "$url".Trim()
+	if ($u -notmatch '^https?://') { $u = "http://$u" }
+	return $u.TrimEnd('/') + '/'
+}
+
+# Does Plex answer at $url? (Its identity needs no token.)
+function Test-Plex($url) {
+	try { $null = Invoke-WebRequest -UseBasicParsing "${url}identity" -TimeoutSec 5; return $true } catch { return $false }
+}
+
+# Plex Media Server on Windows keeps its settings, its sign-in token too, in the registry of
+# the account it runs as.
+function Find-PlexToken {
+	$p = Get-ItemProperty -LiteralPath 'HKCU:\Software\Plex, Inc.\Plex Media Server' -Name PlexOnlineToken -ErrorAction SilentlyContinue
+	if ($p) { return "$($p.PlexOnlineToken)".Trim() }
+	return ''
+}
+
+# Plex's libraries, one entry per folder: Type (movie, show, ...), Section (its number) and Path
+# (the folder as Plex sees it). Read as UTF-8 JSON (Windows PowerShell would otherwise guess
+# another encoding, and mangle folder names with accents).
+function Get-PlexLocations($url, $token) {
+	try {
+		$r = Invoke-WebRequest -UseBasicParsing "${url}library/sections" -Headers @{ 'X-Plex-Token' = $token; Accept = 'application/json' } -TimeoutSec 15
+	} catch {
+		throw "Plex at $url didn't accept the token, or didn't answer ($($_.Exception.Message)); check ARR_PLEX_TOKEN; nothing was set up"
+	}
+	$doc = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()) | ConvertFrom-Json
+	foreach ($d in @($doc.MediaContainer.Directory | Where-Object { $_ })) {
+		if ("$($d.key)" -notmatch '^\d{1,9}$') { continue }
+		foreach ($l in @($d.Location | Where-Object { $_ -and $_.path })) {
+			[pscustomobject]@{ Type = "$($d.type)"; Section = [int]"$($d.key)"; Path = "$($l.path)" }
+		}
+	}
+}
+
+# A folder as typed or pasted (Explorer's "Copy as path" adds quotes), without the separator
+# at its end, but never a bare drive (D:\).
+function Trim-Folder($p) {
+	$p = "$p".Trim().Trim('"').Trim()
+	$t = $p.TrimEnd([char]'\', [char]'/')
+	if (-not $t -or $t.EndsWith(':')) { return $p }
+	return $t
+}
+
+# Can Arr save files in $dir? (Tried with a file it then deletes.)
+function Test-Writable($dir) {
+	$probe = Join-Path $dir ('.arr-write-test-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+	try { [IO.File]::WriteAllText($probe, ''); Remove-Item -LiteralPath $probe -Force; return $true } catch { return $false }
+}
+
+# A TOML basic string holding $s.
+function Toml-String($s) { return '"' + ("$s" -replace '\\', '\\' -replace '"', '\"') + '"' }
 
 # Opens a page in the browser while someone is at the keyboard.
 function Open-Page($url) {

@@ -67,7 +67,10 @@ irm https://raw.githubusercontent.com/newtonharry/Arr/main/install.ps1 | iex
 
 It needs no administrator rights, except to start Arr when the computer starts (see
 [Starting when the computer starts](#starting-when-the-computer-starts)). It installs FFmpeg
-with `winget` if it's missing (it asks first), opens the same setup page, and starts Arr in the
+with `winget` if it's missing (it asks first), then asks how to set Arr up: press Enter for the
+same setup page in your web browser, or type P to answer a few questions in PowerShell instead
+(Plex's address and token, which it reads from Plex's settings when it can, your library folders,
+the download folder, and whether Arr may download). It starts Arr in the
 background whenever you log in, as Plex itself does on Windows, or at boot if you choose that.
 Arr lives in `%LOCALAPPDATA%\Programs\Arr`, its config and data
 in `%LOCALAPPDATA%\Arr` (only your account can open it), and its log in
@@ -181,7 +184,11 @@ These options change an existing install: `--tmdb-key`, `--plex-token`, `--plex-
 Windows, set `ARR_TMDB_KEY`, `ARR_UPLOAD_LIMIT_KIB`, `ARR_TORRENT_PORT`, `ARR_ERROR_REPORTS` or
 `ARR_AUTO_UPDATE` before the install line.
 
+On Windows, `ARR_SEARCH_ONLY=1` turns downloading off too.
+
 `--port`, `--movies`, `--tv`, `--downloads`, `--movie-section`, `--tv-section` and `--terminal`
+(on Windows `ARR_PORT`, `ARR_PLEX_URL`, `ARR_PLEX_TOKEN`, `ARR_MOVIES`, `ARR_TV`,
+`ARR_DOWNLOADS`, `ARR_MOVIE_SECTION`, `ARR_TV_SECTION`, `ARR_TERMINAL` and `ARR_BROWSER`)
 apply only to the first setup, as do the remote access values once remote access is set up. A
 re-run with a different value stops with an `error:` line (at a terminal it warns and carries
 on without it; on Windows it warns and ignores it).
@@ -323,6 +330,14 @@ Useful flags: `--movies DIR`, `--tv DIR`, `--downloads DIR`, `--plex-url URL`, `
 on later), `--install-only`, `--at-boot` / `--no-at-boot` (without a terminal the installer
 never asks for a password, so on a Mac `--at-boot` is what lets it use `sudo`: tell the user).
 `install.sh --help` lists them all.
+
+On Windows the same works with environment variables, as `irm | iex` can't take flags:
+`$env:ARR_YES = '1'` (add `$env:ARR_PLEX_TOKEN` if the error asks for it), then the install line.
+With `ARR_YES`, a first setup answers the questions in PowerShell on its own; if it can't find
+something (Plex, its token, a library folder) it stops before changing anything and names the
+variables to set: `ARR_PLEX_URL`, `ARR_PLEX_TOKEN`, `ARR_MOVIES`, `ARR_TV`, `ARR_DOWNLOADS`,
+`ARR_MOVIE_SECTION`, `ARR_TV_SECTION`, `ARR_SEARCH_ONLY`. The top of
+[`install.ps1`](install.ps1) lists them all.
 
 To confirm the install worked, the agent can run `arr check --config <state dir>/config.toml`;
 it prints JSON with `"config": "ok"`.

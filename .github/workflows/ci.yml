@@ -423,3 +423,117 @@ jobs:
             Get-Process ping -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             net user arrtest /delete | Out-Null
           }
+      # The setup here in PowerShell, the way an agent runs a first install (ARR_YES and the values
+      # it needs), against a stand-in for Plex: the config passes arr check, Arr starts and imports
+      # the (empty) libraries, and a re-run keeps it. Before that: the config lookup and other pure
+      # helpers; with nobody to answer and no Plex, a first install stops before installing anything
+      # and names ARR_PLEX_URL, also with input redirected and no ARR_YES (instead of opening a setup
+      # page nobody can answer); and a busy port stops a first install, naming ARR_PORT.
+      - name: Setup in PowerShell (first install without questions)
+        shell: powershell
+        run: |
+          function Fail($m) { "FAIL: $m"; exit 1 }
+          $text = Get-Content install.ps1 -Raw
+          $i = $text.IndexOf("`ntry {`n`tInstall-Arr")
+          if ($i -lt 0) { Fail 'cannot find the end of install.ps1' }
+          Invoke-Expression $text.Substring(0, $i) # its functions, without running the installer
+          $toml = "$env:RUNNER_TEMP\lookup.toml"
+          [IO.File]::WriteAllText($toml, "[embedded]`nlisten = `"0.0.0.0:50413`"`n`n[server] # the API`n  listen = `"127.0.0.1:8799`" # its port`n`n[execution]`n# downloading`nenabled = true`n`n[library]`nmovies = `"D:\\Media\\Movies`"`nother = 'C:\x'`n")
+          if ((Get-Conf $toml 'server' 'listen') -ne '127.0.0.1:8799') { Fail "server listen is $(Get-Conf $toml 'server' 'listen')" }
+          if ((Get-Conf $toml 'execution' 'enabled') -ne 'true') { Fail 'execution enabled, after a comment line' }
+          if ((Get-Conf $toml 'library' 'movies') -ne 'D:\Media\Movies') { Fail "library movies is $(Get-Conf $toml 'library' 'movies')" }
+          if ((Get-Conf $toml 'library' 'other') -ne 'C:\x') { Fail 'a literal string' }
+          if ($null -ne (Get-Conf $toml 'tmdb' 'enabled')) { Fail 'a missing section has a value' }
+          if ((Toml-String 'D:\a "b"') -ne '"D:\\a \"b\""') { Fail "Toml-String gives $(Toml-String 'D:\a "b"')" }
+          if ((Get-PlexUrl 'localhost:32400') -ne 'http://localhost:32400/') { Fail 'Get-PlexUrl without a scheme' }
+          if ((Get-PlexUrl 'http://localhost:32400//') -ne 'http://localhost:32400/') { Fail 'Get-PlexUrl with slashes' }
+          if ((Trim-Folder '"D:\Media\Movies\"') -ne 'D:\Media\Movies') { Fail 'Trim-Folder with quotes' }
+          if ((Trim-Folder 'D:\') -ne 'D:\') { Fail 'Trim-Folder on a drive' }
+
+          Start-Process python -ArgumentList '-m', 'http.server', '8994', '--bind', '127.0.0.1', '--directory', 'dist'
+          $media = "$env:RUNNER_TEMP\arr terminal media"
+          New-Item -ItemType Directory -Force "$media\Movies", "$media\TV Shows" | Out-Null
+          $plexLog = "$env:RUNNER_TEMP\fakeplex.log"
+          Start-Process python -ArgumentList 'tests\installer\fakeplex.py', '32497', 'ci-plex-token', "`"$media\Movies`"", "`"$media\TV Shows`"", "`"$plexLog`""
+          Start-Sleep -Seconds 3
+          $state = "$env:RUNNER_TEMP\arr terminal state"
+          $bin = "$env:RUNNER_TEMP\arr terminal bin"
+          $env:ARR_DOWNLOAD_BASE = 'http://127.0.0.1:8994'
+          $env:ARR_BIN_DIR = $bin; $env:ARR_STATE_DIR = $state
+          $env:ARR_AUTO_UPDATE = '0'; $env:ARR_INSTALL_STRICT = '1'
+
+          # Nobody to answer and no Plex: nothing is installed, and the error names the variable.
+          $env:ARR_YES = '1'; $env:ARR_PORT = '8791'; $env:ARR_PLEX_URL = 'http://127.0.0.1:32496'
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          "no Plex said: $msg"
+          if ($msg -notmatch 'ARR_PLEX_URL') { Fail 'a first install with ARR_YES and no Plex did not name ARR_PLEX_URL' }
+          if (Test-Path "$bin\arr.exe") { Fail 'it installed Arr before stopping' }
+
+          # The same with input redirected and no ARR_YES: no setup page that nobody can answer.
+          $env:ARR_YES = $null
+          $empty = "$env:RUNNER_TEMP\empty.txt"
+          Set-Content $empty ''
+          $p = Start-Process powershell.exe -PassThru -NoNewWindow -RedirectStandardInput $empty `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\redirected.out" -RedirectStandardError "$env:RUNNER_TEMP\redirected.err" `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"Get-Content '$pwd\install.ps1' -Raw | Invoke-Expression`""
+          if (-not $p.WaitForExit(180000)) { Stop-Process -Id $p.Id -Force; Fail 'a redirected first install kept waiting (for a setup page?)' }
+          $said = (Get-Content "$env:RUNNER_TEMP\redirected.out", "$env:RUNNER_TEMP\redirected.err" -ErrorAction SilentlyContinue) -join "`n"
+          "redirected said: $said"
+          if ($said -notmatch 'ARR_PLEX_URL') { Fail 'a redirected first install did not stop naming ARR_PLEX_URL' }
+          if ($said -match 'in your web browser') { Fail 'a redirected first install went to the setup page' }
+          if (Test-Path "$bin\arr.exe") { Fail 'the redirected first install installed Arr' }
+
+          # A busy port: refused before anything is installed, naming ARR_PORT.
+          $env:ARR_YES = '1'; $env:ARR_PLEX_URL = 'http://127.0.0.1:32497'; $env:ARR_PLEX_TOKEN = 'ci-plex-token'
+          $busy = New-Object Net.Sockets.TcpListener -ArgumentList ([Net.IPAddress]::Loopback), 8792
+          $busy.Start()
+          $env:ARR_PORT = '8792'
+          $msg = $null
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $msg = $_.Exception.Message }
+          $busy.Stop()
+          "busy port said: $msg"
+          if ($msg -notmatch 'ARR_PORT' -or $msg -notmatch '8792') { Fail 'a busy port was not refused naming ARR_PORT' }
+          if (Test-Path "$bin\arr.exe") { Fail 'it installed Arr before refusing the busy port' }
+
+          # The first install: every answer from the variables or found (the folders Plex names,
+          # the download folder next to the movies).
+          $env:ARR_PORT = '8791'
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          $config = Get-Content "$state\config.toml" -Raw
+          'config.toml:'; $config
+          function Esc($s) { $s.Replace('\', '\\') }
+          foreach ($want in 'listen = "127.0.0.1:8791"', 'base_url = "http://127.0.0.1:32497/"', 'token_file = "secrets/plex_token"',
+              'movie_section = 1', 'tv_section = 2', "movies = `"$(Esc "$media\Movies")`"", "tv = `"$(Esc "$media\TV Shows")`"",
+              "movies_path = `"$(Esc "$media\Movies")`"", "tv_path = `"$(Esc "$media\TV Shows")`"",
+              "download_dir = `"$(Esc "$media\arr-downloads")`"", 'mode = "coexistence"') {
+            if (-not $config.Contains($want)) { Fail "config lacks $want" }
+          }
+          if ($config -notmatch '(?m)^\[execution\]\r?\nenabled = true') { Fail 'downloading is not on' }
+          if ($config.Contains('ci-plex-token')) { Fail 'the Plex token is in the config' }
+          if ([IO.File]::ReadAllText("$state\secrets\plex_token") -ne 'ci-plex-token') { Fail 'the plex_token secret' }
+          if (-not (Test-Path "$media\arr-downloads" -PathType Container)) { Fail 'no download folder' }
+          if (-not (Test-Path "$state\default-indexers")) { Fail 'Knaben is not noted as offered' }
+          if (Test-Path "$state\config.toml.new") { Fail 'config.toml.new was left behind' }
+          & "$bin\arr.exe" check --config "$state\config.toml" | Out-Null
+          if ($LASTEXITCODE) { Fail 'arr check rejects the config' }
+          function Healthy { try { [bool](Invoke-RestMethod http://127.0.0.1:8791/api/v1/health -TimeoutSec 5) } catch { $false } }
+          if (-not (Healthy)) { Fail 'Arr does not answer on 8791' }
+          if ("$((Get-ScheduledTask -TaskName 'Arr').Principal.LogonType)" -eq 'S4U') { Fail 'Arr starts at boot, which nobody asked for' }
+          if (Get-ScheduledTask -TaskName 'Arr update' -ErrorAction SilentlyContinue) { Fail 'automatic updates are on' }
+          $asked = Get-Content $plexLog -Raw
+          foreach ($want in 'GET /library/sections/1/all', 'GET /library/sections/2/all') {
+            if (-not $asked.Contains($want)) { Fail "Arr never asked Plex for $want (no import)" }
+          }
+
+          # A re-run keeps the config, and says the setup values are only for a first setup.
+          $before = [IO.File]::ReadAllText("$state\config.toml")
+          $warned = Get-Content install.ps1 -Raw | Invoke-Expression 3>&1 | Out-String
+          if ($warned -notmatch 'apply only to a first setup') { Fail "a re-run did not say the setup values are ignored: $warned" }
+          if ([IO.File]::ReadAllText("$state\config.toml") -ne $before) { Fail 'a re-run changed the config' }
+          if (-not (Healthy)) { Fail 'Arr does not answer after the re-run' }
+          $env:ARR_REMOVE = 'arr'; $env:ARR_DELETE_DATA = '1'
+          Get-Content uninstall.ps1 -Raw | Invoke-Expression
+          if (Test-Path $state) { Fail 'the state folder is still there' }
+          if (-not (Test-Path "$media\Movies")) { Fail 'uninstalling removed the media folder' }
+          'setup in PowerShell: all checks passed'
