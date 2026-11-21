@@ -13,19 +13,24 @@
 #                        set up once with administrator rights (Windows shows a permission prompt,
 #                        or run this from an administrator PowerShell). Without a prompt and
 #                        without ARR_AT_BOOT=1, a re-run keeps whichever kind is installed.
-#   ARR_AUTO_UPDATE      1 to install new versions automatically, 0 to turn that off
+#   ARR_AUTO_UPDATE      1 to install new versions automatically, 0 to turn that off. Asked at a
+#                        PowerShell prompt if not given (default no); without a prompt it stays
+#                        off on a new install, and a re-run keeps it as it is.
 #   ARR_ERROR_REPORTS    1 to send error reports, 0 not to (docs/PRIVACY.md)
-#   ARR_TMDB_KEY         an optional backup TMDB key (movies come from Plex)
+#   ARR_TMDB_KEY         an optional backup TMDB key (movies come from Plex), checked before
+#                        anything changes
 #   ARR_UPLOAD_LIMIT_KIB upload limit for downloads in KiB/s (0 = no limit)
 #   ARR_TORRENT_PORT     the port downloads use (default 50413)
 #   ARR_PORT             Arr's port on this computer (default 8787; first setup only, and
-#                        with ARR_YES a re-run with a different port is refused)
+#                        with ARR_YES a re-run with a different port is refused). A first
+#                        setup stops before changing anything if another program uses it.
 #   ARR_STATE_DIR        Arr's folder: config, secrets, database (default: where Arr is
 #                        installed, else %LOCALAPPDATA%\Arr)
 #   ARR_BIN_DIR          where arr.exe goes (default: where it is, else %LOCALAPPDATA%\Programs\Arr)
 #   ARR_NO_SETUP         1 to install the program only
 #   ARR_YES              1 to never ask (FFmpeg is installed without asking); first setup
-#                        needs the setup page, so it needs someone at the browser
+#                        needs the setup page, so it needs someone at the browser and is
+#                        refused with ARR_YES or without a PowerShell prompt to type in
 #
 # Running this again keeps your settings and updates Arr; the options above that you give
 # are applied, the rest are kept.
@@ -77,6 +82,7 @@ function Install-Arr {
 	$script:Swapped = @()
 	$script:Snapshot = $null
 	$script:Healthy = $false # once Arr runs well again, nothing is undone
+	$script:BootFailure = $null # why Arr couldn't be set to start at boot in this run
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 	$Repo = 'newtonharry/Arr'
@@ -104,6 +110,7 @@ function Install-Arr {
 	$UploadLimit = if ($env:ARR_UPLOAD_LIMIT_KIB) { [int]$env:ARR_UPLOAD_LIMIT_KIB } else { 0 }
 	$AutoUpdate = $env:ARR_AUTO_UPDATE
 	$Yes = $env:ARR_YES -eq '1'
+	$firstInstall = $false
 	$Config = Join-Path $StateDir 'config.toml'
 	$Arr = Join-Path $BinDir 'arr.exe'
 	$Background = Join-Path $BinDir 'arr-background.exe'
@@ -141,15 +148,22 @@ function Install-Arr {
 	if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
 		Say 'This PC has an ARM processor; Arr runs through Windows 11''s x64 emulation.'
 	}
-	if ($Yes -and $env:ARR_NO_SETUP -ne '1' -and -not (Test-Path $Config)) {
-		throw 'Windows setup needs the setup page in a browser; run this without ARR_YES'
+	# The setup page needs a person, and so does a question asked here: ARR_YES, or input that
+	# isn't a PowerShell prompt, means nobody can answer it.
+	if (-not (Interactive) -and $env:ARR_NO_SETUP -ne '1' -and -not (Test-Path $Config)) {
+		throw 'Windows setup needs the setup page in a browser; run this in PowerShell without ARR_YES'
 	}
 	if ($StateDir -ne (Join-Path $env:LOCALAPPDATA 'Arr') -and -not $env:ARR_STATE_DIR) { Say "Found Arr installed in $StateDir" }
 	Assert-OwnTask
+	# A first setup needs Arr's port free: the setup page uses it, then Arr.
+	if ($env:ARR_NO_SETUP -ne '1' -and -not (Test-Path $Config) -and (Test-PortBusy $Port)) {
+		$who = if (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue) { ', maybe by the Arr already running from the "Arr" task (Stop-ScheduledTask Arr stops it)' } else { ' by another program' }
+		throw "port $Port on this computer is already in use$who. Choose another port for Arr, for example `$env:ARR_PORT = '8788', then run this again; nothing was changed"
+	}
 	# A re-run keeps Arr's port from its config.
 	if (Test-Path $Config) {
-		$m = Select-String -Path $Config -Pattern '^listen = "[^"]*:(\d+)"$' | Select-Object -First 1
-		if ($m) { $Port = [int]$m.Matches[0].Groups[1].Value }
+		$m = Get-Conf $Config 'server' 'listen'
+		if ($m -match ':(\d+)$') { $Port = [int]$Matches[1] }
 		if ($env:ARR_PORT -and [int]$env:ARR_PORT -ne $Port) {
 			if ($Yes) { throw "ARR_PORT is $env:ARR_PORT, but Arr uses port $Port from its config (change listen in $Config); nothing was changed" }
 			# Options left set in this window from an earlier run shouldn't stop this one.
@@ -222,7 +236,11 @@ function Install-Arr {
 			throw 'Arr needs FFmpeg. Install it, then run this again.'
 		}
 		& winget.exe install --id Gyan.FFmpeg --exact --silent --accept-package-agreements --accept-source-agreements
+		$wingetExit = $LASTEXITCODE
 		$ffprobe = Find-FFprobe
+		if (-not $ffprobe -and $wingetExit -ne 0) {
+			throw "winget couldn't install FFmpeg (exit code $wingetExit). Download it from https://www.gyan.dev/ffmpeg/builds/ (ffmpeg-release-essentials.zip), unzip it, add its bin folder to your PATH, then open a new PowerShell window and run this again."
+		}
 		if (-not $ffprobe) { throw 'FFmpeg was installed but ffprobe.exe was not found; open a new PowerShell window and run this again.' }
 	}
 	Say "Found $ffprobe"
@@ -298,26 +316,39 @@ function Install-Arr {
 		}
 		Remove-Item $beforeIndexers -Force -ErrorAction SilentlyContinue
 	} else {
-		Step 'Setting up Arr in your web browser'
-		if (Test-Path "$Config.failed") { Say "(config.toml.failed in $StateDir is the last setup attempt that failed; this starts over)" }
 		$firstInstall = $true
+		# A TMDB key given up front is checked before setup, so a key TMDB refuses stops here
+		# with nothing set up; it is saved once setup has worked.
+		$tmdbKey = $env:ARR_TMDB_KEY
+		if ($tmdbKey) {
+			$why = $tmdbKey.Trim() | Run-Arr tmdb-key --check
+			if ($LASTEXITCODE -ne 0) { throw "TMDB didn't accept ARR_TMDB_KEY: $(($why -join ' ') -replace '^Error: ', '') (see docs/TMDB.md); nothing was set up" }
+		}
+		Step 'Setting up Arr in your web browser'
+		if (Test-Path "$Config.failed") { Say "(The last setup attempt failed; what it chose is kept in $Config.failed. This setup starts from the beginning.)" }
 		$reports = @(if ($env:ARR_ERROR_REPORTS -eq '1') { '--error-reports' })
 		# Remote access given up front: the page can show its address (it's set up after this).
 		$wizardDomain = ($env:ARR_NGROK_DOMAIN -replace '^https?://', '' -replace '/.*$', '').ToLowerInvariant()
 		$publicArgs = @(if ($wizardDomain -match '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { '--public-url'; "https://$wizardDomain" })
 		& $Arr wizard --state-dir $StateDir --port $Port --torrent-port $TorrentPort `
 			--upload-limit-kib $UploadLimit --ffprobe $ffprobe --open @reports @publicArgs
-		if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Config)) { throw "setup wasn't finished; run this again to start over" }
+		if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Config)) {
+			$kept = if (Test-Path "$Config.failed") { " What the failed attempt chose is kept in $Config.failed." } else { '' }
+			throw "setup wasn't finished, so Arr isn't set up yet.$kept Run this again to go through setup again."
+		}
+		if ($tmdbKey) {
+			try { $tmdbKey.Trim() | Set-Arr tmdb-key }
+			catch { Write-Warning "$($_.Exception.Message); Arr carries on without the TMDB backup (run this again with ARR_TMDB_KEY to retry)" }
+		}
 	}
-	# The setup page asked about automatic updates (maybe on a run that stopped before here);
-	# the answer is used once, below.
+	# The setup page asked about automatic updates (maybe on a run that stopped before here).
+	# The file stays until the updater step below has acted on it.
 	$choices = Join-Path $StateDir 'setup-choices'
 	if (-not $AutoUpdate -and (Test-Path $choices)) {
 		$c = Select-String -Path $choices -Pattern '^auto_update=([01])$' | Select-Object -First 1
 		if ($c) { $AutoUpdate = $c.Matches[0].Groups[1].Value }
 	}
-	Remove-Item $choices -Force -ErrorAction SilentlyContinue
-	$downloading = (Get-Content $Config -Raw) -match '\[execution\]\r?\nenabled = true'
+	$downloading = (Get-Conf $Config 'execution' 'enabled') -eq 'true'
 
 	# ------------------------------------------------------------ phone and ChatGPT access
 
@@ -327,12 +358,16 @@ function Install-Arr {
 	if ($hasRemote -and $remoteValues) {
 		Write-Warning 'remote access is already set up, so the ARR_NGROK_*, ARR_GOOGLE_* and ARR_ALLOW_EMAILS values are ignored (docs/REMOTE.md says how to change it)'
 	}
-	if (-not $wantRemote -and -not $hasRemote -and (Interactive)) {
+	function Ask-Remote {
 		Say ''
 		Say 'Arr can also work from ChatGPT on your phone and other devices. That needs a free ngrok'
 		Say 'account and a Google sign-in app; this guide walks you through both (about 15 minutes).'
-		$wantRemote = Confirm 'Set that up now?' 'n'
+		return (Confirm 'Set that up now?' 'n')
 	}
+	# A re-run asks now: it restarts Arr anyway. On a first install the setup page is waiting for
+	# Arr to start, so the question comes once Arr is running (after "Starting Arr" below).
+	$offerRemote = -not $wantRemote -and -not $hasRemote -and (Interactive)
+	if ($offerRemote -and -not $firstInstall) { $wantRemote = Ask-Remote; $offerRemote = $false }
 	if ($wantRemote -and $hasRemote) {
 		Step 'Setting up access from ChatGPT on your phone and other devices'
 		Say 'Your config already has remote access; keeping it.'
@@ -342,7 +377,6 @@ function Install-Arr {
 
 	# ------------------------------------------------------------ run it
 
-	Step 'Starting Arr'
 	# A task that starts Arr when you log in (as Plex on Windows does), without a window.
 	$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 	$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -352,76 +386,106 @@ function Install-Arr {
 	# Starting when the computer does means the tasks run whether or not you're logged on
 	# (S4U, no password stored). Registering that takes an administrator, so only a run at a
 	# prompt, or ARR_AT_BOOT=1, does it; any other run keeps whichever kind is installed and
-	# leaves the tasks as they are.
+	# leaves the tasks as they are. Both questions here come before Arr starts: its tasks are
+	# then switched in one administrator step while it is stopped, so Arr starts once, the way
+	# it will keep starting, and isn't stopped again after the setup page has opened it.
 	$bootNow = Test-S4U 'Arr'
 	$atBoot = $env:ARR_AT_BOOT
 	if ($atBoot) { $wantBoot = $atBoot -eq '1' }
 	elseif ($bootNow) { $wantBoot = $true }
 	else { $wantBoot = (Interactive) -and (Confirm 'Start Arr when this computer starts, even before anyone logs in? It needs administrator rights once (Windows asks permission).' 'y') }
 	$canElevate = $atBoot -eq '1' -or (Interactive)
-	# Only now is Arr stopped: everything that could fail without it running is done.
-	Stop-Arr $Background
-	if (-not $bootNow) {
-		Register-ScheduledTask -TaskName 'Arr' -Description 'Arr media manager (installed by install.ps1)' -Force `
-			-Action (New-ScheduledTaskAction -Execute $Background -Argument "--config `"$Config`"") `
-			-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
-	}
-	# An administrator's task lets you start it (see Set-TaskMode); if Windows won't, it starts
-	# the task again by itself within a minute, so wait longer.
-	$started = if ($bootNow) { Start-ArrTask 'Arr' } else { Start-ScheduledTask -TaskName 'Arr'; $true }
-	$script:ArrStopped = $false
-	$wait = if ($started) { 30 } else { 150 }
-	$api = "http://127.0.0.1:$Port"
-	$log = Join-Path $StateDir 'arr.log'
-	if (-not (Wait-Healthy $api '' $wait)) {
-		if (-not $script:Swapped -and -not $script:Snapshot) { throw "Arr didn't start; see $log" }
-		$what = if ($script:Swapped) { 'the new version of Arr didn''t start, so the previous version and settings are back' }
-		else { 'Arr didn''t start with the new settings, so the previous ones are back' }
-		Stop-Arr $Background
-		Undo-Run
-		$started = if ($bootNow) { Start-ArrTask 'Arr' } else { Start-ScheduledTask -TaskName 'Arr'; $true }
-		$script:ArrStopped = $false
-		$back = if (Wait-Healthy $api '' $(if ($started) { 30 } else { 150 })) { 'and it is running' } else { 'but it didn''t start either' }
-		throw "$what, $back; see $log"
-	}
-	$script:Healthy = $true
-	if ($script:Snapshot) { Remove-Item -Recurse -Force $script:Snapshot -ErrorAction SilentlyContinue; $script:Snapshot = $null }
-
-	# A configured tunnel runs as its own log-on task next to Arr, without a window.
-	$PublicUrl = $null
-	$m = Select-String -Path $Config -Pattern '^public_url = "(https://[^"]+)"$' | Select-Object -First 1
-	if ($m -and (Test-Path $NgrokYml) -and (Select-String -Path $Config -Pattern '^\[mcp\.oauth\]' -Quiet)) {
-		$PublicUrl = $m.Matches[0].Groups[1].Value
-		# Also after an uninstall that kept Arr's data: the tunnel needs ngrok back.
-		$ngrok = Find-Ngrok $BinDir
-		if (-not $ngrok) { $ngrok = Install-Ngrok $BinDir }
-		Step "Starting the tunnel for $PublicUrl"
-		Stop-Tunnel $NgrokYml
-		$tunnelArgs = "--hidden `"$ngrok`" http 127.0.0.1:$Port `"--url=$PublicUrl`" --config `"$NgrokYml`" `"--log=$TunnelLog`" --log-level=warn"
-		# A tunnel task already set to start at boot stays as it is (re-registering it takes an administrator).
-		if (Test-S4U 'Arr tunnel') { $null = Start-ArrTask 'Arr tunnel' }
-		else {
-			Register-ScheduledTask -TaskName 'Arr tunnel' -Description 'Public HTTPS address for Arr, ngrok (installed by install.ps1)' -Force `
-				-Action (New-ScheduledTaskAction -Execute $Background -Argument $tunnelArgs) `
-				-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
-			Start-ScheduledTask -TaskName 'Arr tunnel'
-		}
-	} elseif (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) {
-		Step 'Removing the tunnel (remote access isn''t set up any more)'
-		Stop-Tunnel $NgrokYml
-		Unregister-ScheduledTask -TaskName 'Arr tunnel' -Confirm:$false
-	}
-
-	# ------------------------------------------------------------ automatic updates
-
+	# Automatic updates contact GitHub, so they are on only when asked for (PRODUCT.md).
 	$updateTask = Get-ScheduledTask -TaskName 'Arr update' -ErrorAction SilentlyContinue
 	if (-not $AutoUpdate) {
 		# Already on (its script may be gone, for example removed by antivirus): repaired below.
 		if ((Test-Path $Updater) -or $updateTask) { $AutoUpdate = '1' }
 		elseif (-not (Interactive)) { $AutoUpdate = '0' } # only ARR_AUTO_UPDATE=1 turns it on
-		elseif (Confirm 'Install new versions of Arr automatically (checked once a day)?' 'y') { $AutoUpdate = '1' }
+		elseif (Confirm 'Install new versions of Arr automatically (checked once a day)?' 'n') { $AutoUpdate = '1' }
 		else { $AutoUpdate = '0' }
 	}
+	$api = "http://127.0.0.1:$Port"
+	$log = Join-Path $StateDir 'arr.log'
+
+	# The public address, when remote access is set up; ngrok comes back too after an uninstall
+	# that kept Arr's data. Returns the address and ngrok's path, or two $nulls.
+	function Find-Tunnel {
+		$m = Select-String -Path $Config -Pattern '^public_url = "(https://[^"]+)"$' | Select-Object -First 1
+		if (-not ($m -and (Test-Path $NgrokYml) -and (Select-String -Path $Config -Pattern '^\[mcp\.oauth\]' -Quiet))) { return $null, $null }
+		$n = Find-Ngrok $BinDir
+		if (-not $n) { $n = Install-Ngrok $BinDir }
+		return $m.Matches[0].Groups[1].Value, $n
+	}
+	# A configured tunnel runs as its own log-on task next to Arr, without a window.
+	function Register-Tunnel {
+		if ($PublicUrl) {
+			Stop-Tunnel $NgrokYml
+			# A tunnel task already set to start at boot stays as it is (re-registering it takes an administrator).
+			if (-not (Test-S4U 'Arr tunnel')) {
+				$tunnelArgs = "--hidden `"$ngrok`" http 127.0.0.1:$Port `"--url=$PublicUrl`" --config `"$NgrokYml`" `"--log=$TunnelLog`" --log-level=warn"
+				Register-ScheduledTask -TaskName 'Arr tunnel' -Description 'Public HTTPS address for Arr, ngrok (installed by install.ps1)' -Force `
+					-Action (New-ScheduledTaskAction -Execute $Background -Argument $tunnelArgs) `
+					-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
+			}
+		} elseif (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) {
+			Step 'Removing the tunnel (remote access isn''t set up any more)'
+			Stop-Tunnel $NgrokYml
+			Unregister-ScheduledTask -TaskName 'Arr tunnel' -Confirm:$false
+		}
+	}
+	# Switches Arr's tasks to the kind chosen, while Arr is stopped. Returns $true when they were
+	# just switched to start at boot; why that wasn't possible goes in $script:BootFailure.
+	function Switch-ArrTasks {
+		$arrTasks = @('Arr', 'Arr tunnel', 'Arr update' | Where-Object { Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue })
+		$logonTasks = @($arrTasks | Where-Object { -not (Test-S4U $_) })
+		$bootTasks = @($arrTasks | Where-Object { Test-S4U $_ })
+		if ($wantBoot -and $logonTasks) {
+			# Tried once per run: a refusal stands until the next run.
+			if ($script:BootFailure) { return $false }
+			if (-not $canElevate) {
+				Say 'Note: Arr''s new tasks start when you log in. To start them at boot, run this again at a PowerShell prompt (it needs administrator rights).'
+				return $false
+			}
+			Step 'Starting Arr when the computer starts'
+			Say 'Arr will start at boot and keep running when nobody is logged in. Windows gives it no network credentials then,'
+			Say 'so media on a network drive mapped to a letter (Z:) is not reachable until you log in: use a local drive.'
+			$why = Set-TaskMode $user $true
+			if ($why) {
+				# Nothing to undo if Windows never let the step run: the tasks start at log-on.
+				if ($why -like 'Start at boot needs an administrator account*') { Write-Warning $why }
+				else { Write-Warning "Arr still starts when you log in, not at boot: $why" }
+				$script:BootFailure = $why
+				return $false
+			}
+			if ($script:ElevatedNote) {
+				Write-Warning "Arr starts at boot, but $($script:ElevatedNote) Restarting Arr will end its process and Windows will start it again within a minute."
+			}
+			return $true
+		}
+		if (-not $wantBoot -and $bootTasks) {
+			if (-not $canElevate) {
+				Say 'Arr starts at boot, and taking that away needs administrator rights: run this again at a PowerShell prompt with $env:ARR_AT_BOOT = "0".'
+			} else {
+				Step 'Starting Arr when you log in'
+				$why = Set-TaskMode $user $false
+				if ($why) { Write-Warning "Arr keeps starting at boot: $why" }
+			}
+		}
+		return $false
+	}
+	# Starts Arr's task and waits for Arr to answer. A task an administrator registered to start
+	# at boot lets you start it (see Set-TaskMode); if Windows won't, it starts the task again by
+	# itself within a minute, so this waits longer.
+	function Start-ArrAndWait {
+		$boot = Test-S4U 'Arr'
+		$started = if ($boot) { Start-ArrTask 'Arr' } else { Start-ScheduledTask -TaskName 'Arr'; $true }
+		$script:ArrStopped = $false
+		$wait = if (-not $started) { 150 } elseif ($boot) { 60 } else { 30 }
+		return (Wait-Healthy $api '' $wait)
+	}
+
+	# Everything that can fail without Arr running comes first: ngrok, the updater, the tunnel task.
+	$PublicUrl, $ngrok = Find-Tunnel
 	if ($AutoUpdate -eq '1') {
 		Step 'Turning on automatic updates'
 		Write-Updater $Updater $Repo $Target $BinDir $StateDir $Port
@@ -442,69 +506,62 @@ function Install-Arr {
 		Unregister-ScheduledTask -TaskName 'Arr update' -Confirm:$false -ErrorAction SilentlyContinue
 		Remove-Item $Updater -Force -ErrorAction SilentlyContinue
 	}
+	# The setup page's answer has been acted on.
+	Remove-Item $choices -Force -ErrorAction SilentlyContinue
+	Register-Tunnel
 
-	# ------------------------------------------------------------ start at boot
+	Step 'Starting Arr'
+	# Only now is Arr stopped.
+	Stop-Arr $Background
+	if (-not $bootNow) {
+		Register-ScheduledTask -TaskName 'Arr' -Description 'Arr media manager (installed by install.ps1)' -Force `
+			-Action (New-ScheduledTaskAction -Execute $Background -Argument "--config `"$Config`"") `
+			-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $user) -Settings $settings -Principal $principal | Out-Null
+	}
+	$toBoot = Switch-ArrTasks
+	$up = Start-ArrAndWait
+	if (-not $up -and $toBoot) {
+		# The boot task can't run Arr (for example, Windows won't let this account log on as a
+		# batch job): back to starting at log-on.
+		$script:BootFailure = "Arr didn't start from the boot task; see $log"
+		Write-Warning "Arr starts when you log in, not at boot: $($script:BootFailure)"
+		Stop-Arr $Background
+		$null = Set-TaskMode $user $false
+		$up = Start-ArrAndWait
+	}
+	if (-not $up) {
+		if (-not $script:Swapped -and -not $script:Snapshot) { throw "Arr didn't start; see $log" }
+		$what = if ($script:Swapped) { 'the new version of Arr didn''t start, so the previous version and settings are back' }
+		else { 'Arr didn''t start with the new settings, so the previous ones are back' }
+		Stop-Arr $Background
+		Undo-Run
+		$back = if (Start-ArrAndWait) { 'and it is running' } else { 'but it didn''t start either' }
+		throw "$what, $back; see $log"
+	}
+	$script:Healthy = $true
+	if ($script:Snapshot) { Remove-Item -Recurse -Force $script:Snapshot -ErrorAction SilentlyContinue; $script:Snapshot = $null }
+	if ($PublicUrl) {
+		Step "Starting the tunnel for $PublicUrl"
+		$null = Start-ArrTask 'Arr tunnel'
+	}
 
-	# The tasks above are at log-on, unless they were already set to run at boot; now the
-	# administrator step switches all of Arr's tasks to the kind that was chosen.
-	$arrTasks = @('Arr', 'Arr tunnel', 'Arr update' | Where-Object { Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue })
-	$logonTasks = @($arrTasks | Where-Object { -not (Test-S4U $_) })
-	$bootTasks = @($arrTasks | Where-Object { Test-S4U $_ })
-	$bootFailure = $null
-	if ($wantBoot -and $logonTasks) {
-		if (-not $canElevate) {
-			Say 'Note: Arr''s new tasks start when you log in. To start them at boot, run this again at a PowerShell prompt (it needs administrator rights).'
-		} else {
-			Step 'Starting Arr when the computer starts'
-			Say 'Arr will start at boot and keep running when nobody is logged in. Windows gives it no network credentials then,'
-			Say 'so media on a network drive mapped to a letter (Z:) is not reachable until you log in: use a local drive.'
-			$why = Set-TaskMode $user $true
-			if ($why) {
-				# Nothing to undo if Windows never let the step run; Arr keeps running as it was.
-				if ($why -like 'Start at boot needs an administrator account*') { Write-Warning $why }
-				else { Write-Warning "Arr still starts when you log in, not at boot: $why" }
-				$bootFailure = $why
-			} else {
-				if ($script:ElevatedNote) {
-					Write-Warning "Arr starts at boot, but $($script:ElevatedNote) Restarting Arr will end its process and Windows will start it again within a minute."
-				}
-				# Arr and its tunnel restart under the new tasks: the ones running now were started at log-on.
-				Stop-Arr $Background
-				$started = Start-ArrTask 'Arr'
-				$script:ArrStopped = $false
-				if (Wait-Healthy $api '' $(if ($started) { 60 } else { 150 })) {
-					if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) {
-						Stop-Tunnel $NgrokYml
-						$null = Start-ArrTask 'Arr tunnel'
-					}
-				} else {
-					# The boot task can't run Arr (for example, Windows won't let this account log on
-					# as a batch job): back to starting at log-on, with Arr running.
-					$bootFailure = "Arr didn't start from the boot task; see $log"
-					Write-Warning "Arr starts when you log in, not at boot: $bootFailure"
-					$null = Set-TaskMode $user $false
-					Stop-Arr $Background
-					$null = Start-ArrTask 'Arr'
-					$script:ArrStopped = $false
-					if (-not (Wait-Healthy $api '' 150)) { throw "Arr didn't start after going back to log-on; see $log" }
-					if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) { Stop-Tunnel $NgrokYml; $null = Start-ArrTask 'Arr tunnel' }
-				}
-			}
+	# A first install offers remote access now that Arr runs. Saying yes changes Arr's config,
+	# so Arr restarts once, after it is set up.
+	if ($offerRemote -and (Ask-Remote)) {
+		$remoteOk = $true
+		try { Set-RemoteAccess }
+		catch {
+			$remoteOk = $false
+			Write-Warning "remote access wasn't set up: $($_.Exception.Message). Arr runs without it; to try again, run the install line again after `$env:ARR_REMOTE = '1'."
 		}
-	} elseif (-not $wantBoot -and $bootTasks) {
-		if (-not $canElevate) {
-			Say 'Arr starts at boot, and taking that away needs administrator rights: run this again at a PowerShell prompt with $env:ARR_AT_BOOT = "0".'
-		} else {
-			Step 'Starting Arr when you log in'
-			$why = Set-TaskMode $user $false
-			if ($why) { Write-Warning "Arr keeps starting at boot: $why" }
-			else {
-				Stop-Arr $Background
-				$null = Start-ArrTask 'Arr'
-				$script:ArrStopped = $false
-				if (-not (Wait-Healthy $api '' 60)) { throw "Arr didn't start after the change; see $log" }
-				if (Get-ScheduledTask -TaskName 'Arr tunnel' -ErrorAction SilentlyContinue) { Stop-Tunnel $NgrokYml; $null = Start-ArrTask 'Arr tunnel' }
-			}
+		if ($remoteOk) {
+			$PublicUrl, $ngrok = Find-Tunnel
+			Register-Tunnel
+			Step 'Restarting Arr with remote access'
+			Stop-Arr $Background
+			$null = Switch-ArrTasks
+			if (-not (Start-ArrAndWait)) { throw "Arr didn't start again after adding remote access; see $log" }
+			if ($PublicUrl) { $null = Start-ArrTask 'Arr tunnel' }
 		}
 	}
 
@@ -531,7 +588,7 @@ function Install-Arr {
 	}
 
 	# Asked for with ARR_AT_BOOT=1 and not possible: Arr runs (it starts at log-on), but a script must be told.
-	if ($bootFailure -and $atBoot -eq '1') { throw "Arr could not be set to start at boot, so it starts when you log in: $bootFailure" }
+	if ($script:BootFailure -and $atBoot -eq '1') { throw "Arr could not be set to start at boot, so it starts when you log in: $($script:BootFailure)" }
 
 	$mcp = @{ mcpServers = @{ arr = @{ command = $Arr; args = @('mcp', '--api-url', "$api/", '--token-file', (Join-Path $StateDir 'secrets\api_token')) } } } |
 		ConvertTo-Json -Depth 5
@@ -767,6 +824,47 @@ function Stop-Tunnel($ngrokYml) {
 function Test-S4U($name) {
 	$t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
 	return [bool]($t -and "$($t.Principal.LogonType)" -eq 'S4U')
+}
+
+# A value from a TOML file: KEY in [SECTION], strings unquoted, wherever the key sits in the
+# section ($null if it isn't there). Like install.sh's conf: enough for what installers write
+# (one key per line, simple strings), not a TOML parser.
+function Get-Conf($path, $section, $key) {
+	if (-not (Test-Path -LiteralPath $path)) { return $null }
+	$cur = $null
+	foreach ($line in [IO.File]::ReadAllLines($path)) {
+		$t = $line.Trim()
+		if ($t.StartsWith('[')) { $cur = ($t -replace '#.*$', '') -replace '\s', ''; continue }
+		if ($cur -ne "[$section]") { continue }
+		$eq = $t.IndexOf('=')
+		if ($eq -lt 1 -or $t.Substring(0, $eq).Trim() -ne $key) { continue }
+		$v = $t.Substring($eq + 1).Trim()
+		if ($v.StartsWith('"')) {
+			$out = New-Object Text.StringBuilder
+			for ($i = 1; $i -lt $v.Length; $i++) {
+				$c = $v[$i]
+				if ($c -eq [char]'\') { $i++; if ($i -lt $v.Length) { [void]$out.Append($v[$i]) } }
+				elseif ($c -eq [char]'"') { break }
+				else { [void]$out.Append($c) }
+			}
+			return $out.ToString()
+		}
+		if ($v.StartsWith("'")) { $r = $v.Substring(1); $j = $r.IndexOf("'"); if ($j -ge 0) { return $r.Substring(0, $j) } else { return $r } }
+		return ($v -replace '\s*(#.*)?$', '')
+	}
+	return $null
+}
+
+# Is something already listening on this computer's $port (so Arr can't)?
+function Test-PortBusy($port) {
+	$l = New-Object Net.Sockets.TcpListener -ArgumentList ([Net.IPAddress]::Loopback), ([int]$port)
+	$l.ExclusiveAddressUse = $true
+	try { $l.Start(); $l.Stop() } catch { return $true }
+	# A program listening on every address may still let the line above through.
+	$c = New-Object Net.Sockets.TcpClient
+	try { return [bool]($c.ConnectAsync('127.0.0.1', [int]$port).Wait(1000) -and $c.Connected) }
+	catch { return $false }
+	finally { $c.Close() }
 }
 
 function Test-Admin {
@@ -1238,11 +1336,6 @@ try {
 		Write-Host 'Putting back the previous version and settings.'
 		try { Undo-Run } catch { Write-Host "couldn't put them all back: $($_.Exception.Message)" -ForegroundColor Red }
 	}
-	# Arr was stopped to restart it on the new version, and that didn't happen: start it again.
-	if ($script:ArrStopped -and (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)) {
-		Write-Host 'Starting Arr again.'
-		try { Start-ScheduledTask -TaskName 'Arr' } catch {}
-	}
 	# Told to Arr's developer only if this install's config says so (docs/PRIVACY.md).
 	try { $bin, $state = Get-ArrDirs } catch { $bin, $state = 'none', 'none' }
 	if ((Test-Path (Join-Path $bin 'arr.exe')) -and (Test-Path (Join-Path $state 'config.toml'))) {
@@ -1255,4 +1348,12 @@ try {
 } finally {
 	# Ctrl-C at a prompt skips catch: put back what this run changed all the same.
 	if (-not $script:Healthy -and ($script:Swapped -or $script:Snapshot)) { try { Undo-Run } catch {} }
+	# Arr was stopped to restart it (on the new version, or with new settings) and this run
+	# ended before it started again: start it again. Every start clears ArrStopped, so an Arr
+	# this run already started is left alone.
+	if ($script:ArrStopped -and (Get-ScheduledTask -TaskName 'Arr' -ErrorAction SilentlyContinue)) {
+		$script:ArrStopped = $false
+		Write-Host 'Starting Arr again.'
+		try { Start-ScheduledTask -TaskName 'Arr' -ErrorAction Stop } catch {}
+	}
 }

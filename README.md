@@ -125,7 +125,9 @@ keeps running. Run the current installer again to start at boot.
 
 ### Updates
 
-The installer asks whether Arr should keep itself up to date. Say yes and Arr checks for a new
+The installer asks whether Arr should keep itself up to date (on Windows the answer defaults to
+no, as the setup page's box does; with nobody to ask, a new install stays without updates and a
+re-run keeps them as they are). Say yes and Arr checks for a new
 release once a day, at a random time overnight. When one appears, it downloads it, checks
 its SHA-256, swaps the binary and restarts. If the new version doesn't start within 30
 seconds, it puts the old one back. It only installs release builds from this repository, and
