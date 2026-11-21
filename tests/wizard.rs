@@ -892,18 +892,6 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
 
     let (s, v) = page.post("/api/plex/install", json!({})).await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    // Only Linux asks for a password before installing (unless the installer is already
-    // past that and reporting its own steps).
-    let first = if cfg!(target_os = "macos") {
-        "Starting the Plex installer"
-    } else {
-        "Waiting for your password"
-    };
-    let step = v["install"]["step"].as_str().unwrap_or_default();
-    assert!(
-        step == first || step == "Installing Plex Media Server",
-        "{v}"
-    );
     let mut install = Value::Null;
     for _ in 0..60 {
         let (_, v) = page.get("/api/state").await;

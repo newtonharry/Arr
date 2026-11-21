@@ -816,7 +816,7 @@ async fn install_plex(State(wiz): St) -> Response {
             return problem(StatusCode::CONFLICT, "Plex is already being installed");
         }
         inner.install = Install::Running {
-            step: first_install_step().into(),
+            step: first_install_step(std::env::consts::OS).into(),
         };
     }
     let w = wiz.clone();
@@ -839,8 +839,8 @@ async fn install_plex(State(wiz): St) -> Response {
 
 /// Shown until the installer reports its own steps. Only Linux asks for a password first:
 /// Windows asks for permission after the download, and macOS doesn't ask.
-fn first_install_step() -> &'static str {
-    match std::env::consts::OS {
+fn first_install_step(os: &str) -> &'static str {
+    match os {
         "windows" | "macos" => "Starting the Plex installer",
         _ => "Waiting for your password",
     }
@@ -1765,6 +1765,13 @@ mod tests {
             assert_eq!(trim_sep("D:\\Media\\"), "D:\\Media");
             assert_eq!(trim_sep("D:\\"), "D:\\");
         }
+    }
+
+    #[test]
+    fn only_linux_waits_for_a_password_before_installing_plex() {
+        assert_eq!(first_install_step("linux"), "Waiting for your password");
+        assert_eq!(first_install_step("windows"), "Starting the Plex installer");
+        assert_eq!(first_install_step("macos"), "Starting the Plex installer");
     }
 
     #[test]

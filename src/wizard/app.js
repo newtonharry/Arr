@@ -7,6 +7,8 @@ let filled = null;
 let linking = false;
 
 const GONE = "Arr's setup has stopped, so this page can't go on. Look at the terminal window to see why, or run the installer again.";
+// Requests in a row that nothing answered. Any answer, even an error, resets it.
+let unanswered = 0;
 
 async function call(method, path, body) {
   const opts = { method, headers: { "x-arr-setup": "1" } };
@@ -17,8 +19,10 @@ async function call(method, path, body) {
   let resp;
   try {
     resp = await fetch(path, opts);
+    unanswered = 0;
   } catch (_) {
     // Nothing answered: the installer, and this page's server with it, may have stopped.
+    unanswered++;
     const e = new Error(GONE);
     e.gone = true;
     throw e;
@@ -122,8 +126,11 @@ function renderServer(s) {
   // No Plex here (or it's being installed): offer to install it, where there's a way to.
   const busy = install === "running" || linking;
   const canOffer = s.can_install || !!s.install_command;
-  const installing = !s.plex && s.signed_in && (busy || install === "failed" ||
-    (canOffer && s.missing === "not_installed" && install !== "done"));
+  // A failed install counts only while the latest look still finds no Plex: one found since
+  // (linked to another account, say) shows its own way on.
+  const notInstalled = s.missing === "not_installed";
+  const installing = !s.plex && s.signed_in && (busy || (install === "failed" && notInstalled) ||
+    (canOffer && notInstalled && install !== "done"));
   $("install").hidden = !installing;
   if (installing) {
     $("missing").hidden = true;
@@ -182,10 +189,14 @@ function fillLibraries(plex) {
   for (const kind of ["movies", "tv"]) {
     const sel = $(`${kind}-lib`);
     const before = sel.options.length ? sel.value : null;
+    // Whether the list offered a library, and where the chosen one was, before this refill.
+    const offered = [...sel.options].some((o) => o.value);
+    const where = sel.selectedOptions.length ? sel.selectedOptions[0].dataset.where : undefined;
     sel.replaceChildren();
     for (const lib of plex[kind]) {
       const o = document.createElement("option");
       o.value = lib.id;
+      o.dataset.where = JSON.stringify([lib.plex_path, lib.local_path]);
       o.textContent = plex[kind].filter((l) => l.title === lib.title).length > 1
         ? `${lib.title} (${lib.plex_path})` : lib.title;
       sel.append(o);
@@ -194,9 +205,13 @@ function fillLibraries(plex) {
     skip.value = "";
     skip.textContent = kind === "movies" ? "Don't add movies" : "Don't add TV shows";
     sel.append(skip);
-    // Keep what was chosen (and its folder) while it's still in the list.
-    if (before !== null && [...sel.options].some((o) => o.value === before)) sel.value = before;
-    else libraryChanged(kind);
+    // Keep what was chosen (and its folder) while it's still in the list where it was. A
+    // library moved in Plex gets its new folder; "Don't add" stays only if it was chosen over
+    // a library, so a library just created gets chosen.
+    const match = before === null ? null : [...sel.options].find((o) => o.value === before);
+    const keep = match && (before ? match.dataset.where === where : offered);
+    if (match && (before || offered)) sel.value = before;
+    if (!keep) libraryChanged(kind);
   }
 }
 
@@ -264,6 +279,10 @@ function suggestDownloads() {
   const dl = $("downloads");
   if (dl.dataset.edited) return;
   const folders = ["movies", "tv"].map((k) => $(`${k}-lib`).value && unquote($(`${k}-folder`).value)).filter(Boolean);
+  // Every library folder the page knows of, chosen or not: the download folder must neither
+  // be in one nor hold one.
+  const known = state && state.plex ? [...state.plex.movies, ...state.plex.tv] : [];
+  const libraries = folders.concat(known.map((l) => l.local_path).filter(Boolean));
   let suggestion = "";
   for (const f of folders) {
     const sep = /^([A-Za-z]:)?\\/.test(f) ? "\\" : "/";
@@ -273,7 +292,7 @@ function suggestDownloads() {
     const parent = trimmed.slice(0, cut);
     if (/^\\\\[^\\]*$/.test(parent) || parent === "\\") continue;
     const candidate = `${parent}${sep}arr-downloads`;
-    if (folders.some((lib) => inside(candidate, lib))) continue;
+    if (libraries.some((lib) => inside(candidate, lib) || inside(lib, candidate))) continue;
     suggestion = candidate;
     break;
   }
@@ -323,15 +342,13 @@ let pollId = 0;
 // installer has stopped (its window closed, say): the page says so and stops asking.
 function poll(step, ms) {
   const id = ++pollId;
-  let unanswered = 0;
   const tick = async () => {
     if (id !== pollId) return;
     let more = true;
     try {
       more = await step();
-      unanswered = 0;
     } catch (e) {
-      if (e.gone && ++unanswered >= 4) {
+      if (e.gone && unanswered >= 4) {
         showError(GONE);
         more = false;
       }
@@ -350,8 +367,9 @@ function startSigninPolling() {
       s = await call("POST", "/api/plex/check");
       showError("");
     } catch (e) {
-      // Nothing answering is counted by poll, and said after a few times.
-      if (!e.gone) showError(e.message);
+      // Nothing answered: poll says so after a few times, and asking again now won't help.
+      if (e.gone) throw e;
+      showError(e.message);
       s = await call("GET", "/api/state");
     }
     render(s);
@@ -401,8 +419,12 @@ $("switch-account").addEventListener("click", startSignin);
 // Reports start as soon as the box is ticked, so a problem later in setup is covered too.
 // An error already showing (a failed Finish, say) stays as it is.
 $("reporting").addEventListener("change", async (ev) => {
-  try { render(await call("POST", "/api/reporting", { enabled: ev.target.checked })); }
-  catch (e) { showError(e.message); }
+  try {
+    const r = (await call("POST", "/api/reporting", { enabled: ev.target.checked })).reporting;
+    if (state) state.reporting = r;
+    $("reporting-box").hidden = !r.available;
+    $("reporting").checked = r.enabled;
+  } catch (e) { showError(e.message); }
 });
 
 for (const id of ["look-again", "install-look", "libs-look"]) {
