@@ -185,7 +185,11 @@ function fillLibraries(plex) {
   for (const el of document.querySelectorAll(".library")) el.hidden = plex[el.dataset.kind].length === 0;
   $("step-options").hidden = none;
   $("apply").disabled = none;
-  if (none) return;
+  if (none) {
+    // Nothing to choose from: forget the old lists, so libraries made next start fresh.
+    for (const kind of ["movies", "tv"]) $(`${kind}-lib`).replaceChildren();
+    return;
+  }
   for (const kind of ["movies", "tv"]) {
     const sel = $(`${kind}-lib`);
     const before = sel.options.length ? sel.value : null;
@@ -213,6 +217,8 @@ function fillLibraries(plex) {
     if (match && (before || offered)) sel.value = before;
     if (!keep) libraryChanged(kind);
   }
+  // A library found just now may sit where the suggested download folder is.
+  suggestDownloads();
 }
 
 const DOWNLOADS_HINT = $("downloads-hint").textContent;
