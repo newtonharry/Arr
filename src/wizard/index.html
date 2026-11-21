@@ -42,15 +42,16 @@
         <button type="button" id="switch-account" hidden>Sign in with a different account</button>
       </div>
       <div id="install" hidden>
-        <p>Plex isn't on this computer yet. Plex is the free app that plays your movies and shows on your TV, phone and browser, and Arr can install it for you.</p>
+        <p id="install-intro">Arr couldn't find Plex running on this computer. If you already have Plex, open it, then click <strong>Look again</strong>. If not, Arr can install it for you. Plex is the free app that plays your movies and shows on your TV, phone and browser.</p>
         <div id="install-ask">
           <button type="button" id="install-btn" class="primary">Install Plex for me</button>
-          <p class="hint">Your computer will ask for your password, as it does when you install any app.</p>
+          <p class="hint" id="install-hint"></p>
         </div>
         <div id="install-manual" hidden>
-          <p>To install it, open a terminal, paste this line and press Enter, then come back and click <strong>Look again</strong>:</p>
+          <p>To install it yourself, open a terminal, paste this line and press Enter, then come back and click <strong>Look again</strong>:</p>
           <pre><code id="install-cmd"></code></pre>
         </div>
+        <p id="install-download" hidden>You can also <a href="https://www.plex.tv/media-server-downloads/" target="_blank" rel="noopener noreferrer">download Plex Media Server</a> and install it yourself, then click <strong>Look again</strong>.</p>
         <button type="button" id="install-look" hidden>Look again</button>
         <div id="install-progress" hidden>
           <div class="spinner" aria-hidden="true"></div>
@@ -73,14 +74,15 @@
         <p class="hint" id="tv-hint"></p>
       </div>
       <div id="new-libraries" hidden>
-        <p>Plex has no movie or TV library yet. Arr will create them in these folders:</p>
-        <label>Movies <input id="new-movies" autocomplete="off"></label>
-        <label>TV shows <input id="new-tv" autocomplete="off"></label>
-        <button type="button" id="create-libs" class="primary">Create my libraries</button>
-        <p class="hint">Or add them in Plex yourself, then click <strong>Look again</strong>.</p>
-        <button type="button" id="libs-look">Look again</button>
+        <p id="new-libraries-text"></p>
+        <label id="new-movies-box">Movies <input id="new-movies" autocomplete="off"></label>
+        <label id="new-tv-box">TV shows <input id="new-tv" autocomplete="off"></label>
+        <button type="button" id="create-libs" class="primary"></button>
       </div>
+      <p id="libs-docker" hidden></p>
       <p class="hint bad" id="libs-warning" hidden></p>
+      <p class="hint">If you add or change a library in Plex, click <strong>Look again</strong> to see it here.</p>
+      <button type="button" id="libs-look">Look again</button>
     </section>
 
     <section id="step-options" class="card" hidden>
@@ -88,8 +90,9 @@
       <label>Download folder <input id="downloads" autocomplete="off"></label>
       <p class="hint" id="downloads-hint">Downloads finish here, then move into your library. Keep it on the same drive as your library to save space.</p>
 
+      <h3>Updates</h3>
       <label class="check"><input type="checkbox" id="auto-update"> Install Arr updates automatically</label>
-      <p class="hint">Recommended. Arr checks once a day for a new version and installs it, and goes back to the old one if the new one doesn't start.</p>
+      <p class="hint">When this is on, Arr checks once a day for a new version and installs it. If the new version doesn't start, Arr goes back to the one before. When it's off, you get a new version by running the installer again.</p>
 
       <button type="submit" id="apply" class="primary big">Finish setup</button>
     </section>
@@ -103,10 +106,11 @@
 
   <section id="done" class="card" hidden>
     <h2>Your Arr app is ready</h2>
-    <p>Arr is set up and knows what's already in your Plex libraries. The installer is finishing up in the terminal, starting Arr in the background.</p>
+    <p>Arr is set up and knows what's already in your Plex libraries.</p>
+    <p><strong>Look at the terminal window.</strong> The installer may have one or two more questions for you there.</p>
     <div id="open-box">
       <button type="button" id="open-arr" class="primary" disabled>Open Arr</button>
-      <span id="open-status" class="muted" role="status">Starting Arr…</span>
+      <span id="open-status" class="muted" role="status">Waiting for Arr to start…</span>
     </div>
     <p id="open-elsewhere" class="hint" hidden>This page isn't on the computer that runs Arr, so open the address below there.</p>
     <h3>On this computer</h3>
@@ -117,7 +121,7 @@
       <p class="hint">Sign in with Google. Scan this with your phone's camera:</p>
       <div id="app-qr"></div>
     </div>
-    <p id="remote-no" class="hint">Arr works on this computer for now. To use it on your phone, run the installer again with remote access (<code>--remote</code>); <a href="https://github.com/newtonharry/Arr/blob/main/docs/REMOTE.md" target="_blank" rel="noopener noreferrer">how it works</a>.</p>
+    <p id="remote-no" class="hint">Arr works on this computer for now. To use it on your phone too, answer yes when the installer asks about it in the terminal. To set it up later, <span id="remote-how">run the installer again with</span> <code id="remote-cmd">--remote</code>. <a href="https://github.com/newtonharry/Arr/blob/main/docs/REMOTE.md" target="_blank" rel="noopener noreferrer">How it works</a>.</p>
     <p id="bookmark-hint" class="hint"></p>
     <p class="hint">You can close this tab when you've opened Arr.</p>
   </section>
