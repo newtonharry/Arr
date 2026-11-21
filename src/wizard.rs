@@ -189,10 +189,17 @@ pub async fn run(mut opts: Options) -> Result<()> {
     let http = upstream::http_client(PLEX_TIMEOUT);
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(opts.bind, opts.port))
         .await
-        .with_context(|| {
-            format!(
-                "can't listen on {}:{} (is Arr already running?)",
-                opts.bind, opts.port
+        .map_err(|e| {
+            // The installer's own setting, which is how a person chooses the port.
+            let choose = if cfg!(windows) {
+                "set $env:ARR_PORT = '8790' (or another number), then run the install line again"
+            } else {
+                "run the installer again with --port 8790 (or another number)"
+            };
+            anyhow::anyhow!(
+                "can't use port {port} on {} ({e}). Another program may be using it. To use another port, {choose}.",
+                opts.bind,
+                port = opts.port
             )
         })?;
     let wiz = Arc::new(Wizard {
@@ -449,6 +456,8 @@ fn snapshot(wiz: &Wizard) -> Value {
             "name": p.name,
             "movies": libs("movie"),
             "tv": libs("show"),
+            // Plex in Docker: the page can't create libraries there.
+            "docker": !p.mounts.is_empty(),
         })
     });
     json!({
@@ -459,6 +468,8 @@ fn snapshot(wiz: &Wizard) -> Value {
         "install": inner.install,
         "can_install": install_command(wiz).is_some(),
         "install_command": manual_install_command(wiz),
+        // The page words installing Plex, and remote access, for this computer's system.
+        "platform": std::env::consts::OS,
         "media_movies": crate::plexinstall::default_media().join("Movies"),
         "media_tv": crate::plexinstall::default_media().join("TV Shows"),
         "phase": inner.phase,
@@ -805,7 +816,7 @@ async fn install_plex(State(wiz): St) -> Response {
             return problem(StatusCode::CONFLICT, "Plex is already being installed");
         }
         inner.install = Install::Running {
-            step: "Waiting for your password".into(),
+            step: first_install_step(std::env::consts::OS).into(),
         };
     }
     let w = wiz.clone();
@@ -824,6 +835,15 @@ async fn install_plex(State(wiz): St) -> Response {
         };
     });
     Json(snapshot(&wiz)).into_response()
+}
+
+/// Shown until the installer reports its own steps. Only Linux asks for a password first:
+/// Windows asks for permission after the download, and macOS doesn't ask.
+fn first_install_step(os: &str) -> &'static str {
+    match os {
+        "windows" | "macos" => "Starting the Plex installer",
+        _ => "Waiting for your password",
+    }
 }
 
 fn set_install_step(wiz: &Wizard, step: &str) {
@@ -1745,6 +1765,13 @@ mod tests {
             assert_eq!(trim_sep("D:\\Media\\"), "D:\\Media");
             assert_eq!(trim_sep("D:\\"), "D:\\");
         }
+    }
+
+    #[test]
+    fn only_linux_waits_for_a_password_before_installing_plex() {
+        assert_eq!(first_install_step("linux"), "Waiting for your password");
+        assert_eq!(first_install_step("windows"), "Starting the Plex installer");
+        assert_eq!(first_install_step("macos"), "Starting the Plex installer");
     }
 
     #[test]
