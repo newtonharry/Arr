@@ -6,17 +6,39 @@ let state = null;
 let filled = null;
 let linking = false;
 
+const GONE = "Arr's setup has stopped, so this page can't go on. Look at the terminal window to see why, or run the installer again.";
+
 async function call(method, path, body) {
   const opts = { method, headers: { "x-arr-setup": "1" } };
   if (body !== undefined) {
     opts.headers["content-type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const resp = await fetch(path, opts);
+  let resp;
+  try {
+    resp = await fetch(path, opts);
+  } catch (_) {
+    // Nothing answered: the installer, and this page's server with it, may have stopped.
+    const e = new Error(GONE);
+    e.gone = true;
+    throw e;
+  }
   let data = null;
   try { data = await resp.json(); } catch (_) { /* not JSON */ }
   if (!resp.ok) throw new Error((data && data.error) || `Something went wrong (${resp.status})`);
   return data;
+}
+
+// Shows an error unless it's already showing, so a later render doesn't scroll to it again.
+function showErrorOnce(msg) {
+  if ($("error").textContent !== msg) showError(msg);
+}
+
+// One pair of quotes around a pasted path (Windows' "Copy as path" adds them) isn't part of it.
+function unquote(raw) {
+  const p = raw.trim();
+  const q = p[0];
+  return p.length >= 2 && (q === '"' || q === "'") && p[p.length - 1] === q ? p.slice(1, -1).trim() : p;
 }
 
 function showError(msg) {
@@ -43,7 +65,7 @@ function render(s) {
     return;
   }
   // The form is back, and Finish starts again where it stopped (the import resumes).
-  if (phase === "failed") showError(`${s.phase.message}\n\nClick Finish setup to try again.`);
+  if (phase === "failed") showErrorOnce(`${s.phase.message}\n\nClick Finish setup to try again.`);
 
   $("signin").hidden = s.signed_in;
   $("signed-in").hidden = !s.signed_in;
@@ -58,6 +80,7 @@ function render(s) {
   const noLibraries = ready && s.plex.movies.length === 0 && s.plex.tv.length === 0;
   $("step-libraries").hidden = !ready;
   $("step-options").hidden = !ready || noLibraries;
+  $("install-hint").textContent = INSTALL_HINT[s.platform] || INSTALL_HINT.linux;
   // Refilled when Plex's libraries change (added in Plex, then Look again).
   const lists = ready ? JSON.stringify([s.plex.movies, s.plex.tv]) : null;
   if (ready && lists !== filled) { fillLibraries(s.plex); filled = lists; }
@@ -65,9 +88,9 @@ function render(s) {
 
 const MISSING = {
   not_installed: [
-    "Arr couldn't find Plex on this computer. Arr puts movies and shows where Plex looks, so it has to run on the computer that runs Plex. ",
-    "Install Plex Media Server", "https://www.plex.tv/media-server-downloads/",
-    ", start it, then look again.",
+    "Arr couldn't find Plex running on this computer. Arr puts movies and shows where Plex looks, so it has to run on the computer that runs Plex. If you already have Plex, open it, then click Look again. If not, ",
+    "install Plex Media Server", "https://www.plex.tv/media-server-downloads/",
+    ", open it, then click Look again.",
   ],
   not_linked: [
     "Plex is on this computer, but it isn't linked to the Plex account you signed in with. ",
@@ -85,6 +108,13 @@ const MISSING = {
   ],
 };
 
+// What happens when Arr installs Plex, on the computer this page's server runs on.
+const INSTALL_HINT = {
+  linux: "Your computer will ask for your password, as it does when you install any app.",
+  windows: "Arr downloads Plex first. Then Windows asks if the Plex installer may make changes to this computer: click Yes.",
+  macos: "Arr downloads Plex and puts it in your Applications folder. It doesn't need your password.",
+};
+
 function renderServer(s) {
   $("connected").hidden = !s.plex;
   if (s.plex) $("connected").textContent = `Found ${s.plex.name} on this computer.`;
@@ -97,14 +127,18 @@ function renderServer(s) {
   $("install").hidden = !installing;
   if (installing) {
     $("missing").hidden = true;
+    const failed = install === "failed" && !busy;
+    $("install-intro").hidden = busy;
     $("install-progress").hidden = !busy;
     $("install-step").textContent = linking ? "Linking Plex to your account…" : (s.install.step || "");
     $("install-ask").hidden = busy || !s.can_install;
-    $("install-manual").hidden = busy || s.can_install;
+    // The line to paste is shown when the page can't install Plex, or couldn't.
+    $("install-manual").hidden = busy || !s.install_command || (s.can_install && !failed);
     $("install-cmd").textContent = s.install_command || "";
-    // After a failed install, Plex may be there anyway (or be installed by hand).
-    $("install-look").hidden = busy || (s.can_install && install !== "failed");
-    if (install === "failed" && !busy) showError(s.install.message);
+    $("install-download").hidden = !failed || !!s.install_command;
+    // Plex may be installed but not running, or be installed by hand: always look again.
+    $("install-look").hidden = busy;
+    if (failed) showErrorOnce(s.install.message);
     return;
   }
   // Signed in but not connected: always offer to look again, even when the last look
@@ -125,16 +159,26 @@ function renderServer(s) {
 
 function fillLibraries(plex) {
   const none = plex.movies.length === 0 && plex.tv.length === 0;
-  $("new-libraries").hidden = !none;
+  const noMovies = plex.movies.length === 0, noTv = plex.tv.length === 0;
+  // Arr can create the missing kind of library, except in a Plex that runs in Docker.
+  $("new-libraries").hidden = !(noMovies || noTv) || plex.docker;
+  $("libs-docker").hidden = !(noMovies || noTv) || !plex.docker;
+  const which = none ? "a Movies or TV Shows library" : noMovies ? "a Movies library" : "a TV Shows library";
+  $("libs-docker").textContent = `Plex runs in Docker on this computer, so Arr can't create libraries in it. Add ${which} in Plex, then click Look again.`;
+  $("new-libraries-text").textContent = none
+    ? "Plex has no movie or TV library yet. Arr will create them in these folders:"
+    : `Plex has no ${noMovies ? "movie" : "TV"} library yet. Arr can create one in this folder:`;
+  $("create-libs").textContent = none ? "Create my libraries"
+    : noMovies ? "Create the Movies library" : "Create the TV Shows library";
+  $("new-movies-box").hidden = !noMovies;
+  $("new-tv-box").hidden = !noTv;
+  if (!$("new-movies").value) $("new-movies").value = state.media_movies;
+  if (!$("new-tv").value) $("new-tv").value = state.media_tv;
   $("libraries-intro").hidden = none;
-  for (const el of document.querySelectorAll(".library")) el.hidden = none;
+  for (const el of document.querySelectorAll(".library")) el.hidden = plex[el.dataset.kind].length === 0;
   $("step-options").hidden = none;
   $("apply").disabled = none;
-  if (none) {
-    if (!$("new-movies").value) $("new-movies").value = state.media_movies;
-    if (!$("new-tv").value) $("new-tv").value = state.media_tv;
-    return;
-  }
+  if (none) return;
   for (const kind of ["movies", "tv"]) {
     const sel = $(`${kind}-lib`);
     const before = sel.options.length ? sel.value : null;
@@ -156,48 +200,103 @@ function fillLibraries(plex) {
   }
 }
 
+const DOWNLOADS_HINT = $("downloads-hint").textContent;
+
 for (const kind of ["movies", "tv"]) {
   $(`${kind}-lib`).addEventListener("change", () => libraryChanged(kind));
-  $(`${kind}-folder`).addEventListener("change", () => checkFolder(`${kind}-folder`, `${kind}-hint`, false));
+  $(`${kind}-folder`).addEventListener("change", () => {
+    checkFolder(`${kind}-folder`, `${kind}-hint`, false);
+    suggestDownloads();
+  });
 }
+// Once the person types in the download folder, Arr stops suggesting one.
+$("downloads").addEventListener("input", () => { $("downloads").dataset.edited = "1"; });
 $("downloads").addEventListener("change", () => checkFolder("downloads", "downloads-hint", true));
+for (const id of ["new-movies", "new-tv"]) {
+  $(id).addEventListener("change", () => { $(id).value = unquote($(id).value); });
+}
+
+function chosenLibrary(kind) {
+  return state.plex[kind].find((l) => l.id === $(`${kind}-lib`).value);
+}
+
+// What the hint under a library's folder says until the folder is checked.
+function libraryHint(lib) {
+  if (!lib) return "";
+  return lib.local_path
+    ? (lib.local_path === lib.plex_path ? "" : `Plex sees this folder as ${lib.plex_path}.`)
+    : `Plex keeps this library in ${lib.plex_path}. Enter where that folder is on this computer.`;
+}
 
 function libraryChanged(kind) {
-  const lib = state.plex[kind].find((l) => l.id === $(`${kind}-lib`).value);
+  const lib = chosenLibrary(kind);
   const folder = $(`${kind}-folder`);
   const hint = $(`${kind}-hint`);
   folder.closest(".folder").hidden = !lib;
-  hint.textContent = "";
+  hint.classList.remove("bad", "was-bad");
+  hint.textContent = libraryHint(lib);
   if (lib) {
     folder.value = lib.local_path || "";
-    hint.textContent = lib.local_path
-      ? (lib.local_path === lib.plex_path ? "" : `Plex sees this folder as ${lib.plex_path}.`)
-      : `Plex keeps this library in ${lib.plex_path}. Enter where that folder is on this computer.`;
     if (lib.local_path) checkFolder(`${kind}-folder`, `${kind}-hint`, false);
   }
   suggestDownloads();
 }
 
+// A path without its trailing separators, for comparing: "D:\Media\" -> "d:\media".
+function pathKey(p) {
+  const t = p.replace(/[\\/]+$/, "");
+  return /^([A-Za-z]:|\\\\)/.test(p) ? t.replace(/\//g, "\\").toLowerCase() : t;
+}
+
+// Whether `path` is `folder` or inside it. A root ("/", "D:\") holds everything on it.
+function inside(path, folder) {
+  const a = pathKey(path), b = pathKey(folder);
+  const sep = /^([A-Za-z]:|\\\\)/.test(folder) ? "\\" : "/";
+  return a === b || a.startsWith(b + sep);
+}
+
+// A download folder beside the first library folder that has room beside it:
+// /srv/media/Movies -> /srv/media/arr-downloads, D:\Media\Movies -> D:\Media\arr-downloads.
+// Never inside a library (one at D:\ has no folder beside it), and never beside a network
+// share (\\NAS\Movies), since \\NAS\arr-downloads isn't a folder. Until the person types
+// their own, it follows the library folders.
 function suggestDownloads() {
   const dl = $("downloads");
   if (dl.dataset.edited) return;
-  const first = ["movies", "tv"].map((k) => $(`${k}-lib`).value && $(`${k}-folder`).value).find(Boolean);
-  if (!first) return;
-  // Beside the library folder: /srv/media/Movies -> /srv/media/arr-downloads, and on
-  // Windows D:\Media\Movies -> D:\Media\arr-downloads.
-  const sep = /^([A-Za-z]:)?\\/.test(first) ? "\\" : "/";
-  const trimmed = first.replace(/[\\/]+$/, "");
-  const cut = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-  dl.value = `${cut >= 0 ? trimmed.slice(0, cut) : trimmed}${sep}arr-downloads`;
+  const folders = ["movies", "tv"].map((k) => $(`${k}-lib`).value && unquote($(`${k}-folder`).value)).filter(Boolean);
+  let suggestion = "";
+  for (const f of folders) {
+    const sep = /^([A-Za-z]:)?\\/.test(f) ? "\\" : "/";
+    const trimmed = f.replace(/[\\/]+$/, "");
+    const cut = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    if (cut < 0) continue;
+    const parent = trimmed.slice(0, cut);
+    if (/^\\\\[^\\]*$/.test(parent) || parent === "\\") continue;
+    const candidate = `${parent}${sep}arr-downloads`;
+    if (folders.some((lib) => inside(candidate, lib))) continue;
+    suggestion = candidate;
+    break;
+  }
+  if (suggestion === dl.value) return;
+  dl.value = suggestion;
+  checkFolder("downloads", "downloads-hint", true);
 }
 
 async function checkFolder(inputId, hintId, create) {
-  const path = $(inputId).value.trim();
-  if (inputId === "downloads") $(inputId).dataset.edited = "1";
-  if (!path) return;
+  const input = $(inputId), hint = $(hintId);
+  const path = unquote(input.value);
+  if (input.value !== path) input.value = path;
+  if (!path) {
+    // Nothing to check: the hint goes back to what it said before.
+    hint.classList.remove("bad", "was-bad");
+    hint.textContent = inputId === "downloads" ? DOWNLOADS_HINT
+      : libraryHint(chosenLibrary(inputId.replace("-folder", "")));
+    return;
+  }
   try {
     const r = await call("POST", "/api/folder", { path, create });
-    const hint = $(hintId);
+    // Changed while it was being checked: the newer check has the say.
+    if (unquote(input.value) !== path) return;
     hint.classList.toggle("bad", !r.ok);
     if (!r.ok) hint.textContent = r.message;
     else if (hint.classList.contains("was-bad") || !hint.textContent) hint.textContent = "✓ Arr can use this folder.";
@@ -220,13 +319,23 @@ async function act(button, fn) {
 let pollId = 0;
 
 // Calls step every `ms` until it returns false. Each call waits for the one before, and
-// starting another poll ends this one.
+// starting another poll ends this one. When nothing answers a few times in a row, the
+// installer has stopped (its window closed, say): the page says so and stops asking.
 function poll(step, ms) {
   const id = ++pollId;
+  let unanswered = 0;
   const tick = async () => {
     if (id !== pollId) return;
     let more = true;
-    try { more = await step(); } catch (_) { /* try again next time */ }
+    try {
+      more = await step();
+      unanswered = 0;
+    } catch (e) {
+      if (e.gone && ++unanswered >= 4) {
+        showError(GONE);
+        more = false;
+      }
+    }
     if (more !== false && id === pollId) setTimeout(tick, ms);
   };
   setTimeout(tick, ms);
@@ -241,7 +350,8 @@ function startSigninPolling() {
       s = await call("POST", "/api/plex/check");
       showError("");
     } catch (e) {
-      showError(e.message);
+      // Nothing answering is counted by poll, and said after a few times.
+      if (!e.gone) showError(e.message);
       s = await call("GET", "/api/state");
     }
     render(s);
@@ -257,8 +367,14 @@ function startProgressPolling() {
   }, 1000);
 }
 
+let signingIn = false;
+
 // A new sign-in starts over, so it can be with a different account.
 async function startSignin() {
+  // A second click while the first is under way would open a second tab.
+  if (signingIn) return;
+  signingIn = true;
+  $("signin-btn").disabled = $("switch-account").disabled = true;
   showError("");
   // Open the tab now, while the click still counts: browsers block pop-ups opened later.
   const tab = window.open("about:blank", "_blank");
@@ -273,6 +389,9 @@ async function startSignin() {
   } catch (e) {
     if (tab) tab.close();
     showError(e.message);
+  } finally {
+    signingIn = false;
+    $("signin-btn").disabled = $("switch-account").disabled = false;
   }
 }
 
@@ -280,8 +399,11 @@ $("signin-btn").addEventListener("click", startSignin);
 $("switch-account").addEventListener("click", startSignin);
 
 // Reports start as soon as the box is ticked, so a problem later in setup is covered too.
-$("reporting").addEventListener("change", (ev) =>
-  act(null, () => call("POST", "/api/reporting", { enabled: ev.target.checked })));
+// An error already showing (a failed Finish, say) stays as it is.
+$("reporting").addEventListener("change", async (ev) => {
+  try { render(await call("POST", "/api/reporting", { enabled: ev.target.checked })); }
+  catch (e) { showError(e.message); }
+});
 
 for (const id of ["look-again", "install-look", "libs-look"]) {
   $(id).addEventListener("click", (ev) => act(ev.target, () => call("POST", "/api/plex/check")));
@@ -311,8 +433,10 @@ async function linkPlex(s) {
   finally { linking = false; render(state); }
 }
 
+// Only the kinds Plex doesn't have yet (Arr never makes a second library of a kind).
 $("create-libs").addEventListener("click", async (ev) => {
-  const body = { movies: $("new-movies").value, tv: $("new-tv").value, language: navigator.language || "" };
+  const folder = (kind) => state.plex[kind].length ? null : unquote($(`new-${kind}`).value);
+  const body = { movies: folder("movies"), tv: folder("tv"), language: navigator.language || "" };
   await act(ev.target, () => call("POST", "/api/plex/libraries", body));
   const warnings = (state && state.warnings) || [];
   $("libs-warning").textContent = warnings.join(" ");
@@ -323,12 +447,12 @@ $("form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const lib = (kind) => {
     const id = $(`${kind}-lib`).value;
-    return id ? { id, folder: $(`${kind}-folder`).value.trim() } : null;
+    return id ? { id, folder: unquote($(`${kind}-folder`).value) } : null;
   };
   const body = {
     movies: lib("movies"),
     tv: lib("tv"),
-    downloads: $("downloads").value.trim(),
+    downloads: unquote($("downloads").value),
     auto_update: $("auto-update").checked,
     reporting: $("reporting").checked,
   };
@@ -343,6 +467,10 @@ call("GET", "/api/state").then((s) => {
   // Reloaded during or just after installing Plex: pick up where it was.
   if (s.install.state === "running") followInstall();
   else if (s.install.state === "done" && !s.plex && s.signed_in) linkPlex(s);
+  // Signed in but no Plex yet: look again now, so a Plex opened since is found on reload.
+  else if (s.signed_in && !s.plex && s.phase.state !== "working" && s.phase.state !== "done") {
+    act(null, () => call("POST", "/api/plex/check"));
+  }
   if (s.phase.state === "working") startProgressPolling();
 }).catch((e) => showError(e.message));
 
@@ -361,6 +489,11 @@ function showDone(s) {
   if (remote) {
     $("app-public").textContent = s.app.public_url;
     $("app-qr").replaceChildren(qrSvg(s.app.public_url));
+  }
+  // The Windows installer takes no options: it reads ARR_REMOTE instead.
+  if (s.platform === "windows") {
+    $("remote-how").textContent = "run the install line again after";
+    $("remote-cmd").textContent = "$env:ARR_REMOTE = '1'";
   }
   const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
   $("bookmark-hint").textContent = `Once Arr is open, bookmark it: press ${mac ? "⌘D" : "Ctrl+D"}. On a phone: Share → Add to Home Screen.`;
@@ -394,7 +527,7 @@ async function prepareOpen() {
       $("open-arr").disabled = false;
       return;
     }
-    if (Date.now() - started > 90000) status.textContent = "Arr is taking a while to start. The terminal says what it's doing.";
+    if (Date.now() - started > 90000) status.textContent = "Arr hasn't started yet. Look at the terminal window: the installer may be waiting for an answer.";
     setTimeout(look, 1000);
   };
   look();
@@ -409,11 +542,13 @@ $("open-arr").addEventListener("click", async () => {
   // Opened now, while the click still counts, so the browser doesn't block it.
   const tab = window.open("", "_blank");
   if (tab) { try { tab.opener = null; } catch (_) { /* fine */ } }
-  const token = new URL(appLink).searchParams.get("t");
+  const link = appLink;
+  const token = new URL(link).searchParams.get("t");
   appLink = null;
   button.disabled = true;
   status.textContent = "Signing in…";
   let ok = false;
+  let answered = false;
   try {
     const r = await fetch("/app/link", {
       method: "POST",
@@ -421,8 +556,9 @@ $("open-arr").addEventListener("click", async () => {
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ t: token }),
     });
+    answered = true;
     ok = r.type === "opaqueredirect" || r.status === 303;
-  } catch (_) { /* Arr isn't answering */ }
+  } catch (_) { /* Arr isn't answering: restarting, say */ }
   if (ok) {
     if (tab) tab.location.href = `${location.origin}/`;
     else window.open(`${location.origin}/`, "_blank");
@@ -430,13 +566,20 @@ $("open-arr").addEventListener("click", async () => {
     return;
   }
   if (tab) tab.close();
+  // Nothing answered, so the link wasn't used: keep it for the next click.
+  if (!answered) {
+    appLink = link;
+    status.textContent = "Arr didn't answer. Wait a moment, then click Open Arr again.";
+    button.disabled = false;
+    return;
+  }
   // Expired or already used: a new one, if this page can still ask for it.
   try {
     appLink = (await call("POST", "/api/app-link")).url;
     status.textContent = "That sign-in didn't work. Click Open Arr to try again.";
     button.disabled = false;
   } catch (_) {
-    status.textContent = `That sign-in link has expired. Open ${location.origin} and use the new link the installer printed in the terminal, or run "arr app-link" there.`;
+    status.textContent = `That sign-in link has expired. Look in the terminal window for the sign-in link the installer printed when it finished, and open it on this computer. Arr is at ${location.origin}.`;
   }
 });
 

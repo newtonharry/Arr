@@ -441,6 +441,10 @@ async fn browser_setup_signs_in_to_plex_writes_the_config_and_imports() {
     // The Plex on this computer is the account's own server, so Arr connects straight away.
     assert_eq!(v["plex"]["name"], "Living Room");
     assert_eq!(v["missing"], Value::Null);
+    // Not in Docker, so the page may offer to create libraries; and the page words installing
+    // Plex and remote access for this computer's system.
+    assert_eq!(v["plex"]["docker"], false, "{v}");
+    assert_eq!(v["platform"], std::env::consts::OS, "{v}");
     assert_eq!(
         v["plex"]["movies"],
         json!([{ "id": "1:0", "title": "Movies", "plex_path": movies, "local_path": movies }])
@@ -888,6 +892,18 @@ async fn a_computer_without_plex_gets_it_installed_linked_and_libraries_made() {
 
     let (s, v) = page.post("/api/plex/install", json!({})).await;
     assert_eq!(s, StatusCode::OK, "{v}");
+    // Only Linux asks for a password before installing (unless the installer is already
+    // past that and reporting its own steps).
+    let first = if cfg!(target_os = "macos") {
+        "Starting the Plex installer"
+    } else {
+        "Waiting for your password"
+    };
+    let step = v["install"]["step"].as_str().unwrap_or_default();
+    assert!(
+        step == first || step == "Installing Plex Media Server",
+        "{v}"
+    );
     let mut install = Value::Null;
     for _ in 0..60 {
         let (_, v) = page.get("/api/state").await;
@@ -981,6 +997,29 @@ async fn a_late_answer_for_an_earlier_signin_is_ignored() {
     let (_, v) = page.get("/api/state").await;
     assert_eq!(v["signed_in"], false, "{v}");
     assert_eq!(v["waiting_for_signin"], true, "{v}");
+}
+
+#[test]
+fn a_port_in_use_says_how_to_choose_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let out = std::process::Command::new(BIN)
+        .args(["wizard", "--no-docker", "--port", &port.to_string()])
+        .arg("--state-dir")
+        .arg(tmp.path().join("state"))
+        .arg("--ffprobe")
+        .arg(ffprobe())
+        .env("ARR_SENTRY_DSN", "http://key@127.0.0.1:9/1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(&format!("can't use port {port}")), "{err}");
+    // The installer's setting: a flag, or ARR_PORT on Windows, where it takes none.
+    let how = if cfg!(windows) { "ARR_PORT" } else { "--port" };
+    assert!(err.contains(how), "{err}");
+    assert!(!err.contains("already running?"), "{err}");
 }
 
 #[test]
