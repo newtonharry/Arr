@@ -42,6 +42,7 @@ ALLOW_EMAILS="${ARR_ALLOW_EMAILS:-}"
 AUTO_UPDATE="${ARR_AUTO_UPDATE:-}"
 ERROR_REPORTS="${ARR_ERROR_REPORTS:-}"
 AT_BOOT="${ARR_AT_BOOT:-}"
+BROWSER="${ARR_BROWSER:-}"
 SETUP=1
 FIRST_INSTALL=0
 TERMINAL=0
@@ -58,6 +59,8 @@ Running this again updates Arr and keeps your setup. Settings you leave out stay
 are; a setting you give is applied, or refused before anything changes.
 
   --yes                  answer every question with its default (no prompts)
+  --browser              set Arr up on a web page in your browser without being asked first
+                         (first setup only; the default when someone is at the terminal)
   --terminal             answer setup questions here instead of on a web page (first setup only)
   --install-only         install the binary and stop (no setup)
   --version vX.Y.Z       install a specific release (default: latest)
@@ -82,6 +85,7 @@ are; a setting you give is applied, or refused before anything changes.
                          lingering (sudo loginctl enable-linger). Asked at a terminal if not given.
   --no-at-boot           start Arr when you log in instead (it stays so until you run this again)
   --auto-update          install new releases automatically (a daily check); asked if not given
+                         (default no), and a re-run keeps automatic updates that are on
   --no-auto-update       don't, and turn automatic updates off if they were on
   --error-reports        send error reports, scrubbed of personal data (docs/PRIVACY.md);
                          asked in the terminal setup if not given (the web setup has a box)
@@ -107,6 +111,7 @@ while [ $# -gt 0 ]; do
 	--yes | -y) YES=1 ;;
 	--install-only) SETUP=0 ;;
 	--terminal) TERMINAL=1 ;;
+	--browser) BROWSER=1 ;;
 	--no-service) SERVICE=0 ;;
 	--at-boot) AT_BOOT=1 ;;
 	--no-at-boot) AT_BOOT=0 ;;
@@ -141,6 +146,11 @@ while [ $# -gt 0 ]; do
 	shift
 done
 case "$AT_BOOT" in "" | 0 | 1) ;; *) echo "ARR_AT_BOOT must be 1 or 0, not '$AT_BOOT'" >&2; exit 2 ;; esac
+# Anything else would be read as "off": ARR_AUTO_UPDATE=true would turn automatic updates off.
+case "$AUTO_UPDATE" in "" | 0 | 1) ;; *) echo "ARR_AUTO_UPDATE must be 1 or 0, not '$AUTO_UPDATE'" >&2; exit 2 ;; esac
+case "$ERROR_REPORTS" in "" | 0 | 1) ;; *) echo "ARR_ERROR_REPORTS must be 1 or 0, not '$ERROR_REPORTS'" >&2; exit 2 ;; esac
+case "$BROWSER" in "" | 0 | 1) ;; *) echo "ARR_BROWSER must be 1 or 0, not '$BROWSER'" >&2; exit 2 ;; esac
+[ "$BROWSER" != 1 ] || [ "$TERMINAL" != 1 ] || { echo "--browser and --terminal can't be used together" >&2; exit 2; }
 # Remote settings from environment variables turn remote setup on, as their flags do.
 [ -z "$NGROK_TOKEN$NGROK_DOMAIN$GOOGLE_ID$GOOGLE_SECRET$ALLOW_EMAILS" ] || REMOTE=1
 
@@ -171,9 +181,13 @@ ask() { # ask "Question" default -> answer
 ask_secret() { # ask_secret "Question" -> answer, not shown as it's typed
 	interactive || return 0
 	printf '%s: ' "$1" >/dev/tty
+	# This runs in $(...), so it tells the exit trap through a file that echo is off: Ctrl-C
+	# here must not leave the terminal hiding what's typed.
+	: >"$tmp/echo-off"
 	stty -echo </dev/tty 2>/dev/null || true
 	read -r a </dev/tty || a=""
 	stty echo </dev/tty 2>/dev/null || true
+	rm -f "$tmp/echo-off"
 	printf '\n' >/dev/tty
 	printf '%s' "$a"
 }
@@ -197,11 +211,7 @@ open_page() {
 			# The desktop session the setup page found, if it ran; otherwise find it now. Either
 			# way the browser gets the user's runtime folder and session bus, not just a display.
 			[ -n "${DESKTOP_ENV:-}" ] || desktop_env
-			if [ -z "${DESKTOP_ENV:-}" ]; then
-				[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
-				rt="/run/user/$(id -u "$SUDO_USER")"
-				DESKTOP_ENV="XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus${DISPLAY:+ DISPLAY=$DISPLAY}${WAYLAND_DISPLAY:+ WAYLAND_DISPLAY=$WAYLAND_DISPLAY}"
-			fi
+			[ -n "${DESKTOP_ENV:-}" ] || return 0
 			# shellcheck disable=SC2086 # NAME=value words without spaces
 			set -- sudo -u "$SUDO_USER" env $DESKTOP_ENV xdg-open "$url"
 		else
@@ -492,6 +502,7 @@ if [ "$SETUP" = 1 ] && [ -f "$CONFIG" ]; then
 	first_only --movie-section "$MOVIE_SECTION" plex movie_section
 	first_only --tv-section "$TV_SECTION" plex tv_section
 	[ "$TERMINAL" = 0 ] || reject "--terminal only applies to the first setup, and Arr is set up already"
+	[ "$BROWSER" != 1 ] || reject "--browser only applies to the first setup, and Arr is set up already"
 	# Settings for a part of Arr this install doesn't use (at a terminal: carry on without them).
 	if { [ -n "$PLEX_TOKEN" ] || { [ "$PLEX_URL_SET" = 1 ] && [ "$PLEX_URL" != "$(conf plex base_url)" ]; }; } &&
 		! grep -q '^\[plex\]' "$CONFIG"; then
@@ -505,6 +516,23 @@ if [ "$SETUP" = 1 ] && [ -f "$CONFIG" ]; then
 	if grep -q '^\[mcp\.oauth\]' "$CONFIG" && ! remote_same; then
 		reject "remote access is set up already; to change it, edit [mcp.oauth] in $CONFIG as docs/REMOTE.md explains, then run this again"
 	fi
+fi
+# Setup options given (flags, or their ARR_ variables). The setup page asks for these itself,
+# so they mean the terminal setup.
+setup_opts() {
+	o=""
+	[ "$PLEX_URL_SET" = 0 ] || o="$o, --plex-url"
+	[ -z "$PLEX_TOKEN" ] || o="$o, --plex-token"
+	[ -z "$MOVIES" ] || o="$o, --movies"
+	[ -z "$TV" ] || o="$o, --tv"
+	[ -z "$MOVIE_SECTION" ] || o="$o, --movie-section"
+	[ -z "$TV_SECTION" ] || o="$o, --tv-section"
+	[ -z "$DOWNLOADS" ] || o="$o, --downloads"
+	[ "$DOWNLOADING" = 1 ] || o="$o, --search-only"
+	printf '%s' "${o#, }"
+}
+if [ "$SETUP" = 1 ] && [ ! -f "$CONFIG" ] && [ "$BROWSER" = 1 ] && [ -n "$(setup_opts)" ]; then
+	die "--browser can't be used with $(setup_opts): the setup page asks for those itself. Leave them out, or use --terminal instead of --browser"
 fi
 
 VIA_API=0 GH_DEFAULT=0
@@ -523,7 +551,8 @@ tmp=$(mktemp -d)
 # Arr answers, UNDO_BIN and SNAP are cleared and this only removes the temp folder; the
 # script's exit status stays its own. A folder holding settings that couldn't be put back
 # stays. dash skips EXIT on a signal, so Ctrl-C or a dropped SSH session exits through it.
-trap 'rc=$?; trap "" INT TERM HUP; set +e; undo_bin; [ -n "$KEEP" ] || rm -rf "$tmp"; exit "$rc"' EXIT
+# Stopped at a hidden prompt (ask_secret), it turns the terminal's echo back on.
+trap 'rc=$?; trap "" INT TERM HUP; set +e; [ ! -f "$tmp/echo-off" ] || { stty echo </dev/tty; printf "\n" >/dev/tty; } 2>/dev/null; undo_bin; [ -n "$KEEP" ] || rm -rf "$tmp"; exit "$rc"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
@@ -587,6 +616,9 @@ fi
 # ---------------------------------------------------------------- ffprobe
 
 step "Checking for ffprobe (Arr uses it to check every download before import)"
+# Homebrew's folders may not be on this shell's PATH yet (a fresh Homebrew, or a shell that
+# never loaded its setup), and an FFmpeg already installed there counts.
+[ "$os" != Darwin ] || PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 if ! have ffprobe; then
 	sudo=""
 	# With --yes, sudo must fail instead of waiting for a password nobody will type.
@@ -620,10 +652,8 @@ if ! have ffprobe; then
 		die "install FFmpeg (it provides ffprobe), then run this again"
 	fi
 fi
-# Homebrew's folders may not be on this shell's PATH yet (a fresh Homebrew, or a shell that
-# never loaded its setup).
-[ "$os" != Darwin ] || PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
-FFPROBE=$(command -v ffprobe)
+FFPROBE=$(command -v ffprobe) ||
+	die "FFmpeg was installed, but ffprobe still isn't on this shell's PATH; open a new terminal and run this again"
 say "Found $FFPROBE"
 
 # ---------------------------------------------------------------- setup
@@ -642,9 +672,16 @@ fetch -o /dev/null "$PLEX_URL/identity" 2>/dev/null ||
 fetch -o /dev/null "$PLEX_URL/identity" || die "can't reach Plex at $PLEX_URL (use --plex-url)"
 say "Plex is at $PLEX_URL"
 
+# A running container named for Plex (or from a Plex image) that serves Plex's port, 32400,
+# published or exposed (host networking publishes nothing): not Tautulli, Overseerr or
+# another Plex helper.
 plex_container=""
 if have docker; then
-	plex_container=$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -i plex | grep -iv -e tautulli -e overseerr -e seerr | head -n1 | cut -d' ' -f1 || true)
+	docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -i plex >"$tmp/containers" || true
+	while read -r name _; do
+		ports=$(docker inspect -f '{{range $p, $v := .Config.ExposedPorts}}{{$p}} {{end}}{{range $p, $v := .HostConfig.PortBindings}}{{$p}} {{end}}' "$name" 2>/dev/null) || continue
+		case " $ports" in *" 32400/tcp "*) plex_container=$name; break ;; esac
+	done <"$tmp/containers"
 fi
 # Where Plex keeps its token, for the usual ways of installing it.
 prefs_candidates() {
@@ -672,7 +709,7 @@ fi
 if [ -z "$PLEX_TOKEN" ]; then
 	say "Arr needs your Plex token. In Plex Web, open any movie, choose ... > Get Info > View XML,"
 	say "and copy the value after X-Plex-Token= in the address bar."
-	PLEX_TOKEN=$(ask "Plex token" "")
+	PLEX_TOKEN=$(ask_secret "Plex token (it isn't shown as you type or paste it)")
 fi
 [ -n "$PLEX_TOKEN" ] || die "a Plex token is required (use --plex-token)"
 # Tokens go to curl through private header files, never on its command line (visible in ps).
@@ -765,6 +802,9 @@ if [ -z "$ERROR_REPORTS" ]; then
 fi
 
 step "Writing $CONFIG"
+# Private files from here to the end of configure; the umask goes back after, so the service
+# files and anything else written later get their usual modes.
+umask_was=$(umask)
 umask 077
 # init creates the folders and the API token; a previous failed run may have done so already.
 [ -f "$STATE_DIR/secrets/api_token" ] || "$ARR" init --state-dir "$STATE_DIR" --listen "127.0.0.1:$PORT" >/dev/null
@@ -861,6 +901,7 @@ say "Config checked"
 # This config already has Knaben: note that it was offered, so taking it out sticks
 # (arr set default-indexers never adds it back).
 printf 'knaben\n' >"$STATE_DIR/default-indexers"
+umask "$umask_was"
 }
 
 # The address this machine uses on its network.
@@ -873,21 +914,35 @@ lan_ip() {
 }
 
 # sudo usually drops the desktop's variables. Finds the sudo user's desktop session again,
-# so the setup page can open in their own browser.
+# so the setup page can open in their own browser. Under sudo -E they are still set: then the
+# ones that are set are passed on. Sets DESKTOP_ENV, NAME=value words for env.
 desktop_env() {
-	[ "$os" = Linux ] && [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && have loginctl || return 0
-	[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
-	sid=$(loginctl show-user "$SUDO_USER" -p Display --value 2>/dev/null) || return 0
-	[ -n "$sid" ] || return 0
+	[ "$os" = Linux ] && [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] || return 0
 	rt="/run/user/$(id -u "$SUDO_USER")"
-	case "$(loginctl show-session "$sid" -p Type --value 2>/dev/null)" in
-	wayland) WAYLAND_DISPLAY=$(ls "$rt" 2>/dev/null | grep -m1 '^wayland-[0-9]*$') || return 0 ;;
-	x11) DISPLAY=$(loginctl show-session "$sid" -p Display --value 2>/dev/null) || return 0 ;;
-	esac
-	[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
-	DESKTOP_ENV="XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus"
-	[ -z "${DISPLAY:-}" ] || DESKTOP_ENV="$DESKTOP_ENV DISPLAY=$DISPLAY"
-	[ -z "${WAYLAND_DISPLAY:-}" ] || DESKTOP_ENV="$DESKTOP_ENV WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+	de_rt=${XDG_RUNTIME_DIR:-$rt} de_bus=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$rt/bus} de_xa=${XAUTHORITY:-}
+	if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+		have loginctl || return 0
+		sid=$(loginctl show-user "$SUDO_USER" -p Display --value 2>/dev/null) || return 0
+		[ -n "$sid" ] || return 0
+		case "$(loginctl show-session "$sid" -p Type --value 2>/dev/null)" in
+		wayland) WAYLAND_DISPLAY=$(ls "$rt" 2>/dev/null | grep -m1 '^wayland-[0-9]*$') || return 0 ;;
+		x11) DISPLAY=$(loginctl show-session "$sid" -p Display --value 2>/dev/null) || return 0 ;;
+		esac
+		[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+		# Whatever of these sudo kept is root's, not the desktop's.
+		de_rt=$rt de_bus=unix:path=$rt/bus de_xa=""
+	fi
+	DESKTOP_ENV=""
+	de_add XDG_RUNTIME_DIR "$de_rt"
+	de_add DBUS_SESSION_BUS_ADDRESS "$de_bus"
+	de_add DISPLAY "${DISPLAY:-}"
+	de_add WAYLAND_DISPLAY "${WAYLAND_DISPLAY:-}"
+	de_add XAUTHORITY "$de_xa"
+}
+# de_add NAME VALUE: one more word for DESKTOP_ENV. It is split on spaces and globbed, so a
+# value with a space or a wildcard in it is left out.
+de_add() {
+	case "$2" in "" | *[[:space:]]* | *[*?[]*) ;; *) DESKTOP_ENV="$DESKTOP_ENV${DESKTOP_ENV:+ }$1=$2" ;; esac
 }
 
 # Setup on a web page: sign in to Plex, pick libraries and folders, import what Plex has.
@@ -907,8 +962,11 @@ browser_setup() {
 	fi
 	case "$bind" in "" | *%*) bind=$(lan_ip) ;; esac
 	[ -n "$bind" ] || bind=127.0.0.1
-	umask 077
-	mkdir -p "$STATE_DIR"
+	case "$bind" in 127.0.0.1 | *:*) ;; *) port_free "$bind" ;; esac
+	# The page refuses a state folder others can read, as Arr does: an existing one is made
+	# private too. Only the folder: the page's own files set their modes themselves.
+	(umask 077 && mkdir -p "$STATE_DIR")
+	chmod 700 "$STATE_DIR"
 	set -- "$ARR" wizard --state-dir "$STATE_DIR" --bind "$bind" --port "$PORT" \
 		--torrent-port "$TORRENT_PORT" --upload-limit-kib "$UPLOAD_LIMIT_KIB" --ffprobe "$FFPROBE"
 	[ "$bind" != 127.0.0.1 ] || set -- "$@" --open
@@ -922,17 +980,33 @@ browser_setup() {
 		set -- sudo -u "$RUN_AS" env $DESKTOP_ENV "$@"
 	fi
 	# The page writes config.toml only once setup has succeeded, so a run that stops here
-	# leaves nothing half-done.
-	"$@" </dev/null || die "setup wasn't finished, so nothing was saved; run this again to start over"
+	# leaves Arr not set up (an attempt that failed is kept as config.toml.failed).
+	if ! "$@" </dev/null; then
+		kept=""
+		[ ! -f "$CONFIG.failed" ] || kept=" (a failed attempt's settings are kept in $CONFIG.failed)"
+		die "setup wasn't finished, so Arr isn't set up yet$kept; run this again to start setup again"
+	fi
 	setup_choices
 }
 
-# The setup page's answer about automatic updates, used once (an option given wins).
+# The setup page's answer about automatic updates (an option given wins). The file stays
+# until the automatic updates step has acted on it, so a run that stops before then doesn't
+# lose the answer.
 setup_choices() {
 	if [ -z "$AUTO_UPDATE" ] && [ -f "$STATE_DIR/setup-choices" ]; then
 		AUTO_UPDATE=$(sed -n 's/^auto_update=\([01]\)$/\1/p' "$STATE_DIR/setup-choices")
 	fi
-	rm -f "$STATE_DIR/setup-choices"
+}
+
+# port_free ADDRESS: stops, naming --port, if something already answers on ADDRESS:$PORT
+# (curl's 7 is "couldn't connect"). Arr, or its setup page, couldn't listen there, and running
+# this again would fail the same way.
+port_free() {
+	rc=0
+	curl -s --noproxy '*' --max-time 3 -o /dev/null "http://$1:$PORT/" 2>/dev/null || rc=$?
+	[ "$rc" != 7 ] || return 0
+	alt=$((PORT + 1)); [ "$alt" -le 65535 ] || alt=8788
+	die "port $PORT on this computer is already in use (by another program, or an Arr installed somewhere else); run this again with --port and a free port, for example --port $alt"
 }
 
 # set_conf NAME [VALUE]: one setting through arr set, which checks it first and changes
@@ -1047,10 +1121,35 @@ if [ -f "$CONFIG" ]; then
 else
 	FIRST_INSTALL=1
 	[ ! -f "$CONFIG.failed" ] || say "Setting Arr up from the start ($CONFIG.failed holds the last attempt, which failed)."
-	if [ "$TERMINAL" != 1 ] && interactive && [ "$DOWNLOADING" = 1 ] && [ "$PLEX_URL_SET" = 0 ] &&
-		[ -z "$PLEX_TOKEN$MOVIES$TV$MOVIE_SECTION$TV_SECTION$DOWNLOADS$TMDB_KEY" ]; then
-		# Setup options on the command line (or --search-only) mean the terminal setup.
+	# Arr's setup page, or its page later, couldn't listen on a port something else has.
+	port_free 127.0.0.1
+	# The web page, unless the answer is already known: --browser or --terminal, nobody to ask
+	# (--yes, no terminal), or setup options on the command line, which mean the terminal setup.
+	# Over SSH the page opens on the computer you're typing on, as it always has.
+	opts=$(setup_opts)
+	if [ "$BROWSER" = 1 ]; then
+		HOW=browser
+	elif [ "$TERMINAL" = 1 ] || ! interactive; then
+		HOW=terminal
+	elif [ -n "$opts" ]; then
+		HOW=terminal
+		say "Setting Arr up here in the terminal, because setup options were given ($opts)."
+	elif [ -n "${SSH_CONNECTION:-}" ]; then
+		HOW=browser
+	else
+		HOW=""
+		while [ -z "$HOW" ]; do
+			case "$(ask "Set up Arr in your web browser, or here in the terminal? (b = browser, t = terminal)" b)" in
+			[Bb]*) HOW=browser ;;
+			[Tt]*) HOW=terminal ;;
+			*) say "Type b for the web browser or t for the terminal." ;;
+			esac
+		done
+	fi
+	if [ "$HOW" = browser ]; then
 		browser_setup
+		# A TMDB key isn't on the page: it's added now, as on a re-run.
+		[ -z "$TMDB_KEY" ] || set_secret tmdb-key "$TMDB_KEY"
 	else
 		configure
 	fi
@@ -1117,15 +1216,17 @@ remote_setup() {
 
 	NGROK=$(command -v ngrok || true)
 	[ -n "$NGROK" ] || install_ngrok
-	umask 077
 	# The authtoken stays in a private config file, never on a command line. web_addr: false
 	# turns off ngrok's local inspection API, which would otherwise let any local user read the
-	# sign-in tokens passing through the tunnel.
-	printf 'version: "3"\nagent:\n  authtoken: %s\n  web_addr: false\n' "$NGROK_TOKEN" >"$STATE_DIR/ngrok.yml"
+	# sign-in tokens passing through the tunnel. (The private umask is for these files only.)
+	(umask 077 && printf 'version: "3"\nagent:\n  authtoken: %s\n  web_addr: false\n' "$NGROK_TOKEN" >"$STATE_DIR/ngrok.yml") ||
+		die "couldn't write $STATE_DIR/ngrok.yml"
 	"$NGROK" config check --config "$STATE_DIR/ngrok.yml" >/dev/null || die "ngrok rejected its config"
-	printf '%s' "$GOOGLE_SECRET" >"$STATE_DIR/secrets/google_client_secret"
-	[ -f "$STATE_DIR/secrets/mcp_token" ] ||
-		od -An -N32 -tx1 /dev/urandom | tr -d ' \n' >"$STATE_DIR/secrets/mcp_token"
+	(
+		umask 077
+		printf '%s' "$GOOGLE_SECRET" >"$STATE_DIR/secrets/google_client_secret" &&
+			{ [ -f "$STATE_DIR/secrets/mcp_token" ] || od -An -N32 -tx1 /dev/urandom | tr -d ' \n' >"$STATE_DIR/secrets/mcp_token"; }
+	) || die "couldn't write Arr's secrets in $STATE_DIR/secrets"
 
 	# /mcp must accept the ngrok host; then add the sign-in section.
 	cp "$CONFIG" "$tmp/config.before-remote"
@@ -1159,34 +1260,34 @@ EOF
 	fi
 	say "Remote access configured for https://$NGROK_DOMAIN"
 }
-# Offered once, like on Windows, when nobody asked for it either way.
-if [ "$REMOTE" != 1 ] && ! grep -q '^\[mcp\.oauth\]' "$CONFIG" && interactive; then
-	say ""
-	say "Arr can also work from ChatGPT on your phone and other devices. That needs a free ngrok"
-	say "account and a Google sign-in app; this guide walks you through both (about 15 minutes)."
-	if confirm "Set that up now?" n; then REMOTE=1; fi
-fi
-if [ "$REMOTE" = 1 ]; then remote_setup; fi
-# Files written above as root (ngrok.yml, a secret) are the service user's too, with or
-# without a service.
-[ "$(id -u)" != 0 ] || [ "$RUN_AS" = root ] || chown -R "$RUN_AS" "$STATE_DIR"
-
-# A configured tunnel runs as its own service next to Arr, and needs the ngrok agent.
 PUBLIC_URL=""
 logs_tunnel="the arr-tunnel service's log"
 NGROK=${NGROK:-}
-if [ -f "$STATE_DIR/ngrok.yml" ] && grep -q '^\[mcp\.oauth\]' "$CONFIG"; then
-	PUBLIC_URL=$(sed -n 's/^public_url = "\(.*\)"$/\1/p' "$CONFIG" | head -n1)
-	[ -n "$NGROK" ] || NGROK=$(command -v ngrok || true)
-	[ -n "$NGROK" ] || [ ! -x "$BIN_DIR/ngrok" ] || NGROK="$BIN_DIR/ngrok"
-	[ -n "$NGROK" ] || install_ngrok
-fi
+remote_step() {
+	# Offered once, like on Windows, when nobody asked for it either way.
+	if [ "$REMOTE" != 1 ] && ! grep -q '^\[mcp\.oauth\]' "$CONFIG" && interactive; then
+		say ""
+		say "Arr can also work from ChatGPT on your phone and other devices. That needs a free ngrok"
+		say "account and a Google sign-in app; this guide walks you through both (about 15 minutes)."
+		if confirm "Set that up now?" n; then REMOTE=1; fi
+	fi
+	if [ "$REMOTE" = 1 ]; then remote_setup; fi
+	# Files written above as root (ngrok.yml, a secret) are the service user's too, with or
+	# without a service.
+	[ "$(id -u)" != 0 ] || [ "$RUN_AS" = root ] || chown -R "$RUN_AS" "$STATE_DIR"
+
+	# A configured tunnel runs as its own service next to Arr, and needs the ngrok agent.
+	if [ -f "$STATE_DIR/ngrok.yml" ] && grep -q '^\[mcp\.oauth\]' "$CONFIG"; then
+		PUBLIC_URL=$(sed -n 's/^public_url = "\(.*\)"$/\1/p' "$CONFIG" | head -n1)
+		[ -n "$NGROK" ] || NGROK=$(command -v ngrok || true)
+		[ -n "$NGROK" ] || [ ! -x "$BIN_DIR/ngrok" ] || NGROK="$BIN_DIR/ngrok"
+		[ -n "$NGROK" ] || install_ngrok
+	fi
+}
 
 # ---------------------------------------------------------------- run it
 
-step "Starting Arr"
 run_cmd="\"$ARR\" serve --config \"$CONFIG\""
-started=0
 # systemd quoting: escape \ and " and double %; arguments (not the program) also expand $.
 sd_exe() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')"; }
 sd() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g; s/\$/$$/g')"; }
@@ -1325,12 +1426,19 @@ boot_restart() {
 }
 # Once unloaded, a login item can't be kickstarted: a rollback loads it again instead.
 launchd_restart() { agent_stop "$L_ARR"; launchctl load "$LA_DIR/$L_ARR.plist"; }
-mac_service() {
-	ELEVATED=0
+# How Arr starts on a Mac (BOOT_NOW), asked at a terminal when nothing says. A first setup on
+# the web page starts Arr as a login item first (BOOT_CHOSEN set), and asks this after.
+BOOT_CHOSEN=""
+boot_choice() {
+	BOOT_CHOSEN=1
 	if [ -n "$AT_BOOT" ]; then BOOT_NOW=$AT_BOOT
 	elif [ "$CUR_BOOT" = 1 ]; then BOOT_NOW=1
 	elif interactive && confirm "Start Arr when this computer starts, even before anyone logs in? It needs your admin password once." y; then BOOT_NOW=1
 	else BOOT_NOW=0; fi
+}
+mac_service() {
+	ELEVATED=0
+	[ -n "$BOOT_CHOSEN" ] || boot_choice
 	if [ "$AT_BOOT" = 1 ] || interactive; then ELEV_OK=1; fi
 	D_ARR="$LD_DIR/$L_ARR.plist" D_TUN="$LD_DIR/$L_TUN.plist"
 
@@ -1414,7 +1522,19 @@ mac_service() {
 	fi
 }
 
-if [ "$SERVICE" = 1 ] && [ "$os" = Linux ] && have systemctl && [ -d /run/systemd/system ]; then
+# Will a background service start Arr? (Otherwise you start it yourself.)
+service_starts() {
+	[ "$SERVICE" = 1 ] && { [ "$os" = Darwin ] || { [ "$os" = Linux ] && have systemctl && [ -d /run/systemd/system ]; }; }
+}
+# start_arr TITLE: installs Arr's service (and its tunnel's) as the settings now are, (re)starts
+# Arr and waits for it to answer, or, with no service, says how to start it and ends the run.
+# A first setup on the web page runs this twice when an answer after the first start (remote
+# access, starting at boot on a Mac) changes the service. (Not indented, like configure: the
+# unit text below is written as it stands.)
+start_arr() {
+step "$1"
+started=0
+if service_starts && [ "$os" = Linux ]; then
 	unit="[Unit]
 Description=Arr media manager
 After=network-online.target
@@ -1453,9 +1573,12 @@ User=$RUN_AS"
 		logs_tunnel="journalctl --user -u arr-tunnel"
 	fi
 	mkdir -p "$sdir"
+	# Unit files are readable by everyone, as systemd's own are, whatever this shell's umask.
 	printf '%s\n[Install]\nWantedBy=%s\n' "$unit" "$wanted" >"$sdir/arr.service"
+	chmod 644 "$sdir/arr.service"
 	if [ -n "$PUBLIC_URL" ]; then
 		printf '%s\n[Install]\nWantedBy=%s\n' "$tunnel" "$wanted" >"$sdir/arr-tunnel.service"
+		chmod 644 "$sdir/arr-tunnel.service"
 	elif [ -f "$sdir/arr-tunnel.service" ]; then
 		# Remote access is gone from the config, so its tunnel goes too.
 		$sctl disable --now arr-tunnel >/dev/null 2>&1 || true
@@ -1473,8 +1596,9 @@ User=$RUN_AS"
 		fi
 	}
 	started=1
-	[ "$(id -u)" = 0 ] || enable_linger
-elif [ "$SERVICE" = 1 ] && [ "$os" = Darwin ]; then
+	# Once a run: a second start must not ask for the password again.
+	[ "$(id -u)" = 0 ] || [ "${LINGER_DONE:-0}" = 1 ] || { LINGER_DONE=1; enable_linger; }
+elif service_starts; then
 	logs="tail -f \"$STATE_DIR/arr.log\""
 	logs_tunnel="$STATE_DIR/tunnel.log"
 	mac_service
@@ -1486,19 +1610,13 @@ if [ "$started" != 1 ]; then
 	say "  $run_cmd"
 	[ -z "$PUBLIC_URL" ] ||
 		say "  \"$NGROK\" http 127.0.0.1:$PORT --url=$PUBLIC_URL --config \"$STATE_DIR/ngrok.yml\""
+	# Started already for the setup page: remote access was added to its config since.
+	[ "${HOW:-}" != browser ] || [ -z "$PUBLIC_URL" ] ||
+		say "If Arr is running already, stop it (Ctrl-C where it runs) and start it again, so it uses remote access."
 	exit 0
 fi
 
 # A new version that doesn't answer is swapped back for the one that did.
-API="http://127.0.0.1:$PORT"
-healthy() {
-	i=0
-	until fetch --max-time 3 -o /dev/null "$API/api/v1/health" 2>/dev/null; do
-		i=$((i + 1))
-		[ $i -lt 30 ] || return 1
-		sleep 1
-	done
-}
 if ! healthy; then
 	if [ "$UNDO_BIN" = 1 ]; then
 		undo_bin
@@ -1509,6 +1627,43 @@ if ! healthy; then
 fi
 UNDO_BIN=0 SNAP=""
 rm -rf "$tmp/snap"
+}
+API="http://127.0.0.1:$PORT"
+healthy() {
+	i=0
+	until fetch --max-time 3 -o /dev/null "$API/api/v1/health" 2>/dev/null; do
+		i=$((i + 1))
+		[ $i -lt 30 ] || return 1
+		sleep 1
+	done
+}
+
+if [ "${HOW:-}" = browser ] && service_starts; then
+	# The setup page is waiting for Arr ("Open Arr"): start it now, and ask the rest after.
+	# On a Mac it starts as a login item first; starting at boot is asked below.
+	[ "$os" != Darwin ] || [ "$CUR_BOOT" = 1 ] || { BOOT_NOW=0; BOOT_CHOSEN=1; }
+	start_arr "Starting Arr"
+	say "Arr is running: the setup page's \"Open Arr\" button works now."
+	again=0
+	remote_step
+	[ -z "$PUBLIC_URL" ] || again=1
+	if [ "$os" = Darwin ] && [ "$BOOT_NOW" = 0 ]; then
+		boot_choice
+		[ "$BOOT_NOW" = 0 ] || again=1
+	fi
+	[ "$again" = 0 ] || start_arr "Restarting Arr with these settings"
+else
+	if [ "${HOW:-}" = browser ]; then
+		# Nothing starts Arr in the background, so the setup page waits until you do.
+		say ""
+		say "No background service will be installed, so Arr doesn't start by itself; the setup page"
+		say "waits until it does. Start Arr in another terminal with:"
+		say "  $run_cmd"
+		say "and come back to this window for the last questions."
+	fi
+	remote_step
+	start_arr "Starting Arr"
+fi
 
 # ---------------------------------------------------------------- automatic updates
 
@@ -1530,7 +1685,8 @@ if [ -z "$AUTO_UPDATE" ]; then
 		# Updating needs your say-so: without a prompt (--yes, or no terminal), only
 		# --auto-update turns it on.
 		AUTO_UPDATE=0
-	elif confirm "Install new versions of Arr automatically (checked once a day)?" y; then
+	# Opt-in, like the setup page's box: anything that reaches out on its own is (PRODUCT.md).
+	elif confirm "Install new versions of Arr automatically (checked once a day)?" n; then
 		AUTO_UPDATE=1
 	else
 		AUTO_UPDATE=0
@@ -1770,6 +1926,7 @@ EOF
 			"$(sd "$UPDATER")" >"$udir/arr-update.service"
 		printf '[Unit]\nDescription=Check for Arr updates once a day\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=6h\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' \
 			>"$udir/arr-update.timer"
+		chmod 644 "$udir/arr-update.service" "$udir/arr-update.timer"
 		$sctl daemon-reload && $sctl enable --now arr-update.timer >/dev/null 2>&1 ||
 			die "couldn't start the update timer"
 		# "Update now" in the web app: Arr creates this file (it can't start the updater itself;
@@ -1777,6 +1934,7 @@ EOF
 		# updater when it appears.
 		printf '[Unit]\nDescription=Start the Arr update when the web app asks for it\n\n[Path]\nPathExists=%s/update-requested\nUnit=arr-update.service\n\n[Install]\nWantedBy=paths.target\n' \
 			"$(printf '%s' "$STATE_DIR" | sed 's/%/%%/g')" >"$udir/arr-update.path"
+		chmod 644 "$udir/arr-update.path"
 		if ! { $sctl daemon-reload && $sctl enable --now arr-update.path >/dev/null 2>&1; }; then
 			rm -f "$udir/arr-update.path"
 			$sctl daemon-reload || true
@@ -1831,6 +1989,8 @@ elif [ -f "$UPDATER" ] || [ -f "$udir/arr-update.timer" ] || [ -f "$uplist" ] ||
 	esac
 	rm -f "$UPDATER"
 fi
+# The setup page's answer has been acted on (setup_choices).
+rm -f "$STATE_DIR/setup-choices"
 
 # A config without Plex has nothing to import.
 if grep -q '^\[plex\]' "$CONFIG"; then
