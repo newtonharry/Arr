@@ -333,13 +333,18 @@ mod tests {
 
     #[test]
     fn prune_drops_expired_entries_and_keeps_live_ones() {
-        let c = TtlCache::new(Duration::from_secs(60), 8);
-        c.insert(1, "live");
-        // An entry that expired while nothing was inserted (`insert` would have dropped it).
+        let c = TtlCache::new(Duration::from_millis(1), 8);
+        // An entry that expires while nothing is inserted (`insert` would have dropped it).
         c.entries
             .lock()
             .unwrap()
-            .insert(2, (Instant::now() - Duration::from_secs(61), "expired"));
+            .insert(2, (Instant::now(), "expired"));
+        std::thread::sleep(Duration::from_millis(5));
+        // Stamped in the future, so it is live however long this thread is held up.
+        c.entries
+            .lock()
+            .unwrap()
+            .insert(1, (Instant::now() + Duration::from_secs(3600), "live"));
         assert_eq!(c.len(), 2);
         c.prune();
         assert_eq!(c.len(), 1);

@@ -146,16 +146,16 @@ pub async fn run(ffprobe: &Path, file: &Path, timeout: Duration) -> Result<Probe
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let cpu = timeout.as_secs() + 5;
-    // SAFETY: only async-signal-safe `setrlimit` calls between fork and exec.
     #[cfg(unix)]
-    unsafe {
-        cmd.pre_exec(move || {
+    {
+        let limit = move || {
             let set = |res, v: u64| {
                 let lim = libc::rlimit {
                     rlim_cur: v as libc::rlim_t,
                     rlim_max: v as libc::rlim_t,
                 };
-                if libc::setrlimit(res, &lim) != 0 {
+                // SAFETY: `lim` is a valid rlimit that outlives the call.
+                if unsafe { libc::setrlimit(res, &lim) } != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -166,7 +166,10 @@ pub async fn run(ffprobe: &Path, file: &Path, timeout: Duration) -> Result<Probe
             set(libc::RLIMIT_CORE, 0)?;
             set(libc::RLIMIT_NOFILE, 64)?;
             Ok(())
-        });
+        };
+        // SAFETY: the hook only makes async-signal-safe `setrlimit` calls between fork and
+        // exec, and allocates nothing.
+        unsafe { cmd.pre_exec(limit) };
     }
     // Windows: started suspended and without a console, put in its job, then let run, so
     // the limits hold from its first instruction.
@@ -258,14 +261,19 @@ mod job {
                 // SAFETY: a thread id from the snapshot; the handle is closed right away.
                 let h = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, te.th32ThreadID) };
                 if !h.is_null() {
-                    if unsafe { ResumeThread(h) } != u32::MAX {
+                    // SAFETY: `h` is a thread handle just opened with THREAD_SUSPEND_RESUME.
+                    let ok = unsafe { ResumeThread(h) } != u32::MAX;
+                    if ok {
                         resumed += 1;
                     }
+                    // SAFETY: `h` is open and owned here; it is closed once.
                     unsafe { CloseHandle(h) };
                 }
             }
+            // SAFETY: the same valid snapshot and entry as for Thread32First.
             more = unsafe { Thread32Next(snap, &mut te) } != 0;
         }
+        // SAFETY: the snapshot opened above, closed once.
         unsafe { CloseHandle(snap) };
         if resumed == 0 {
             return Err(std::io::Error::other("its thread couldn't be started"));
@@ -285,6 +293,7 @@ mod job {
 
     // SAFETY: a kernel handle, usable from any thread.
     unsafe impl Send for Job {}
+    // SAFETY: the handle is only ever closed (in Drop); nothing is mutated through `&Job`.
     unsafe impl Sync for Job {}
 
     /// Puts `child` in a new job: `cpu_secs` of CPU time, 2 GiB of memory, no child processes.

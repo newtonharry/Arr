@@ -220,10 +220,13 @@ pub fn app_link(cfg: &RuntimeConfig) -> Result<String> {
         Some(o) => o.public_url.clone(),
         None => {
             let ip = cfg.listen.ip();
-            let host = match ip {
-                ip if ip.is_loopback() || ip.is_unspecified() => "localhost".to_string(),
-                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-                ip => ip.to_string(),
+            let host = if ip.is_loopback() || ip.is_unspecified() {
+                "localhost".to_string()
+            } else {
+                match ip {
+                    std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                    std::net::IpAddr::V4(v4) => v4.to_string(),
+                }
             };
             format!("http://{host}:{}", cfg.listen.port())
         }

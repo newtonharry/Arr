@@ -133,6 +133,7 @@ pub fn file_id(path: &Path) -> std::io::Result<(u64, u64)> {
             .access_mode(0)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
+        // SAFETY: a plain C struct of integers, for which all-zero bytes are a valid value.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid open handle and a zeroed out-parameter of the right type.
         if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {

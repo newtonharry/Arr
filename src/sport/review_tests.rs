@@ -847,6 +847,56 @@ async fn the_gate_remembers_a_bounded_number_of_events_and_not_errors() {
 }
 
 #[tokio::test]
+async fn a_failed_search_keeps_the_last_answer_without_holding_off_the_next() {
+    let gate = CopiesGate::default();
+    // No cooldown, so `fresh` searches again; a plain request reuses an answer for an hour.
+    gate.set_limits(Duration::ZERO, Duration::from_secs(3600), 2);
+    let searches = AtomicUsize::new(0);
+    let id = "event:ufc:1";
+    let ok = || async {
+        searches.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, &str>(found(true))
+    };
+    assert!(matches!(
+        gate.serve(id, false, ok).await,
+        Ok(Served::Searched(_))
+    ));
+    let answered = Instant::now();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // A fresh search fails on our side (no backend).
+    let failing = || async { Err::<Searched, _>("no backend") };
+    assert!(gate.serve(id, true, failing).await.is_err());
+    let at_least = answered.elapsed();
+    // Both starts of this minute are spent: the last answer is served, with its real age
+    // (it used to be marked an hour old, which panics on Windows in the first hour after
+    // boot, and reported the wrong age everywhere).
+    match gate.serve(id, false, ok).await {
+        Ok(Served::Cached { age, .. }) => assert!(
+            age >= at_least && age < Duration::from_secs(60),
+            "{age:?} (at least {at_least:?})"
+        ),
+        _ => panic!("the last answer should be served while the limits turn requests away"),
+    }
+    // With room to search, the failure does not hold the event off, whatever the cooldown
+    // and the ttl: a plain request searches.
+    gate.set_limits(Duration::from_secs(3600), Duration::from_secs(3600), 100);
+    assert!(matches!(
+        gate.serve(id, false, ok).await,
+        Ok(Served::Searched(_))
+    ));
+    assert_eq!(searches.load(Ordering::SeqCst), 2);
+    // The same for a fresh request, which the cooldown (not the ttl) would hold off.
+    gate.set_limits(Duration::ZERO, Duration::from_secs(3600), 100);
+    assert!(gate.serve(id, true, failing).await.is_err());
+    gate.set_limits(Duration::from_secs(3600), Duration::from_secs(3600), 100);
+    assert!(matches!(
+        gate.serve(id, true, ok).await,
+        Ok(Served::Searched(_))
+    ));
+    assert_eq!(searches.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn prune_keeps_answers_and_events_in_their_cooldown() {
     let gate = CopiesGate::default();
     let searches = AtomicUsize::new(0);

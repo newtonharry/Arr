@@ -44,3 +44,10 @@ things. A capability that ships in the API or the web app ships in MCP in the sa
 - CI pins the Rust toolchain (see `.github/workflows`); run `cargo fmt`, `cargo clippy` and
   `cargo test` on it before asking for review. Windows is built in CI, so keep Unix-only code
   behind `cfg(unix)`.
+- Lints are set in `Cargo.toml` (`[lints.clippy]`), and CI runs
+  `cargo clippy --all-targets --locked -- -D warnings`, so any warning fails the build. Fix
+  what a lint finds. Where a lint is wrong for one spot, put
+  `#[expect(clippy::name, reason = "...")]` on that spot, never a bare `allow`. Code that
+  changes with a feature (`test-client` adds a `Client` variant) can't carry an `expect`
+  that holds both ways: write it so it is right either way (an `if let` instead of a `match`
+  ending in `_`).

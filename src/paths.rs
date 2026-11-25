@@ -198,6 +198,7 @@ pub fn overlap(a: &Path, b: &Path) -> Result<bool, String> {
 pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is a plain C struct, for which all-zero bytes are a valid value.
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid NUL-terminated path and a zeroed out-parameter of the right type.
     let rc = unsafe { libc::statvfs(c.as_ptr(), &mut s) };

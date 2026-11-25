@@ -347,13 +347,13 @@ async fn spawn_wizard(
     let mut cmd = tokio::process::Command::new(BIN);
     #[cfg(unix)]
     if let Some(mask) = umask {
-        // SAFETY: umask is async-signal-safe and only sets the child's mask.
-        unsafe {
-            cmd.pre_exec(move || {
-                libc::umask(mask as libc::mode_t);
-                Ok(())
-            });
-        }
+        let set_mask = move || {
+            // SAFETY: umask has no preconditions; it only sets this process's mask.
+            unsafe { libc::umask(mask as libc::mode_t) };
+            Ok(())
+        };
+        // SAFETY: the hook only calls umask, which is async-signal-safe.
+        unsafe { cmd.pre_exec(set_mask) };
     }
     #[cfg(not(unix))]
     let _ = umask;

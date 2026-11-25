@@ -47,16 +47,18 @@ impl Client {
     }
 
     pub fn embedded(&self) -> Option<&Embedded> {
-        match self {
-            Client::Embedded(e) => Some(e),
-            _ => None,
+        if let Client::Embedded(e) = self {
+            Some(e)
+        } else {
+            None
         }
     }
 
     pub fn qbit(&self) -> Option<&Qbit> {
-        match self {
-            Client::Qbit(q) => Some(q),
-            _ => None,
+        if let Client::Qbit(q) = self {
+            Some(q)
+        } else {
+            None
         }
     }
 
@@ -105,9 +107,10 @@ impl Client {
         hash: &str,
         sel: &crate::qbit::FileSelection,
     ) -> Result<Vec<crate::ids::MediaId>, UpstreamError> {
-        match self {
-            Client::Embedded(e) => e.settle_selection(hash, sel).await,
-            _ => Ok(vec![]),
+        if let Client::Embedded(e) = self {
+            e.settle_selection(hash, sel).await
+        } else {
+            Ok(vec![])
         }
     }
 
@@ -142,9 +145,10 @@ impl Client {
     /// qBittorrent's force start (past its queue). The embedded engine has no client-side
     /// queue: an unpaused torrent already runs.
     pub async fn set_force_start(&self, hash: &str) -> Result<(), UpstreamError> {
-        match self {
-            Client::Qbit(q) => q.set_force_start(hash).await,
-            _ => Ok(()),
+        if let Client::Qbit(q) = self {
+            q.set_force_start(hash).await
+        } else {
+            Ok(())
         }
     }
 

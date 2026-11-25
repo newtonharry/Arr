@@ -3732,6 +3732,10 @@ pub fn fold_failure(
 ) -> bool {
     if covered.iter().all(|t| shown.contains_key(t)) {
         let cards: HashSet<&String> = covered.iter().filter_map(|t| shown.get(t)).collect();
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "each card's count goes up once; the order is not observable"
+        )]
         for c in cards {
             *counts.entry(c.clone()).or_insert(1) += 1;
         }

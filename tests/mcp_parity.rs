@@ -271,7 +271,8 @@ fn paths_of(arg: &str) -> Vec<String> {
 /// cannot be read.
 fn web_calls_in(js: &str) -> Result<Vec<(String, String)>, String> {
     let mut out = vec![];
-    let method_re = regex::Regex::new(r#"method:\s*['"]([A-Z]+)['"]"#).unwrap();
+    let method_re =
+        regex::Regex::new(r#"method:\s*['"]([A-Z]+)['"]"#).map_err(|e| e.to_string())?;
     for (helper, prefix) in [
         ("api", "/app/api"),
         ("sportReq", "/app/api/v1/sport"),
@@ -328,7 +329,7 @@ fn web_calls_in(js: &str) -> Result<Vec<(String, String)>, String> {
     }
     // Every other way to reach the server would bypass the helpers above.
     let fetches = regex::Regex::new(r"\bfetch\s*\(")
-        .unwrap()
+        .map_err(|e| e.to_string())?
         .find_iter(js)
         .count();
     if fetches != 3 {

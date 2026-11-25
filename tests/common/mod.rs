@@ -757,7 +757,8 @@ async fn tmdb_details(
     if !tmdb_authorized(&headers, &q) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if let Some(v) = m.lock().unwrap().tmdb_movies.get(&id).cloned() {
+    let found = m.lock().unwrap().tmdb_movies.get(&id).cloned();
+    if let Some(v) = found {
         return axum::Json(v).into_response();
     }
     if id == "900001" {
