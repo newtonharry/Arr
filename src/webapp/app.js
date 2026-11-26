@@ -150,34 +150,20 @@ function remember(m, k, v, max) { m.delete(k); m.set(k, v); if (m.size > max) m.
 // A read that started before authentication ended (authGen) paints and stores nothing; one that
 // started before the last change (cacheGen) may still paint but stores nothing.
 let authGen = 0, cacheGen = 0, feedGen = 0, idlePolls = 0, lastFeedAt = 0;
-function bust() { cacheGen++; idlePolls = 0; lastFeedAt = 0; S.feedEtag = ''; S.ideasEtag = ''; SC.clear(); LC.clear(); TC.clear(); TE.clear(); driveC = null; dropFeed(); dropIdeas(); }
-// The last feed and ideas, kept in this browser for the person who saw them, so opening Arr paints
-// at once and revalidates with a bodiless 304 when nothing changed.
-const FEED_KEY = 'arr.feed', IDEAS_KEY = 'arr.ideas';
+function bust() { cacheGen++; idlePolls = 0; lastFeedAt = 0; S.feedEtag = ''; S.ideasEtag = ''; SC.clear(); LC.clear(); TC.clear(); TE.clear(); driveC = null; dropFeed(); }
+// The last feed, kept in this browser for the person who saw it, so opening Arr paints at once.
+const FEED_KEY = 'arr.feed';
 function saveFeed() {
   if (!S.me || !S.feed) return;
-  try { localStorage.setItem(FEED_KEY, JSON.stringify({ u: S.me.email || '', feed: S.feed, etag: S.feedEtag || '' })); } catch { /* storage blocked: next open starts empty */ }
+  try { localStorage.setItem(FEED_KEY, JSON.stringify({ u: S.me.email || '', feed: S.feed })); } catch { /* storage blocked: next open starts empty */ }
 }
 function dropFeed() { try { localStorage.removeItem(FEED_KEY); } catch { /* nothing kept */ } }
 function savedFeed() {
   try {
     const c = JSON.parse(localStorage.getItem(FEED_KEY) || 'null');
-    if (c && c.u === ((S.me && S.me.email) || '') && c.feed && typeof c.feed === 'object') return { feed: c.feed, etag: typeof c.etag === 'string' ? c.etag : '' };
+    if (c && c.u === ((S.me && S.me.email) || '') && c.feed && typeof c.feed === 'object') return c.feed;
     if (c) dropFeed(); // someone else's, or unreadable
   } catch { dropFeed(); }
-  return null;
-}
-function saveIdeas() {
-  if (!S.me || !S.ideas) return;
-  try { localStorage.setItem(IDEAS_KEY, JSON.stringify({ u: S.me.email || '', ideas: S.ideas, etag: S.ideasEtag || '' })); } catch { /* storage blocked */ }
-}
-function dropIdeas() { try { localStorage.removeItem(IDEAS_KEY); } catch { /* nothing kept */ } }
-function savedIdeas() {
-  try {
-    const c = JSON.parse(localStorage.getItem(IDEAS_KEY) || 'null');
-    if (c && c.u === ((S.me && S.me.email) || '') && c.ideas && typeof c.ideas === 'object') return { ideas: c.ideas, etag: typeof c.etag === 'string' ? c.etag : '' };
-    if (c) dropIdeas();
-  } catch { dropIdeas(); }
   return null;
 }
 let token = 0, pollT = 0, retryT = 0, feedP = null, ideasP = null, searchSeq = 0, searchAbort = null, debounceT = 0;
@@ -1186,12 +1172,12 @@ function loadFeed() {
 function loadIdeas() {
   if (S.ideas && Date.now() - S.ideasAt < 6e5) return Promise.resolve(S.ideas);
   return (ideasP ||= (async () => {
-    const ag = authGen, cg = cacheGen;
+    const ag = authGen;
     try {
       const r = await api('/v1/ideas', S.ideas && S.ideasEtag ? { etag: S.ideasEtag } : undefined);
       if (ag !== authGen) return S.ideas;
       if (r.notModified && S.ideas) { S.ideasAt = Date.now(); }
-      else if (r.ok && r.data) { S.ideas = r.data; S.ideasEtag = r.etag || ''; S.ideasAt = Date.now(); if (cg === cacheGen) saveIdeas(); }
+      else if (r.ok && r.data) { S.ideas = r.data; S.ideasEtag = r.etag || ''; S.ideasAt = Date.now(); }
     } catch { /* optional */ } finally { ideasP = null; }
     return S.ideas;
   })());
@@ -2348,7 +2334,7 @@ function movieBody() {
 
 // ---------- sign in ----------
 function showSignin(data) {
-  S.out = true; authGen++; token++; S.feedEtag = ''; S.ideasEtag = ''; dropFeed(); dropIdeas();
+  S.out = true; authGen++; token++; S.feedEtag = ''; S.ideasEtag = ''; dropFeed();
   clearTimeout(pollT); clearTimeout(retryT); clearTimeout(watchT); watchT = 0;
   setBanner(''); S.setup = false;
   document.title = 'Sign in · Arr';
@@ -2976,9 +2962,7 @@ async function boot() {
 // Signed in: show what was seen last time (only ever the same person's) while the feed is fetched.
 function start() {
   if (S.feed) saveFeed();
-  else if (onHome()) { const f = savedFeed(); if (f) { S.feed = f.feed; S.feedEtag = f.etag; S.cached = true; } }
-  if (S.ideas) saveIdeas();
-  else { const i = savedIdeas(); if (i) { S.ideas = i.ideas; S.ideasEtag = i.etag; } }
+  else if (onHome()) { const f = savedFeed(); if (f) { S.feed = f; S.cached = true; } }
   route();
   // The feed also says whether TMDB is used, which the footer credit needs on every screen.
   if (!onHome()) loadFeed();

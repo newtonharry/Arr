@@ -275,35 +275,20 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             )
             .route(
                 "/app/vendor/preact.mjs",
-                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
-                    asset(
-                        &h,
-                        q.v.as_deref(),
-                        "text/javascript; charset=utf-8",
-                        PREACT_JS,
-                    )
+                get(|h: HeaderMap| async move {
+                    asset(&h, None, "text/javascript; charset=utf-8", PREACT_JS)
                 }),
             )
             .route(
                 "/app/vendor/hooks.mjs",
-                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
-                    asset(
-                        &h,
-                        q.v.as_deref(),
-                        "text/javascript; charset=utf-8",
-                        PREACT_HOOKS_JS,
-                    )
+                get(|h: HeaderMap| async move {
+                    asset(&h, None, "text/javascript; charset=utf-8", PREACT_HOOKS_JS)
                 }),
             )
             .route(
                 "/app/vendor/LICENSE-preact",
-                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
-                    asset(
-                        &h,
-                        q.v.as_deref(),
-                        "text/plain; charset=utf-8",
-                        PREACT_LICENSE,
-                    )
+                get(|h: HeaderMap| async move {
+                    asset(&h, None, "text/plain; charset=utf-8", PREACT_LICENSE)
                 }),
             )
             .route(
@@ -314,27 +299,18 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
             )
             .route(
                 "/app/mascot.svg",
-                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
-                    asset(&h, q.v.as_deref(), "image/svg+xml", MASCOT)
-                }),
+                get(|h: HeaderMap| async move { asset(&h, None, "image/svg+xml", MASCOT) }),
             )
             // Browsers ask for /favicon.ico whatever the page says: send them to the mascot.
             .route("/favicon.ico", get(favicon))
             .route(
                 "/app/tmdb.svg",
-                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
-                    asset(&h, q.v.as_deref(), "image/svg+xml", TMDB_LOGO)
-                }),
+                get(|h: HeaderMap| async move { asset(&h, None, "image/svg+xml", TMDB_LOGO) }),
             )
             .route(
                 "/app/qrcodegen.js",
-                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
-                    asset(
-                        &h,
-                        q.v.as_deref(),
-                        "text/javascript; charset=utf-8",
-                        QRCODEGEN_JS,
-                    )
+                get(|h: HeaderMap| async move {
+                    asset(&h, None, "text/javascript; charset=utf-8", QRCODEGEN_JS)
                 }),
             )
             .route(

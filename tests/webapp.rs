@@ -3025,6 +3025,57 @@ async fn feed_ideas_update_library_and_openapi_return_304_on_matching_etag() {
         .unwrap();
     assert_eq!(f2.status(), 200, "state change must return 200");
     assert_ne!(f2.headers()["etag"].to_str().unwrap(), ftag);
+
+    // Title pages answer 304 too. A requester recorded later leaves the API's own reply as it
+    // was, so the lists and pages that carry `requested_by` must hash the annotated reply.
+    let lib = "/app/api/v1/library/movies?limit=50&offset=0";
+    let movie = "/app/api/v1/movie/movie:tmdb:900001";
+    let show = "/app/api/v1/show/series:tvdb:372264";
+    let mut tags = Vec::new();
+    for path in [lib, movie, show] {
+        let r = site
+            .app(Method::GET, path, Some(&cookie))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        let tag = r.headers()["etag"].to_str().unwrap().to_string();
+        let r304 = site
+            .app(Method::GET, path, Some(&cookie))
+            .header("if-none-match", &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r304.status(), 304, "{path}");
+        assert!(r304.bytes().await.unwrap().is_empty(), "{path}");
+        tags.push(tag);
+    }
+    rusqlite::Connection::open(e.state.cfg.state_dir.join("web.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO requested_by (media_id, name, at) VALUES ('movie:tmdb:900001', 'Ann', 0)",
+            [],
+        )
+        .unwrap();
+    for (path, tag) in [lib, movie].into_iter().zip(&tags) {
+        let r = site
+            .app(Method::GET, path, Some(&cookie))
+            .header("if-none-match", tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            200,
+            "{path}: the requester must change the ETag"
+        );
+        assert_ne!(r.headers()["etag"].to_str().unwrap(), tag, "{path}");
+        let v: Value = r.json().await.unwrap();
+        assert!(
+            v.to_string().contains(r#""requested_by":"Ann""#),
+            "{path}: {v}"
+        );
+    }
 }
 
 #[tokio::test]
