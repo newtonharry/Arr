@@ -12,7 +12,7 @@ function savedSort() {
 }
 function saveSort(v) { try { localStorage.setItem('arr.librarySort', v); } catch { /* storage blocked: the choice lasts until the page closes */ } }
 // Module state, read while rendering. Whatever changes it calls bump() to draw it again.
-const S = { feed: null, ideas: null, ideasAt: 0, out: false, all: false, kind: 'movies', filter: '', sort: savedSort(), me: null, tmdb: false, banner: '', setup: false, live: '' };
+const S = { feed: null, feedEtag: '', ideas: null, ideasEtag: '', ideasAt: 0, out: false, all: false, kind: 'movies', filter: '', sort: savedSort(), me: null, tmdb: false, banner: '', setup: false, live: '' };
 let V = { t: 'hint', text: '' }; // what the main area shows
 const R = { path: null }; // the screen under the sheet, for the active tab
 const A = new Map(); // add / retry state by id, kept for the session
@@ -143,27 +143,41 @@ function runCelebrations() {
 const hideEl = (el, on) => { if (el) el.style.visibility = on ? 'hidden' : ''; };
 // Answers kept in memory so a screen can show the last one at once while a fresh one is fetched.
 // Anything the person changes makes them wrong, so bust() forgets them all.
-const SC = new Map(), LC = new Map(), TC = new Map(); // search, library and title answers
+const SC = new Map(), LC = new Map(), TC = new Map(), TE = new Map(); // search, library, title answers and title ETags
 let driveC = null; // the drives line of the library: { drives, at }
 const SEARCH_TTL = 3 * 60e3;
 function remember(m, k, v, max) { m.delete(k); m.set(k, v); if (m.size > max) m.delete(m.keys().next().value); }
 // A read that started before authentication ended (authGen) paints and stores nothing; one that
 // started before the last change (cacheGen) may still paint but stores nothing.
-let authGen = 0, cacheGen = 0, feedGen = 0;
-function bust() { cacheGen++; SC.clear(); LC.clear(); TC.clear(); driveC = null; dropFeed(); }
-// The last feed, kept in this browser for the person who saw it, so opening Arr paints at once.
-const FEED_KEY = 'arr.feed';
+let authGen = 0, cacheGen = 0, feedGen = 0, idlePolls = 0, lastFeedAt = 0;
+function bust() { cacheGen++; idlePolls = 0; lastFeedAt = 0; S.feedEtag = ''; S.ideasEtag = ''; SC.clear(); LC.clear(); TC.clear(); TE.clear(); driveC = null; dropFeed(); dropIdeas(); }
+// The last feed and ideas, kept in this browser for the person who saw them, so opening Arr paints
+// at once and revalidates with a bodiless 304 when nothing changed.
+const FEED_KEY = 'arr.feed', IDEAS_KEY = 'arr.ideas';
 function saveFeed() {
   if (!S.me || !S.feed) return;
-  try { localStorage.setItem(FEED_KEY, JSON.stringify({ u: S.me.email || '', feed: S.feed })); } catch { /* storage blocked: next open starts empty */ }
+  try { localStorage.setItem(FEED_KEY, JSON.stringify({ u: S.me.email || '', feed: S.feed, etag: S.feedEtag || '' })); } catch { /* storage blocked: next open starts empty */ }
 }
 function dropFeed() { try { localStorage.removeItem(FEED_KEY); } catch { /* nothing kept */ } }
 function savedFeed() {
   try {
     const c = JSON.parse(localStorage.getItem(FEED_KEY) || 'null');
-    if (c && c.u === ((S.me && S.me.email) || '') && c.feed && typeof c.feed === 'object') return c.feed;
+    if (c && c.u === ((S.me && S.me.email) || '') && c.feed && typeof c.feed === 'object') return { feed: c.feed, etag: typeof c.etag === 'string' ? c.etag : '' };
     if (c) dropFeed(); // someone else's, or unreadable
   } catch { dropFeed(); }
+  return null;
+}
+function saveIdeas() {
+  if (!S.me || !S.ideas) return;
+  try { localStorage.setItem(IDEAS_KEY, JSON.stringify({ u: S.me.email || '', ideas: S.ideas, etag: S.ideasEtag || '' })); } catch { /* storage blocked */ }
+}
+function dropIdeas() { try { localStorage.removeItem(IDEAS_KEY); } catch { /* nothing kept */ } }
+function savedIdeas() {
+  try {
+    const c = JSON.parse(localStorage.getItem(IDEAS_KEY) || 'null');
+    if (c && c.u === ((S.me && S.me.email) || '') && c.ideas && typeof c.ideas === 'object') return { ideas: c.ideas, etag: typeof c.etag === 'string' ? c.etag : '' };
+    if (c) dropIdeas();
+  } catch { dropIdeas(); }
   return null;
 }
 let token = 0, pollT = 0, retryT = 0, feedP = null, ideasP = null, searchSeq = 0, searchAbort = null, debounceT = 0;
@@ -191,16 +205,18 @@ function setView(v) { V = v; bump(); }
 // Whatever it says, Arr asks the feed again until the answer is good, on every screen, so it
 // never outlives the problem.
 const SETUP_MSG = 'Arr is still being set up. Check back soon.';
-let watchT = 0;
-function setBanner(t) { if (S.banner !== t) { S.banner = t; bump(); } if (t) watchBanner(); }
-function setSetup(on) { if (S.setup !== on) { S.setup = on; bump(); } if (on) watchBanner(); }
+let watchT = 0, watchN = 0;
+function setBanner(t) { if (S.banner !== t) { S.banner = t; bump(); } if (t) watchBanner(); else watchN = 0; }
+function setSetup(on) { if (S.setup !== on) { S.setup = on; bump(); } if (on) watchBanner(); else if (!S.banner) watchN = 0; }
 function watchBanner() {
-  if (watchT || S.out) return;
+  if (watchT || S.out || document.hidden) return;
+  const ms = [5000, 15000, 30000][Math.min(watchN++, 2)];
   watchT = setTimeout(async () => {
     watchT = 0;
+    if (document.hidden || S.out) return;
     await loadFeed();
     if ((S.banner || S.setup) && !S.out) watchBanner();
-  }, 5000);
+  }, ms);
 }
 const say = (m) => { S.live = ''; bump(); setTimeout(() => { S.live = m; bump(); }, 50); };
 const hint = (text, role) => ({ t: 'hint', text, role });
@@ -225,17 +241,22 @@ const ICONS = {
 const ic = (name) => h('svg', { viewBox: '0 0 24 24', class: 'ic', 'aria-hidden': 'true' }, h('path', { d: ICONS[name] }));
 
 // ---------- network ----------
-async function api(path, { method = 'GET', body, signal } = {}) {
+async function api(path, { method = 'GET', body, signal, etag } = {}) {
   let r;
   try {
     r = await fetch('/app/api' + path, {
       method, signal, credentials: 'same-origin',
-      headers: { 'X-Arr-App': '1', ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      headers: { 'X-Arr-App': '1', ...(body ? { 'Content-Type': 'application/json' } : {}), ...(etag ? { 'If-None-Match': etag } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
     if (e.name !== 'AbortError') setBanner("Can't reach Arr right now. Trying again…");
     throw e;
+  }
+  const tag = r.headers.get('etag') || '';
+  if (r.status === 304) {
+    setBanner('');
+    return { ok: true, status: 304, notModified: true, etag: tag || etag || '', data: null };
   }
   let data = null;
   try { data = await r.json(); } catch { /* empty body */ }
@@ -245,7 +266,7 @@ async function api(path, { method = 'GET', body, signal } = {}) {
   // Only a reply that isn't Arr's own error (a proxy or tunnel failing) means Arr is out of reach.
   if (r.status >= 500 && !code) { setBanner("Can't reach Arr right now. Trying again…"); throw new Error('unreachable'); }
   setBanner('');
-  return { ok: r.ok, status: r.status, data };
+  return { ok: r.ok, status: r.status, notModified: false, etag: tag, data };
 }
 
 // ---------- small helpers ----------
@@ -1109,6 +1130,20 @@ function Home() {
 }
 function paintHome() { if (S.feed) setView({ t: 'home' }); }
 const onHome = () => parseHash().path === '/';
+const feedActive = () => !!(S.feed && S.feed.on_its_way && S.feed.on_its_way.length > 0);
+// Downloads in progress update promptly (5 s when focused, 15 s if visible on another window).
+// When nothing is downloading, stretch the interval on unchanged polls and pause while unfocused.
+function feedDelay() {
+  if (feedActive()) return document.hasFocus() ? 5000 : 15000;
+  if (!document.hasFocus()) return 0;
+  return [15000, 30000, 60000, 120000][Math.min(idlePolls, 3)];
+}
+function scheduleFeedPoll() {
+  clearTimeout(pollT);
+  if (document.hidden || !onHome() || S.out) return;
+  const ms = feedDelay();
+  if (ms > 0) pollT = setTimeout(loadFeed, ms);
+}
 // One feed read at a time: asking while one is on its way waits for that answer.
 function loadFeed() {
   if (S.out) return Promise.resolve(false);
@@ -1116,23 +1151,48 @@ function loadFeed() {
   return (feedP ||= (async () => {
     const ag = authGen, cg = (feedGen = cacheGen);
     try {
-      const r = await api('/v1/feed');
+      const r = await api('/v1/feed', S.feed && S.feedEtag ? { etag: S.feedEtag } : undefined);
       if (ag !== authGen) return false;
-      if (r.ok) { noteArrivals(r.data); S.feed = r.data; S.cached = false; S.tmdb = !!r.data.tmdb_backup; if (cg === cacheGen) saveFeed(); setSetup(false); if (onHome()) paintHome(); bump(); }
+      if (r.notModified && S.feed) {
+        lastFeedAt = Date.now();
+        idlePolls++;
+        S.cached = false;
+        setSetup(false);
+        if (onHome()) paintHome();
+        bump();
+        return true;
+      }
+      if (r.ok && r.data) {
+        lastFeedAt = Date.now();
+        idlePolls = 0;
+        noteArrivals(r.data);
+        S.feed = r.data;
+        S.feedEtag = r.etag || '';
+        S.cached = false;
+        S.tmdb = !!r.data.tmdb_backup;
+        if (cg === cacheGen) saveFeed();
+        setSetup(false);
+        if (onHome()) paintHome();
+        bump();
+      }
       return r.ok;
     } catch { return false; } finally {
       feedP = null;
       if (S.cached) { S.cached = false; bump(); }
-      clearTimeout(pollT);
-      if (!document.hidden && onHome() && !S.out) pollT = setTimeout(loadFeed, 5000);
+      scheduleFeedPoll();
     }
   })());
 }
 function loadIdeas() {
   if (S.ideas && Date.now() - S.ideasAt < 6e5) return Promise.resolve(S.ideas);
   return (ideasP ||= (async () => {
-    const ag = authGen;
-    try { const r = await api('/v1/ideas'); if (r.ok && ag === authGen) { S.ideas = r.data; S.ideasAt = Date.now(); } } catch { /* optional */ } finally { ideasP = null; }
+    const ag = authGen, cg = cacheGen;
+    try {
+      const r = await api('/v1/ideas', S.ideas && S.ideasEtag ? { etag: S.ideasEtag } : undefined);
+      if (ag !== authGen) return S.ideas;
+      if (r.notModified && S.ideas) { S.ideasAt = Date.now(); }
+      else if (r.ok && r.data) { S.ideas = r.data; S.ideasEtag = r.etag || ''; S.ideasAt = Date.now(); if (cg === cacheGen) saveIdeas(); }
+    } catch { /* optional */ } finally { ideasP = null; }
     return S.ideas;
   })());
 }
@@ -1440,9 +1500,9 @@ function Library({ t }) {
   const m = useRef({ seq: 0, items: [], ft: 0 }).current;
   async function load(reset) {
     const ag = authGen, cg = cacheGen, my = ++m.seq, key = `${S.kind}|${S.sort}|${S.filter.trim()}`;
+    const hit = reset ? LC.get(key) : null;
     if (reset) {
       // The last answer for this list shows while the new one is fetched.
-      const hit = LC.get(key);
       m.items = []; m.enter = true;
       setSt(hit ? { items: hit.items, total: hit.total, status: 'Updating…' } : { items: [], total: 0, status: 'Loading…' });
     } else if (m.gen !== cacheGen) {
@@ -1451,13 +1511,21 @@ function Library({ t }) {
       setSt((s) => ({ ...s, status: 'Updating…' }));
     }
     const qs = `limit=50&offset=${m.items.length}&sort=${S.sort}` + (S.filter.trim() ? '&q=' + encodeURIComponent(S.filter.trim()) : '');
+    const pageTag = reset && hit && hit.etag && hit.items.length <= 50 ? hit.etag : '';
     try {
-      const r = await api(`/v1/library/${S.kind}?${qs}`);
+      const r = await api(`/v1/library/${S.kind}?${qs}`, pageTag ? { etag: pageTag } : undefined);
       if (my !== m.seq || t !== token || ag !== authGen) return;
+      if (r.notModified && hit) {
+        m.items = hit.items;
+        m.gen = cg;
+        setSt({ items: hit.items, total: hit.total, status: hit.items.length ? '' : S.filter.trim() ? `No matches for “${S.filter.trim()}”.` : 'Nothing here yet. Add something from the search above.' });
+        return;
+      }
       if (!r.ok) { setSt((s) => ({ ...s, status: "Couldn't load the library just now." })); return; }
+      const firstPage = m.items.length === 0;
       m.items = m.items.concat(r.data.items || []);
       m.gen = cg;
-      if (cg === cacheGen) remember(LC, key, { items: m.items, total: r.data.total || 0 }, 12);
+      if (cg === cacheGen) remember(LC, key, { items: m.items, total: r.data.total || 0, etag: firstPage ? r.etag || '' : '' }, 12);
       setSt({ items: m.items, total: r.data.total || 0, status: m.items.length ? '' : S.filter.trim() ? `No matches for “${S.filter.trim()}”.` : 'Nothing here yet. Add something from the search above.' });
     } catch { if (my === m.seq && t === token && !S.out) { setSt((s) => ({ ...s, status: '' })); if (!m.items.length) failed(t); } }
   }
@@ -1609,15 +1677,22 @@ async function loadTitle(quiet) {
     // A league page does not wait for ever: the server answers within about eight seconds even when its source is down.
     const dl = P.kind === 'league' ? new AbortController() : null, dt = dl && setTimeout(() => dl.abort(), SPORT_MS.GET + 5e3);
     let r;
-    try { r = await api(P.kind === 'league' ? `/v1/sport/league/${enc(P.id)}` : `/v1/${P.kind}/${enc(P.id)}`, dl ? { signal: dl.signal } : undefined); } finally { clearTimeout(dt); }
+    const tag = P.data ? TE.get(P.id) || '' : '';
+    const opt = dl || tag ? { ...(dl ? { signal: dl.signal } : {}), ...(tag ? { etag: tag } : {}) } : undefined;
+    try { r = await api(P.kind === 'league' ? `/v1/sport/league/${enc(P.id)}` : `/v1/${P.kind}/${enc(P.id)}`, opt); } finally { clearTimeout(dt); }
     if (stale()) return;
     P.upd = false;
-    if (!r.ok) { TC.delete(P.id); if (!P.data || r.status === 404) { P.data = null; P.err = errText(r); } await seasons; if (!stale()) bump(); return; }
-    P.data = r.data; P.err = '';
-    if (cg === cacheGen) remember(TC, P.id, r.data, 30);
-    document.title = `${nameOf(r.data)} · Arr`;
-    if (P.kind === 'league' && cg === cacheGen) settleLeague(r.data);
-    if (P.opt.fetch) { P.opt.fetch = false; loadCopies(); }
+    if (r.notModified && P.data) {
+      P.err = '';
+      if (P.opt.fetch) { P.opt.fetch = false; loadCopies(); }
+    } else {
+      if (!r.ok) { TC.delete(P.id); TE.delete(P.id); if (!P.data || r.status === 404) { P.data = null; P.err = errText(r); } await seasons; if (!stale()) bump(); return; }
+      P.data = r.data; P.err = '';
+      if (cg === cacheGen) { remember(TC, P.id, r.data, 30); if (r.etag) remember(TE, P.id, r.etag, 30); else TE.delete(P.id); }
+      document.title = `${nameOf(r.data)} · Arr`;
+      if (P.kind === 'league' && cg === cacheGen) settleLeague(r.data);
+      if (P.opt.fetch) { P.opt.fetch = false; loadCopies(); }
+    }
   } catch {
     if (stale()) return;
     P.upd = false;
@@ -2273,8 +2348,8 @@ function movieBody() {
 
 // ---------- sign in ----------
 function showSignin(data) {
-  S.out = true; authGen++; token++; dropFeed();
-  clearTimeout(pollT); clearTimeout(retryT);
+  S.out = true; authGen++; token++; S.feedEtag = ''; S.ideasEtag = ''; dropFeed(); dropIdeas();
+  clearTimeout(pollT); clearTimeout(retryT); clearTimeout(watchT); watchT = 0;
   setBanner(''); S.setup = false;
   document.title = 'Sign in · Arr';
   setView({ t: 'signin', google: !!(data && data.signin && data.signin.google) });
@@ -2496,7 +2571,7 @@ const errMsg = (r, fallback) => (r.data && r.data.error && r.data.error.message)
 const whatsNew = (href) => h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, 'What’s new');
 
 // "Update now". U.phase: idle, waiting (the updater is working), done, failed.
-const U = { info: null, phase: 'idle', from: '', prevAt: null, err: '', pollT: 0, updated: '', seen: false, checkedAt: 0 };
+const U = { info: null, etag: '', phase: 'idle', from: '', prevAt: null, err: '', pollT: 0, updated: '', seen: false, checkedAt: 0 };
 // The version this browser last saw, kept so a change (even a nightly one) is told once.
 function noteVersion(current) {
   try {
@@ -2508,9 +2583,10 @@ function noteVersion(current) {
 async function loadUpdate() {
   U.checkedAt = Date.now();
   try {
-    const r = await api('/v1/update');
-    if (!r.ok) return;
+    const r = await api('/v1/update', U.info && U.etag ? { etag: U.etag } : undefined);
+    if (r.notModified || !r.ok || !r.data) return;
     U.info = r.data;
+    U.etag = r.etag || '';
     if (!U.seen) { U.seen = true; U.updated = noteVersion(r.data.current); }
     bump();
   } catch { /* the banner says Arr can't be reached */ }
@@ -2863,13 +2939,24 @@ function go(q) {
   else location.hash = url;
 }
 
+function onWake(visibleChange) {
+  if (document.hidden || S.out) return;
+  if (onHome()) {
+    if (Date.now() - lastFeedAt >= 5000) loadFeed();
+    else scheduleFeedPoll();
+  }
+  if (visibleChange && P.shown) loadTitle(true);
+  if ((S.banner || S.setup) && !watchT) watchBanner();
+  // The server checks GitHub releases at most every six hours.
+  if (S.me && U.phase === 'idle' && Date.now() - U.checkedAt > 6 * 60 * 60 * 1000) loadUpdate();
+}
 async function boot() {
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && onHome()) loadFeed(); else clearTimeout(pollT);
-    if (!document.hidden && P.shown) loadTitle(true);
-    // The server remembers its release check for six hours; asking now and then is cheap.
-    if (!document.hidden && S.me && U.phase === 'idle' && Date.now() - U.checkedAt > 30 * 60 * 1000) loadUpdate();
+    if (document.hidden) { clearTimeout(pollT); clearTimeout(watchT); watchT = 0; }
+    else onWake(true);
   });
+  window.addEventListener('focus', () => onWake(false));
+  window.addEventListener('blur', () => { if (onHome() && !S.out) scheduleFeedPoll(); });
   window.addEventListener('hashchange', route);
   // Who is signed in, the feed and the ideas are asked together; none waits for another.
   const path = parseHash().path;
@@ -2889,7 +2976,9 @@ async function boot() {
 // Signed in: show what was seen last time (only ever the same person's) while the feed is fetched.
 function start() {
   if (S.feed) saveFeed();
-  else if (onHome()) { const f = savedFeed(); if (f) { S.feed = f; S.cached = true; } }
+  else if (onHome()) { const f = savedFeed(); if (f) { S.feed = f.feed; S.feedEtag = f.etag; S.cached = true; } }
+  if (S.ideas) saveIdeas();
+  else { const i = savedIdeas(); if (i) { S.ideas = i.ideas; S.ideasEtag = i.etag; } }
   route();
   // The feed also says whether TMDB is used, which the footer credit needs on every screen.
   if (!onHome()) loadFeed();

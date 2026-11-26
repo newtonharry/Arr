@@ -20,7 +20,7 @@ use crate::ids::MediaId;
 use crate::push::{self, Push};
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::{Form, Path as UrlPath, Request, State};
+use axum::extract::{Form, Path as UrlPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -259,90 +259,134 @@ pub fn router(state: &Arc<AppState>, api: Router) -> Result<Router> {
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::spawn(push::run(push, web.api.clone(), web.token.clone()));
     }
-    Ok(Router::new()
-        .route(
-            "/",
-            get(|h: HeaderMap| async move { asset(&h, "text/html; charset=utf-8", INDEX) }),
-        )
-        .route(
-            "/app/app.js",
-            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", APP_JS) }),
-        )
-        .route(
-            "/app/vendor/preact.mjs",
-            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", PREACT_JS) }),
-        )
-        .route(
-            "/app/vendor/hooks.mjs",
-            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", PREACT_HOOKS_JS) }),
-        )
-        .route(
-            "/app/vendor/LICENSE-preact",
-            get(|h: HeaderMap| async move { asset(&h, "text/plain; charset=utf-8", PREACT_LICENSE) }),
-        )
-        .route(
-            "/app/app.css",
-            get(|h: HeaderMap| async move { asset(&h, "text/css; charset=utf-8", APP_CSS) }),
-        )
-        .route(
-            "/app/mascot.svg",
-            get(|h: HeaderMap| async move { asset(&h, "image/svg+xml", MASCOT) }),
-        )
-        // Browsers ask for /favicon.ico whatever the page says: send them to the mascot.
-        .route("/favicon.ico", get(favicon))
-        .route(
-            "/app/tmdb.svg",
-            get(|h: HeaderMap| async move { asset(&h, "image/svg+xml", TMDB_LOGO) }),
-        )
-        .route(
-            "/app/qrcodegen.js",
-            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", QRCODEGEN_JS) }),
-        )
-        .route(
-            "/app/sw.js",
-            get(|h: HeaderMap| async move { asset(&h, "text/javascript; charset=utf-8", SERVICE_WORKER) }),
-        )
-        .route(
-            "/app/manifest.webmanifest",
-            get(|h: HeaderMap| async move { asset(&h, "application/manifest+json", MANIFEST) }),
-        )
-        .route(
-            "/app/fonts/nunito-latin.woff2",
-            get(|| async { font("font/woff2", FONT_LATIN) }),
-        )
-        .route(
-            "/app/fonts/nunito-latin-ext.woff2",
-            get(|| async { font("font/woff2", FONT_LATIN_EXT) }),
-        )
-        .route(
-            "/app/icons/apple-touch-icon.png",
-            get(|| async { font("image/png", ICON_APPLE) }),
-        )
-        .route(
-            "/app/icons/icon-192.png",
-            get(|| async { font("image/png", ICON_192) }),
-        )
-        .route(
-            "/app/icons/icon-512.png",
-            get(|| async { font("image/png", ICON_512) }),
-        )
-        .route(
-            "/app/icons/icon-maskable-512.png",
-            get(|| async { font("image/png", ICON_MASKABLE) }),
-        )
-        .route("/app/link", get(link_page).post(link_consume))
-        .route("/app/art/{media_id}", get(art))
-        .route("/app/api/me", get(me))
-        .route("/app/api/signout", post(signout))
-        .route("/app/api/v1/notifications/key", get(notifications_key))
-        .route(
-            "/app/api/v1/notifications/subscribe",
-            post(notifications_subscribe).delete(notifications_unsubscribe),
-        )
-        .route("/app/api/v1/{*rest}", any(proxy))
-        // Nothing here takes a larger body than the proxy forwards (a form, a subscription).
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_PROXY_BODY))
-        .with_state(web))
+    Ok(
+        Router::new()
+            .route(
+                "/",
+                get(|h: HeaderMap| async move {
+                    asset(&h, None, "text/html; charset=utf-8", index_html())
+                }),
+            )
+            .route(
+                "/app/app.js",
+                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
+                    asset(&h, q.v.as_deref(), "text/javascript; charset=utf-8", APP_JS)
+                }),
+            )
+            .route(
+                "/app/vendor/preact.mjs",
+                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
+                    asset(
+                        &h,
+                        q.v.as_deref(),
+                        "text/javascript; charset=utf-8",
+                        PREACT_JS,
+                    )
+                }),
+            )
+            .route(
+                "/app/vendor/hooks.mjs",
+                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
+                    asset(
+                        &h,
+                        q.v.as_deref(),
+                        "text/javascript; charset=utf-8",
+                        PREACT_HOOKS_JS,
+                    )
+                }),
+            )
+            .route(
+                "/app/vendor/LICENSE-preact",
+                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
+                    asset(
+                        &h,
+                        q.v.as_deref(),
+                        "text/plain; charset=utf-8",
+                        PREACT_LICENSE,
+                    )
+                }),
+            )
+            .route(
+                "/app/app.css",
+                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
+                    asset(&h, q.v.as_deref(), "text/css; charset=utf-8", APP_CSS)
+                }),
+            )
+            .route(
+                "/app/mascot.svg",
+                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
+                    asset(&h, q.v.as_deref(), "image/svg+xml", MASCOT)
+                }),
+            )
+            // Browsers ask for /favicon.ico whatever the page says: send them to the mascot.
+            .route("/favicon.ico", get(favicon))
+            .route(
+                "/app/tmdb.svg",
+                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
+                    asset(&h, q.v.as_deref(), "image/svg+xml", TMDB_LOGO)
+                }),
+            )
+            .route(
+                "/app/qrcodegen.js",
+                get(|h: HeaderMap, Query(q): Query<AssetQuery>| async move {
+                    asset(
+                        &h,
+                        q.v.as_deref(),
+                        "text/javascript; charset=utf-8",
+                        QRCODEGEN_JS,
+                    )
+                }),
+            )
+            .route(
+                "/app/sw.js",
+                get(|h: HeaderMap| async move {
+                    asset(&h, None, "text/javascript; charset=utf-8", SERVICE_WORKER)
+                }),
+            )
+            .route(
+                "/app/manifest.webmanifest",
+                get(|h: HeaderMap| async move {
+                    asset(&h, None, "application/manifest+json", MANIFEST)
+                }),
+            )
+            .route(
+                "/app/fonts/nunito-latin.woff2",
+                get(|h: HeaderMap| async move { font(&h, "font/woff2", FONT_LATIN) }),
+            )
+            .route(
+                "/app/fonts/nunito-latin-ext.woff2",
+                get(|h: HeaderMap| async move { font(&h, "font/woff2", FONT_LATIN_EXT) }),
+            )
+            .route(
+                "/app/icons/apple-touch-icon.png",
+                get(|h: HeaderMap| async move { font(&h, "image/png", ICON_APPLE) }),
+            )
+            .route(
+                "/app/icons/icon-192.png",
+                get(|h: HeaderMap| async move { font(&h, "image/png", ICON_192) }),
+            )
+            .route(
+                "/app/icons/icon-512.png",
+                get(|h: HeaderMap| async move { font(&h, "image/png", ICON_512) }),
+            )
+            .route(
+                "/app/icons/icon-maskable-512.png",
+                get(|h: HeaderMap| async move { font(&h, "image/png", ICON_MASKABLE) }),
+            )
+            .route("/app/link", get(link_page).post(link_consume))
+            .route("/app/art/{media_id}", get(art))
+            .route("/app/api/me", get(me))
+            .route("/app/api/signout", post(signout))
+            .route("/app/api/v1/notifications/key", get(notifications_key))
+            .route(
+                "/app/api/v1/notifications/subscribe",
+                post(notifications_subscribe).delete(notifications_unsubscribe),
+            )
+            .route("/app/api/v1/{*rest}", any(proxy))
+            // Nothing here takes a larger body than the proxy forwards (a form, a subscription).
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_PROXY_BODY))
+            .with_state(web),
+    )
 }
 
 const INDEX: &str = include_str!("webapp/index.html");
@@ -405,61 +449,97 @@ fn secure_headers(r: &mut Response) {
     );
 }
 
-/// A text asset. `no-cache` makes the browser ask every time; the ETag (a hash of the
-/// embedded bytes) lets it be told, with a bodiless 304, that its copy is current.
-fn asset(req: &HeaderMap, content_type: &'static str, body: &'static str) -> Response {
-    let tag = etag(body);
-    let mut r = if if_none_match(req, &tag) {
-        let mut r = Response::new(Body::empty());
-        *r.status_mut() = StatusCode::NOT_MODIFIED;
-        r
+#[derive(Deserialize)]
+struct AssetQuery {
+    v: Option<String>,
+}
+
+/// `index.html` with content hashes on `app.js` and `app.css` so repeat visits skip
+/// revalidating them while any upgrade busts the cache as soon as `/` is revalidated.
+fn index_html() -> &'static str {
+    static HTML: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HTML.get_or_init(|| {
+        INDEX
+            .replace(
+                "href=\"/app/app.css\"",
+                &format!(
+                    "href=\"/app/app.css?v={}\"",
+                    asset_version(APP_CSS.as_bytes())
+                ),
+            )
+            .replace(
+                "src=\"/app/app.js\"",
+                &format!("src=\"/app/app.js?v={}\"", asset_version(APP_JS.as_bytes())),
+            )
+    })
+}
+
+/// A text asset. Unversioned requests get `no-cache` with an ETag (304 when unchanged); requests
+/// carrying the matching `?v=<hash>` from `index.html` are cached for a year as immutable.
+fn asset(
+    req: &HeaderMap,
+    version: Option<&str>,
+    content_type: &'static str,
+    body: &'static str,
+) -> Response {
+    let (tag, hash) = asset_tag(body.as_bytes());
+    let cache = if version == Some(hash.as_str()) {
+        "public, max-age=31536000, immutable"
     } else {
-        ([(header::CONTENT_TYPE, content_type)], body).into_response()
+        "no-cache"
     };
-    r.headers_mut().insert(header::ETAG, tag);
+    let mut r = if crate::api::if_none_match(req, &tag) {
+        crate::api::not_modified(tag)
+    } else {
+        let mut r = ([(header::CONTENT_TYPE, content_type)], body).into_response();
+        r.headers_mut().insert(header::ETAG, tag);
+        r
+    };
     r.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
     secure_headers(&mut r);
     r
 }
 
-/// The weak ETag of an embedded asset (the gzip and plain bodies are equivalent), hashed on first use and kept (assets never change
-/// while the program runs).
-fn etag(body: &'static str) -> HeaderValue {
-    static TAGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, HeaderValue>>> =
-        std::sync::OnceLock::new();
+/// Short hex hash of an embedded asset, used as its `?v=` cache-buster.
+fn asset_version(body: &'static [u8]) -> String {
+    asset_tag(body).1
+}
+
+/// The weak ETag and short version hash of an embedded asset, computed once and kept.
+fn asset_tag(body: &'static [u8]) -> (HeaderValue, String) {
+    static TAGS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<usize, (HeaderValue, String)>>,
+    > = std::sync::OnceLock::new();
     let mut tags = TAGS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     tags.entry(body.as_ptr() as usize)
         .or_insert_with(|| {
-            let digest = Sha256::digest(body.as_bytes());
-            HeaderValue::from_str(&format!("W/\"{}\"", hex::encode(&digest[..12])))
-                .expect("hex is a valid header value")
+            let digest = Sha256::digest(body);
+            let full = hex::encode(&digest[..12]);
+            let short = full[..12].to_string();
+            let tag = HeaderValue::from_str(&format!("W/\"{full}\""))
+                .expect("hex is a valid header value");
+            (tag, short)
         })
         .clone()
 }
 
-/// Whether the request's `If-None-Match` names `tag` (weak or strong, or `*`).
-fn if_none_match(req: &HeaderMap, tag: &HeaderValue) -> bool {
-    let Ok(tag) = tag.to_str() else { return false };
-    req.get_all(header::IF_NONE_MATCH)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-        .any(|t| {
-            t == "*" || t.strip_prefix("W/").unwrap_or(t) == tag.strip_prefix("W/").unwrap_or(tag)
-        })
-}
-
-/// A file that never changes (a font or an icon), cached for a week.
-fn font(content_type: &'static str, body: &'static [u8]) -> Response {
-    let mut r = ([(header::CONTENT_TYPE, content_type)], body).into_response();
+/// A file that never changes (a font or an icon), cached for a year with an ETag.
+fn font(req: &HeaderMap, content_type: &'static str, body: &'static [u8]) -> Response {
+    let (tag, _) = asset_tag(body);
+    let mut r = if crate::api::if_none_match(req, &tag) {
+        crate::api::not_modified(tag)
+    } else {
+        let mut r = ([(header::CONTENT_TYPE, content_type)], body).into_response();
+        r.headers_mut().insert(header::ETAG, tag);
+        r
+    };
     r.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=604800, immutable"),
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
     secure_headers(&mut r);
     r
@@ -606,10 +686,17 @@ async fn art(State(w): Wa, headers: HeaderMap, UrlPath(id): UrlPath<String>) -> 
     };
     let mut r = match w.art.poster(&w.state, &id).await {
         Some((bytes, kind)) => {
-            let mut r = ([(header::CONTENT_TYPE, kind)], bytes).into_response();
+            let tag = crate::api::weak_etag(&bytes);
+            let mut r = if crate::api::if_none_match(&headers, &tag) {
+                crate::api::not_modified(tag)
+            } else {
+                let mut r = ([(header::CONTENT_TYPE, kind)], bytes).into_response();
+                r.headers_mut().insert(header::ETAG, tag);
+                r
+            };
             r.headers_mut().insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("private, max-age=604800"),
+                HeaderValue::from_static("private, max-age=2592000"),
             );
             r
         }
@@ -1013,6 +1100,7 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
         Err(_) => return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "API unavailable"),
     };
     auth.set_sensitive(true);
+    let (adds, reads_list, reads_one) = annotated_kinds(&parts.method, &parts_path);
     let mut rb = Request::builder()
         .method(parts.method.clone())
         .uri(uri)
@@ -1020,12 +1108,19 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     if let Some(ct) = parts.headers.get(header::CONTENT_TYPE) {
         rb = rb.header(header::CONTENT_TYPE, ct);
     }
+    // Forward conditional checks only when the proxy passes the reply straight through; annotated
+    // reads add `requested_by`, so their ETag is computed after annotation below.
+    if !(reads_list || reads_one)
+        && let Some(inm) = parts.headers.get(header::IF_NONE_MATCH)
+    {
+        rb = rb.header(header::IF_NONE_MATCH, inm);
+    }
     let Ok(inner) = rb.body(Body::from(bytes)) else {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request", "bad request");
     };
     let Ok(resp) = w.api.clone().oneshot(inner).await;
     let (rp, rbody) = resp.into_parts();
-    let (adds, reads_list, reads_one) = annotated_kinds(&parts.method, &parts_path);
+    let mut annotated_tag = None;
     let body = if adds || reads_list || reads_one {
         let Ok(raw) = axum::body::to_bytes(rbody, MAX_PROXY_REPLY).await else {
             return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "reply too large");
@@ -1038,6 +1133,16 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
         else {
             return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "API unavailable");
         };
+        if (reads_list || reads_one) && rp.status.is_success() {
+            let tag = crate::api::weak_etag(&raw);
+            if crate::api::if_none_match(&parts.headers, &tag) {
+                let mut out = crate::api::not_modified(tag);
+                out.headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                return out;
+            }
+            annotated_tag = Some(tag);
+        }
         Body::from(raw)
     } else {
         // Passed through as it comes, not held whole in memory.
@@ -1048,10 +1153,13 @@ async fn proxy(State(w): Wa, req: Request) -> Response {
     };
     let mut out = Response::new(body);
     *out.status_mut() = rp.status;
-    for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
+    for name in [header::CONTENT_TYPE, header::RETRY_AFTER, header::ETAG] {
         if let Some(v) = rp.headers.get(&name) {
             out.headers_mut().insert(name, v.clone());
         }
+    }
+    if let Some(tag) = annotated_tag {
+        out.headers_mut().insert(header::ETAG, tag);
     }
     out.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

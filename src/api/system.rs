@@ -35,8 +35,8 @@ async fn update_view(st: &AppState) -> Value {
 
 /// `GET /update`: the running version, the latest release (checked at most every six hours,
 /// and only when automatic updates are installed) and what the updater last did.
-pub(super) async fn update_get(State(st): St) -> ApiResult {
-    ok(update_view(&st).await)
+pub(super) async fn update_get(State(st): St, headers: HeaderMap) -> ApiResult {
+    ok_etag(&headers, update_view(&st).await)
 }
 
 /// `POST /update`: asks the installed updater to run. It takes no body: the updater decides

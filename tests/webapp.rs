@@ -137,32 +137,32 @@ async fn pages_and_assets_carry_the_security_headers() {
         (
             "/app/icons/apple-touch-icon.png",
             "image/png",
-            "public, max-age=604800, immutable",
+            "public, max-age=31536000, immutable",
         ),
         (
             "/app/icons/icon-192.png",
             "image/png",
-            "public, max-age=604800, immutable",
+            "public, max-age=31536000, immutable",
         ),
         (
             "/app/icons/icon-512.png",
             "image/png",
-            "public, max-age=604800, immutable",
+            "public, max-age=31536000, immutable",
         ),
         (
             "/app/icons/icon-maskable-512.png",
             "image/png",
-            "public, max-age=604800, immutable",
+            "public, max-age=31536000, immutable",
         ),
         (
             "/app/fonts/nunito-latin.woff2",
             "font/woff2",
-            "public, max-age=604800, immutable",
+            "public, max-age=31536000, immutable",
         ),
         (
             "/app/fonts/nunito-latin-ext.woff2",
             "font/woff2",
-            "public, max-age=604800, immutable",
+            "public, max-age=31536000, immutable",
         ),
     ] {
         let r = site.plain(Method::GET, path).send().await.unwrap();
@@ -1948,16 +1948,32 @@ async fn posters_are_fetched_once_and_served_from_the_cache() {
     assert_eq!(site.art("nonsense", Some(&cookie)).await.status(), 400);
     assert!(image_fetches(&e).is_empty());
 
-    // A movie poster comes from the TMDB image host, then from disk.
+    // A movie poster comes from the TMDB image host, then from disk, and supports 304 ETag.
+    let mut poster_tag = String::new();
     for _ in 0..2 {
         let r = site.art("movie:tmdb:900001", Some(&cookie)).await;
         assert_eq!(r.status(), 200);
         let h = r.headers();
         assert_eq!(h["content-type"], "image/jpeg");
-        assert_eq!(h["cache-control"], "private, max-age=604800");
+        assert_eq!(h["cache-control"], "private, max-age=2592000");
         assert_eq!(h["x-content-type-options"], "nosniff");
+        poster_tag = h["etag"].to_str().unwrap().to_string();
         assert_eq!(&r.bytes().await.unwrap()[..3], &[0xff, 0xd8, 0xff]);
     }
+    let not_mod = site
+        .plain(Method::GET, "/app/art/movie%3Atmdb%3A900001")
+        .header("cookie", &cookie)
+        .header("if-none-match", &poster_tag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(not_mod.status(), 304);
+    assert_eq!(not_mod.headers()["etag"].to_str().unwrap(), poster_tag);
+    assert_eq!(
+        not_mod.headers()["cache-control"],
+        "private, max-age=2592000"
+    );
+    assert!(not_mod.bytes().await.unwrap().is_empty());
     assert_eq!(image_fetches(&e), ["/t/p/w342/leviticus.jpg"]);
 
     // A show's poster, and its seasons and episodes, share one fetch (TVDB id 372264 is
@@ -2841,14 +2857,248 @@ async fn text_assets_and_json_are_gzipped_on_request_and_images_are_not() {
         assert_eq!(&zipped[..2], &[0x1f, 0x8b], "{path}: gzip magic");
         assert!(zipped.len() < plain.len() / 2, "{path}");
     }
-    let r = raw
-        .get(format!("{}/app/icons/icon-192.png", site.base))
-        .header("accept-encoding", "gzip")
+    for skip in [
+        "/app/icons/icon-192.png",
+        "/app/fonts/nunito-latin.woff2",
+        "/api/v1/health",
+        "/nonexistent-probe",
+    ] {
+        let r = raw
+            .get(format!("{}{skip}", site.base))
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            r.headers().get("content-encoding").is_none(),
+            "{skip} should not be gzipped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn versioned_static_assets_are_cached_as_immutable() {
+    let e = start_exec(ExecOptions::default()).await;
+    let site = serve(e.state.clone()).await;
+    let html = site
+        .plain(Method::GET, "/")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for prefix in ["/app/app.js?v=", "/app/app.css?v="] {
+        let start = html
+            .find(prefix)
+            .unwrap_or_else(|| panic!("missing {prefix}"));
+        let rest = &html[start..];
+        let end = rest.find('"').unwrap();
+        let versioned = &rest[..end];
+        let r = site.plain(Method::GET, versioned).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{versioned}");
+        assert_eq!(
+            r.headers()["cache-control"],
+            "public, max-age=31536000, immutable",
+            "{versioned}"
+        );
+        let tag = r.headers()["etag"].to_str().unwrap().to_string();
+        let r304 = site
+            .plain(Method::GET, versioned)
+            .header("if-none-match", &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r304.status(), 304, "{versioned}");
+        assert!(r304.bytes().await.unwrap().is_empty());
+
+        // A wrong version parameter falls back to `no-cache` instead of pinning stale bytes.
+        let wrong = format!("{prefix}stale");
+        let rw = site.plain(Method::GET, &wrong).send().await.unwrap();
+        assert_eq!(rw.status(), 200, "{wrong}");
+        assert_eq!(rw.headers()["cache-control"], "no-cache", "{wrong}");
+    }
+    // Fonts also support conditional 304 revalidation.
+    let f = site
+        .plain(Method::GET, "/app/fonts/nunito-latin.woff2")
+        .send()
+        .await
+        .unwrap();
+    let ftag = f.headers()["etag"].to_str().unwrap().to_string();
+    let f304 = site
+        .plain(Method::GET, "/app/fonts/nunito-latin.woff2")
+        .header("if-none-match", &ftag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(f304.status(), 304);
+    assert!(f304.bytes().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn feed_ideas_update_library_and_openapi_return_304_on_matching_etag() {
+    let e = exec().await;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+
+    // OpenAPI schema supports conditional 304.
+    let r = site
+        .plain(Method::GET, "/api/v1/openapi.json")
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    assert!(r.headers().get("content-encoding").is_none());
+    let otag = r.headers()["etag"].to_str().unwrap().to_string();
+    let r304 = site
+        .plain(Method::GET, "/api/v1/openapi.json")
+        .header("if-none-match", &otag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r304.status(), 304);
+    assert!(r304.bytes().await.unwrap().is_empty());
+
+    // Proxied web app endpoints return ETag and answer 304 with empty body when unchanged.
+    for path in [
+        "/app/api/v1/feed",
+        "/app/api/v1/ideas",
+        "/app/api/v1/update",
+        "/app/api/v1/library/movies?limit=50&offset=0",
+        "/app/api/v1/library/series?limit=50&offset=0",
+    ] {
+        let r = site
+            .app(Method::GET, path, Some(&cookie))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        assert_eq!(r.headers()["cache-control"], "no-store", "{path}");
+        let tag = r.headers()["etag"].to_str().unwrap().to_string();
+        assert!(tag.starts_with("W/\""), "{path}: {tag}");
+        assert!(!r.bytes().await.unwrap().is_empty(), "{path}");
+
+        let r304 = site
+            .app(Method::GET, path, Some(&cookie))
+            .header("if-none-match", &tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r304.status(), 304, "{path}");
+        assert_eq!(r304.headers()["etag"].to_str().unwrap(), tag, "{path}");
+        assert_eq!(r304.headers()["cache-control"], "no-store", "{path}");
+        assert!(r304.bytes().await.unwrap().is_empty(), "{path}");
+    }
+
+    // Feed ETag ignores `generated_at` (stays 304 across ticks) and changes when state changes.
+    let f1 = site
+        .app(Method::GET, "/app/api/v1/feed", Some(&cookie))
+        .send()
+        .await
+        .unwrap();
+    let ftag = f1.headers()["etag"].to_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let f_still = site
+        .app(Method::GET, "/app/api/v1/feed", Some(&cookie))
+        .header("if-none-match", &ftag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        f_still.status(),
+        304,
+        "generated_at must not bust feed ETag"
+    );
+
+    // Adding a title changes the feed and invalidates the old ETag.
+    let (s, _) = site
+        .json(
+            site.app(Method::POST, "/app/api/v1/quick-add", Some(&cookie))
+                .json(&json!({ "media_id": "movie:tmdb:900001" })),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let f2 = site
+        .app(Method::GET, "/app/api/v1/feed", Some(&cookie))
+        .header("if-none-match", &ftag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(f2.status(), 200, "state change must return 200");
+    assert_ne!(f2.headers()["etag"].to_str().unwrap(), ftag);
+}
+
+#[tokio::test]
+async fn plex_movie_posters_are_resized_through_local_plex_transcoder() {
+    let e = start_exec(ExecOptions::default()).await;
+    e.mock.lock().unwrap().plex_transcode = true;
+    let site = serve(e.state.clone()).await;
+    let cookie = site.sign_in(&e).await;
+
+    let r = site.art("movie:tmdb:910001", Some(&cookie)).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "image/jpeg");
+    let body = r.bytes().await.unwrap();
+    assert_eq!(&body[..3], &[0xff, 0xd8, 0xff]);
+    // Served via local Plex transcoder (342x513), never fetching the full-res image directly.
+    assert!(
+        image_fetches(&e).is_empty(),
+        "should not hit direct full-res image"
+    );
+    let log = e.mock.lock().unwrap().plex_transcode_log.clone();
+    assert_eq!(log.len(), 1);
+    assert!(log[0].1, "X-Plex-Token must be sent to local Plex");
+    assert!(log[0].0.contains("width=342") && log[0].0.contains("height=513"));
+    assert!(log[0].0.contains("uploads%2Frel0001.jpg"));
+
+    // An oversized (> 128 KiB) pre-cached movie poster on disk is replaced once with the compact copy.
+    let mut big = vec![0xff, 0xd8, 0xff, 0xe0];
+    big.resize(140 * 1024, 0x42);
+    fsutil::atomic_replace_private(&e.state.cfg.state_dir.join("art/movie-910001"), &big).unwrap();
+    let r2 = site.art("movie:tmdb:910001", Some(&cookie)).await;
+    assert_eq!(r2.status(), 200);
+    let shrunk = r2.bytes().await.unwrap();
+    assert!(shrunk.len() < 1024, "oversized cached poster should shrink");
+    let on_disk = std::fs::read(e.state.cfg.state_dir.join("art/movie-910001")).unwrap();
+    assert_eq!(on_disk.len(), shrunk.len());
+}
+
+#[tokio::test]
+async fn remote_mcp_json_responses_are_gzipped() {
+    let (env, _g) = GoogleEnv::new(&["user@example.com"]).await;
+    let raw = reqwest::Client::builder().no_gzip().build().unwrap();
+    let req_body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    });
+    let call = |gzip: bool| {
+        let mut rb = raw
+            .post(env.url("/mcp"))
+            .bearer_auth("mcp-token-web-0123456789abcdef")
+            .header("accept", "application/json, text/event-stream")
+            .json(&req_body);
+        if gzip {
+            rb = rb.header("accept-encoding", "gzip");
+        }
+        rb
+    };
+    let plain = call(false).send().await.unwrap();
+    assert_eq!(plain.status(), 200);
+    assert!(plain.headers().get("content-encoding").is_none());
+    let plain_bytes = plain.bytes().await.unwrap();
+
+    let zipped = call(true).send().await.unwrap();
+    assert_eq!(zipped.status(), 200);
+    assert_eq!(zipped.headers()["content-encoding"], "gzip");
+    let zipped_bytes = zipped.bytes().await.unwrap();
+    assert_eq!(&zipped_bytes[..2], &[0x1f, 0x8b], "gzip magic");
+    assert!(
+        zipped_bytes.len() < plain_bytes.len() / 2,
+        "expected >50% compression: plain={}, gz={}",
+        plain_bytes.len(),
+        zipped_bytes.len()
+    );
 }
 
 /// A server for the headless-browser rig (`cargo test -- --ignored rig_server`): a UFC card two
