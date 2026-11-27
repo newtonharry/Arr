@@ -196,8 +196,14 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r(r"(?i)\b(bearer|basic)\s+[^\s,;]+"), "$1 <secret>"),
         (
             r(
-                r#"(?i)\b(token|secret|password|passwd|pwd|api[_-]?key|authorization|cookie|code)(\s*[=:]\s*)[^\s,;&"']+"#,
+                r#"(?i)\b(token|secret|password|passwd|pwd|api[_-]?key|authorization|cookie)(\s*[=:]\s*)[^\s,;&"']+"#,
             ),
+            "$1$2<secret>",
+        ),
+        // An OAuth `code=` is a secret; an operating-system error code (`code: 10054`) is all
+        // digits, says nothing about anyone, and is what tells one failure from another.
+        (
+            r(r#"(?i)\b(code)(\s*[=:]\s*)[^\s,;&"']*[^\s,;&"'0-9][^\s,;&"']*"#),
             "$1$2<secret>",
         ),
         (r(r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>]+"#), "<url>"),
@@ -369,6 +375,17 @@ mod tests {
         for bad in ["", "  ", "not a dsn", "https://sentry.io/1"] {
             assert!(parse_dsn(bad).is_none(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_os_error_code_is_kept_and_an_oauth_code_is_not() {
+        let out = scrub("framer failed: Recv(Os { code: 10054, kind: Uncategorized })");
+        assert!(out.contains("code: 10054"), "{out}");
+        let out = scrub("callback with code=4/0AbCdEf and code: abc123");
+        assert!(
+            !out.contains("4/0AbCdEf") && !out.contains("abc123"),
+            "{out}"
+        );
     }
 
     #[test]
