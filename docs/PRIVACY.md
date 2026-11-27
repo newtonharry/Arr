@@ -94,7 +94,7 @@ downloaded, or your logs. Messages are cut off after 2,000 characters. The clean
 ## The version check and the recent-problems list
 
 Two things that are not error reports. When automatic updates are on, Arr asks GitHub for the
-latest release (`api.github.com`, at most every six hours) to show "an update is available";
+latest release (`api.github.com`, at most once an hour) to show "an update is available";
 GitHub sees your address, as any website would, and Arr sends nothing about you. And the Health
 screen shows the last 50 warnings and errors Arr logged: they are kept only in memory (gone at
 restart), pass through the same scrubber as reports before they are stored, and are shown only

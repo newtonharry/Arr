@@ -964,7 +964,7 @@ These take the bearer token on `/api/v1` (and the web app's session through `/ap
 passes exactly these routes). All are in the OpenAPI document.
 
 - `GET /api/v1/update`: `{current, latest, available, can_update, auto_updates, release_url,
-  status}`. `latest` is GitHub's latest release, checked at most every six hours and only when
+  status}`. `latest` is GitHub's latest release, checked at most once an hour and only when
   automatic updates are installed (`null` otherwise, or when GitHub didn't answer).
   `can_update` is true only when the installed updater and the service manager's watcher can
   be started from here; installs from before this existed report `false` until the installer

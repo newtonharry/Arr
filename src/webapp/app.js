@@ -2933,8 +2933,8 @@ function onWake(visibleChange) {
   }
   if (visibleChange && P.shown) loadTitle(true);
   if ((S.banner || S.setup) && !watchT) watchBanner();
-  // The server checks GitHub releases at most every six hours.
-  if (S.me && U.phase === 'idle' && Date.now() - U.checkedAt > 6 * 60 * 60 * 1000) loadUpdate();
+  // The server checks GitHub releases at most once an hour.
+  if (S.me && U.phase === 'idle' && Date.now() - U.checkedAt > 60 * 60 * 1000) loadUpdate();
 }
 async function boot() {
   document.addEventListener('visibilitychange', () => {

@@ -92,7 +92,7 @@ ChatGPT (see below).
 ### Starting when the computer starts
 
 After a power cut a Plex box often sits at its login screen. Arr can start before anyone logs
-in, with its tunnel (and the daily update job), on every system:
+in, with its tunnel (and the hourly update job), on every system:
 
 - **Linux, installed with `sudo`:** always. The systemd service starts at boot.
 - **Linux, installed without `sudo`:** the installer turns on lingering (`loginctl enable-linger`),
@@ -118,7 +118,7 @@ in, with its tunnel (and the daily update job), on every system:
 For scripts: `--at-boot` or `--no-at-boot` (`install.sh`), `$env:ARR_AT_BOOT = '1'` or `'0'`
 (`install.ps1`; PowerShell's `irm | iex` can't take flags). Without a flag the question is asked
 only when someone is at the terminal. An install run with nobody to ask (`--yes` without
-`--at-boot`, no terminal, and the daily update job) never asks for a password: it keeps the
+`--at-boot`, no terminal, and the hourly update job) never asks for a password: it keeps the
 kind of install you have, leaves its service definitions as they are if changing them would need
 an administrator, and still swaps the binary, restarts Arr, checks it answers and goes back to
 the old version if it doesn't. To change the kind later, run the installer again with the flag;
@@ -153,14 +153,14 @@ the state folder on macOS.
 #### Updating and changing settings from the web app
 
 With automatic updates on, the web app (Settings, and a line under the header on every screen) shows
-"Arr X is available · Update now". Arr checks GitHub's latest release at most every six hours
+"Arr X is available · Update now". Arr checks GitHub's latest release at most once an hour
 (only when automatic updates are installed) and, when you tap, asks the same updater to run:
 it never installs anything itself. On Linux it creates `update-requested` in its state folder
 and a systemd `arr-update.path` unit starts the updater; on macOS it creates a file in
 `update-queue` that the update job's `QueueDirectories` watches; on Windows it starts the
 "Arr update" task. The updater removes the request first, and writes `update-status.json` for
 the app to show. **Installs from before this existed** keep working as they were, and show no
-Update now button until you run the installer once more (the daily updater doesn't rewrite
+Update now button until you run the installer once more (the hourly updater doesn't rewrite
 itself); the Settings screen says so.
 
 Settings also changes downloading, the upload limit, the torrent port, error reports and the TMDB

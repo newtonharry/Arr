@@ -483,7 +483,7 @@ function Install-Arr {
 		# Already on (its script may be gone, for example removed by antivirus): repaired below.
 		if ((Test-Path $Updater) -or $updateTask) { $AutoUpdate = '1' }
 		elseif (-not (Interactive)) { $AutoUpdate = '0' } # only ARR_AUTO_UPDATE=1 turns it on
-		elseif (Confirm 'Install new versions of Arr automatically (checked once a day)?' 'n') { $AutoUpdate = '1' }
+		elseif (Confirm 'Install new versions of Arr automatically (checked every hour)?' 'n') { $AutoUpdate = '1' }
 		else { $AutoUpdate = '0' }
 	}
 	$api = "http://127.0.0.1:$Port"
@@ -534,11 +534,11 @@ function Install-Arr {
 				$taskArgs = "--hidden `"$ps`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Updater`""
 				Register-ScheduledTask -TaskName 'Arr update' -Description 'Installs new Arr releases (installed by install.ps1)' -Force `
 					-Action (New-ScheduledTaskAction -Execute $Background -Argument $taskArgs) `
-					-Trigger (New-ScheduledTaskTrigger -Daily -At $at) `
+					-Trigger (New-ScheduledTaskTrigger -Once -At $at -RepetitionInterval (New-TimeSpan -Hours 1)) `
 					-Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew) `
 					-Principal $principal | Out-Null
 			}
-			Say 'Arr checks for a new release once a day and installs it. Turn this off with $env:ARR_AUTO_UPDATE = "0" and running this again.'
+			Say 'Arr checks for a new release every hour and installs it. Turn this off with $env:ARR_AUTO_UPDATE = "0" and running this again.'
 			return $true
 		}
 		$task = Get-ScheduledTask -TaskName 'Arr update' -ErrorAction SilentlyContinue
@@ -1360,7 +1360,7 @@ if ($boot -and [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne
 # Registers task $t to start at boot ($atBoot) or at log-on. Returns a note when, at boot, its
 # user couldn't be let to start and stop it.
 function Register-ArrTask($t, $atBoot) {
-	if ($t.At) { $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]$t.At); $set = $updateSettings }
+	if ($t.At) { $trigger = New-ScheduledTaskTrigger -Once -At ([datetime]$t.At) -RepetitionInterval (New-TimeSpan -Hours 1); $set = $updateSettings }
 	else {
 		$trigger = @(New-ScheduledTaskTrigger -AtLogOn -User $user)
 		if ($atBoot) { $trigger += New-ScheduledTaskTrigger -AtStartup }
@@ -1642,7 +1642,7 @@ function Wait-Healthy($api, $version, $seconds) {
 function Write-Updater($path, $repo, $target, $binDir, $stateDir, $port) {
 	$q = { param($s) "'" + ($s -replace "'", "''") + "'" }
 	$head = @"
-# Arr updater, written by install.ps1. The daily "Arr update" task runs it; you can run it
+# Arr updater, written by install.ps1. The hourly "Arr update" task runs it; you can run it
 # by hand too. It trusts only the release zips CI builds from version tags (checked by
 # SHA-256), and goes back to the old version if the new one doesn't start.
 `$Repo = $(& $q $repo)

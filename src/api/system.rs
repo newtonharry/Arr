@@ -33,7 +33,7 @@ async fn update_view(st: &AppState) -> Value {
     })
 }
 
-/// `GET /update`: the running version, the latest release (checked at most every six hours,
+/// `GET /update`: the running version, the latest release (checked at most once an hour,
 /// and only when automatic updates are installed) and what the updater last did.
 pub(super) async fn update_get(State(st): St, headers: HeaderMap) -> ApiResult {
     ok_etag(&headers, update_view(&st).await)

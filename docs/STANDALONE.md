@@ -213,7 +213,7 @@ one changes only the service definitions (the binary, config and state folder ar
   Windows tasks that start at log-on.
 
 Putting a service in the first mode on a Mac or on Windows needs an administrator once; an
-installer run with nobody to ask (`--yes`, the daily updater) never asks, and keeps whichever
+installer run with nobody to ask (`--yes`, the hourly updater) never asks, and keeps whichever
 mode is installed. To restart Arr without administrator rights in the first mode, end your own
 `arr serve` process on macOS (launchd's `KeepAlive` starts it again from the binary on disk), or
 `Stop-ScheduledTask Arr; Start-ScheduledTask Arr` on Windows (the installer gives your account
