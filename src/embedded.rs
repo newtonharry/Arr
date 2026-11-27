@@ -1,4 +1,4 @@
-//! The embedded BitTorrent engine: one librqbit 9.0.1 session inside this process, used
+//! The embedded BitTorrent engine: one librqbit 9.1.0 session inside this process, used
 //! instead of qBittorrent when `[embedded]` is configured. There is no HTTP daemon, web UI,
 //! qBittorrent URL, credential or API.
 //!
@@ -54,7 +54,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::OnceCell;
 
-pub const ENGINE: &str = "librqbit 9.0.1";
+pub const ENGINE: &str = "librqbit 9.1.0";
 
 pub struct Embedded {
     cfg: EmbeddedConfig,
@@ -1863,6 +1863,18 @@ impl Embedded {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_engine_label_names_the_pinned_librqbit() {
+        let version = super::ENGINE
+            .strip_prefix("librqbit ")
+            .expect("a librqbit label");
+        let pin = format!("librqbit = {{ version = \"={version}\"");
+        assert!(
+            include_str!("../Cargo.toml").contains(&pin),
+            "ENGINE says {version}, but Cargo.toml pins another librqbit"
+        );
+    }
+
     use super::*;
 
     #[test]

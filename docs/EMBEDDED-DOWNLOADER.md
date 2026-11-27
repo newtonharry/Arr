@@ -1,8 +1,8 @@
-# Embedded downloader (librqbit 9.0.1)
+# Embedded downloader (librqbit 9.1.0)
 
 The embedded downloader is an optional download backend: librqbit's BitTorrent engine runs
 inside the `arr` process instead of qBittorrent.
-- **Dependency.** `librqbit = { version = "=9.0.1", default-features = false, features =
+- **Dependency.** `librqbit = { version = "=9.1.0", default-features = false, features =
   ["rust-tls"] }`, used through `librqbit::Session`.
 - **No daemon or UI.** There is no rqbit HTTP daemon, web UI, extra frontend or stub.
 - **Selection.** It is selected by an `[embedded]` section; then no qBittorrent section,
