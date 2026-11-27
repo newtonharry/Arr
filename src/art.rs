@@ -2,17 +2,27 @@
 //! folder, and served from `/app/art/{media_id}`. Browsers never contact those sites.
 
 use crate::api::AppState;
+use crate::config::PlexConfig;
 use crate::fsutil;
 use crate::ids::{MediaId, SeriesKey};
 use crate::upstream;
 use anyhow::Result;
 use reqwest::Url;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 
 const MAX_POSTER_BYTES: usize = 2 * 1024 * 1024;
+/// Target poster dimensions when asking the local Plex server to resize full-resolution artwork
+/// (matches TMDB's `w342` 2:3 size: 3x sharp for the app's largest 116px card).
+const POSTER_WIDTH: &str = "342";
+const POSTER_HEIGHT: &str = "513";
+/// Cached movie posters larger than this are likely full-resolution originals; try once per run
+/// to replace them with a resized copy.
+const SHRINK_ABOVE_BYTES: usize = 128 * 1024;
 /// A poster is fetched again after this long (TMDB's terms limit how long its data is kept).
 const POSTER_TTL: Duration = Duration::from_secs(30 * 86_400);
 /// A source with no poster is asked again after this long.
@@ -28,6 +38,7 @@ pub struct Art {
     dir: PathBuf,
     http: upstream::Http,
     permits: Semaphore,
+    shrink_tried: Mutex<HashSet<String>>,
 }
 
 /// Where a poster comes from.
@@ -44,6 +55,17 @@ impl Source {
             Source::Show(id) => format!("show-{id}"),
         }
     }
+}
+
+/// Validated upstream image candidates for one title.
+enum Candidates {
+    /// A movie: validated Plex poster URL (usually full-res) and/or TMDB `w342` URL.
+    Movie {
+        plex: Option<Url>,
+        tmdb: Option<Url>,
+    },
+    /// A TVmaze show poster (`medium` size, already compact).
+    Show(Option<Url>),
 }
 
 /// The image type of `bytes` when it is one of the three allowed ones.
@@ -67,6 +89,23 @@ fn fresh(path: &Path, ttl: Duration) -> bool {
         .is_some_and(|age| age < ttl)
 }
 
+/// Local Plex Media Server photo transcoder URL for an already-validated poster address.
+fn plex_transcode_url(plex: &PlexConfig, source: &Url) -> Option<Url> {
+    let base = format!(
+        "{}/photo/:/transcode",
+        plex.base_url.as_str().trim_end_matches('/')
+    );
+    let mut url = Url::parse(&base).ok()?;
+    url.query_pairs_mut()
+        .append_pair("width", POSTER_WIDTH)
+        .append_pair("height", POSTER_HEIGHT)
+        .append_pair("minSize", "1")
+        .append_pair("upscale", "0")
+        .append_pair("format", "jpg")
+        .append_pair("url", source.as_str());
+    Some(url)
+}
+
 impl Art {
     pub fn new(state_dir: &Path) -> Result<Self> {
         let dir = state_dir.join("art");
@@ -75,6 +114,7 @@ impl Art {
             dir,
             http: upstream::http_client(Duration::from_secs(15)),
             permits: Semaphore::new(MAX_IN_FLIGHT),
+            shrink_tried: Mutex::new(HashSet::new()),
         })
     }
 
@@ -111,7 +151,30 @@ impl Art {
         };
         let key = source.key();
         if let Some(hit) = self.cached(&key) {
-            return hit;
+            // If an older cache entry holds a full-resolution movie poster, try once to replace it
+            // with a compact resized version so existing installs benefit without waiting 30 days.
+            if let Some((bytes, kind)) = hit {
+                if matches!(source, Source::Movie(_))
+                    && bytes.len() > SHRINK_ABOVE_BYTES
+                    && self.claim_shrink(&key)
+                {
+                    if permit.is_none() {
+                        permit = self.permits.acquire().await.ok();
+                    }
+                    let _permit = permit;
+                    if let Ok(Candidates::Movie { plex, tmdb }) = self.candidates(st, &source).await
+                        && let Some((smaller, skind)) = self
+                            .fetch_compact_movie(st, plex.as_ref(), tmdb.as_ref())
+                            .await
+                        && smaller.len() < bytes.len()
+                    {
+                        self.remember(&key, Some(&smaller));
+                        return Some((smaller, skind));
+                    }
+                }
+                return Some((bytes, kind));
+            }
+            return None;
         }
         if permit.is_none() {
             permit = Some(self.permits.acquire().await.ok()?);
@@ -121,26 +184,85 @@ impl Art {
         if let Some(hit) = self.cached(&key) {
             return hit;
         }
-        let url = match self.image_url(st, &source).await {
-            Ok(Some(u)) => u,
-            Ok(None) => {
+        let poster = match self.candidates(st, &source).await {
+            Ok(Candidates::Movie {
+                plex: None,
+                tmdb: None,
+            })
+            | Ok(Candidates::Show(None)) => {
                 self.remember(&key, None);
                 return None;
             }
+            Ok(Candidates::Movie { plex, tmdb }) => {
+                if let Some(p) = self
+                    .fetch_compact_movie(st, plex.as_ref(), tmdb.as_ref())
+                    .await
+                {
+                    Some(p)
+                } else if let Some(u) = plex {
+                    self.fetch_url(u).await
+                } else {
+                    None
+                }
+            }
+            Ok(Candidates::Show(Some(u))) => self.fetch_url(u).await,
             Err(()) => return None,
-        };
-        let resp = upstream::send(self.http.get(url)).await.ok()?;
+        }?;
+        self.remember(&key, Some(&poster.0));
+        Some(poster)
+    }
+
+    fn claim_shrink(&self, key: &str) -> bool {
+        self.shrink_tried
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.to_string())
+    }
+
+    /// Tries to fetch a compact (~342px) movie poster: first through the local Plex server's photo
+    /// transcoder (when Plex is configured), then from TMDB's `w342` endpoint.
+    async fn fetch_compact_movie(
+        &self,
+        st: &AppState,
+        plex: Option<&Url>,
+        tmdb: Option<&Url>,
+    ) -> Option<Poster> {
+        if let (Some(src), Some(cfg)) = (plex, st.cfg.plex.as_ref())
+            && let Some(transcode) = plex_transcode_url(cfg, src)
+            && let Some(p) = self
+                .fetch_request(
+                    self.http
+                        .get(transcode)
+                        .header("X-Plex-Token", cfg.token.expose()),
+                )
+                .await
+        {
+            return Some(p);
+        }
+        if let Some(u) = tmdb {
+            return self.fetch_url(u.clone()).await;
+        }
+        None
+    }
+
+    async fn fetch_url(&self, url: Url) -> Option<Poster> {
+        self.fetch_request(self.http.get(url)).await
+    }
+
+    async fn fetch_request(&self, req: reqwest::RequestBuilder) -> Option<Poster> {
+        let resp = upstream::send(req).await.ok()?;
         let allowed = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
+            .and_then(|t| t.split(';').next())
+            .map(str::trim)
             .is_some_and(|t| matches!(t, "image/jpeg" | "image/png" | "image/webp"));
         if !allowed {
             return None;
         }
         let bytes = upstream::read_bytes(resp, MAX_POSTER_BYTES).await.ok()?;
         let kind = sniff(&bytes)?;
-        self.remember(&key, Some(&bytes));
         Some((bytes, kind))
     }
 
@@ -180,22 +302,22 @@ impl Art {
         }
     }
 
-    /// The poster's address, on the configured image host only. `Err` when the provider could
-    /// not be asked (nothing is remembered); `Ok(None)` when it has no usable poster.
-    async fn image_url(&self, st: &AppState, source: &Source) -> Result<Option<Url>, ()> {
+    /// The poster addresses, on the configured image hosts only. `Err` when the provider could
+    /// not be asked (nothing is remembered); `Ok(Candidates::... { None })` when it has no usable poster.
+    async fn candidates(&self, st: &AppState, source: &Source) -> Result<Candidates, ()> {
         match source {
             Source::Movie(id) => {
                 let movies = st.movies.as_ref().ok_or(())?;
                 let movie = movies.movie(*id).await.map_err(|_| ())?;
-                // Plex's poster first (on Plex's image host only), then TMDB's.
-                if let Some(thumb) = movie.as_ref().and_then(|m| m.plex_thumb.as_deref())
-                    && let Ok(given) = Url::parse(thumb)
-                    && let Some(base) = st.cfg.plex.as_ref().map(|p| &p.image_base_url)
-                    && given.host_str() == base.host_str()
-                    && let Some(url) = on_base(base, given.path().trim_start_matches('/'))
-                {
-                    return Ok(Some(url));
-                }
+                let plex = movie
+                    .as_ref()
+                    .and_then(|m| m.plex_thumb.as_deref())
+                    .and_then(|thumb| Url::parse(thumb).ok())
+                    .and_then(|given| {
+                        let base = &st.cfg.plex.as_ref()?.image_base_url;
+                        (given.host_str() == base.host_str()).then_some(())?;
+                        on_base(base, given.path().trim_start_matches('/'))
+                    });
                 let path = movie.and_then(|m| m.poster_path).filter(|p| {
                     p.starts_with('/')
                         && p.len() < 100
@@ -203,10 +325,11 @@ impl Art {
                             .bytes()
                             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
                 });
-                Ok(path.and_then(|p| {
+                let tmdb = path.and_then(|p| {
                     let base = &st.cfg.tmdb.as_ref()?.image_base_url;
                     on_base(base, &format!("t/p/w342{p}"))
-                }))
+                });
+                Ok(Candidates::Movie { plex, tmdb })
             }
             Source::Show(id) => {
                 let tv = st.tvmaze.as_ref().ok_or(())?;
@@ -214,12 +337,13 @@ impl Art {
                 let given = show
                     .and_then(|s| s.image?.medium)
                     .and_then(|u| Url::parse(&u).ok());
-                Ok(given.and_then(|u| {
+                let url = given.and_then(|u| {
                     let base = &st.cfg.tvmaze.as_ref()?.image_base_url;
                     // Only the path is used: the address is always the configured host's.
                     (u.host_str() == base.host_str()).then_some(())?;
                     on_base(base, u.path().trim_start_matches('/'))
-                }))
+                });
+                Ok(Candidates::Show(url))
             }
         }
     }

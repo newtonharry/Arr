@@ -23,7 +23,7 @@ use crate::store::{CreateOutcome, Store};
 use crate::target::{Resolver, Target};
 use crate::worker::{self, Worker};
 use crate::{fsutil, openapi};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
@@ -919,11 +919,25 @@ fn protected_routes() -> Vec<(&'static str, axum::routing::MethodRouter<Arc<AppS
 fn public_routes() -> Vec<(&'static str, axum::routing::MethodRouter<Arc<AppState>>)> {
     vec![
         ("/api/v1/health", get(health)),
-        (
-            "/api/v1/openapi.json",
-            get(|| async { Json(openapi::document()) }),
-        ),
+        ("/api/v1/openapi.json", get(openapi_json)),
     ]
+}
+
+async fn openapi_json(headers: HeaderMap) -> Response {
+    static DOC: std::sync::OnceLock<(Bytes, HeaderValue)> = std::sync::OnceLock::new();
+    let (raw, tag) = DOC.get_or_init(|| {
+        let bytes = Bytes::from(
+            serde_json::to_vec(&openapi::document()).expect("OpenAPI document serializes"),
+        );
+        let tag = weak_etag(&bytes);
+        (bytes, tag)
+    });
+    if if_none_match(&headers, tag) {
+        return not_modified(tag.clone());
+    }
+    let mut r = ([(header::CONTENT_TYPE, "application/json")], raw.clone()).into_response();
+    r.headers_mut().insert(header::ETAG, tag.clone());
+    r
 }
 
 /// Every path the API serves, public and protected: for the MCP parity test.
@@ -1127,6 +1141,47 @@ fn plan_id(p: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
 
 fn ok(v: Value) -> ApiResult {
     Ok(Json(v).into_response())
+}
+
+/// Weak ETag from a SHA-256 prefix of `bytes` (weak because gzip and plain encodings are
+/// equivalent).
+pub(crate) fn weak_etag(bytes: &[u8]) -> HeaderValue {
+    let digest = Sha256::digest(bytes);
+    HeaderValue::from_str(&format!("W/\"{}\"", hex::encode(&digest[..12])))
+        .expect("hex is a valid header value")
+}
+
+/// Whether the request's `If-None-Match` names `tag` (weak or strong, or `*`).
+pub(crate) fn if_none_match(req: &HeaderMap, tag: &HeaderValue) -> bool {
+    let Ok(tag) = tag.to_str() else { return false };
+    req.get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|t| {
+            t == "*" || t.strip_prefix("W/").unwrap_or(t) == tag.strip_prefix("W/").unwrap_or(tag)
+        })
+}
+
+/// Empty `304 Not Modified` carrying `tag`.
+pub(crate) fn not_modified(tag: HeaderValue) -> Response {
+    let mut r = Response::new(Body::empty());
+    *r.status_mut() = StatusCode::NOT_MODIFIED;
+    r.headers_mut().insert(header::ETAG, tag);
+    r
+}
+
+/// JSON response with a weak ETag; returns `304 Not Modified` when `If-None-Match` matches.
+pub(crate) fn ok_etag(req: &HeaderMap, v: Value) -> ApiResult {
+    let raw = serde_json::to_vec(&v).map_err(|e| ApiError::internal("json", e.to_string()))?;
+    let tag = weak_etag(&raw);
+    if if_none_match(req, &tag) {
+        return Ok(not_modified(tag));
+    }
+    let mut r = ([(header::CONTENT_TYPE, "application/json")], raw).into_response();
+    r.headers_mut().insert(header::ETAG, tag);
+    Ok(r)
 }
 
 fn created(v: Value) -> ApiResult {
@@ -1722,7 +1777,11 @@ fn managed(app: &str) -> bool {
     !app.ends_with("(unmanaged)")
 }
 
-async fn library_movies(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult {
+async fn library_movies(
+    State(st): St,
+    headers: HeaderMap,
+    ApiQuery(q): ApiQuery<ListQuery>,
+) -> ApiResult {
     let l = st.loaded()?;
     let index = st.index();
     let (limit, offset) = page_bounds(q.limit, q.offset)?;
@@ -1770,10 +1829,17 @@ async fn library_movies(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
             v
         })
         .collect();
-    ok(json!({ "total": items.len(), "items": views, "observation": observation(&l) }))
+    ok_etag(
+        &headers,
+        json!({ "total": items.len(), "items": views, "observation": observation(&l) }),
+    )
 }
 
-async fn library_series(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult {
+async fn library_series(
+    State(st): St,
+    headers: HeaderMap,
+    ApiQuery(q): ApiQuery<ListQuery>,
+) -> ApiResult {
     let l = st.loaded()?;
     let index = st.index();
     let (limit, offset) = page_bounds(q.limit, q.offset)?;
@@ -1837,7 +1903,10 @@ async fn library_series(State(st): St, ApiQuery(q): ApiQuery<ListQuery>) -> ApiR
             v
         })
         .collect();
-    ok(json!({ "total": items.len(), "items": views, "observation": observation(&l) }))
+    ok_etag(
+        &headers,
+        json!({ "total": items.len(), "items": views, "observation": observation(&l) }),
+    )
 }
 
 /// A copy of `s` without its episode list (most of a series' size).
@@ -4200,8 +4269,8 @@ pub async fn serve(cfg: RuntimeConfig) -> anyhow::Result<()> {
 pub fn app(state: Arc<AppState>) -> anyhow::Result<(Router, Box<dyn FnOnce() + Send>)> {
     let api = router(state.clone());
     let web = crate::webapp::router(&state, api.clone())?;
-    // gzip for the JSON API and the web app (the default predicate leaves images, event
-    // streams and tiny bodies alone). Not for `/mcp`, whose replies may stream.
+    // gzip for the JSON API, the web app and JSON `/mcp` / OAuth responses; the predicate leaves
+    // images, already-compressed fonts, event streams and tiny bodies (< 256 B) alone.
     let (api, web) = (api.layer(compress()), web.layer(compress()));
     match &state.cfg.mcp {
         Some(m) => {
@@ -4211,17 +4280,26 @@ pub fn app(state: Arc<AppState>) -> anyhow::Result<(Router, Box<dyn FnOnce() + S
                 state.cfg.api_token.expose(),
                 &state.cfg.state_dir,
             )?;
-            Ok((mcp.merge(api).merge(web), Box::new(stop)))
+            Ok((mcp.layer(compress()).merge(api).merge(web), Box::new(stop)))
         }
         None => Ok((api.merge(web), Box::new(|| {}))),
     }
 }
 
-fn compress() -> tower_http::compression::CompressionLayer {
+fn compress()
+-> tower_http::compression::CompressionLayer<impl tower_http::compression::predicate::Predicate> {
+    use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
+    let predicate = SizeAbove::new(256)
+        .and(NotForContentType::GRPC)
+        .and(NotForContentType::IMAGES)
+        .and(NotForContentType::new("text/event-stream"))
+        .and(NotForContentType::new("font/woff2"))
+        .and(NotForContentType::new("font/woff"));
     tower_http::compression::CompressionLayer::new()
         .no_br()
         .no_deflate()
         .no_zstd()
+        .compress_when(predicate)
 }
 
 async fn shutdown() {
@@ -4819,7 +4897,7 @@ fn download_covers(request: MediaId, grab: MediaId) -> bool {
     }
 }
 
-async fn feed(State(st): St) -> ApiResult {
+async fn feed(State(st): St, headers: HeaderMap) -> ApiResult {
     st.loaded()?;
     let now = OffsetDateTime::now_utc();
     let index = st.index();
@@ -4991,8 +5069,8 @@ async fn feed(State(st): St) -> ApiResult {
             .collect();
 
     let sport = sport::coming_up(&st, now).await?;
-    ok(json!({
-        "generated_at": rfc3339(now),
+    // Hash the semantic feed without `generated_at` so unchanged polls answer 304 with no body.
+    let mut payload = json!({
         "movies_enabled": st.movies.is_some(),
         "sport_enabled": st.sports.is_some(),
         "tmdb_backup": st.movies.as_ref().is_some_and(Movies::has_tmdb),
@@ -5002,7 +5080,21 @@ async fn feed(State(st): St) -> ApiResult {
         "looking": looking,
         "coming_up": coming_up,
         "sport": sport,
-    }))
+    });
+    let semantic =
+        serde_json::to_vec(&payload).map_err(|e| ApiError::internal("feed json", e.to_string()))?;
+    let tag = weak_etag(&semantic);
+    if if_none_match(&headers, &tag) {
+        return Ok(not_modified(tag));
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("generated_at".into(), json!(rfc3339(now)));
+    }
+    let raw =
+        serde_json::to_vec(&payload).map_err(|e| ApiError::internal("feed json", e.to_string()))?;
+    let mut r = ([(header::CONTENT_TYPE, "application/json")], raw).into_response();
+    r.headers_mut().insert(header::ETAG, tag);
+    Ok(r)
 }
 
 /// The longest a page waits for review scores; whatever is ready by then is shown.
@@ -5058,7 +5150,7 @@ async fn hidden_ideas(st: &AppState) -> Result<std::collections::HashSet<String>
 
 /// Popular shows with new episodes this week (TVmaze web schedule), without the ones people
 /// hid. Each item says whether the show is already here (`owned`, `library_state`).
-async fn ideas(State(st): St) -> ApiResult {
+async fn ideas(State(st): St, headers: HeaderMap) -> ApiResult {
     let Some(tv) = &st.tvmaze else {
         return ok(json!({ "status": "disabled", "items": [] }));
     };
@@ -5104,7 +5196,7 @@ async fn ideas(State(st): St) -> ApiResult {
             })
         })
         .collect();
-    ok(json!({ "status": "ok", "items": items }))
+    ok_etag(&headers, json!({ "status": "ok", "items": items }))
 }
 
 #[derive(Deserialize)]

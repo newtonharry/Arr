@@ -10,11 +10,10 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 fn movie(v: &Value, tmdb: u64) -> Option<&Value> {
-    v["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["tmdb_id"] == tmdb)
+    let Some(items) = v["items"].as_array() else {
+        panic!("no items array: {v}")
+    };
+    items.iter().find(|m| m["tmdb_id"] == tmdb)
 }
 
 #[tokio::test]

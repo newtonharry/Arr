@@ -461,7 +461,7 @@ async fn judging_waits_for_a_slot_inside_its_budget_and_runs_off_the_workers() {
     assert!(none.is_none());
     let waited = started.elapsed();
     assert!(
-        waited >= find::JUDGE_BUDGET - std::time::Duration::from_millis(100)
+        waited >= find::JUDGE_BUDGET.saturating_sub(std::time::Duration::from_millis(100))
             && waited < find::JUDGE_BUDGET + std::time::Duration::from_secs(2),
         "{waited:?}"
     );

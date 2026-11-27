@@ -793,7 +793,12 @@ fn file_names_fit_keep_their_parts_apart_and_are_safe_everywhere() {
             if part != Part::Whole {
                 assert!(name.contains(&part.label()), "{ch}: {name}");
             }
-            assert!(name.ends_with(".mkv"));
+            #[expect(
+                clippy::case_sensitive_file_extension_comparisons,
+                reason = "arr names its copies with a lowercase .mkv; this checks exactly that"
+            )]
+            let mkv = name.ends_with(".mkv");
+            assert!(mkv);
             names.push(name);
         }
         let mut sorted = names.clone();

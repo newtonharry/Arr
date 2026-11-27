@@ -111,6 +111,10 @@ pub struct MockState {
     pub download_gate: Option<Arc<tokio::sync::Notify>>,
     /// Poster requests received by the TMDB and TVmaze image hosts (paths).
     pub image_log: Vec<String>,
+    /// When true, `/plex/photo/:/transcode` answers 200 with a compact JPEG.
+    pub plex_transcode: bool,
+    /// Each `/plex/photo/:/transcode` request: (query, token_ok).
+    pub plex_transcode_log: Vec<(String, bool)>,
     /// TVmaze `image` values overriding the built-in ones, per show id.
     pub tvmaze_images: HashMap<u32, Value>,
     /// Plex's metadata service answers HTTP 500.
@@ -757,7 +761,8 @@ async fn tmdb_details(
     if !tmdb_authorized(&headers, &q) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if let Some(v) = m.lock().unwrap().tmdb_movies.get(&id).cloned() {
+    let found = m.lock().unwrap().tmdb_movies.get(&id).cloned();
+    if let Some(v) = found {
         return axum::Json(v).into_response();
     }
     if id == "900001" {
@@ -1147,6 +1152,31 @@ async fn plex_offers(
 const TINY_JPEG: &[u8] = &[
     0xff, 0xd8, 0xff, 0xe0, 0, 16, b'J', b'F', b'I', b'F', 0, 1, 0xff, 0xd9,
 ];
+
+async fn plex_transcode(
+    State(m): State<Mock>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let enabled = m.lock().unwrap().plex_transcode;
+    if !enabled {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+    let token_ok = headers
+        .get("x-plex-token")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|t| t == PLEX_TOKEN);
+    m.lock()
+        .unwrap()
+        .plex_transcode_log
+        .push((uri.query().unwrap_or("").to_string(), token_ok));
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+        TINY_JPEG,
+    )
+        .into_response()
+}
 
 async fn image_host(State(m): State<Mock>, uri: Uri) -> Response {
     m.lock().unwrap().image_log.push(uri.path().to_string());
@@ -1594,6 +1624,8 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         schedule_fail: false,
         download_gate: None,
         image_log: vec![],
+        plex_transcode: false,
+        plex_transcode_log: vec![],
         tvmaze_images: HashMap::new(),
         plex_meta_fail: false,
         plex_meta_log: vec![],
@@ -1650,6 +1682,8 @@ pub async fn start_mock() -> (SocketAddr, Mock) {
         )
         .route("/plex/identity", get(plex_identity))
         .route("/plex/services/browse/{b64}", get(plex_browse))
+        .without_v07_checks()
+        .route("/plex/photo/:/transcode", get(plex_transcode))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

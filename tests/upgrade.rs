@@ -70,7 +70,11 @@ fn every_released_config_layout_still_loads() {
     let mut names: Vec<_> = std::fs::read_dir(fixtures().join("configs"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".toml"))
+        .filter(|n| {
+            std::path::Path::new(n)
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("toml"))
+        })
         .collect();
     names.sort();
     assert!(names.len() >= 9, "fixtures went missing: {names:?}");

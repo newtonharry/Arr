@@ -1934,10 +1934,11 @@ fn parse_bounded(
         let mut segs: Vec<Vec<(&str, Option<usize>)>> = vec![vec![]];
         for (ti, tok) in t.iter().enumerate() {
             match tok {
-                Tok::W(s, _) => segs
-                    .last_mut()
-                    .expect("one")
-                    .push((s.as_str(), gclaim_at[gi][ti])),
+                Tok::W(s, _) => {
+                    if let Some(seg) = segs.last_mut() {
+                        seg.push((s.as_str(), gclaim_at[gi][ti]));
+                    }
+                }
                 Tok::Bar => segs.push(vec![]),
                 _ => {}
             }

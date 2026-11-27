@@ -57,3 +57,23 @@ tempfile = "3"
 
 [profile.release]
 strip = true
+
+# Lints beyond clippy's defaults, picked for catching bugs rather than style. CI's
+# `cargo clippy -- -D warnings` turns every warning into a failure. If one is wrong for a
+# particular line, use `#[expect(clippy::name, reason = "...")]` there, not a blanket allow.
+[lints.clippy]
+# Panics and deadlocks
+unchecked_time_subtraction = "warn"
+unwrap_in_result = "warn"
+significant_drop_in_scrutinee = "warn"
+# Logic slips
+case_sensitive_file_extension_comparisons = "warn"
+match_wildcard_for_single_variants = "warn"
+iter_over_hash_type = "warn"
+# Leftovers
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+# unsafe needs its reasoning written down
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"

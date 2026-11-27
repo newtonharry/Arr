@@ -80,6 +80,10 @@ fn fetched(e: &Exec) -> Vec<String> {
 }
 
 /// The last add: `Some(magnet)` for a magnet add, `None` for a `.torrent` file.
+#[expect(
+    clippy::unwrap_in_result,
+    reason = "no add at all fails the test; None means a .torrent add"
+)]
 fn last_add_magnet(e: &Exec) -> Option<String> {
     e.qb.lock()
         .unwrap()

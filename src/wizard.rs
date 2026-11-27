@@ -259,7 +259,7 @@ pub async fn run(mut opts: Options) -> Result<()> {
     } else {
         match wiz.opts.bind {
             IpAddr::V6(v6) => format!("[{v6}]"),
-            v4 => v4.to_string(),
+            v4 @ IpAddr::V4(_) => v4.to_string(),
         }
     };
     let link = format!("http://{host}:{}/?code={}", wiz.opts.port, wiz.code);
@@ -310,7 +310,8 @@ pub async fn run(mut opts: Options) -> Result<()> {
         let _ = task.await;
     }
     served?;
-    match wiz.inner.lock().unwrap().phase.clone() {
+    let phase = wiz.inner.lock().unwrap().phase.clone();
+    match phase {
         Phase::Done => Ok(()),
         _ => bail!("setup wasn't finished"),
     }

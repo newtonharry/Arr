@@ -35,6 +35,9 @@ pub const PER_MINUTE: usize = 6;
 struct Entry {
     at: Instant,
     searched: Option<Arc<Searched>>,
+    /// Kept only to be served while the limits turn requests away: it holds off no search.
+    /// (A search that failed on the caller's side leaves the answer before it like this.)
+    stale: bool,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Entry>>>;
@@ -99,7 +102,7 @@ impl CopiesGate {
                     return true;
                 }
                 match s.try_lock() {
-                    Ok(g) => g.as_ref().is_some_and(|e| e.at.elapsed() < ttl),
+                    Ok(g) => g.as_ref().is_some_and(|e| !e.stale && e.at.elapsed() < ttl),
                     Err(_) => true,
                 }
             });
@@ -111,9 +114,10 @@ impl CopiesGate {
                     .filter_map(|(k, s)| {
                         s.try_lock()
                             .ok()
-                            .map(|g| (k.clone(), g.as_ref().map(|e| e.at)))
+                            .map(|g| (k.clone(), g.as_ref().map(|e| (!e.stale, e.at))))
                     })
-                    .min_by_key(|(_, at)| *at)
+                    // An empty slot first, then a stale answer, then the oldest.
+                    .min_by_key(|(_, rank)| *rank)
                     .map(|(k, _)| k);
                 match oldest {
                     Some(k) => {
@@ -192,7 +196,7 @@ impl CopiesGate {
                 Some(f) if !fresh && f.complete => ttl,
                 _ => cooldown,
             };
-            if age < limit {
+            if !e.stale && age < limit {
                 return Ok(match &e.searched {
                     Some(f) => Served::Cached {
                         found: f.clone(),
@@ -218,19 +222,23 @@ impl CopiesGate {
         // The start is recorded before the search is awaited, so that a request that is
         // dropped half way (a client that went away) still spends the event's cooldown, and the
         // one queued behind it does not begin another at once.
-        let previous = guard.as_ref().and_then(|e| e.searched.clone());
+        let previous = guard
+            .as_ref()
+            .and_then(|e| Some((e.at, e.searched.clone()?)));
         *guard = Some(Entry {
             at: Instant::now(),
             searched: None,
+            stale: false,
         });
         let found = match search().await {
             Ok(f) => Arc::new(f),
             Err(e) => {
                 // An error is the caller's (a missing backend): no query was sent, so the
                 // start is not held against the event.
-                *guard = previous.map(|f| Entry {
-                    at: Instant::now() - cooldown.max(ttl),
+                *guard = previous.map(|(at, f)| Entry {
+                    at,
                     searched: Some(f),
+                    stale: true,
                 });
                 return Err(e);
             }
@@ -238,6 +246,7 @@ impl CopiesGate {
         *guard = Some(Entry {
             at: Instant::now(),
             searched: Some(found.clone()),
+            stale: false,
         });
         Ok(Served::Searched(found))
     }
