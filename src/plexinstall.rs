@@ -67,8 +67,12 @@ pub fn default_media() -> PathBuf {
 pub async fn run(opts: Options) -> Result<()> {
     // Only Linux installs system packages; Windows and macOS install Plex as you.
     #[cfg(target_os = "linux")]
-    if unsafe { libc::geteuid() } != 0 {
-        bail!("arr plex-install installs system software: run it as administrator (sudo)");
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            bail!("arr plex-install installs system software: run it as administrator (sudo)");
+        }
     }
     // The installer runs with a private umask (077); the media folders must be readable by
     // Plex's own user, so this process uses the usual 022 whatever it inherited.
@@ -302,7 +306,11 @@ async fn install_macos() -> Result<()> {
     };
     let zips: Vec<&serde_json::Value> = releases
         .iter()
-        .filter(|r| r["url"].as_str().is_some_and(|u| u.ends_with(".zip")))
+        .filter(|r| {
+            r["url"]
+                .as_str()
+                .is_some_and(|u| u.to_ascii_lowercase().ends_with(".zip"))
+        })
         .collect();
     let release = zips
         .iter()

@@ -324,7 +324,7 @@ impl EvalContext<'_> {
                     ));
                 }
             }
-            _ => {}
+            Target::Movie(_) => {}
         }
         out
     }
