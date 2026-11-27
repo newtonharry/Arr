@@ -84,7 +84,7 @@ are; a setting you give is applied, or refused before anything changes.
                          a system-wide install always does, and a per-user install turns on
                          lingering (sudo loginctl enable-linger). Asked at a terminal if not given.
   --no-at-boot           start Arr when you log in instead (it stays so until you run this again)
-  --auto-update          install new releases automatically (a daily check); asked if not given
+  --auto-update          install new releases automatically (checked every hour); asked if not given
                          (default no), and a re-run keeps automatic updates that are on
   --no-auto-update       don't, and turn automatic updates off if they were on
   --error-reports        send error reports, scrubbed of personal data (docs/PRIVACY.md);
@@ -1691,7 +1691,7 @@ fi
 
 # ---------------------------------------------------------------- automatic updates
 
-# A daily job installs new releases. It runs a local updater written here, never a script
+# An hourly job installs new releases. It runs a local updater written here, never a script
 # fetched from GitHub, so it trusts only the release binaries CI builds from version tags
 # (checked by SHA-256), and it rolls back if the new version doesn't start.
 if [ "$os" = Darwin ]; then kind=launchd; elif [ "$(id -u)" = 0 ]; then kind=system; else kind=user; fi
@@ -1710,7 +1710,7 @@ if [ -z "$AUTO_UPDATE" ]; then
 		# --auto-update turns it on.
 		AUTO_UPDATE=0
 	# Opt-in, like the setup page's box: anything that reaches out on its own is (PRODUCT.md).
-	elif confirm "Install new versions of Arr automatically (checked once a day)?" n; then
+	elif confirm "Install new versions of Arr automatically (checked every hour)?" n; then
 		AUTO_UPDATE=1
 	else
 		AUTO_UPDATE=0
@@ -1748,7 +1748,7 @@ fi
 if [ "$AUTO_UPDATE" = 1 ]; then
 	step "Turning on automatic updates"
 	{
-		printf '#!/bin/sh\n# Arr updater, written by install.sh. A daily job runs it; you can run it by hand too.\n'
+		printf '#!/bin/sh\n# Arr updater, written by install.sh. An hourly job runs it; you can run it by hand too.\n'
 		printf 'REPO=%s\nARR=%s\nTARGET=%s\nKIND=%s\nPORT=%s\nLOCK_KIND=%s\nLOCK_TOOL=%s\nCONFIG=%s\nLD_DIR=%s\nSTATE_DIR=%s\nOWNER=%s\n' \
 			"$(sq "$REPO")" "$(sq "$ARR")" "$(sq "$target")" "$(sq "$kind")" "$(sq "$PORT")" \
 			"$(sq "$lock_kind")" "$(sq "$lock_tool")" "$(sq "$CONFIG")" "$(sq "$LD_DIR")" "$(sq "$STATE_DIR")" \
@@ -1851,7 +1851,7 @@ healthy() {
 	done
 }
 
-# One update at a time: a manual run and the daily job must not share .previous and .new.
+# One update at a time: a manual run and the hourly job must not share .previous and .new.
 # flock (Linux) holds a kernel lock that ends with this process, so it can't go stale;
 # shlock (macOS) writes its pid atomically and replaces a dead holder's lock safely.
 lock="$ARR.update-lock"
@@ -1948,7 +1948,7 @@ EOF
 	system | user)
 		printf '[Unit]\nDescription=Update Arr to the latest release\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/bin/sh %s\n' \
 			"$(sd "$UPDATER")" >"$udir/arr-update.service"
-		printf '[Unit]\nDescription=Check for Arr updates once a day\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=6h\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' \
+		printf '[Unit]\nDescription=Check for Arr updates every hour\n\n[Timer]\nOnCalendar=hourly\nRandomizedDelaySec=15m\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' \
 			>"$udir/arr-update.timer"
 		chmod 644 "$udir/arr-update.service" "$udir/arr-update.timer"
 		$sctl daemon-reload && $sctl enable --now arr-update.timer >/dev/null 2>&1 ||
@@ -1962,19 +1962,19 @@ EOF
 		if ! { $sctl daemon-reload && $sctl enable --now arr-update.path >/dev/null 2>&1; }; then
 			rm -f "$udir/arr-update.path"
 			$sctl daemon-reload || true
-			say "Note: the web app's \"Update now\" isn't available (systemd wouldn't start its watcher); updates still run once a day."
+			say "Note: the web app's \"Update now\" isn't available (systemd wouldn't start its watcher); updates are still checked for every hour."
 		fi
 		;;
 	launchd)
 		upd_args="    <string>/bin/sh</string><string>$(xml "$UPDATER")</string>"
-		upd_keys="  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>$(($(od -An -N1 -tu1 /dev/urandom) % 60))</integer></dict>
+		upd_keys="  <key>StartInterval</key><integer>3600</integer>
   <key>StandardOutPath</key><string>$(xml "$STATE_DIR/update.log")</string>
   <key>StandardErrorPath</key><string>$(xml "$STATE_DIR/update.log")</string>
   <key>QueueDirectories</key><array><string>$(xml "$STATE_DIR/update-queue")</string></array>"
 		# The web app's "Update now" puts a file in this folder; launchd starts the job while
 		# there is one.
 		mkdir -p "$STATE_DIR/update-queue"
-		# At boot the daily job is a daemon too: it runs as you, so it needs no password to
+		# At boot the hourly job is a daemon too: it runs as you, so it needs no password to
 		# run, and it still runs when nobody is logged in. Otherwise it is a login item.
 		upd_d=$(mac_plist "$L_UPD" 1 "$upd_args" "$upd_keys")
 		mac_plist "$L_UPD" 0 "$upd_args" "$upd_keys" >"$tmp/upd.a.plist"
@@ -1990,9 +1990,9 @@ EOF
 		fi
 		;;
 	esac
-	say "Arr checks for a new release once a day and installs it. Turn this off with --no-auto-update."
+	say "Arr checks for a new release every hour and installs it. Turn this off with --no-auto-update."
 elif [ -f "$UPDATER" ] || [ -f "$udir/arr-update.timer" ] || [ -f "$uplist" ] || [ -f "$udplist" ]; then
-	# Whatever is left of them: the daily job without its updater would only fail.
+	# Whatever is left of them: the hourly job without its updater would only fail.
 	step "Turning off automatic updates"
 	case "$kind" in
 	system | user)
@@ -2007,7 +2007,7 @@ elif [ -f "$UPDATER" ] || [ -f "$udir/arr-update.timer" ] || [ -f "$uplist" ] ||
 			# A daemon: removing it takes an administrator. Without one it stays, and finds
 			# no updater to run.
 			if [ "$ELEV_OK" = 1 ] && mac_sudo && { el_start; el_remove "$L_UPD"; elevate; }; then :
-			else say "Note: the daily update job ($udplist) is still installed but does nothing; run this again at a terminal to remove it."; fi
+			else say "Note: the hourly update job ($udplist) is still installed but does nothing; run this again at a terminal to remove it."; fi
 		fi
 		;;
 	esac

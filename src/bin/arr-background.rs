@@ -3,7 +3,7 @@
 //! - `arr-background --config <config.toml>` is `arr serve`, logging to `arr.log` beside the
 //!   config (the "Arr" task, started at log-on);
 //! - `arr-background --hidden <program> [args...]` runs a program without a window and exits
-//!   with its exit code (the daily "Arr update" task runs PowerShell this way).
+//!   with its exit code (the hourly "Arr update" task runs PowerShell this way).
 //!
 //! On Windows this is a GUI program, so starting it opens no window; elsewhere it behaves
 //! the same but has no use, since `arr serve` runs under systemd or launchd.

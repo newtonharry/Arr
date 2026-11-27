@@ -2867,7 +2867,7 @@ async function boot() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && onHome()) loadFeed(); else clearTimeout(pollT);
     if (!document.hidden && P.shown) loadTitle(true);
-    // The server remembers its release check for six hours; asking now and then is cheap.
+    // The server remembers its release check for an hour; asking now and then is cheap.
     if (!document.hidden && S.me && U.phase === 'idle' && Date.now() - U.checkedAt > 30 * 60 * 1000) loadUpdate();
   });
   window.addEventListener('hashchange', route);

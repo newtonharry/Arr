@@ -1,7 +1,7 @@
 //! "Update now" in the web app.
 //!
 //! Arr never updates itself. The updater `install.sh` / `install.ps1` set up (the same one the
-//! daily job runs, which checks the SHA-256 and rolls back if the new version doesn't start) does
+//! hourly job runs, which checks the SHA-256 and rolls back if the new version doesn't start) does
 //! the work, and Arr only asks for it:
 //!
 //! - Linux: Arr creates `update-requested` in its state folder, and a systemd `arr-update.path`
@@ -33,7 +33,7 @@ const LATEST_URL: &str = "https://api.github.com/repos/newtonharry/Arr/releases/
 /// The updater scripts carry this word when they know the trigger and status files.
 const MARKER: &str = "arr-update-trigger";
 /// How long a release answer is kept; a failed check is tried again sooner.
-const KEEP: Duration = Duration::from_secs(6 * 3600);
+const KEEP: Duration = Duration::from_secs(3600);
 const KEEP_FAILURE: Duration = Duration::from_secs(15 * 60);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// No second request while one was made this recently.
